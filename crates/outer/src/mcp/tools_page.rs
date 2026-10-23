@@ -105,22 +105,32 @@ fn schema_type(schema: &Value) -> String {
             return format!("one of: {}", options.join(", "));
         }
     }
-    schema
-        .get("type")
-        .and_then(Value::as_str)
-        .map(|kind| {
-            if kind == "array" {
-                "array".to_string()
-            } else {
-                kind.to_string()
+    if let Some(kind) = schema.get("type") {
+        // `Option<T>` renders as `"type": ["string", "null"]`: name the
+        // non-null members.
+        if let Some(names) = kind.as_array() {
+            let mut parts: Vec<&str> = names
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|name| *name != "null")
+                .collect();
+            parts.sort();
+            parts.dedup();
+            if !parts.is_empty() {
+                return parts.join(" or ");
             }
-        })
-        .or_else(|| {
-            schema
-                .get("$ref")
-                .and_then(Value::as_str)
-                .map(|_| "object".to_string())
-        })
+        }
+        if let Some(kind) = kind.as_str() {
+            if kind == "array" {
+                return "array".to_string();
+            }
+            return kind.to_string();
+        }
+    }
+    schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .map(|_| "object".to_string())
         .unwrap_or_else(|| "value".to_string())
 }
 
@@ -128,6 +138,13 @@ fn schema_type(schema: &Value) -> String {
 mod tests {
     use super::super::registry::registry;
     use super::*;
+
+    #[test]
+    fn optional_fields_render_the_inner_type() {
+        // schemata renders `Option<String>` as `"type": ["string", "null"]`.
+        let schema = serde_json::json!({"type": ["string", "null"]});
+        assert_eq!(schema_type(&schema), "string");
+    }
 
     #[test]
     fn committed_reference_matches_registry() {

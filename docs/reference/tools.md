@@ -48,7 +48,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `accept_terms` | boolean | yes | Required on first sign-in: accept the Terms and Privacy Policy. |
 | `code` | string | yes | The 6-digit code from the inbox. |
 | `email` | string | yes | The email address the code was sent to. |
-| `key_name` | value | no | A label for the minted API key (shown in `list_api_keys`). |
+| `key_name` | string | no | A label for the minted API key (shown in `list_api_keys`). |
 
 ## `whoami`
 
@@ -66,7 +66,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `name` | value | no | A label for the new key (shown in `list_api_keys`). |
+| `name` | string | no | A label for the new key (shown in `list_api_keys`). |
 
 ## `list_api_keys`
 
@@ -113,9 +113,9 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `name` | value | no | Display name (defaults to the slug). |
+| `name` | string | no | Display name (defaults to the slug). |
 | `slug` | string | yes | URL name: lowercase letters, digits and dashes, 1-48 chars. |
-| `wait` | value | no | Wait for the first deploy (default true). False returns immediately; poll deploy_status. |
+| `wait` | boolean | no | Wait for the first deploy (default true). False returns immediately; poll deploy_status. |
 
 ## `list_apps`
 
@@ -168,8 +168,8 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `path_prefix` | value | no | Only files under this directory. |
-| `sha` | value | no | A commit sha (default: the tip of main). |
+| `path_prefix` | string | no | Only files under this directory. |
+| `sha` | string | no | A commit sha (default: the tip of main). |
 
 ## `read_file`
 
@@ -182,10 +182,10 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `end_line` | value | no | Last line to return, inclusive (default: end of file). |
+| `end_line` | integer | no | Last line to return, inclusive (default: end of file). |
 | `path` | string | yes | Repo-relative path. |
-| `sha` | value | no | A commit sha (default: the tip of main). |
-| `start_line` | value | no | First line to return (1-based, default 1). |
+| `sha` | string | no | A commit sha (default: the tip of main). |
+| `start_line` | integer | no | First line to return (1-based, default 1). |
 
 ## `search_code`
 
@@ -199,7 +199,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
 | `query` | string | yes | Text to find (fixed string unless regex is true). |
-| `regex` | value | no | Treat the query as an extended regular expression. |
+| `regex` | boolean | no | Treat the query as an extended regular expression. |
 
 ## `commit`
 
@@ -211,12 +211,12 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `base` | value | no | Expected head (CAS): a moved head answers conflict with current_sha. |
+| `base` | string | no | Expected head (CAS): a moved head answers conflict with current_sha. |
 | `deletes` | array of string | no | Paths to delete. |
 | `edits` | array of object | no | Exact-match replacements in existing files. |
 | `message` | string | yes | Commit message, 1-500 chars. |
 | `moves` | array of object | no | File renames. |
-| `wait` | value | no | Wait for the deploy (default true). False returns immediately; poll deploy_status. |
+| `wait` | boolean | no | Wait for the deploy (default true). False returns immediately; poll deploy_status. |
 | `writes` | array of object | no | Full-file writes (new files or replacements). |
 
 ## `history`
@@ -229,8 +229,8 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `path` | value | no | Only commits touching this path. |
-| `skip` | value | no | Commits to skip (the next_skip cursor). |
+| `path` | string | no | Only commits touching this path. |
+| `skip` | integer | no | Commits to skip (the next_skip cursor). |
 
 ## `show_commit`
 
@@ -256,7 +256,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
 | `sha` | string | yes | An earlier successfully deployed sha: the new commit copies its tree. |
-| `wait` | value | no | Wait for the deploy (default true). |
+| `wait` | boolean | no | Wait for the deploy (default true). |
 
 ## `deploy_status`
 
@@ -268,8 +268,8 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `deploy_id` | value | no | A deploy id (default: the latest deploy). |
-| `wait` | value | no | Wait for a terminal state (default false). |
+| `deploy_id` | string | no | A deploy id (default: the latest deploy). |
+| `wait` | boolean | no | Wait for a terminal state (default false). |
 
 ## `deploy_log`
 
@@ -282,7 +282,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `deploy_id` | value | no | A deploy id (default: the latest deploy). |
+| `deploy_id` | string | no | A deploy id (default: the latest deploy). |
 
 ## `app_logs`
 
@@ -295,6 +295,6 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `limit` | value | no | Most recent lines to return (default 100, max 500). |
-| `since` | value | no | Only lines after this sequence number (exclusive); pass back next_since to poll. |
+| `limit` | integer | no | Most recent lines to return (default 100, max 500). |
+| `since` | integer | no | Only lines after this sequence number (exclusive); pass back next_since to poll. |
 
