@@ -455,8 +455,10 @@ pub async fn mcp_handler(
                 .map(|t| {
                     json!({
                         "name": t.name,
+                        "title": registry::title_of(t.name),
                         "description": t.description,
                         "inputSchema": t.input_schema,
+                        "annotations": t.hints.to_json(&registry::title_of(t.name)),
                     })
                 })
                 .collect();
