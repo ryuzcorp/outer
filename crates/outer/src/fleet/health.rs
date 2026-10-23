@@ -11,7 +11,8 @@ use std::time::Duration;
 pub async fn wait_healthy(host: &str, port: u16, timeout: Duration) -> bool {
     static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_millis(500))
+            .pool_max_idle_per_host(0)
             .build()
             .unwrap_or_default()
     });
