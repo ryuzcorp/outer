@@ -14,6 +14,7 @@ retries and keeps going.
 | Claude Code | `claude mcp add --transport http outer https://outer.now/mcp`. The first account tool call opens the browser |
 | claude.ai, Desktop, mobile | Settings → Connectors → Add custom connector → `https://outer.now/mcp` |
 | Codex CLI, IDE, ChatGPT desktop app | `codex mcp add outer --url https://outer.now/mcp`, then `codex mcp login outer` |
+| Perplexity | Settings → Connectors → add a custom MCP connector with `https://outer.now/mcp` (tested: OAuth sign-in, then `@Outer build me …`) |
 | ChatGPT web | Coming in M2 — a custom plugin pointing at the MCP URL |
 | Anything else | OAuth if supported, else `sign_in` → `verify_code` → `Authorization` header (see [Sign in](/sign-in)) |
 
@@ -25,7 +26,7 @@ retry the call.
 
 ## How sign-in works
 
-Claude, Codex and ChatGPT use OAuth: your client opens Outer's sign-in page,
+Claude, Codex, ChatGPT and Perplexity use OAuth: your client opens Outer's sign-in page,
 you enter your email and the emailed code, accept the terms and approve the
 client. Clients without OAuth use two MCP tools instead — details in
 [Sign in](/sign-in).
