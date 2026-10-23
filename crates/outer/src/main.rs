@@ -433,6 +433,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         pool.clone(),
         Duration::from_secs(60.min(rt.sleep_after_secs.max(1))),
     );
+    outer::cron::spawn_cron_task(
+        pool.clone(),
+        fleets.clone(),
+        outer::cron::TICK_EVERY,
+        outer::cron::WAKE_LEAD,
+    );
 
     let app = http::app(
         http::AppState {

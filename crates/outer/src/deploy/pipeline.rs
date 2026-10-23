@@ -22,6 +22,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 use crate::apps::{self, App};
+use crate::cron;
 use crate::fleet::cgroups;
 use crate::fleet::manager::FleetStorage;
 use crate::fleet::sandbox::{self, Sandbox};
@@ -117,9 +118,9 @@ impl Deployer {
     }
 
     /// Deploy `sha` of `app`: row `queued` → `building` → `deploying` →
-    /// `success`|`failed`. On success calls `apps::set_last_deploy`. Returns
-    /// the outcome for both success and step failure; only bookkeeping
-    /// failures (the row itself) are `Err`.
+    /// `success`|`failed`. On success calls `apps::set_last_deploy` and
+    /// replaces the app's cron rows. Returns the outcome for both success
+    /// and step failure; only bookkeeping failures (the row itself) are `Err`.
     pub async fn deploy(
         &self,
         pool: &SqlitePool,
@@ -149,11 +150,12 @@ impl Deployer {
             .await;
         let Journal { steps, log } = journal;
         match result {
-            Ok(version) => {
+            Ok((version, crons)) => {
                 let log_tail = tail_cap(&log);
                 let steps_json = steps_json(&steps);
                 finish_success(pool, &deploy_id, &steps_json, &log_tail).await?;
                 apps::set_last_deploy(pool, &app.id, sha).await?;
+                cron::sync_app_crons(pool, &app.id, &crons, apps::now_ms()).await?;
                 Ok(DeployOutcome {
                     deploy_id,
                     sha: sha.to_string(),
@@ -209,7 +211,7 @@ impl Deployer {
     }
 
     /// Rows run in order; the first failure stops the pipeline. `Ok` carries
-    /// the celld version on success.
+    /// the celld version and the validated cron schedules on success.
     async fn run_steps(
         &self,
         pool: &SqlitePool,
@@ -218,7 +220,7 @@ impl Deployer {
         app: &App,
         sha: &str,
         journal: &mut Journal,
-    ) -> Result<Option<String>, StepFailed> {
+    ) -> Result<(Option<String>, Vec<String>), StepFailed> {
         let Journal { steps, log } = journal;
         // 1. Worktree.
         let started = Instant::now();
@@ -262,10 +264,10 @@ impl Deployer {
 
         // 4. Deploy root.
         let started = Instant::now();
-        let root = match self.deploy_root(app) {
-            Ok((root, out)) => {
+        let (root, crons) = match self.deploy_root(app) {
+            Ok((root, crons, out)) => {
                 push_step(steps, log, "deploy-root", started, false, &out);
-                root
+                (root, crons)
             }
             Err(e) => {
                 push_step(steps, log, "deploy-root", started, false, &format!("{e:#}"));
@@ -279,7 +281,7 @@ impl Deployer {
         match self.celld_deploy(app, deploy_id, &root).await {
             Ok((out, version)) => {
                 push_step(steps, log, "deploy", started, false, &out);
-                Ok(version)
+                Ok((version, crons))
             }
             Err(e) => {
                 push_step(steps, log, "deploy", started, false, &format!("{e:#}"));
@@ -432,8 +434,11 @@ impl Deployer {
         Ok((false, out))
     }
 
-    /// Step 4: find and validate the wrangler config. Returns the deploy root.
-    fn deploy_root(&self, app: &App) -> anyhow::Result<(PathBuf, String)> {
+    /// Step 4: find and validate the wrangler config. Returns the deploy
+    /// root and the validated `triggers.crons` schedules. An invalid cron
+    /// expression fails the step, naming the expression, before anything
+    /// goes live.
+    fn deploy_root(&self, app: &App) -> anyhow::Result<(PathBuf, Vec<String>, String)> {
         let work = self.work_dir(&app.slug);
         let config = find_deploy_config(&work).ok_or_else(|| {
             anyhow::anyhow!(
@@ -448,11 +453,16 @@ impl Deployer {
             serde_json::from_str(&raw)?
         };
         validate_config_keys(&parsed)?;
+        let crons = cron::crons_from_config(&parsed)?;
         let root = config
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| work.clone());
-        Ok((root.clone(), format!("deploy root {}\n", root.display())))
+        Ok((
+            root.clone(),
+            crons,
+            format!("deploy root {}\n", root.display()),
+        ))
     }
 
     /// Step 5: `celld deploy <root> ... --json`; returns (output, version).
@@ -1352,6 +1362,115 @@ mod tests {
             last_sha, None,
             "a failed deploy never touches last_deploy_sha"
         );
+    }
+
+    #[test]
+    fn deploy_root_returns_validated_crons() {
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let app = test_app(10000);
+        let work = deployer.work_dir(&app.slug);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(
+            work.join("wrangler.json"),
+            r#"{"name":"grocery","main":"index.js","triggers":{"crons":["*/15 * * * *","0 9 * * MON"]}}"#,
+        )
+        .unwrap();
+        let (root, crons, _) = deployer.deploy_root(&app).unwrap();
+        assert_eq!(root, work);
+        assert_eq!(crons, ["*/15 * * * *", "0 9 * * MON"]);
+    }
+
+    #[test]
+    fn deploy_root_rejects_an_invalid_cron_naming_it() {
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let app = test_app(10000);
+        let work = deployer.work_dir(&app.slug);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(
+            work.join("wrangler.json"),
+            r#"{"name":"grocery","triggers":{"crons":["every hour"]}}"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", deployer.deploy_root(&app).unwrap_err());
+        assert!(
+            err.contains("every hour"),
+            "deploy-root names the bad expression: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_with_invalid_cron_fails_at_deploy_root_and_writes_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig {
+            repos_dir: dir.path().join("git"),
+        };
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "seed".to_string(),
+                base: None,
+                writes: vec![
+                    write("index.ts", "v1"),
+                    write(
+                        "wrangler.json",
+                        r#"{"name":"grocery","main":"index.js","triggers":{"crons":["not-a-cron"]}}"#,
+                    ),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10001);
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // No package.json: install and build skip without binaries, and the
+        // bad cron stops the deploy at deploy-root, before celld runs.
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not-a-cron"),
+            "the error names the expression: {:?}",
+            outcome.error
+        );
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM app_cron WHERE app_id = ?1")
+            .bind(&app.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a failed deploy writes no cron rows");
     }
 
     #[tokio::test]
