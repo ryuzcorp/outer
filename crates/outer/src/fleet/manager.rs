@@ -309,6 +309,14 @@ impl FleetManager {
         // this slug.
         let key = self.wake_lock(&app.slug).await;
         let _wake = key.lock().await;
+        // The caller loaded `app` before waiting on the lock; `delete_app`
+        // holds the same lock while it removes the app. Re-read the row so a
+        // request that queued behind a delete can't respawn the fleet (and
+        // mint credentials) for an app that no longer exists.
+        match apps::get_by_slug(pool, &app.slug).await? {
+            Some(current) if current.id == app.id => {}
+            _ => anyhow::bail!("app {} no longer exists", app.slug),
+        }
         if Self::alive(&self.inner.fleets, &app.slug).await {
             self.mark_wake_activity(pool, app).await?;
             return Ok(());
@@ -745,6 +753,13 @@ mod tests {
             "a wake must touch last_request_at"
         );
         assert!(app.asleep_since.is_none());
+
+        // A request that loaded the app before a delete (which holds the same
+        // wake lock) must not wake it afterwards: the row is gone.
+        let stale = app.clone();
+        apps::delete_row(&pool, &stale.id).await.unwrap();
+        let err = manager.ensure_awake(&pool, &stale).await.unwrap_err();
+        assert!(err.to_string().contains("no longer exists"), "{err}");
     }
 
     /// Needs a real celld binary and an S3-compatible bucket (RustFS, with
