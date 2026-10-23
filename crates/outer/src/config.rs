@@ -80,9 +80,8 @@ impl std::fmt::Debug for Config {
             .field("store", &self.store)
             .field("cloudflare", &self.cloudflare)
             .field("signup_open", &self.signup_open)
+            .field("ai_gateway", &self.ai_gateway)
             .field("admin_emails", &self.admin_emails)
-            .field("terms_version", &self.terms_version)
-            .field("email_from", &self.email_from)
             .field("oauth_access_ttl", &self.oauth_access_ttl)
             .field("oauth_refresh_ttl", &self.oauth_refresh_ttl)
             .field("log_filter", &self.log_filter)
@@ -114,6 +113,8 @@ pub struct Config {
     /// `OUTER_SIGNUP=open|closed` (default closed): open admits anyone passing
     /// the abuse checks, closed admits only allowlisted and admin emails.
     pub signup_open: bool,
+    /// Jev classification gateway (`OUTER_AI_GATEWAY`, default `outer`).
+    pub ai_gateway: String,
     /// `OUTER_ADMIN_EMAILS`: comma-separated, normalized to lowercase.
     pub admin_emails: Vec<String>,
     /// `OUTER_TERMS_VERSION`: changing it re-asks every account at next sign-in.
@@ -276,6 +277,7 @@ impl Config {
                 false
             }
         };
+        let ai_gateway = get("OUTER_AI_GATEWAY").unwrap_or("outer").to_string();
         let admin_emails = get("OUTER_ADMIN_EMAILS")
             .map(|raw| {
                 raw.split(',')
@@ -375,6 +377,7 @@ impl Config {
             store,
             cloudflare,
             signup_open,
+            ai_gateway,
             admin_emails,
             terms_version: terms_version.unwrap_or_else(|| "dev".to_string()),
             email_from,
@@ -614,6 +617,18 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn ai_gateway_defaults_to_outer_and_overrides() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert_eq!(cfg.ai_gateway, "outer");
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_AI_GATEWAY", "staging"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.ai_gateway, "staging");
     }
 
     #[test]

@@ -1,52 +1,36 @@
-//! The gate decision and its deploy integration (spec §15.1).
+//! The gate decision and its deploy integration (spec §15.1, Jev-only).
 //!
-//! Decision table, with Jev unavailable (M1 has no API key):
+//! Decision table (handwritten wordlists removed; classification is Jev only):
 //!
 //! | Signal | Result |
 //! | --- | --- |
-//! | `strong` wordlist hit | block |
-//! | Jev `strong_profanity ≥ 0.5` | block |
-//! | `ambiguous` hit with Jev `strong_profanity < 0.5` | pass |
-//! | `sexual_minors > 0.3`, `phishing > 0.9`, `round(severity) == 3` | block + queue |
-//! | Jev unavailable | `strong` blocks, `ambiguous` blocks (fail closed); other text passes as `recheck` |
+//! | `profanity ≥ 0.5` | block (reason `profanity`) |
+//! | `minors > 0.3`, `phishing > 0.9`, `round(severity) == 3` | block (reason `harmful`) + admin queue |
+//! | `hate ≥ 0.5` | record for the admin queue, never block |
+//! | Jev unavailable (3 s timeout, one retry) | fail closed: the deploy ends `failed` at step `gate` |
 //!
-//! The decision takes an `Option<JevScores>`: `None` is "Jev unavailable".
-//! A Jev client later calls the same function with `Some(scores)` — no
-//! restructuring needed.
-//!
-//! Chunk cache (`moderation_text`, per app): chunks already `clear` or
-//! `allowed` are skipped. New chunks are recorded: `clear` when only mild
-//! (or no) words matched — the Jev question explicitly excludes mild
-//! words, so nothing later can flag them; `recheck` when clean but Jev
-//! couldn't confirm yet, so the next deploy re-checks them and a late Jev
-//! hit can hold the app. Blocked chunks are never recorded, so the next
-//! deploy re-examines them. Template chunks get no special-casing:
-//! per-app persistence means a template's text is recorded `clear` on the
-//! first clean deploy and skipped forever after in that app.
+//! Chunk cache (`moderation_text`, per app) is keyed by sha256 of the chunk
+//! text with only whitespace/case folding — no leetspeak folding anymore.
+//! `clear` chunks are skipped on later deploys; blocked and queued chunks
+//! are never recorded, so the next deploy re-checks them.
 
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use super::extract::{Chunk, TooLarge};
-use super::normalize::{mask_excerpt, normalize, NormalizedText};
-use super::wordlist::{find_evasion, find_spaced, Tier, WordHit};
+use super::jev::{ChunkScores, JevClient, JevError};
 use super::{too_large_message, user_message};
 
-/// Jev's classification of one text, when available. M1 always passes
-/// `None`: no API key yet, so the gate runs on wordlists only.
-#[derive(Debug, Clone, Copy)]
-pub struct JevScores {
-    pub strong_profanity: f32,
-    pub sexual_minors: f32,
-    pub phishing: f32,
-    pub hate: f32,
-    pub severity: f32,
-}
+/// Hate Noul at or above this is worth the admin queue (never a block).
+const HATE_QUEUE_AT: f32 = 0.5;
+/// Excerpts carry the chunk's own text, truncated to about this many chars.
+const EXCERPT_CHARS: usize = 100;
 
 /// Why a deploy blocked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
     Profanity,
+    Harmful,
     TooLarge,
 }
 
@@ -54,12 +38,15 @@ impl BlockReason {
     pub fn as_str(self) -> &'static str {
         match self {
             BlockReason::Profanity => "profanity",
+            BlockReason::Harmful => "harmful",
             BlockReason::TooLarge => "too_large_to_review",
         }
     }
 }
 
-/// One blocked line, per the spec §15.1 `findings` shape.
+/// One gate finding, per the spec §15.1 `findings` shape plus the score.
+/// `signal` is always `"jev"`: we no longer know a matched word, so the
+/// excerpt is the chunk's own text (truncated), unmasked.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Finding {
     pub path: String,
@@ -67,54 +54,47 @@ pub struct Finding {
     pub excerpt: String,
     pub category: &'static str,
     pub signal: &'static str,
+    pub score: f32,
 }
 
 /// The gate's verdict over one deploy.
 #[derive(Debug)]
 pub enum Decision {
-    Pass,
+    Pass { queued: bool },
     Block { reason: BlockReason, queue: bool },
 }
 
-/// Pure decision function: wordlist hit counts plus an optional Jev
-/// verdict. Later stages (migrations, celld deploy) never see this; the
-/// caller maps it to a deploy outcome.
-pub fn decide(strong_hits: usize, ambiguous_hits: usize, jev: Option<JevScores>) -> Decision {
-    let Some(scores) = jev else {
-        // Jev unavailable (M1): fail closed. Strong blocks; ambiguous
-        // blocks too; anything else passes and is marked recheck.
-        if strong_hits > 0 || ambiguous_hits > 0 {
-            return Decision::Block {
-                reason: BlockReason::Profanity,
-                queue: false,
-            };
-        }
-        return Decision::Pass;
-    };
-    if scores.strong_profanity >= 0.5 {
-        return Decision::Block {
-            reason: BlockReason::Profanity,
-            queue: false,
-        };
+/// What one chunk's scores mean. Pure; boundary-tested below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkVerdict {
+    Clear,
+    HateQueue,
+    BlockProfanity,
+    BlockHarmful,
+}
+
+/// Classify one chunk's scores. Hate never blocks, whatever it says.
+pub fn judge(scores: &ChunkScores) -> ChunkVerdict {
+    if scores.profanity >= 0.5 {
+        return ChunkVerdict::BlockProfanity;
     }
-    if scores.sexual_minors > 0.3 || scores.phishing > 0.9 || scores.severity.round() == 3.0 {
-        return Decision::Block {
-            reason: BlockReason::Profanity,
-            queue: true,
-        };
+    if scores.minors > 0.3 || scores.phishing > 0.9 || scores.severity.round() == 3.0 {
+        return ChunkVerdict::BlockHarmful;
     }
-    if strong_hits > 0 {
-        // Belt and braces: a wordlist strong hit blocks even when Jev
-        // disagrees, since Jev is weaker outside English (spec §15.4).
-        return Decision::Block {
-            reason: BlockReason::Profanity,
-            queue: false,
-        };
+    if scores.hate >= HATE_QUEUE_AT {
+        return ChunkVerdict::HateQueue;
     }
-    if ambiguous_hits > 0 {
-        return Decision::Pass; // Jev cleared it (strong_profanity < 0.5)
-    }
-    Decision::Pass
+    ChunkVerdict::Clear
+}
+
+/// The gate failed in a way the pipeline must distinguish: Jev down (fail
+/// closed as a `failed` deploy) versus a genuine bug or DB error.
+#[derive(Debug, thiserror::Error)]
+pub enum GateError {
+    #[error("review unavailable")]
+    Unavailable(#[source] JevError),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 /// Gate statistics for tests and the deploy log.
@@ -131,6 +111,7 @@ pub struct GateStats {
 pub enum GateOutcome {
     Pass {
         stats: GateStats,
+        queued: bool,
     },
     Block {
         reason: BlockReason,
@@ -143,86 +124,130 @@ pub enum GateOutcome {
 /// Cap on findings in one deploy row: the first hit writes `user_message`.
 const MAX_FINDINGS: usize = 25;
 
-/// Run the gate over extracted `chunks` for `app_id`: cache lookup,
-/// wordlist matching, decision, cache + `moderation_check` writes.
+/// Run the gate over extracted `chunks` for `app_id`: cache lookup, Jev
+/// classification of the new chunks, decision, cache + `moderation_check`
+/// writes. Jev errors fail closed: `Err(GateError::Unavailable)` caches
+/// nothing and records nothing.
 ///
-/// `deploy_id`/`sha` identify the check row (stage `gate`). `jev` is
-/// always `None` in M1.
+/// `deploy_id`/`sha` identify the check row (stage `gate`).
 pub async fn run_gate(
     pool: &SqlitePool,
     app_id: &str,
     deploy_id: &str,
     sha: &str,
     chunks: Vec<Chunk>,
-    jev: Option<JevScores>,
-) -> anyhow::Result<GateOutcome> {
+    jev: &JevClient,
+) -> Result<GateOutcome, GateError> {
     let now = crate::apps::now_ms();
     let mut stats = GateStats {
         chunks: chunks.len(),
         ..GateStats::default()
     };
-    let mut checked: Vec<(Chunk, NormalizedText)> = Vec::new();
-    let mut hashes: Vec<String> = Vec::new();
-    for chunk in chunks {
-        let n = normalize(&chunk.text);
-        let hash = sha256_hex(&n.spaced);
-        hashes.push(hash);
-        checked.push((chunk, n));
+    let mut hashes: Vec<String> = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        hashes.push(cache_key(&chunk.text));
     }
-    stats.files = checked
+    stats.files = chunks
         .iter()
-        .map(|(c, _)| &c.path)
+        .map(|c| &c.path)
         .collect::<std::collections::HashSet<_>>()
         .len();
 
     let cached = cached_verdicts(pool, app_id, &hashes).await?;
-    let mut findings = Vec::new();
-    let mut strong_hits = 0;
-    let mut ambiguous_hits = 0;
-    let mut to_record: Vec<(String, &'static str)> = Vec::new();
+    let mut fresh: Vec<(usize, String)> = Vec::new();
+    for (i, hash) in hashes.iter().enumerate() {
+        if cached
+            .get(hash)
+            .is_some_and(|v| v == "clear" || v == "allowed")
+        {
+            stats.skipped += 1;
+        } else {
+            fresh.push((i, chunks[i].text.clone()));
+        }
+    }
+    stats.checked = fresh.len();
 
-    for ((chunk, n), hash) in checked.into_iter().zip(hashes) {
-        if let Some(v) = cached.get(&hash) {
-            if v == "clear" || v == "allowed" {
-                stats.skipped += 1;
-                continue;
-            }
-        }
-        stats.checked += 1;
-        let hits = all_hits(&n);
-        let strong = hits.iter().filter(|h| h.tier == Tier::Strong).count();
-        let ambiguous = hits.iter().filter(|h| h.tier == Tier::Ambiguous).count();
-        let mild = hits.iter().any(|h| h.tier == Tier::Mild);
-        strong_hits += strong;
-        ambiguous_hits += ambiguous;
-        // Blocked chunks are never recorded: the next deploy re-examines
-        // them. Passed chunks record `clear` when only mild (or no) words
-        // matched, `recheck` otherwise.
-        let blocked_chunk = strong > 0 || (ambiguous > 0 && jev.is_none());
-        if !blocked_chunk {
-            to_record.push((hash, if mild { "clear" } else { "recheck" }));
-        }
-        for hit in hits {
-            if hit.tier == Tier::Mild || findings.len() >= MAX_FINDINGS {
-                continue;
-            }
-            if hit.tier == Tier::Ambiguous && jev.is_some() {
-                continue; // decided by Jev below, not by wordlist
-            }
-            findings.push(mask_hit(&chunk, &n, &hit));
+    let mut scores = vec![ChunkScores::default(); chunks.len()];
+    if !fresh.is_empty() {
+        let texts: Vec<String> = fresh.iter().map(|(_, t)| t.clone()).collect();
+        let fresh_scores = jev.classify(&texts).await.map_err(GateError::Unavailable)?;
+        for ((i, _), s) in fresh.iter().zip(fresh_scores) {
+            scores[*i] = s;
         }
     }
 
-    let outcome = match decide(strong_hits, ambiguous_hits, jev) {
-        Decision::Pass => {
-            record_chunks(pool, app_id, &to_record, now).await?;
-            write_check(pool, app_id, deploy_id, sha, "pass", "[]", None, now).await?;
-            GateOutcome::Pass { stats }
+    let mut findings = Vec::new();
+    let mut to_record: Vec<(String, &'static str)> = Vec::new();
+    let mut profane = false;
+    let mut harmful = false;
+    let mut hateful = false;
+    let mut scored_rows = Vec::with_capacity(chunks.len());
+    for ((chunk, hash), chunk_scores) in chunks.iter().zip(&hashes).zip(&scores) {
+        let cached_clear = cached
+            .get(hash)
+            .is_some_and(|v| v == "clear" || v == "allowed");
+        if !cached_clear {
+            scored_rows.push(scored_row(chunk, chunk_scores));
         }
-        Decision::Block { reason, queue } => {
-            let _ = queue; // M2 wires the admin queue; recorded in the row.
+        match judge(chunk_scores) {
+            ChunkVerdict::Clear => {
+                if !cached_clear {
+                    to_record.push((hash.clone(), "clear"));
+                }
+            }
+            ChunkVerdict::HateQueue => {
+                hateful = true;
+                push_findings(&mut findings, chunk, chunk_scores);
+            }
+            ChunkVerdict::BlockProfanity => {
+                profane = true;
+                push_findings(&mut findings, chunk, chunk_scores);
+            }
+            ChunkVerdict::BlockHarmful => {
+                harmful = true;
+                push_findings(&mut findings, chunk, chunk_scores);
+            }
+        }
+    }
+
+    let decision = if profane {
+        Decision::Block {
+            reason: BlockReason::Profanity,
+            queue: harmful,
+        }
+    } else if harmful {
+        Decision::Block {
+            reason: BlockReason::Harmful,
+            queue: true,
+        }
+    } else {
+        Decision::Pass { queued: hateful }
+    };
+    let queued = matches!(decision, Decision::Block { queue: true, .. })
+        || matches!(decision, Decision::Pass { queued: true });
+    let scores_json = serde_json::json!({"queued": queued, "chunks": scored_rows}).to_string();
+
+    let outcome = match decision {
+        Decision::Pass { queued } => {
+            record_chunks(pool, app_id, &to_record, now).await?;
+            write_check(
+                pool,
+                app_id,
+                deploy_id,
+                sha,
+                if queued { "queued" } else { "pass" },
+                &serde_json::to_string(&findings).unwrap_or_else(|_| "[]".to_string()),
+                Some(&scores_json),
+                now,
+            )
+            .await?;
+            GateOutcome::Pass { stats, queued }
+        }
+        Decision::Block { reason, .. } => {
+            // Blocked and queued chunks are never recorded: the next deploy
+            // re-checks them.
             let message = findings.first().map(user_message).unwrap_or_else(|| {
-                "Outer didn't publish this change because the page text was blocked by the profanity gate. Your app still shows the previous version.".to_string()
+                "Outer didn't publish this change because the page text was blocked by the content gate. Your app still shows the previous version.".to_string()
             });
             let findings_json =
                 serde_json::to_string(&findings).unwrap_or_else(|_| "[]".to_string());
@@ -233,7 +258,7 @@ pub async fn run_gate(
                 sha,
                 "blocked",
                 &findings_json,
-                None,
+                Some(&scores_json),
                 now,
             )
             .await?;
@@ -246,6 +271,34 @@ pub async fn run_gate(
         }
     };
     Ok(outcome)
+}
+
+/// The localhost-dev path: no Jev client (no Cloudflare pair), so nothing
+/// is classified. Still writes the `moderation_check` row so the pass is
+/// auditable; off localhost the config refuses to boot without the pair,
+/// so this never runs there.
+pub async fn run_skipped(
+    pool: &SqlitePool,
+    app_id: &str,
+    deploy_id: &str,
+    sha: &str,
+    chunks: &[Chunk],
+) -> anyhow::Result<GateOutcome> {
+    let now = crate::apps::now_ms();
+    let stats = GateStats {
+        files: chunks
+            .iter()
+            .map(|c| &c.path)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        chunks: chunks.len(),
+        ..GateStats::default()
+    };
+    write_check(pool, app_id, deploy_id, sha, "pass", "[]", None, now).await?;
+    Ok(GateOutcome::Pass {
+        stats,
+        queued: false,
+    })
 }
 
 /// The over-caps path: no chunks to check, but still a `moderation_check`
@@ -267,72 +320,67 @@ pub async fn run_too_large(
     })
 }
 
-fn all_hits(n: &NormalizedText) -> Vec<WordHit> {
-    let mut hits = find_spaced(n);
-    hits.extend(find_evasion(n));
-    // Deterministic finding order: base position, spaced hits before
-    // evasion hits on the same span (one finding per span and tier).
-    hits.sort_by(|a, b| {
-        (a.base.start, a.base.end, a.evasion, &a.pattern).cmp(&(
-            b.base.start,
-            b.base.end,
-            b.evasion,
-            &b.pattern,
-        ))
-    });
-    hits.dedup_by(|a, b| a.base == b.base && a.tier == b.tier);
-    hits
+/// Cache key: sha256 over the text with only whitespace/case folding. No
+/// leetspeak folding anymore — Jev sees the raw text, so the key must not
+/// merge texts Jev would judge differently.
+pub fn cache_key(text: &str) -> String {
+    let folded = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    sha256_hex(&folded)
 }
 
-/// letter. The excerpt is the full chunk when short, else a window
-/// around the hit.
-fn mask_hit(chunk: &Chunk, n: &NormalizedText, hit: &WordHit) -> Finding {
-    let orig_chars: Vec<char> = chunk.text.chars().collect();
-    let orig_range = base_to_orig(n, &hit.base);
-    let excerpt = window(&chunk.text, &orig_chars, orig_range.clone());
-    Finding {
-        path: chunk.path.clone(),
-        line: chunk.line,
-        excerpt: mask_excerpt(&excerpt.text, excerpt.range),
-        category: "profanity",
-        signal: "wordlist",
-    }
-}
-
-struct Window {
-    text: String,
-    range: std::ops::Range<usize>,
-}
-
-fn window(text: &str, chars: &[char], orig: std::ops::Range<usize>) -> Window {
-    const MAX_EXCERPT: usize = 200;
-    const CONTEXT: usize = 60;
-    if chars.len() <= MAX_EXCERPT {
-        return Window {
-            text: text.to_string(),
-            range: orig,
+/// One finding per triggered signal on the chunk.
+fn push_findings(findings: &mut Vec<Finding>, chunk: &Chunk, scores: &ChunkScores) {
+    let triggers: &[(&'static str, f32)] = &[
+        ("profanity", scores.profanity),
+        ("sexual_minors", scores.minors),
+        ("phishing", scores.phishing),
+        ("severity", scores.severity),
+        ("hate", scores.hate),
+    ];
+    for (category, value) in triggers {
+        let fires = match *category {
+            "profanity" => scores.profanity >= 0.5,
+            "sexual_minors" => scores.minors > 0.3,
+            "phishing" => scores.phishing > 0.9,
+            "severity" => scores.severity.round() == 3.0,
+            _ => scores.hate >= HATE_QUEUE_AT,
         };
-    }
-    let start = orig.start.saturating_sub(CONTEXT);
-    let end = (orig.end + CONTEXT).min(chars.len());
-    let slice: String = chars[start..end].iter().collect();
-    let prefix = if start > 0 { "…" } else { "" };
-    Window {
-        text: format!("{prefix}{slice}…"),
-        range: orig.start - start + prefix.len()..orig.end - start + prefix.len(),
+        if fires && findings.len() < MAX_FINDINGS {
+            findings.push(Finding {
+                path: chunk.path.clone(),
+                line: chunk.line,
+                excerpt: excerpt(&chunk.text),
+                category,
+                signal: "jev",
+                score: *value,
+            });
+        }
     }
 }
 
-/// Map a base-text span back to original-excerpt char offsets.
-fn base_to_orig(n: &NormalizedText, base: &std::ops::Range<usize>) -> std::ops::Range<usize> {
-    let start = n.base_orig.get(base.start).copied().unwrap_or(0);
-    let end = base
-        .end
-        .checked_sub(1)
-        .and_then(|i| n.base_orig.get(i))
-        .map(|e| e + 1)
-        .unwrap_or(start);
-    start..end.max(start)
+/// The chunk's own text, truncated to ~100 chars. No masking: Jev reports
+/// no matched word, and the text is the owner's own.
+fn excerpt(text: &str) -> String {
+    if text.chars().count() <= EXCERPT_CHARS {
+        return text.to_string();
+    }
+    text.chars().take(EXCERPT_CHARS).collect()
+}
+
+fn scored_row(chunk: &Chunk, scores: &ChunkScores) -> serde_json::Value {
+    serde_json::json!({
+        "path": chunk.path,
+        "line": chunk.line,
+        "profanity": scores.profanity,
+        "minors": scores.minors,
+        "phishing": scores.phishing,
+        "severity": scores.severity,
+        "hate": scores.hate,
+    })
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -347,17 +395,15 @@ async fn cached_verdicts(
     hashes: &[String],
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     let mut out = std::collections::HashMap::new();
-    // Small deploys: one query per chunk keeps the SQL static; chunk
-    // counts are bounded by the text cap.
     for hash in hashes {
-        let row = sqlx::query_as::<_, (String,)>(
-            "SELECT verdict FROM moderation_text WHERE app_id = ?1 AND text_hash = ?2",
+        if let Some((verdict,)) = sqlx::query_as::<_, (String,)>(
+            "SELECT verdict FROM moderation_text WHERE app_id = ? AND text_hash = ?",
         )
         .bind(app_id)
         .bind(hash)
         .fetch_optional(pool)
-        .await?;
-        if let Some((verdict,)) = row {
+        .await?
+        {
             out.insert(hash.clone(), verdict);
         }
     }
@@ -372,7 +418,7 @@ async fn record_chunks(
 ) -> anyhow::Result<()> {
     for (hash, verdict) in rows {
         sqlx::query(
-            "INSERT INTO moderation_text (app_id, text_hash, verdict, checked_at) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO moderation_text (app_id, text_hash, verdict, checked_at) VALUES (?, ?, ?, ?)
              ON CONFLICT (app_id, text_hash) DO UPDATE SET verdict = excluded.verdict, checked_at = excluded.checked_at",
         )
         .bind(app_id)
@@ -417,13 +463,25 @@ async fn write_check(
 #[cfg(test)]
 mod tests {
     use super::super::extract::Chunk;
+    use super::super::jev::fake::*;
     use super::*;
+    use std::sync::Arc;
 
     fn chunk(path: &str, line: u32, text: &str) -> Chunk {
         Chunk {
             path: path.to_string(),
             line,
             text: text.to_string(),
+        }
+    }
+
+    fn clear() -> ChunkScores {
+        ChunkScores {
+            profanity: 0.01,
+            minors: 0.0,
+            phishing: 0.0,
+            hate: 0.0,
+            severity: 0.0,
         }
     }
 
@@ -443,49 +501,174 @@ mod tests {
         (dir, pool)
     }
 
+    fn test_client(base_url: &str) -> JevClient {
+        let mut config = super::super::jev::JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = base_url.to_string();
+        config.timeout = std::time::Duration::from_millis(500);
+        JevClient::new(config).unwrap()
+    }
+
+    /// Answers from marker words in the chunk text, so tests control Jev.
+    fn marker_responder() -> Responder {
+        Arc::new(|body| {
+            let mut answers = serde_json::Map::new();
+            let state = body.pointer("/input/state").unwrap().as_object().unwrap();
+            let questions = body
+                .pointer("/input/questions")
+                .unwrap()
+                .as_object()
+                .unwrap();
+            let mut scored = std::collections::HashMap::new();
+            for (key, text) in state {
+                let text = text.as_str().unwrap_or("");
+                let mut s = clear();
+                if text.contains("PROFANE") {
+                    s.profanity = 0.9;
+                }
+                if text.contains("MINORS") {
+                    s.minors = 0.8;
+                }
+                if text.contains("PHISH") {
+                    s.phishing = 0.95;
+                }
+                if text.contains("SEVERE") {
+                    s.severity = 3.0;
+                }
+                if text.contains("HATEFUL") {
+                    s.hate = 0.9;
+                }
+                scored.insert(key.clone(), s);
+            }
+            for (qid, question) in questions {
+                let slot = qid.split('_').next().unwrap_or("");
+                let s = scored.get(slot).cloned().unwrap_or_else(clear);
+                let value = if question.get("type").and_then(|t| t.as_str()) == Some("score") {
+                    serde_json::json!({"type": "score", "score": s.severity})
+                } else if qid.ends_with("_profanity") {
+                    serde_json::json!({"type": "noul", "noul": s.profanity})
+                } else if qid.ends_with("_minors") {
+                    serde_json::json!({"type": "noul", "noul": s.minors})
+                } else if qid.ends_with("_phishing") {
+                    serde_json::json!({"type": "noul", "noul": s.phishing})
+                } else {
+                    serde_json::json!({"type": "noul", "noul": s.hate})
+                };
+                answers.insert(qid.clone(), value);
+            }
+            (200, envelope(serde_json::json!({"answers": answers})))
+        })
+    }
+
     #[test]
-    fn decide_table_matches_spec() {
-        // Jev unavailable: strong blocks, ambiguous blocks (fail closed).
-        assert!(matches!(decide(1, 0, None), Decision::Block { .. }));
-        assert!(matches!(decide(0, 1, None), Decision::Block { .. }));
-        assert!(matches!(decide(0, 0, None), Decision::Pass));
-        // Jev available: strong_profanity >= 0.5 blocks even alone.
-        let jev = |sp: f32| {
-            Some(JevScores {
-                strong_profanity: sp,
-                sexual_minors: 0.0,
-                phishing: 0.0,
-                hate: 0.0,
-                severity: 0.0,
-            })
-        };
-        assert!(matches!(decide(0, 0, jev(0.7)), Decision::Block { .. }));
-        // Ambiguous cleared by Jev passes.
-        assert!(matches!(decide(0, 1, jev(0.1)), Decision::Pass));
-        // Severe signals block with queue.
-        let severe = JevScores {
-            strong_profanity: 0.1,
-            sexual_minors: 0.4,
-            phishing: 0.0,
-            hate: 0.0,
-            severity: 1.0,
-        };
-        assert!(matches!(
-            decide(0, 0, Some(severe)),
-            Decision::Block { queue: true, .. }
-        ));
+    fn judge_matches_the_decision_table_at_its_boundaries() {
+        // Profanity blocks at exactly 0.5.
+        assert_eq!(
+            judge(&ChunkScores {
+                profanity: 0.5,
+                ..clear()
+            }),
+            ChunkVerdict::BlockProfanity
+        );
+        assert_eq!(
+            judge(&ChunkScores {
+                profanity: 0.499,
+                ..clear()
+            }),
+            ChunkVerdict::Clear
+        );
+        // Minors blocks just above 0.3.
+        assert_eq!(
+            judge(&ChunkScores {
+                minors: 0.3,
+                ..clear()
+            }),
+            ChunkVerdict::Clear
+        );
+        assert_eq!(
+            judge(&ChunkScores {
+                minors: 0.3001,
+                ..clear()
+            }),
+            ChunkVerdict::BlockHarmful
+        );
+        // Phishing blocks just above 0.9.
+        assert_eq!(
+            judge(&ChunkScores {
+                phishing: 0.9,
+                ..clear()
+            }),
+            ChunkVerdict::Clear
+        );
+        assert_eq!(
+            judge(&ChunkScores {
+                phishing: 0.9001,
+                ..clear()
+            }),
+            ChunkVerdict::BlockHarmful
+        );
+        // Severity blocks when it rounds to 3.
+        assert_eq!(
+            judge(&ChunkScores {
+                severity: 2.5,
+                ..clear()
+            }),
+            ChunkVerdict::BlockHarmful
+        );
+        assert_eq!(
+            judge(&ChunkScores {
+                severity: 2.4,
+                ..clear()
+            }),
+            ChunkVerdict::Clear
+        );
+        // Hate queues but never blocks, however certain.
+        assert_eq!(
+            judge(&ChunkScores {
+                hate: 0.499,
+                ..clear()
+            }),
+            ChunkVerdict::Clear
+        );
+        assert_eq!(
+            judge(&ChunkScores {
+                hate: 0.5,
+                ..clear()
+            }),
+            ChunkVerdict::HateQueue
+        );
+        assert_eq!(
+            judge(&ChunkScores {
+                hate: 0.99,
+                ..clear()
+            }),
+            ChunkVerdict::HateQueue
+        );
+        // Profanity outranks everything; one bad chunk doesn't clear others.
+        assert_eq!(
+            judge(&ChunkScores {
+                profanity: 0.9,
+                minors: 0.9,
+                ..clear()
+            }),
+            ChunkVerdict::BlockProfanity
+        );
     }
 
     #[tokio::test]
-    async fn plain_strong_word_blocks_with_path_and_line() {
+    async fn profanity_blocks_with_path_line_excerpt_and_score() {
         let (_d, pool) = test_pool().await;
+        let fake = FakeJev::start(marker_responder()).await;
         let out = run_gate(
             &pool,
             "a",
             "d1",
             "sha",
-            vec![chunk("pages/index.tsx", 42, "this list is fuck awesome")],
-            None,
+            vec![chunk("pages/index.tsx", 42, "this list is PROFANE awesome")],
+            &test_client(&fake.base_url),
         )
         .await
         .unwrap();
@@ -499,113 +682,195 @@ mod tests {
             panic!("must block");
         };
         assert_eq!(reason, BlockReason::Profanity);
+        assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "pages/index.tsx");
         assert_eq!(findings[0].line, 42);
-        assert_eq!(findings[0].excerpt, "this list is f*** awesome");
+        assert_eq!(findings[0].excerpt, "this list is PROFANE awesome");
         assert_eq!(findings[0].category, "profanity");
-        assert_eq!(findings[0].signal, "wordlist");
+        assert_eq!(findings[0].signal, "jev");
+        assert!((findings[0].score - 0.9).abs() < 1e-6);
         assert!(user_message.contains("pages/index.tsx, line 42"));
+        assert!(user_message.contains("strong profanity"));
     }
 
     #[tokio::test]
-    async fn leetspeak_portuguese_and_sql_seed_block() {
+    async fn severe_signals_block_as_harmful_and_queue() {
         let (_d, pool) = test_pool().await;
-        for (path, text) in [
-            ("pages/a.tsx", "you are sh1t"),
-            ("pages/b.tsx", "que porra é essa"),
-            ("migrations/0002.sql", "INSERT INTO t VALUES ('merda');"),
+        let fake = FakeJev::start(marker_responder()).await;
+        let jev = test_client(&fake.base_url);
+        for (text, category) in [
+            ("MINORS content", "sexual_minors"),
+            ("PHISH content", "phishing"),
+            ("SEVERE content", "severity"),
         ] {
-            let out = run_gate(&pool, "a", "d1", "s", vec![chunk(path, 7, text)], None)
+            let out = run_gate(&pool, "a", "d1", "s", vec![chunk("a.tsx", 7, text)], &jev)
                 .await
                 .unwrap();
-            assert!(
-                matches!(out, GateOutcome::Block { .. }),
-                "{path} must block"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn evasions_are_caught_and_masked() {
-        let (_d, pool) = test_pool().await;
-        for evil in ["f.u.c.k you", "oh f-uck", "fu\u{200b}ck", "fück yeah"] {
-            let out = run_gate(&pool, "a", "d1", "s", vec![chunk("a.tsx", 1, evil)], None)
-                .await
-                .unwrap();
-            let GateOutcome::Block { findings, .. } = out else {
-                panic!("{evil:?} must block");
+            let GateOutcome::Block {
+                reason, findings, ..
+            } = out
+            else {
+                panic!("{text} must block");
             };
+            assert_eq!(reason, BlockReason::Harmful, "{text}");
             assert!(
-                findings[0].excerpt.contains("f***"),
-                "{evil:?} masked as {:?}",
-                findings[0].excerpt
+                findings.iter().any(|f| f.category == category),
+                "{text}: {findings:?}"
             );
         }
+        let (verdict, scores): (String, String) = sqlx::query_as(
+            "SELECT verdict, scores FROM moderation_check WHERE app_id = 'a' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(verdict, "blocked");
+        assert!(scores.contains("\"queued\":true"), "{scores}");
     }
 
     #[tokio::test]
-    async fn mild_and_scunthorpe_pass() {
+    async fn hate_queues_without_blocking() {
         let (_d, pool) = test_pool().await;
-        for ok in [
-            "Damn, this is crap",
-            "a cocktail at dusk",
-            "welcome to Scunthorpe",
-        ] {
-            let out = run_gate(&pool, "a", "d1", "s", vec![chunk("a.tsx", 3, ok)], None)
-                .await
-                .unwrap();
-            assert!(matches!(out, GateOutcome::Pass { .. }), "{ok:?} passes");
-        }
-    }
-
-    #[tokio::test]
-    async fn ambiguous_blocks_while_jev_is_unavailable() {
-        // Departure from the M1 bullet ("the cock crowed at dawn deploys"):
-        // fail closed per the §15.1 decision table. Passes once Jev is wired.
-        let (_d, pool) = test_pool().await;
+        let fake = FakeJev::start(marker_responder()).await;
         let out = run_gate(
             &pool,
             "a",
             "d1",
             "s",
-            vec![chunk("a.tsx", 1, "the cock crowed at dawn")],
-            None,
+            vec![chunk("a.tsx", 3, "HATEFUL remarks")],
+            &test_client(&fake.base_url),
         )
         .await
         .unwrap();
-        assert!(matches!(out, GateOutcome::Block { .. }));
+        let GateOutcome::Pass { queued, .. } = out else {
+            panic!("hate never blocks");
+        };
+        assert!(queued);
+        let (verdict, findings): (String, String) =
+            sqlx::query_as("SELECT verdict, findings FROM moderation_check WHERE app_id = 'a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(verdict, "queued");
+        assert!(findings.contains("\"category\":\"hate\""), "{findings}");
     }
 
     #[tokio::test]
-    async fn cache_skips_cleared_text_but_rechecks_blocks() {
+    async fn long_chunks_are_truncated_to_about_100_chars() {
+        let (_d, pool) = test_pool().await;
+        let fake = FakeJev::start(marker_responder()).await;
+        let text = format!("PROFANE {}", "x".repeat(500));
+        let out = run_gate(
+            &pool,
+            "a",
+            "d1",
+            "s",
+            vec![chunk("a.tsx", 1, &text)],
+            &test_client(&fake.base_url),
+        )
+        .await
+        .unwrap();
+        let GateOutcome::Block { findings, .. } = out else {
+            panic!("must block");
+        };
+        assert_eq!(findings[0].excerpt.chars().count(), super::EXCERPT_CHARS);
+        assert!(findings[0].excerpt.starts_with("PROFANE"));
+    }
+
+    #[tokio::test]
+    async fn cache_skips_cleared_text_but_rechecks_blocks_and_queues() {
         let (_dir, pool) = test_pool().await;
-        let chunks = || vec![chunk("a.tsx", 1, "Damn, this is crap")];
-        let first = run_gate(&pool, "a", "d1", "s", chunks(), None)
+        let fake = FakeJev::start(marker_responder()).await;
+        let jev = test_client(&fake.base_url);
+        let chunks = || vec![chunk("a.tsx", 1, "an ordinary sentence")];
+        let first = run_gate(&pool, "a", "d1", "s", chunks(), &jev)
             .await
             .unwrap();
-        let GateOutcome::Pass { stats } = first else {
-            panic!("mild passes");
+        let GateOutcome::Pass { stats, .. } = first else {
+            panic!("clear passes");
         };
         assert!(stats.checked > 0);
-        let second = run_gate(&pool, "a", "d2", "s", chunks(), None)
+        let calls = fake.calls();
+        let second = run_gate(&pool, "a", "d2", "s", chunks(), &jev)
             .await
             .unwrap();
-        let GateOutcome::Pass { stats } = second else {
-            panic!("mild passes again");
+        let GateOutcome::Pass { stats, .. } = second else {
+            panic!("clear passes again");
         };
         assert_eq!(stats.checked, 0, "cached clear chunks are skipped");
         assert!(stats.skipped > 0);
+        assert_eq!(fake.calls(), calls, "no Jev call for cached text");
 
         // Blocked text is never recorded: the next deploy re-examines it.
-        let evil = || vec![chunk("a.tsx", 9, "oh fuck")];
+        let evil = || vec![chunk("a.tsx", 9, "PROFANE again")];
         assert!(matches!(
-            run_gate(&pool, "a", "d3", "s", evil(), None).await.unwrap(),
+            run_gate(&pool, "a", "d3", "s", evil(), &jev).await.unwrap(),
             GateOutcome::Block { .. }
         ));
-        let again = run_gate(&pool, "a", "d4", "s", evil(), None).await.unwrap();
+        let before = fake.calls();
+        let again = run_gate(&pool, "a", "d4", "s", evil(), &jev).await.unwrap();
         let GateOutcome::Block { stats, .. } = again else {
             panic!("still blocked");
         };
         assert!(stats.checked > 0, "blocked text is re-checked");
+        assert_eq!(fake.calls(), before + 1);
+
+        // Queued (hate) text is re-checked too.
+        let mean = || vec![chunk("a.tsx", 5, "HATEFUL again")];
+        run_gate(&pool, "a", "d5", "s", mean(), &jev).await.unwrap();
+        let before = fake.calls();
+        let GateOutcome::Pass { stats, .. } =
+            run_gate(&pool, "a", "d6", "s", mean(), &jev).await.unwrap()
+        else {
+            panic!("hate passes");
+        };
+        assert!(stats.checked > 0, "queued text is re-checked");
+        assert_eq!(fake.calls(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_caches_and_records_nothing() {
+        let (_dir, pool) = test_pool().await;
+        let fake = FakeJev::start(Arc::new(|_| (500, serde_json::json!({"error": "down"})))).await;
+        let err = run_gate(
+            &pool,
+            "a",
+            "d1",
+            "s",
+            vec![chunk("a.tsx", 1, "anything")],
+            &test_client(&fake.base_url),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GateError::Unavailable(_)), "{err:?}");
+        let (texts,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM moderation_text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(texts, 0, "nothing is cached as clear");
+        let (checks,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM moderation_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(checks, 0, "nothing is recorded");
+    }
+
+    #[tokio::test]
+    async fn empty_input_passes_without_a_call() {
+        let (_dir, pool) = test_pool().await;
+        let fake = FakeJev::start(marker_responder()).await;
+        let out = run_gate(&pool, "a", "d1", "s", vec![], &test_client(&fake.base_url))
+            .await
+            .unwrap();
+        assert!(matches!(out, GateOutcome::Pass { queued: false, .. }));
+        assert_eq!(fake.calls(), 0);
+    }
+
+    #[test]
+    fn cache_key_folds_only_whitespace_and_case() {
+        assert_eq!(cache_key("Hello  World"), cache_key("hello world"));
+        assert_eq!(cache_key("a\n\tb"), cache_key("A B"));
+        assert_ne!(cache_key("f.u.c.k"), cache_key("fuck"));
+        assert_ne!(cache_key("damn"), cache_key("Damn!"));
     }
 }

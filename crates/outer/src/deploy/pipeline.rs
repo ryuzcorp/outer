@@ -27,6 +27,8 @@ use crate::fleet::cgroups;
 use crate::fleet::manager::FleetStorage;
 use crate::fleet::sandbox::{self, Sandbox};
 use crate::git::manifest::{self, GitConfig};
+use crate::moderation::gate;
+use crate::moderation::jev::JevClient;
 
 /// What the pipeline needs: dirs, tool paths, storage creds, timeouts.
 #[derive(Debug, Clone)]
@@ -44,6 +46,11 @@ pub struct DeploySettings {
     pub step_timeout: Duration,
     /// Cgroup anchor when containment is active, else `None` (dev).
     pub cgroups: Option<PathBuf>,
+    /// Jev classification for the pre-live gate. `None` only on localhost
+    /// dev without the Cloudflare pair: the gate logs a warning and passes.
+    /// Off localhost the config refuses to boot without the pair, so the
+    /// gate always classifies there.
+    pub jev: Option<JevClient>,
 }
 
 /// One pipeline step's timing for the `deploy` row's `steps` JSON.
@@ -223,7 +230,7 @@ impl Deployer {
                     error: Some(failed.error),
                     reason: None,
                     findings: Vec::new(),
-                    user_message: None,
+                    user_message: failed.user_message,
                     steps,
                     log_tail,
                     version: None,
@@ -318,7 +325,20 @@ impl Deployer {
                 push_step(steps, log, "gate", started, false, &out);
                 return Err(StepEnd::Blocked(blocked));
             }
-            Err(e) => {
+            Err(gate::GateError::Unavailable(e)) => {
+                // Jev is down after its retry: fail closed. Nothing is
+                // uploaded, the previous version keeps serving, and nothing
+                // was cached as clear.
+                tracing::warn!(slug = %app.slug, sha, error = %e, "content review unavailable; failing the deploy closed");
+                let user_message = crate::moderation::unavailable_message();
+                let line = "gate: jev unavailable after retry → failed review_unavailable";
+                push_step(steps, log, "gate", started, false, line);
+                return Err(StepEnd::Failed(StepFailed::unavailable(
+                    "gate",
+                    user_message,
+                )));
+            }
+            Err(gate::GateError::Other(e)) => {
                 push_step(steps, log, "gate", started, false, &format!("{e:#}"));
                 return Err(StepEnd::Failed(StepFailed::plain("gate", &e)));
             }
@@ -666,18 +686,19 @@ impl Deployer {
         )?))
     }
 
-    /// Step 4: the pre-live profanity gate over the built worktree.
-    /// Returns the block with a journal line, or `None` with a journal
-    /// line when the deploy passes. Jev is `None` in M1 (no API key):
-    /// the wordlists decide, fail closed.
+    /// Step 4: the pre-live gate over the built worktree. Returns the block
+    /// with a journal line, or `None` with a journal line when the deploy
+    /// passes. Jev classifies the new chunks; when Jev is unreachable the
+    /// error fails the deploy closed (`review_unavailable`). Without a Jev
+    /// client (localhost dev only) the gate logs a warning and passes.
     async fn review_gate(
         &self,
         pool: &SqlitePool,
         app: &App,
         deploy_id: &str,
         sha: &str,
-    ) -> anyhow::Result<(Option<BlockedInfo>, String)> {
-        use crate::moderation::{extract, gate};
+    ) -> Result<(Option<BlockedInfo>, String), gate::GateError> {
+        use crate::moderation::extract;
         let work = self.work_dir(&app.slug);
         let chunks = match extract::collect(&work, &app.slug, app.name.as_deref()) {
             Ok(chunks) => chunks,
@@ -706,13 +727,31 @@ impl Deployer {
                 ));
             }
         };
-        let outcome = gate::run_gate(pool, &app.id, deploy_id, sha, chunks, None).await?;
-        match outcome {
-            gate::GateOutcome::Pass { stats } => Ok((
+        let Some(jev) = &self.settings.jev else {
+            tracing::warn!(slug = %app.slug, sha, "gate: no Jev client (localhost dev without the Cloudflare pair); passing unchecked");
+            let outcome = gate::run_skipped(pool, &app.id, deploy_id, sha, &chunks).await?;
+            let gate::GateOutcome::Pass { stats, .. } = outcome else {
+                unreachable!("skipped always passes");
+            };
+            return Ok((
                 None,
                 format!(
-                    "gate: {} files, {} chunks ({} checked, {} cached) → pass",
+                    "gate: {} files, {} chunks ({} checked, {} cached) → pass (unchecked localhost dev)",
                     stats.files, stats.chunks, stats.checked, stats.skipped
+                ),
+            ));
+        };
+        let outcome = gate::run_gate(pool, &app.id, deploy_id, sha, chunks, jev).await?;
+        match outcome {
+            gate::GateOutcome::Pass { stats, queued } => Ok((
+                None,
+                format!(
+                    "gate: {} files, {} chunks ({} checked, {} cached) → pass{}",
+                    stats.files,
+                    stats.chunks,
+                    stats.checked,
+                    stats.skipped,
+                    if queued { " (queued for review)" } else { "" },
                 ),
             )),
             gate::GateOutcome::Block {
@@ -722,10 +761,7 @@ impl Deployer {
                 stats,
             } => Ok((
                 Some(BlockedInfo {
-                    reason: match reason {
-                        gate::BlockReason::Profanity => "profanity",
-                        gate::BlockReason::TooLarge => "too_large_to_review",
-                    },
+                    reason: reason.as_str(),
                     findings,
                     user_message,
                 }),
@@ -754,10 +790,12 @@ struct BlockedInfo {
     user_message: String,
 }
 
-/// A step that failed: its name and the first meaningful output line.
+/// A step that failed: its name, the first meaningful output line, and an
+/// optional agent-facing line (only the gate sets one, for `review_unavailable`).
 struct StepFailed {
     step: &'static str,
     error: String,
+    user_message: Option<String>,
 }
 
 impl StepFailed {
@@ -774,6 +812,7 @@ impl StepFailed {
         Self {
             step,
             error: cap_error(error),
+            user_message: None,
         }
     }
 
@@ -788,6 +827,17 @@ impl StepFailed {
         Self {
             step,
             error: cap_error(error),
+            user_message: None,
+        }
+    }
+
+    /// For Jev being unreachable: the deploy fails closed with error code
+    /// `review_unavailable` and an agent-facing line.
+    fn unavailable(step: &'static str, user_message: String) -> Self {
+        Self {
+            step,
+            error: "review_unavailable".to_string(),
+            user_message: Some(user_message),
         }
     }
 }
@@ -1165,6 +1215,8 @@ mod tests {
     use super::*;
     use crate::git::commit::{self, Author, CommitRequest, FileWrite, WriteBody};
     use crate::git::manifest::{self, GitSync};
+    use crate::moderation::jev::fake::{envelope, FakeJev, Responder};
+    use crate::moderation::jev::JevConfig;
     use crate::store::Store;
 
     #[test]
@@ -1366,6 +1418,7 @@ mod tests {
             },
             step_timeout: Duration::from_secs(120),
             cgroups: None,
+            jev: None,
         }
     }
 
@@ -1476,6 +1529,44 @@ mod tests {
             .await
             .unwrap();
         (dir, pool)
+    }
+    fn jev_client(base_url: &str) -> JevClient {
+        let mut config = JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = base_url.to_string();
+        config.timeout = Duration::from_secs(2);
+        JevClient::new(config).unwrap()
+    }
+
+    /// Jev flags chunks containing the marker at profanity 0.95; every
+    /// other signal is clear.
+    fn block_responder() -> Responder {
+        Arc::new(|body| {
+            let mut answers = serde_json::Map::new();
+            let state = body.pointer("/input/state").unwrap().as_object().unwrap();
+            let questions = body
+                .pointer("/input/questions")
+                .unwrap()
+                .as_object()
+                .unwrap();
+            for (qid, question) in questions {
+                let slot = qid.split('_').next().unwrap_or("");
+                let text = state.get(slot).and_then(|v| v.as_str()).unwrap_or("");
+                let hot = text.contains("fuck");
+                let value = if question.get("type").and_then(|t| t.as_str()) == Some("score") {
+                    serde_json::json!({"type": "score", "score": 0.0})
+                } else if qid.ends_with("_profanity") {
+                    serde_json::json!({"type": "noul", "noul": if hot { 0.95 } else { 0.01 }})
+                } else {
+                    serde_json::json!({"type": "noul", "noul": 0.01})
+                };
+                answers.insert(qid.clone(), value);
+            }
+            (200, envelope(serde_json::json!({"answers": answers})))
+        })
     }
 
     #[tokio::test]
@@ -1613,10 +1704,16 @@ mod tests {
         .await
         .unwrap();
 
+        // Jev flags profanity: `blocked` proves the gate stopped the
+        // pipeline, with nothing uploaded. Install and build are no-op
+        // `true`; `celld` is missing, so a pass-through would fail at
+        // `deploy` instead.
+        let fake = FakeJev::start(block_responder()).await;
         let data = tempfile::tempdir().unwrap();
         let mut settings = test_settings(data.path().to_path_buf());
         settings.bun_bin = "/bin/true".to_string();
         settings.celld_bin = "/nonexistent/celld-binary".to_string();
+        settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
         assert_eq!(outcome.status, "blocked");
@@ -1625,7 +1722,9 @@ mod tests {
         assert_eq!(outcome.findings.len(), 1);
         assert_eq!(outcome.findings[0].path, "pages/index.tsx");
         assert_eq!(outcome.findings[0].line, 1);
-        assert_eq!(outcome.findings[0].excerpt, "this list is f*** awesome");
+        assert_eq!(outcome.findings[0].excerpt, "this list is fuck awesome");
+        assert_eq!(outcome.findings[0].category, "profanity");
+        assert_eq!(outcome.findings[0].signal, "jev");
         let message = outcome.user_message.as_deref().unwrap_or("");
         assert!(
             message.contains("pages/index.tsx, line 1"),
@@ -1666,6 +1765,119 @@ mod tests {
             last_sha, None,
             "a blocked deploy never touches last_deploy_sha: the previous version serves"
         );
+    }
+    #[tokio::test]
+    async fn unavailable_jev_fails_the_deploy_closed_at_gate() {
+        // Same tree as the blocked test, but Jev answers 500: the deploy
+        // fails at `gate` with `review_unavailable` instead of blocking.
+        // Nothing is uploaded, the previous version keeps serving, and
+        // nothing is cached as clear.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig {
+            repos_dir: dir.path().join("git"),
+        };
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "clean".to_string(),
+                base: None,
+                writes: vec![
+                    write(
+                        "package.json",
+                        r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
+                    ),
+                    write(
+                        "pages/index.tsx",
+                        "export default () => <h1>Welcome to my grocery list</h1>;",
+                    ),
+                    write(
+                        "dist/wrangler.json",
+                        r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                    ),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10011);
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fake = FakeJev::start(Arc::new(|_| (500, serde_json::json!({"error": "down"})))).await;
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = test_settings(data.path().to_path_buf());
+        settings.bun_bin = "/bin/true".to_string();
+        settings.celld_bin = "/nonexistent/celld-binary".to_string();
+        settings.jev = Some(jev_client(&fake.base_url));
+        let deployer = Deployer::new(settings, 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("gate"));
+        assert_eq!(outcome.error.as_deref(), Some("review_unavailable"));
+        let message = outcome.user_message.as_deref().unwrap_or("");
+        assert!(
+            message.contains("temporarily unavailable"),
+            "agent-facing line says to try again shortly: {message}"
+        );
+        assert!(
+            message.contains("previous version"),
+            "agent-facing line says the old version serves: {message}"
+        );
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["worktree", "install", "build", "gate"]);
+
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM deploy WHERE app_id = ?")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "failed");
+        assert_eq!(row.1.as_deref(), Some("review_unavailable"));
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            last_sha, None,
+            "a review-unavailable deploy never touches last_deploy_sha"
+        );
+        let (texts,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM moderation_text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(texts, 0, "nothing is cached as clear");
+        let (checks,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM moderation_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(checks, 0, "nothing is recorded");
     }
 
     #[test]
@@ -1895,6 +2107,7 @@ mod tests {
             },
             step_timeout: Duration::from_secs(120),
             cgroups: None,
+            jev: None,
         };
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();

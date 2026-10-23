@@ -20,7 +20,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/outer/Cargo.toml ./crates/outer/
 COPY crates/outer/src ./crates/outer/src
 COPY crates/outer/migrations ./crates/outer/migrations
-COPY crates/outer/wordlists ./crates/outer/wordlists
 RUN --mount=type=cache,id=outer-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=outer-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=outer-target,target=/src/target,sharing=locked \
