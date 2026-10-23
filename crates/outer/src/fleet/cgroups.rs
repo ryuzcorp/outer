@@ -490,6 +490,9 @@ pub fn ensure_build_parent(
     }
     write_limit(&dir, "memory.max", &memory_max_bytes.to_string())?;
     write_limit(&dir, "cpu.weight", &cpu_weight.to_string())?;
+    // Build leaves sit one level down: without the controllers enabled here
+    // they have no memory.max / pids.max files to write.
+    enable_controllers(&dir).with_context(|| format!("enabling {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -765,6 +768,7 @@ mod tests {
         let cfg = test_config(dir.path());
         let parent = ensure_build_parent(&anchor, &cfg, 2 * 1024 * 1024 * 1024, 10).unwrap();
         assert_eq!(parent, anchor.join("builds"));
+        controllers_enabled(&parent).expect("build leaves need the parent's controllers");
         assert_eq!(
             std::fs::read_to_string(parent.join("memory.max"))
                 .unwrap()
