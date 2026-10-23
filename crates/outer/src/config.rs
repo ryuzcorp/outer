@@ -67,7 +67,30 @@ impl std::fmt::Debug for CloudflareConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("domain", &self.domain)
+            .field("data_dir", &self.data_dir)
+            .field("listen", &self.listen)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .field("origin_pull_ca", &self.origin_pull_ca)
+            .field("host_id", &self.host_id)
+            .field("store", &self.store)
+            .field("cloudflare", &self.cloudflare)
+            .field("signup_open", &self.signup_open)
+            .field("admin_emails", &self.admin_emails)
+            .field("terms_version", &self.terms_version)
+            .field("email_from", &self.email_from)
+            .field("oauth_access_ttl", &self.oauth_access_ttl)
+            .field("oauth_refresh_ttl", &self.oauth_refresh_ttl)
+            .field("log_filter", &self.log_filter)
+            .field("runtime", &self.runtime)
+            .finish()
+    }
+}
+
 pub struct Config {
     /// Platform host; apps live at `<slug>.<domain>` (`OUTER_DOMAIN`).
     pub domain: String,
@@ -88,6 +111,19 @@ pub struct Config {
     /// Cloudflare pair for scoped R2 credentials (`None` = parent keys
     /// directly, localhost dev only). Read only with `OUTER_STORE=r2`.
     pub cloudflare: Option<CloudflareConfig>,
+    /// `OUTER_SIGNUP=open|closed` (default closed): open admits anyone passing
+    /// the abuse checks, closed admits only allowlisted and admin emails.
+    pub signup_open: bool,
+    /// `OUTER_ADMIN_EMAILS`: comma-separated, normalized to lowercase.
+    pub admin_emails: Vec<String>,
+    /// `OUTER_TERMS_VERSION`: changing it re-asks every account at next sign-in.
+    pub terms_version: String,
+    /// `OUTER_EMAIL_FROM` (default `Outer <hello@outer.now>`).
+    pub email_from: String,
+    /// `OUTER_OAUTH_ACCESS_TTL_S` (default 3600).
+    pub oauth_access_ttl: Duration,
+    /// `OUTER_OAUTH_REFRESH_TTL_D` (default 90).
+    pub oauth_refresh_ttl: Duration,
     /// Log filter directives (`RUST_LOG`, default `info`).
     pub log_filter: String,
     /// Running apps: allocation ranges, binaries, limits, sleep.
@@ -230,6 +266,42 @@ impl Config {
             }
             StoreKind::Memory => None,
         };
+        let signup_open = match get("OUTER_SIGNUP").unwrap_or("closed") {
+            "open" => true,
+            "closed" => false,
+            other => {
+                problems.push(format!(
+                    "OUTER_SIGNUP={other:?} is not one of: closed, open"
+                ));
+                false
+            }
+        };
+        let admin_emails = get("OUTER_ADMIN_EMAILS")
+            .map(|raw| {
+                raw.split(',')
+                    .map(|part| part.trim().to_ascii_lowercase())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let terms_version = get("OUTER_TERMS_VERSION").map(str::to_string);
+        let email_from = get("OUTER_EMAIL_FROM")
+            .unwrap_or("Outer <hello@outer.now>")
+            .to_string();
+        let oauth_access_ttl = Duration::from_secs(parse_num(
+            get("OUTER_OAUTH_ACCESS_TTL_S"),
+            "OUTER_OAUTH_ACCESS_TTL_S",
+            3600u64,
+            &mut problems,
+        ));
+        let oauth_refresh_ttl = Duration::from_secs(
+            parse_num(
+                get("OUTER_OAUTH_REFRESH_TTL_D"),
+                "OUTER_OAUTH_REFRESH_TTL_D",
+                90u64,
+                &mut problems,
+            ) * 86400,
+        );
         let log_filter = get("RUST_LOG").unwrap_or("info").to_string();
         if let Err(err) = tracing_subscriber::EnvFilter::try_new(&log_filter) {
             problems.push(format!(
@@ -302,6 +374,12 @@ impl Config {
             host_id,
             store,
             cloudflare,
+            signup_open,
+            admin_emails,
+            terms_version: terms_version.unwrap_or_else(|| "dev".to_string()),
+            email_from,
+            oauth_access_ttl,
+            oauth_refresh_ttl,
             log_filter,
             runtime,
         };
@@ -352,6 +430,18 @@ impl Config {
             if !r2.endpoint.is_empty() && !r2.endpoint.starts_with("https://") && !self.is_local() {
                 problems.push(format!("OUTER_R2_ENDPOINT={:?} must be https", r2.endpoint));
             }
+        }
+        if !self.is_local() && self.terms_version == "dev" {
+            problems.push(
+                "OUTER_TERMS_VERSION is required when OUTER_DOMAIN is not a localhost dev domain (changing it re-asks every account at next sign-in)"
+                    .to_string(),
+            );
+        }
+        if self.oauth_access_ttl.is_zero() {
+            problems.push("OUTER_OAUTH_ACCESS_TTL_S must be at least 1".to_string());
+        }
+        if self.oauth_refresh_ttl.is_zero() {
+            problems.push("OUTER_OAUTH_REFRESH_TTL_D must be at least 1".to_string());
         }
         let rt = &self.runtime;
         if !is_hostname(&rt.apps_domain) {
@@ -592,6 +682,9 @@ mod tests {
             ("OUTER_TLS_CERT", "/tls/cert.pem"),
             ("OUTER_TLS_KEY", "/tls/key.pem"),
             ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+            ("OUTER_TERMS_VERSION", "2026-10-23"),
+            ("OUTER_ADMIN_EMAILS", " Owner@Example.com ,"),
+            ("OUTER_SIGNUP", "closed"),
         ]))
         .unwrap();
         let StoreKind::R2(r2) = &cfg.store else {
@@ -602,9 +695,66 @@ mod tests {
         assert_eq!(cf.account_id, "acct");
         assert_eq!(cf.credential_ttl, Duration::from_secs(604_800));
         assert_eq!(cf.credential_refresh_after, Duration::from_secs(518_400));
+        assert_eq!(cfg.admin_emails, vec!["owner@example.com"]);
+        assert!(!cfg.signup_open);
+        assert_eq!(cfg.terms_version, "2026-10-23");
+        assert_eq!(cfg.oauth_access_ttl, Duration::from_secs(3600));
+        assert_eq!(cfg.oauth_refresh_ttl, Duration::from_secs(90 * 86400));
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("s3cret"), "{shown}");
         assert!(!shown.contains("cf-token"), "{shown}");
+    }
+
+    #[test]
+    fn auth_vars_default_for_localhost_and_validate_off_it() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert!(!cfg.signup_open, "closed beta is the default");
+        assert!(cfg.admin_emails.is_empty());
+        assert_eq!(cfg.terms_version, "dev");
+        assert_eq!(cfg.email_from, "Outer <hello@outer.now>");
+
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_STORE", "memory"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+            ("OUTER_SIGNUP", "sometimes"),
+            ("OUTER_OAUTH_ACCESS_TTL_S", "0"),
+            ("OUTER_OAUTH_REFRESH_TTL_D", "0"),
+        ]))
+        .unwrap_err();
+        for name in [
+            "OUTER_SIGNUP",
+            "OUTER_TERMS_VERSION",
+            "OUTER_OAUTH_ACCESS_TTL_S",
+            "OUTER_OAUTH_REFRESH_TTL_D",
+        ] {
+            assert!(
+                err.iter().any(|p| p.contains(name)),
+                "missing {name} in {err:?}"
+            );
+        }
+
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_STORE", "memory"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+            ("OUTER_TERMS_VERSION", "2026-10-23"),
+            ("OUTER_SIGNUP", "open"),
+            ("OUTER_OAUTH_ACCESS_TTL_S", "600"),
+            ("OUTER_OAUTH_REFRESH_TTL_D", "30"),
+        ]));
+        // Memory store still refuses off localhost; the auth vars must not add
+        // problems of their own.
+        let err = cfg.unwrap_err();
+        assert!(
+            !err.iter()
+                .any(|p| p.contains("SIGNUP") || p.contains("TERMS") || p.contains("OAUTH")),
+            "valid auth vars must not add problems: {err:?}"
+        );
     }
 
     #[test]

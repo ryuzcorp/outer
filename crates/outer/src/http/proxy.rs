@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::apps;
 use crate::fleet::manager::FleetManager;
+use crate::http::client_ip::{cf_connecting_ip, client_ip};
 
 /// State the integration owner mounts as the fallback for every `Host`
 /// other than the platform host.
@@ -148,18 +149,6 @@ fn is_forwarded_spoof(name: &HeaderName) -> bool {
     )
 }
 
-/// The client IP Cloudflare attests in `CF-Connecting-IP`, when the header
-/// holds a single valid IP. Only trustworthy behind origin pull: otherwise
-/// the header is spoofable and callers must use the peer address instead.
-fn cf_connecting_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("cf-connecting-ip")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|ip| !ip.is_empty() && ip.parse::<std::net::IpAddr>().is_ok())
-        .map(str::to_string)
-}
-
 fn wants_upgrade(headers: &HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONNECTION)
@@ -273,17 +262,10 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip().to_string());
-    // Origin-locked (behind Cloudflare origin pull): the `CF-Connecting-IP`
-    // header Cloudflare attests is the client IP. Otherwise it is spoofable
-    // and the peer address is used; an invalid value falls back to the peer.
+        .map(|info| info.0);
     let upgrade = wants_upgrade(req.headers());
     let cf_ip = cf_connecting_ip(req.headers());
-    let client_ip = if state.origin_locked {
-        cf_ip.clone().or(peer.clone())
-    } else {
-        peer.clone()
-    };
+    let client_ip = client_ip(req.headers(), state.origin_locked, peer);
     // Grabbed before the request is split: the future resolves once the
     // handshake completes, after the 101 goes back downstream.
     let server_upgrade = if upgrade {
