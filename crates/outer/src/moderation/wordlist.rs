@@ -238,6 +238,13 @@ pub fn find_evasion(n: &NormalizedText) -> Vec<WordHit> {
         if !has_evasion_feature(n, base_start..base_end) {
             continue;
         }
+        // The hit must be made of whole tokens: `f.u.c.k` and `fuuuck`
+        // are, but `a s(erver)` or `a s(tored)` only borrow the start of
+        // the next word, and joining across that boundary flags ordinary
+        // prose (found on the first real template deploy).
+        if !whole_tokens(n, base_start..base_end) {
+            continue;
+        }
         if allowlisted(n, base_start..base_end) {
             continue;
         }
@@ -250,6 +257,14 @@ pub fn find_evasion(n: &NormalizedText) -> Vec<WordHit> {
         });
     }
     hits
+}
+
+/// The span starts and ends on token boundaries in `base`: no letter or
+/// digit right before it or right after it.
+fn whole_tokens(n: &NormalizedText, span: std::ops::Range<usize>) -> bool {
+    let before = span.start.checked_sub(1).and_then(|i| n.base.get(i));
+    let after = n.base.get(span.end);
+    !before.is_some_and(|c| c.is_alphanumeric()) && !after.is_some_and(|c| c.is_alphanumeric())
 }
 
 /// A separator was stripped, or a repeat run was collapsed, inside the
@@ -385,6 +400,17 @@ mod tests {
             assert!(!find_evasion(&normalize(evil)).is_empty(), "{evil:?}");
         }
         assert!(find_evasion(&normalize("cocktail hour")).is_empty());
+        // Joining a one-letter word onto the next word's start is prose,
+        // not an evasion (the template's AGENTS.md tripped this).
+        for prose in [
+            "A server-rendered app",
+            "one-time init, or a stored function value",
+            "an Effect, or a stream",
+            "Give every component a stable key",
+            "a sshd config",
+        ] {
+            assert!(blocking_hits(prose).is_empty(), "{prose:?}");
+        }
     }
 
     #[test]
