@@ -1097,3 +1097,358 @@ async fn app_logs_empty_ring_and_method_not_allowed() {
     assert!(page.contains("codex mcp add"));
     assert!(page.contains("outer.localhost"));
 }
+
+#[tokio::test]
+async fn concurrent_creates_race_app_quota() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    // Both calls pass the early quota check at 0 owned apps; the in-lock
+    // recheck in `apps::create` lets exactly one through.
+    let (a, b) = tokio::join!(
+        call(&state, Some(&token), "create_app", json!({"slug": "aa"})),
+        call(&state, Some(&token), "create_app", json!({"slug": "bb"})),
+    );
+    let bodies = [&a.1, &b.1];
+    let wins = bodies
+        .iter()
+        .filter(|body| body["result"].get("isError").is_none())
+        .count();
+    assert_eq!(wins, 1, "exactly one concurrent create wins the quota race");
+    let loser = bodies
+        .iter()
+        .find(|body| body["result"].get("isError").is_some())
+        .unwrap();
+    assert_eq!(
+        loser["result"]["structuredContent"]["error"],
+        "quota_exceeded"
+    );
+    assert_eq!(loser["result"]["structuredContent"]["quota"], "apps_owned");
+    let (_, who) = call(&state, Some(&token), "whoami", json!({})).await;
+    assert_eq!(result(&who)["structuredContent"]["usage"]["apps_owned"], 1);
+}
+
+#[tokio::test]
+async fn commit_quota_claim_is_atomic_and_refunded() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let account_id = crate::apps::ensure_account(&state.pool, "ana@example.com")
+        .await
+        .unwrap();
+    async fn used(state: &McpState, account_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE account_id = ?1")
+            .bind(account_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+    sqlx::query(
+        "INSERT INTO usage_day (account_id, day, code_changes) VALUES (?1, date('now'), 10)",
+    )
+    .bind(&account_id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    // A malformed base never claims: validation runs before the UPSERT.
+    let (_, bad_shape) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "x", "base": "zzzz",
+               "writes": [{"path": "z.txt", "content": "z"}]}),
+    )
+    .await;
+    assert_eq!(is_error(&bad_shape)["error"], "invalid_argument");
+    assert_eq!(used(&state, &account_id).await, 10);
+    // A well-formed but moved base claims, fails in git, and refunds.
+    let (_, unknown) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "x", "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "writes": [{"path": "z.txt", "content": "z"}]}),
+    )
+    .await;
+    assert_eq!(is_error(&unknown)["error"], "conflict");
+    assert_eq!(used(&state, &account_id).await, 10);
+    // Racing at the boundary: exactly one claim fits under 50.
+    sqlx::query("UPDATE usage_day SET code_changes = 49 WHERE account_id = ?1")
+        .bind(&account_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        call(
+            &state,
+            Some(&token),
+            "commit",
+            json!({"app": "groceries", "message": "r1", "writes": [{"path": "r1.txt", "content": "1"}]})
+        ),
+        call(
+            &state,
+            Some(&token),
+            "commit",
+            json!({"app": "groceries", "message": "r2", "writes": [{"path": "r2.txt", "content": "2"}]})
+        ),
+    );
+    let bodies = [&a.1, &b.1];
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|b| b["result"].get("isError").is_none())
+            .count(),
+        1
+    );
+    let loser = bodies
+        .iter()
+        .find(|b| b["result"].get("isError").is_some())
+        .unwrap();
+    assert_eq!(
+        loser["result"]["structuredContent"]["error"],
+        "quota_exceeded"
+    );
+    assert_eq!(used(&state, &account_id).await, 50);
+}
+
+#[tokio::test]
+async fn rollback_in_flight_rejects_and_coalesces() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let created = create_app(&state, &token, "groceries").await;
+    let sha1 = created["deploy"]["sha"].as_str().unwrap().to_string();
+    // A second commit, so the seed is a legal (earlier) rollback target.
+    let (_, second) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "two",
+               "writes": [{"path": "a.txt", "content": "a"}]}),
+    )
+    .await;
+    assert!(result(&second).get("isError").is_none());
+    state.deploys.set_fake(FakeOutcome::slow());
+    // One rollback proceeds (past the cap it reports building); the second
+    // fails fast instead of queueing another build.
+    let (a, b) = tokio::join!(
+        call(
+            &state,
+            Some(&token),
+            "rollback",
+            json!({"app": "groceries", "sha": sha1})
+        ),
+        call(
+            &state,
+            Some(&token),
+            "rollback",
+            json!({"app": "groceries", "sha": sha1})
+        ),
+    );
+    let bodies = [&a.1, &b.1];
+    let limited: Vec<_> = bodies
+        .iter()
+        .filter(|b| b["result"]["structuredContent"]["error"] == "rate_limited")
+        .collect();
+    assert_eq!(limited.len(), 1, "exactly one rollback is rate-limited");
+    assert_eq!(
+        limited[0]["result"]["structuredContent"]["retry_after_s"], 30,
+        "the in-flight refusal names its backoff"
+    );
+    // A deploy row stuck non-terminal coalesces: no new commit, no budget
+    // spent, just the running deploy reported. (The slow fake only writes
+    // its row at completion, so the stuck row is inserted directly.)
+    let app_id = crate::apps::get_by_slug(&state.pool, "groceries")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    sqlx::query(
+        "INSERT INTO deploy (id, app_id, sha, status, created_at) VALUES (?1, ?2, ?3, 'building', ?4)",
+    )
+    .bind("stuck-deploy")
+    .bind(&app_id)
+    .bind(&sha1)
+    .bind(crate::apps::now_ms())
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (_, history_before) =
+        call(&state, Some(&token), "history", json!({"app": "groceries"})).await;
+    let n_before = result(&history_before)["structuredContent"]["commits"]
+        .as_array()
+        .unwrap()
+        .len();
+    let (_, coalesced) = call(
+        &state,
+        Some(&token),
+        "rollback",
+        json!({"app": "groceries", "sha": sha1, "wait": false}),
+    )
+    .await;
+    let structured = &result(&coalesced)["structuredContent"];
+    assert_eq!(structured["deploy"]["status"], "building");
+    assert!(result(&coalesced)["content"].as_array().unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("already running"));
+    let (_, history_after) =
+        call(&state, Some(&token), "history", json!({"app": "groceries"})).await;
+    assert_eq!(
+        result(&history_after)["structuredContent"]["commits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        n_before,
+        "coalescing must not create a commit"
+    );
+    let app_id = crate::apps::get_by_slug(&state.pool, "groceries")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let rollbacks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rollback_day WHERE app_id = ?1")
+        .bind(&app_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(rollbacks, 1, "only the real rollback spends budget");
+}
+
+#[tokio::test]
+async fn rollback_budget_exhausts_with_retry_after() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let created = create_app(&state, &token, "groceries").await;
+    let sha1 = created["deploy"]["sha"].as_str().unwrap().to_string();
+    let (_, second) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "two",
+               "writes": [{"path": "a.txt", "content": "a"}]}),
+    )
+    .await;
+    assert!(result(&second).get("isError").is_none());
+    let app_id = crate::apps::get_by_slug(&state.pool, "groceries")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    sqlx::query("INSERT INTO rollback_day (app_id, day, count) VALUES (?1, date('now'), 20)")
+        .bind(&app_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "rollback",
+        json!({"app": "groceries", "sha": sha1}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "rate_limited");
+    assert!(
+        err["retry_after_s"].as_u64().unwrap_or(0) > 0,
+        "budget exhaustion names its backoff"
+    );
+    let (_, history) = call(&state, Some(&token), "history", json!({"app": "groceries"})).await;
+    assert_eq!(
+        result(&history)["structuredContent"]["commits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "a refused rollback creates nothing"
+    );
+}
+#[tokio::test]
+async fn git_tools_reject_bad_revs_without_server_paths() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    for (tool, args) in [
+        (
+            "list_files",
+            json!({"app": "groceries", "sha": "not-a-sha!!"}),
+        ),
+        (
+            "read_file",
+            json!({"app": "groceries", "path": "pages/index.tsx", "sha": "../../etc"}),
+        ),
+        ("show_commit", json!({"app": "groceries", "sha": "-5"})),
+        ("history", json!({"app": "groceries", "path": "../x"})),
+        (
+            "commit",
+            json!({"app": "groceries", "message": "x", "base": "--help",
+                   "writes": [{"path": "z.txt", "content": "z"}]}),
+        ),
+        ("rollback", json!({"app": "groceries", "sha": "0xzz"})),
+    ] {
+        let (_, body) = call(&state, Some(&token), tool, args).await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "invalid_argument", "tool {tool}");
+        let message = err["message"].as_str().unwrap_or("");
+        assert!(
+            !message.contains("--git-dir") && !message.contains("/tmp"),
+            "tool {tool} leaked a server path: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn untrusted_notice_covers_findings_and_scores_round() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let created = create_app(&state, &token, "groceries").await;
+    let sha1 = created["deploy"]["sha"].as_str().unwrap().to_string();
+    state.deploys.set_fake(FakeOutcome::blocked());
+    let (_, blocked) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "profane",
+               "writes": [{"path": "p.txt", "content": "p"}]}),
+    )
+    .await;
+    let structured = &result(&blocked)["structuredContent"];
+    assert_eq!(structured["deploy"]["status"], "blocked");
+    assert_eq!(structured["deploy"]["findings"][0]["score"], 0.93);
+    let blocks = result(&blocked)["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks[1]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("The following was produced by your app and its visitors."));
+    assert!(blocks[1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("pages/index.tsx"));
+    // `deploy_status` carries the same payload, so it carries the notice too.
+    let (_, status) = call(
+        &state,
+        Some(&token),
+        "deploy_status",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let status_blocks = result(&status)["content"].as_array().unwrap();
+    assert_eq!(status_blocks.len(), 2);
+    assert!(status_blocks[1]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("The following was produced by your app and its visitors."));
+    // A blocked rollback reports its findings behind the notice as well.
+    let (_, rolled) = call(
+        &state,
+        Some(&token),
+        "rollback",
+        json!({"app": "groceries", "sha": sha1}),
+    )
+    .await;
+    let rolled_blocks = result(&rolled)["content"].as_array().unwrap();
+    assert_eq!(rolled_blocks.len(), 2);
+    assert!(rolled_blocks[1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("pages/index.tsx"));
+}

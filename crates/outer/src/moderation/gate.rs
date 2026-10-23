@@ -54,7 +54,14 @@ pub struct Finding {
     pub excerpt: String,
     pub category: &'static str,
     pub signal: &'static str,
+    /// Jev's raw score, rounded to 2 decimals on the wire so `0.93` stays
+    /// `0.93` instead of `0.9300000071525574` (f32 → JSON).
+    #[serde(serialize_with = "round_score_2")]
     pub score: f32,
+}
+
+fn round_score_2<S: serde::Serializer>(value: &f32, out: S) -> Result<S::Ok, S::Error> {
+    out.serialize_f64((*value as f64 * 100.0).round() / 100.0)
 }
 
 /// The gate's verdict over one deploy.

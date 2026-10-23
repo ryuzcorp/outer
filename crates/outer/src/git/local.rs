@@ -65,6 +65,10 @@ pub fn validate_read_path(path: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!path.is_empty(), "path must not be empty");
     anyhow::ensure!(!path.starts_with('/'), "path {path:?} must be relative");
     anyhow::ensure!(
+        !path.starts_with('-'),
+        "path {path:?} must not start with `-`"
+    );
+    anyhow::ensure!(
         path.chars().count() <= 512,
         "path {path:?} exceeds 512 characters"
     );
@@ -78,6 +82,14 @@ pub fn validate_read_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Accept only hex shas before they reach git: full (40) or abbreviated
+/// (4+), so a `-` flag or shell metacharacter can never ride into
+/// `rev-parse` or a `rev:path` spec.
+pub fn validate_sha(rev: &str) -> anyhow::Result<()> {
+    let ok = (4..=64).contains(&rev.len()) && rev.bytes().all(|b| b.is_ascii_hexdigit());
+    anyhow::ensure!(ok, "rev {rev:?} is not a commit sha");
+    Ok(())
+}
 fn git_dir(bare: &Path) -> String {
     format!("--git-dir={}", bare.display())
 }
@@ -92,6 +104,7 @@ pub async fn resolve_rev(bare: &Path, rev: Option<&str>) -> anyhow::Result<Optio
             None => Ok(None),
         },
         Some(rev) => {
+            validate_sha(rev)?;
             let out = run_git(
                 &[&gd, "rev-parse", "--verify", &format!("{rev}^{{commit}}")],
                 &[],
@@ -125,9 +138,13 @@ pub async fn list_files(
         prefix_arg = format!("{}/", prefix.trim_end_matches('/'));
         args.push(&prefix_arg);
     }
-    let out = run_git(&args, &[], GIT_TIMEOUT).await?;
+    let run = run_capped(&args, MAX_GIT_OUTPUT_BYTES).await?;
+    if run.failed() {
+        anyhow::bail!("git ls-tree failed\n{}", run.stderr);
+    }
+    let out = String::from_utf8_lossy(&run.stdout);
     let mut files = Vec::new();
-    let mut truncated = false;
+    let mut truncated = run.truncated;
     for line in out.lines() {
         if files.len() >= limit {
             truncated = true;
@@ -243,9 +260,20 @@ pub async fn grep(
         args.push(".");
     }
     // `git grep` exits 1 on no matches: that is an empty result, not a failure.
-    let out = run_grep(&args).await?;
+    // The stream is capped: the child dies at 1 MiB and parsing stops at 200
+    // hits, so both paths mark `truncated`.
+    let run = run_capped(&args, MAX_GIT_OUTPUT_BYTES).await?;
+    let out = if run.failed() {
+        if run.status.code() == Some(1) {
+            String::new()
+        } else {
+            anyhow::bail!("git grep failed\n{}", run.stderr)
+        }
+    } else {
+        String::from_utf8_lossy(&run.stdout).into_owned()
+    };
     let mut hits = Vec::new();
-    let mut truncated = false;
+    let mut truncated = run.truncated;
     for line in out.lines() {
         if hits.len() >= MAX_GREP_MATCHES {
             truncated = true;
@@ -273,10 +301,32 @@ pub async fn grep(
     Ok((sha, hits, truncated))
 }
 
-/// `git grep` with exit-status handling: 0 means matches on stdout, 1 means
-/// no matches (empty result), anything else is a failure.
-async fn run_grep(args: &[&str]) -> anyhow::Result<String> {
+/// Largest single git stdout kept in memory: `grep`, `ls-tree` and `show`
+/// stream through this cap and kill the child when it fills, so a hostile
+/// tree cannot OOM the platform through an unbounded `wait_with_output`.
+pub const MAX_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// One capped git run: the stdout bytes, whether the cap cut the stream
+/// (the child was killed), the exit status, and a capped stderr for errors.
+/// When cut, bytes after the last newline are dropped so callers never see
+/// a partial line as a real entry.
+struct CappedOutput {
+    stdout: Vec<u8>,
+    truncated: bool,
+    status: std::process::ExitStatus,
+    stderr: String,
+}
+
+impl CappedOutput {
+    /// A real failure: we only kill the child ourselves when the cap hits,
+    /// so a cut stream is never an error even though its status is "killed".
+    fn failed(&self) -> bool {
+        !self.truncated && !self.status.success()
+    }
+}
+async fn run_capped(args: &[&str], cap: usize) -> anyhow::Result<CappedOutput> {
     use std::process::Stdio;
+    use tokio::io::AsyncReadExt as _;
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -285,17 +335,45 @@ async fn run_grep(args: &[&str]) -> anyhow::Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("git grep timed out"))??;
-    match output.status.code() {
-        Some(0) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
-        Some(1) => Ok(String::new()),
-        _ => {
-            let err = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("git grep failed\n{err}")
+    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("spawn git: {e}"))?;
+    let mut stdout = Vec::new();
+    let mut truncated = false;
+    if let Some(pipe) = child.stdout.take() {
+        let mut limited = pipe.take(cap as u64 + 1);
+        tokio::time::timeout(GIT_TIMEOUT, limited.read_to_end(&mut stdout))
+            .await
+            .map_err(|_| anyhow::anyhow!("git {args:?} timed out"))?
+            .map_err(|e| anyhow::anyhow!("git {args:?} stdout: {e}"))?;
+        if stdout.len() > cap {
+            stdout.truncate(cap);
+            truncated = true;
+            if let Some(pos) = stdout.iter().rposition(|&b| b == b'\n') {
+                stdout.truncate(pos + 1);
+            } else {
+                stdout.clear();
+            }
         }
     }
+    // The child is done (EOF) or cut off: make sure it dies, then reap it.
+    let _ = child.start_kill();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("git {args:?} would not die"))?
+        .map_err(|e| anyhow::anyhow!("git {args:?} wait: {e}"))?;
+    let mut stderr = Vec::new();
+    if let Some(pipe) = child.stderr.take() {
+        let mut limited = pipe.take(4096 + 1);
+        let _ = limited.read_to_end(&mut stderr).await;
+        if stderr.len() > 4096 {
+            stderr.truncate(4096);
+        }
+    }
+    Ok(CappedOutput {
+        stdout,
+        truncated,
+        status,
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
 }
 
 /// `skip` commits past the tip of `main`, then `limit` commits, optionally
@@ -360,6 +438,7 @@ pub async fn log(
 /// `sha`'s metadata, changed files and unified patch (capped at
 /// [`MAX_PATCH_BYTES`]).
 pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
+    validate_sha(sha)?;
     let resolved = run_git(
         &[
             &git_dir(bare),
@@ -395,7 +474,7 @@ pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
         at: parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
         message: parts.next().unwrap_or("").trim().to_string(),
     };
-    let files_out = run_git(
+    let files_run = run_capped(
         &[
             &gd,
             "diff-tree",
@@ -405,12 +484,17 @@ pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
             "--root",
             &sha,
         ],
-        &[],
-        GIT_TIMEOUT,
+        MAX_GIT_OUTPUT_BYTES,
     )
     .await?;
-    let files: Vec<String> = files_out.lines().map(str::to_string).collect();
-    let patch = run_git(
+    if files_run.failed() {
+        anyhow::bail!("git diff-tree failed\n{}", files_run.stderr);
+    }
+    let files: Vec<String> = String::from_utf8_lossy(&files_run.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let patch_run = run_capped(
         &[
             &gd,
             "show",
@@ -419,16 +503,19 @@ pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
             "--unified=3",
             &sha,
         ],
-        &[],
-        GIT_TIMEOUT,
+        MAX_GIT_OUTPUT_BYTES,
     )
     .await?;
-    let (patch, truncated) = truncate_utf8(&patch, MAX_PATCH_BYTES);
+    if patch_run.failed() {
+        anyhow::bail!("git show failed\n{}", patch_run.stderr);
+    }
+    let patch = String::from_utf8_lossy(&patch_run.stdout).into_owned();
+    let (patch, cut) = truncate_utf8(&patch, MAX_PATCH_BYTES);
     Ok(ShowResult {
         commit,
         files,
         patch,
-        truncated,
+        truncated: patch_run.truncated || cut,
     })
 }
 
@@ -548,10 +635,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_streaming_caps_a_flood_of_matches() {
+        let (dir, cfg, store, sync) = seed().await;
+        // 12 files of ~144 KiB, every line matching: ~1.7 MiB of grep
+        // output, far past the 1 MiB stream cap.
+        let big: Vec<crate::git::commit::FileWrite> = (0..12)
+            .map(|i| write(&format!("big{i}.txt"), &"match me\n".repeat(16_000)))
+            .collect();
+        commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "flood".to_string(),
+                base: None,
+                writes: big,
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let bare = bare(&dir, &cfg, &store, &sync).await;
+        let (flood_sha, hits, truncated) =
+            grep(&bare, None, "match me", false, None).await.unwrap();
+        assert_eq!(hits.len(), MAX_GREP_MATCHES);
+        assert!(truncated, "the 1 MiB stream cap must cut the flood");
+        assert!(
+            hits.iter()
+                .all(|h| h.path.starts_with("big") && h.text == "match me"),
+            "only whole lines before the cap count as hits"
+        );
+        // The same flood through `show`: the streamed patch is cut too.
+        let shown = show(&bare, &flood_sha).await.unwrap();
+        assert_eq!(shown.files.len(), 12);
+        assert!(shown.truncated);
+        assert!(shown.patch.len() <= MAX_PATCH_BYTES);
+    }
+
+    #[tokio::test]
     async fn read_path_validation() {
         assert!(validate_read_path("../x").is_err());
         assert!(validate_read_path(".git/config").is_err());
         assert!(validate_read_path("/abs").is_err());
+        assert!(validate_read_path("-rf").is_err());
         assert!(validate_read_path("pages/a.tsx").is_ok());
+        assert!(validate_sha("abc").is_err());
+        assert!(validate_sha("xyz!!").is_err());
+        assert!(validate_sha("-5").is_err());
+        assert!(validate_sha("a3f2c91d5e7b4a6c8f0e2d4b6a8c0e2f4a6b8d0e1").is_ok());
     }
 }

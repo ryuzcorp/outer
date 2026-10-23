@@ -147,17 +147,11 @@ pub async fn plan_of(pool: &sqlx::SqlitePool, account_id: &str) -> Result<String
     Ok(plan.unwrap_or_else(|| "free".to_string()))
 }
 
-pub const FREE_APP_MAX: u64 = 1;
-pub const PRO_APP_MAX: u64 = 10;
 pub const FREE_CHANGES_PER_DAY: u64 = 50;
 pub const PRO_CHANGES_PER_DAY: u64 = 500;
 
 pub fn app_limit(plan: &str) -> u64 {
-    if plan == "pro" {
-        PRO_APP_MAX
-    } else {
-        FREE_APP_MAX
-    }
+    crate::apps::app_limit_for_plan(plan)
 }
 
 pub fn change_limit(plan: &str) -> u64 {
@@ -183,15 +177,35 @@ pub async fn changes_used_today(
     Ok(used.unwrap_or(0).max(0) as u64)
 }
 
-/// Refuse the commit when the owner's daily change budget is spent.
-pub async fn check_change_quota(
-    pool: &sqlx::SqlitePool,
-    account_id: &str,
-) -> Result<(u64, u64), ToolError> {
+/// One claimed code change: the post-claim usage and the plan limit.
+pub struct Claim {
+    pub used: u64,
+    pub limit: u64,
+}
+
+/// Atomically claim one code change against the owner's plan: a single
+/// UPSERT whose guard refuses the increment at the limit, so two racing
+/// commits cannot both pass the check. Done BEFORE the git work (spec
+/// §14.1); a commit that never happens must give the change back
+/// ([`refund_change`]), while a created commit counts even when its deploy
+/// fails or is blocked (spec §9.2).
+pub async fn claim_change(pool: &sqlx::SqlitePool, account_id: &str) -> Result<Claim, ToolError> {
     let plan = plan_of(pool, account_id).await?;
     let limit = change_limit(&plan);
+    let rows = sqlx::query(
+        "INSERT INTO usage_day (account_id, day, code_changes) VALUES (?1, ?2, 1) \
+         ON CONFLICT(account_id, day) DO UPDATE SET code_changes = code_changes + 1 \
+         WHERE code_changes < ?3",
+    )
+    .bind(account_id)
+    .bind(today_utc())
+    .bind(limit as i64)
+    .execute(pool)
+    .await
+    .map_err(internal)?
+    .rows_affected();
     let used = changes_used_today(pool, account_id).await?;
-    if used >= limit {
+    if rows == 0 {
         let resets_at = resets_at_utc();
         return Err(ToolError::quota_exceeded(
             format!("{plan} plan: {limit} code changes per day, {used} used"),
@@ -204,15 +218,16 @@ pub async fn check_change_quota(
             Some(&resets_at),
         ));
     }
-    Ok((used, limit))
+    Ok(Claim { used, limit })
 }
 
-/// Count one code change against the owner's plan (spec §14.1: the quota
-/// check and the increment belong together; both run against `usage_day`).
-pub async fn record_change(pool: &sqlx::SqlitePool, account_id: &str) -> anyhow::Result<()> {
+/// Give back a claimed change when the commit never happened (bad base,
+/// moved head, storage failure). One guarded decrement; a missing or empty
+/// row stays empty.
+pub async fn refund_change(pool: &sqlx::SqlitePool, account_id: &str) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO usage_day (account_id, day, code_changes) VALUES (?1, ?2, 1) \
-         ON CONFLICT(account_id, day) DO UPDATE SET code_changes = code_changes + 1",
+        "UPDATE usage_day SET code_changes = code_changes - 1 \
+         WHERE account_id = ?1 AND day = ?2 AND code_changes > 0",
     )
     .bind(account_id)
     .bind(today_utc())
@@ -251,6 +266,110 @@ pub async fn check_app_quota(
         ));
     }
     Ok((used, limit))
+}
+
+/// Seconds until the next UTC midnight, for `retry_after_s`.
+pub fn secs_until_midnight_utc() -> u64 {
+    chrono::Utc::now()
+        .date_naive()
+        .succ_opt()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|t| t.and_utc())
+        .map(|midnight| (midnight - chrono::Utc::now()).num_seconds().max(1) as u64)
+        .unwrap_or(60)
+}
+
+/// Most rollbacks one app may run per UTC day: loops fail fast instead of
+/// queueing builds.
+pub const ROLLBACKS_PER_DAY: u64 = 20;
+
+/// Atomically claim one rollback from the app's daily budget (same UPSERT
+/// shape as [`claim_change`]). Exhaustion is `rate_limited` with
+/// `retry_after_s` until midnight (spec §8.3): the caller made no progress
+/// and should back off, not fix its input.
+pub async fn claim_rollback(pool: &sqlx::SqlitePool, app_id: &str) -> Result<(), ToolError> {
+    let rows = sqlx::query(
+        "INSERT INTO rollback_day (app_id, day, count) VALUES (?1, ?2, 1) \
+         ON CONFLICT(app_id, day) DO UPDATE SET count = count + 1 \
+         WHERE count < ?3",
+    )
+    .bind(app_id)
+    .bind(today_utc())
+    .bind(ROLLBACKS_PER_DAY as i64)
+    .execute(pool)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if rows == 0 {
+        let retry_after_s = secs_until_midnight_utc();
+        return Err(ToolError::rate_limited(
+            format!(
+                "rollback budget spent for today ({ROLLBACKS_PER_DAY}/day per app); try again in {retry_after_s}s"
+            ),
+            retry_after_s,
+        ));
+    }
+    Ok(())
+}
+
+/// Give back a rollback claim when its commit never happened. One guarded
+/// decrement; a missing or empty row stays empty.
+pub async fn refund_rollback(pool: &sqlx::SqlitePool, app_id: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE rollback_day SET count = count - 1 \
+         WHERE app_id = ?1 AND day = ?2 AND count > 0",
+    )
+    .bind(app_id)
+    .bind(today_utc())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Validate a sha/rev/base input before it reaches git: bad shape is the
+/// caller's bug (`invalid_argument`), and no git error path can leak a
+/// server path. The value echoed back is agent-supplied, never a path.
+pub fn check_rev(label: &str, rev: &str) -> Result<(), ToolError> {
+    crate::git::local::validate_sha(rev).map_err(|_| {
+        ToolError::invalid_argument(format!("{label} is not a commit sha: {rev:?}"))
+    })?;
+    Ok(())
+}
+
+/// The §8.4 untrusted data inside a deploy object, if any: the failed
+/// build's log tail, else the gate findings' excerpts (visitor-influenced
+/// page text). `None` means the deploy carries no untrusted payload.
+fn deploy_untrusted_data(deploy: &Value) -> Option<String> {
+    if let Some(log) = deploy.get("log_tail").and_then(Value::as_str) {
+        return Some(log.to_string());
+    }
+    let findings = deploy.get("findings")?.as_array()?;
+    let lines: Vec<String> = findings
+        .iter()
+        .map(|f| {
+            format!(
+                "{}:{}: {}",
+                f.get("path").and_then(Value::as_str).unwrap_or(""),
+                f.get("line").map(|l| l.to_string()).unwrap_or_default(),
+                f.get("excerpt").and_then(Value::as_str).unwrap_or("")
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// A result carrying a deploy object: when the deploy carries build-log
+/// output or gate findings, the payload rides behind the §8.4 notice as
+/// its own text block.
+pub fn ok_deploy(summary: String, deploy: &Value, structured: Value) -> Value {
+    match deploy_untrusted_data(deploy) {
+        Some(data) => ok_untrusted(summary, data, structured),
+        None => ok(summary, structured),
+    }
 }
 
 /// One deploy row, newest-first lookups included.
@@ -327,7 +446,8 @@ pub async fn deploy_by(
     }))
 }
 
-fn terminal(status: &str) -> bool {
+/// Terminal deploy states: nothing more will happen without a new call.
+pub fn is_terminal(status: &str) -> bool {
     matches!(status, "success" | "failed" | "blocked")
 }
 
@@ -358,7 +478,7 @@ pub fn deploy_json(state: &McpState, app: &App, row: &DeployRow) -> Value {
         "deploy_id": row.deploy_id,
         "sha": row.sha,
     });
-    if terminal(&row.status) {
+    if is_terminal(&row.status) {
         if row.status == "success" {
             out["url"] = json!(state.app_url(&app.slug));
         }
@@ -506,7 +626,7 @@ pub async fn await_row(
     loop {
         let row = deploy_by(&state.pool, &app.id, deploy_id).await?;
         match row {
-            Some(row) if terminal(&row.status) || !wait => {
+            Some(row) if is_terminal(&row.status) || !wait => {
                 let mut out = deploy_json(state, app, &row);
                 if deploy_id.is_none() {
                     out["recent"] = recent_deploys(&state.pool, &app.id).await?;

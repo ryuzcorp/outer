@@ -540,6 +540,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         app_scheme: scheme(&config).to_string(),
         app_port_suffix: port_suffix(config.listen, config.tls_enabled()),
         tool_wait: config.tool_wait,
+        rollback_locks: outer::mcp::RollbackLocks::default(),
     };
     let app = http::app(
         http::AppState {

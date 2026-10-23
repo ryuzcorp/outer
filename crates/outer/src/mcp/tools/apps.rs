@@ -57,9 +57,17 @@ async fn seed_app(
     let template = crate::templates::materialize(&ctx.state.store, &tree)
         .await
         .map_err(internal)?;
-    let app = apps::create(&ctx.state.pool, owner_id, slug, name, &ctx.state.alloc)
-        .await
-        .map_err(ToolError::from_create)?;
+    let plan = super::plan_of(&ctx.state.pool, owner_id).await?;
+    let app = apps::create(
+        &ctx.state.pool,
+        owner_id,
+        slug,
+        name,
+        &ctx.state.alloc,
+        super::app_limit(&plan),
+    )
+    .await
+    .map_err(ToolError::from_create)?;
     let author = crate::ops::noreply_author(owner_id, owner_email, &ctx.state.domain);
     let seeded = async {
         crate::git::manifest::init_repo(&ctx.state.store, &ctx.state.git, &ctx.state.sync, slug)
@@ -110,8 +118,8 @@ async fn seed_app(
 
 pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let caller = authed(ctx)?;
-    check_app_quota(&ctx.state.pool, &caller.account_id).await?;
     apps::validate_slug(&input.slug).map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    check_app_quota(&ctx.state.pool, &caller.account_id).await?;
     let (app, sha) = seed_app(
         ctx,
         &caller.account_id,
@@ -121,12 +129,15 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     )
     .await?;
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
-    Ok(ok(
-        format!("{} is live at {}.", app.slug, ctx.state.app_url(&app.slug)),
-        json!({
-            "app": {"slug": app.slug, "url": ctx.state.app_url(&app.slug), "visibility": app.visibility.as_str()},
-            "deploy": deploy,
-        }),
+    let summary = format!("{} is live at {}.", app.slug, ctx.state.app_url(&app.slug));
+    let structured = json!({
+        "app": {"slug": app.slug, "url": ctx.state.app_url(&app.slug), "visibility": app.visibility.as_str()},
+        "deploy": deploy,
+    });
+    Ok(super::ok_deploy(
+        summary,
+        &structured["deploy"].clone(),
+        structured,
     ))
 }
 

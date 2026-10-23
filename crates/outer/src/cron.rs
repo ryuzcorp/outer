@@ -282,7 +282,7 @@ mod tests {
     }
 
     async fn app(pool: &SqlitePool, owner: &str, slug: &str) -> App {
-        apps::create(pool, owner, slug, None, &alloc())
+        apps::create(pool, owner, slug, None, &alloc(), 10)
             .await
             .unwrap()
     }

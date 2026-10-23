@@ -137,6 +137,14 @@ impl ToolError {
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
             E::Taken => Self::invalid_argument("slug is taken or quarantined; choose another slug"),
             E::Exhausted(what) => Self::internal(format!("no free {what} left; ask the operator")),
+            E::Quota { limit, used } => Self::quota_exceeded(
+                format!("app quota: {limit} allowed, {used} owned"),
+                format!("You've used your {limit} app slot(s) on Outer."),
+                "apps_owned",
+                limit,
+                used,
+                None,
+            ),
             E::Internal(e) => {
                 tracing::warn!("create_app internal: {e:#}");
                 Self::internal("creating the app failed on our side; try again in a minute")

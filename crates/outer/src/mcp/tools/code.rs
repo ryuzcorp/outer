@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    authed, check_change_quota, internal, ok, ok_untrusted, owned_app, record_change, run_deploy,
-    Ctx,
+    authed, check_rev, claim_change, internal, ok, ok_deploy, ok_untrusted, owned_app,
+    refund_change, run_deploy, Ctx,
 };
 use crate::git::{self, CommitError};
 use crate::mcp::error::ToolError;
@@ -136,6 +136,16 @@ async fn mirror(ctx: &Ctx<'_>, slug: &str) -> Result<std::path::PathBuf, ToolErr
 
 pub async fn list_files(input: ListFilesInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
+    // Validate before git runs: bad shape is `invalid_argument` with a
+    // message built only from agent input, so no server path can leak.
+    // Anything the mirror itself reports after that is `internal`.
+    if let Some(prefix) = input.path_prefix.as_deref() {
+        crate::git::local::validate_read_path(prefix)
+            .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    }
+    if let Some(rev) = input.sha.as_deref() {
+        check_rev("sha", rev)?;
+    }
     let bare = mirror(ctx, &app.slug).await?;
     let (sha, files, truncated) = crate::git::local::list_files(
         &bare,
@@ -144,7 +154,7 @@ pub async fn list_files(input: ListFilesInput, ctx: &Ctx<'_>) -> Result<Value, T
         5000,
     )
     .await
-    .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    .map_err(internal)?;
     let files: Vec<Value> = files
         .iter()
         .map(|f| json!({"path": f.path, "size": f.size}))
@@ -164,6 +174,9 @@ pub async fn read_file(input: ReadFileInput, ctx: &Ctx<'_>) -> Result<Value, Too
         }
     }
     let app = owned_app(ctx, &input.app).await?;
+    if let Some(rev) = input.sha.as_deref() {
+        check_rev("sha", rev)?;
+    }
     let bare = mirror(ctx, &app.slug).await?;
     let (sha, bytes) = crate::git::local::read_blob(&bare, input.sha.as_deref(), &input.path)
         .await
@@ -341,10 +354,16 @@ fn to_commit_request(
 pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
     let caller = authed(ctx)?;
-    let (used, limit) = check_change_quota(&ctx.state.pool, &caller.account_id).await?;
     let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
     let request = to_commit_request(&input, author)?;
-    let sha = git::commit::commit(
+    if let Some(base) = input.base.as_deref() {
+        check_rev("base", base)?;
+    }
+    // Claimed before the git work: a commit that never happens (bad base,
+    // moved head) gives the change back; a created commit counts even when
+    // its deploy fails or is blocked.
+    let claim = claim_change(&ctx.state.pool, &caller.account_id).await?;
+    let sha = match git::commit::commit(
         &ctx.state.store,
         &ctx.state.git,
         &ctx.state.sync,
@@ -352,28 +371,37 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
         request,
     )
     .await
-    .map_err(ToolError::from_commit)?;
-    record_change(&ctx.state.pool, &caller.account_id)
-        .await
-        .map_err(internal)?;
+    {
+        Ok(sha) => sha,
+        Err(e) => {
+            if let Err(refund) = refund_change(&ctx.state.pool, &caller.account_id).await {
+                tracing::warn!("commit refund failed: {refund:#}");
+            }
+            return Err(ToolError::from_commit(e));
+        }
+    };
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
-    let quota = json!({"limit": limit, "used": used + 1, "resets_at": super::resets_at_utc()});
+    let quota =
+        json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
     let summary = format!(
         "Committed {} ({}).",
         &sha[..12.min(sha.len())],
         deploy["status"].as_str().unwrap_or("")
     );
     let structured = json!({"commit": {"sha": sha}, "deploy": deploy, "quota": quota});
-    // A failed build's log tail can hold app output, so it rides behind
-    // the §8.4 notice like every other untrusted block.
-    match structured["deploy"]["log_tail"].as_str() {
-        Some(log) => Ok(ok_untrusted(summary, log.to_string(), structured)),
-        None => Ok(ok(summary, structured)),
-    }
+    Ok(ok_deploy(
+        summary,
+        &structured["deploy"].clone(),
+        structured,
+    ))
 }
 
 pub async fn history(input: HistoryInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
+    if let Some(path) = input.path.as_deref() {
+        crate::git::local::validate_read_path(path)
+            .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    }
     let bare = mirror(ctx, &app.slug).await?;
     let skip = input.skip.unwrap_or(0) as usize;
     let (head, entries, next_skip) = crate::git::local::log(&bare, input.path.as_deref(), skip, 50)
@@ -399,6 +427,7 @@ pub async fn history(input: HistoryInput, ctx: &Ctx<'_>) -> Result<Value, ToolEr
 
 pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
+    check_rev("sha", &input.sha)?;
     let bare = mirror(ctx, &app.slug).await?;
     let shown = crate::git::local::show(&bare, &input.sha)
         .await
@@ -436,6 +465,38 @@ pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value,
 pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
     let caller = authed(ctx)?;
+    check_rev("sha", &input.sha)?;
+    // At most one rollback runs per app: a second one fails fast instead of
+    // queueing another full build behind the first.
+    let _guard = ctx.state.rollback_locks.try_lock(&app.id).ok_or_else(|| {
+        ToolError::rate_limited(
+            "another rollback is already running for this app; wait for it to finish",
+            30,
+        )
+    })?;
+    // Coalesce: a deploy already queued or running for this app wins over a
+    // new rollback commit. Report it (awaited or not) instead of building.
+    if let Some(row) = super::latest_deploy(&ctx.state.pool, &app.id).await? {
+        if !super::is_terminal(&row.status) {
+            let deploy = super::await_row(
+                ctx.state,
+                &app,
+                Some(&row.deploy_id),
+                input.wait.unwrap_or(true),
+            )
+            .await?;
+            let structured = json!({"commit": {"sha": row.sha}, "deploy": deploy});
+            let summary = format!(
+                "A deploy is already running; reporting it instead of a new rollback ({}).",
+                structured["deploy"]["status"].as_str().unwrap_or("")
+            );
+            return Ok(ok_deploy(
+                summary,
+                &structured["deploy"].clone(),
+                structured,
+            ));
+        }
+    }
     // The target must be an earlier successful deploy: its tree is known
     // good, so review is a cache hit and the fleet can adopt it.
     let target_ok = sqlx::query_scalar::<_, i64>(
@@ -452,8 +513,12 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
             input.sha, input.app
         )));
     }
+    // The daily budget is claimed after the cheap checks and before the git
+    // work: a refused or redundant rollback costs nothing, and a rollback
+    // whose commit never happens gives the claim back.
+    super::claim_rollback(&ctx.state.pool, &app.id).await?;
     let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
-    let sha = git::commit::rollback(
+    let sha = match git::commit::rollback(
         &ctx.state.store,
         &ctx.state.git,
         &ctx.state.sync,
@@ -462,20 +527,31 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
         &author,
     )
     .await
-    .map_err(|e| match e {
-        CommitError::BadRollback { target, reason } => {
-            ToolError::invalid_argument(format!("cannot roll back to {target}: {reason}"))
+    {
+        Ok(sha) => sha,
+        Err(e) => {
+            if let Err(refund) = super::refund_rollback(&ctx.state.pool, &app.id).await {
+                tracing::warn!("rollback refund failed: {refund:#}");
+            }
+            return Err(match e {
+                CommitError::BadRollback { target, reason } => {
+                    ToolError::invalid_argument(format!("cannot roll back to {target}: {reason}"))
+                }
+                other => ToolError::from_commit(other),
+            });
         }
-        other => ToolError::from_commit(other),
-    })?;
+    };
     // Rollbacks don't count as code changes (spec §14.1).
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
-    Ok(ok(
-        format!(
-            "Rolled back to {} ({}).",
-            &input.sha[..12.min(input.sha.len())],
-            deploy["status"].as_str().unwrap_or("")
-        ),
-        json!({"commit": {"sha": sha}, "deploy": deploy}),
+    let summary = format!(
+        "Rolled back to {} ({}).",
+        &input.sha[..12.min(input.sha.len())],
+        deploy["status"].as_str().unwrap_or("")
+    );
+    let structured = json!({"commit": {"sha": sha}, "deploy": deploy});
+    Ok(ok_deploy(
+        summary,
+        &structured["deploy"].clone(),
+        structured,
     ))
 }

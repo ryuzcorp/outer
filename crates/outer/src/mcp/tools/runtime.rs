@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{await_row, deploy_by, ok, ok_untrusted, owned_app, Ctx};
+use super::{await_row, deploy_by, ok_untrusted, owned_app, Ctx};
 use crate::mcp::error::ToolError;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -53,7 +53,11 @@ pub async fn deploy_status(input: DeployStatusInput, ctx: &Ctx<'_>) -> Result<Va
     )
     .await?;
     let status = deploy["status"].as_str().unwrap_or("");
-    Ok(ok(format!("Deploy is {status}."), deploy))
+    Ok(super::ok_deploy(
+        format!("Deploy is {status}."),
+        &deploy.clone(),
+        deploy,
+    ))
 }
 
 pub async fn deploy_log(input: DeployLogInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {

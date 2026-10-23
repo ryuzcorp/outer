@@ -50,7 +50,19 @@ pub async fn create_app(
     let template = templates::materialize(&p.store, &tree).await?;
 
     let owner_id = apps::ensure_account(&p.pool, owner_email).await?;
-    let app = apps::create(&p.pool, &owner_id, slug, name, &p.alloc).await?;
+    let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM account WHERE id = ?1")
+        .bind(&owner_id)
+        .fetch_optional(&p.pool)
+        .await?;
+    let app = apps::create(
+        &p.pool,
+        &owner_id,
+        slug,
+        name,
+        &p.alloc,
+        apps::app_limit_for_plan(&plan.unwrap_or_default()),
+    )
+    .await?;
     let author = noreply_author(&owner_id, owner_email, &p.domain);
     let seeded = async {
         manifest::init_repo(&p.store, &p.git, &p.sync, slug).await?;

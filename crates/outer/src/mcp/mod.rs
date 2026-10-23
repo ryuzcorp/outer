@@ -16,6 +16,7 @@ pub mod tools;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -161,7 +162,7 @@ impl FakeOutcome {
                 excerpt: "this list is fucking awesome".to_string(),
                 category: "profanity",
                 signal: "jev",
-                score: 0.95,
+                score: 0.93,
             }],
             user_message: Some(
                 "Outer didn't publish this change because the page text has strong profanity (pages/index.tsx, line 42). Your app still shows the previous version.",
@@ -229,6 +230,27 @@ impl FakeDeploys {
     }
 }
 
+/// At most one rollback runs per app: `try_lock` fails fast with
+/// `rate_limited` instead of queueing another full build behind one.
+#[derive(Debug, Clone, Default)]
+pub struct RollbackLocks {
+    inner: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl RollbackLocks {
+    /// The app's rollback guard, or `None` when one is already in flight.
+    pub fn try_lock(&self, app_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let slot = self
+            .inner
+            .lock()
+            .expect("rollback locks poisoned")
+            .entry(app_id.to_string())
+            .or_default()
+            .clone();
+        slot.try_lock_owned().ok()
+    }
+}
+
 /// Everything one MCP call touches. Built once in `main.rs` from config;
 /// no globals.
 #[derive(Clone)]
@@ -251,6 +273,8 @@ pub struct McpState {
     pub app_port_suffix: String,
     /// Awaited calls return the in-progress status after this long (§10.3).
     pub tool_wait: Duration,
+    /// At most one rollback runs per app (fails fast otherwise).
+    pub rollback_locks: RollbackLocks,
 }
 
 impl McpState {
@@ -353,6 +377,7 @@ impl McpState {
             app_scheme: "http".to_string(),
             app_port_suffix: String::new(),
             tool_wait: Duration::from_millis(200),
+            rollback_locks: RollbackLocks::default(),
         }
     }
 }
