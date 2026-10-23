@@ -323,6 +323,21 @@ pub fn setup_inner(cfg: &CgroupConfig, placement: &str, pid: u32) -> anyhow::Res
         anyhow::bail!("own cgroup {} missing under {:?}", own.display(), cfg.root);
     }
     ensure_writable(&cfg.root, &own)?;
+    // Already inside an anchor's platform leaf: a second outer process in the
+    // same container (`docker exec outer app deploy …` while `serve` runs,
+    // which runc places in PID 1's cgroup) or a restarted serve. Reuse that
+    // anchor as is: anchoring again would nest a new anchor under the
+    // platform leaf and drain the running serve into it.
+    if let Some(anchor) = existing_anchor(&own, cfg) {
+        for dir in [
+            &anchor.join(&cfg.platform_leaf),
+            &anchor.join(&cfg.build_parent),
+        ] {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        self_check(&anchor)?;
+        return Ok(anchor);
+    }
     let anchor = own.join(&cfg.anchor_name);
     let platform = anchor.join(&cfg.platform_leaf);
     let builds = anchor.join(&cfg.build_parent);
@@ -383,6 +398,19 @@ pub fn setup_inner(cfg: &CgroupConfig, placement: &str, pid: u32) -> anyhow::Res
     }
     self_check(&anchor)?;
     Ok(anchor)
+}
+
+/// The anchor `own` already sits in, when `own` is `<anchor>/<platform_leaf>`
+/// with the configured names.
+fn existing_anchor(own: &Path, cfg: &CgroupConfig) -> Option<PathBuf> {
+    if own.file_name()? != cfg.platform_leaf.as_str() {
+        return None;
+    }
+    let anchor = own.parent()?;
+    if anchor.file_name()? != cfg.anchor_name.as_str() || !anchor.starts_with(&cfg.root) {
+        return None;
+    }
+    Some(anchor.to_path_buf())
 }
 
 /// Fail boot when the anchor cannot carry its limits: `/ready` answers 503
@@ -596,6 +624,32 @@ mod tests {
             (256u64 * 1024 * 1024).to_string()
         );
         self_check(&anchor).unwrap();
+    }
+
+    /// A second outer process placed in the platform leaf (a CLI command via
+    /// `docker exec` while serve runs) reuses the anchor: no nested anchor,
+    /// and the serve process is not drained anywhere.
+    #[test]
+    fn setup_inside_the_platform_leaf_reuses_the_anchor() {
+        let dir = fake_root();
+        let cfg = test_config(dir.path());
+        let serve_pid = std::process::id();
+        let anchor = setup_inner(&cfg, "0::/", serve_pid).unwrap();
+        let platform = anchor.join("platform");
+        let before = std::fs::read_to_string(platform.join("cgroup.procs")).unwrap();
+
+        let again = setup_inner(&cfg, "0::/outer/platform", serve_pid + 1).unwrap();
+        assert_eq!(again, anchor);
+        assert!(!platform.join("outer").exists(), "no nested anchor");
+        assert_eq!(
+            std::fs::read_to_string(platform.join("cgroup.procs")).unwrap(),
+            before,
+            "nothing moved out of (or into) the platform leaf"
+        );
+        // A same-named group elsewhere is not an anchor.
+        let elsewhere = dir.path().join("other").join("platform");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(existing_anchor(&elsewhere, &cfg).is_none());
     }
 
     #[test]
