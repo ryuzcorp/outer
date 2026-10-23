@@ -2,6 +2,7 @@
 //! later) and every app host through [`proxy`].
 
 pub mod proxy;
+pub mod tls;
 
 use axum::extract::State;
 use axum::http::StatusCode;

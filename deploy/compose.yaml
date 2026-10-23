@@ -1,0 +1,51 @@
+# Outer production service: one container on the VPS. This file lives at
+# /srv/outer/compose.yaml on the host; `deploy/release.sh` uploads it and
+# runs `docker compose --env-file /srv/outer/release.env -f
+# /srv/outer/compose.yaml up -d`. Runtime env comes from /srv/outer/outer.env
+# (see outer.env.example); release.env carries only OUTER_IMAGE (plus
+# OUTER_PREVIOUS_IMAGE for rollback).
+#
+# Networking: `network_mode: host` on purpose. Published ports traverse
+# Docker's iptables chains, which bypass a plain INPUT filter, so a
+# `443:443` publish would need extra DOCKER-USER rules to actually restrict
+# 443 to Cloudflare. On the host network the container binds 0.0.0.0:443
+# directly and the host nftables INPUT policy (deploy/firewall.sh: 443 only
+# from Cloudflare's ranges) applies with no exception. The fleet loopback
+# ports (OUTER_FLEET_PORTS) stay on host loopback either way.
+name: outer
+
+services:
+  outer:
+    image: ${OUTER_IMAGE:?set OUTER_IMAGE in /srv/outer/release.env (deploy/release.sh writes it)}
+    restart: unless-stopped
+    network_mode: host
+    # Above outer's stop budget: fleets stop concurrently (each at most ~20 s:
+    # StopGrace::NORMAL is 15 s SIGTERM + 5 s SIGKILL), then outer writes the
+    # final state snapshot before exiting.
+    stop_grace_period: 35s
+    # Tenant isolation: dropping to the app/fleet uids, owning worktrees, the
+    # nft egress policy (needs NET_ADMIN), and per-fleet cgroup leaves.
+    # The cgroup leaves need a writable cgroupfs mount: CAP_SYS_ADMIN lets
+    # outer remount its own cgroup subtree writable at boot, and the
+    # apparmor lift is required because Docker's default profile denies
+    # mount(2) outright on Ubuntu. No `cgroup:` compose knob exists for this:
+    # outer anchors its groups under its own placement (a private cgroup
+    # namespace reports `/`, which is already outer's cgroup); it only needs
+    # the mount writable, which these two grants provide.
+    cap_add: [NET_ADMIN, SETUID, SETGID, CHOWN, SYS_ADMIN]
+    security_opt: [apparmor:unconfined]
+    env_file:
+      - /srv/outer/outer.env
+    volumes:
+      # SQLite, git mirrors, worktrees, caches: the bucket can rebuild all of
+      # it via the snapshot restore, but the live DB lives here.
+      - /srv/outer/data:/data
+      # Cloudflare Origin CA certificate + key and the Authenticated Origin
+      # Pulls CA (OUTER_TLS_CERT/KEY, OUTER_ORIGIN_PULL_CA). Read-only: the
+      # container never writes key material.
+      - /srv/outer/tls:/tls:ro
+    # No HTTP healthcheck on purpose: outer serves TLS with required client
+    # certificates (mTLS), so no unauthenticated probe can pass the
+    # handshake — not even from inside the container, which holds no client
+    # key. deploy/release.sh verifies the rollout instead (container running
+    # + outer's "listening on" log line).

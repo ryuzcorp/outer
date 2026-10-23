@@ -6,9 +6,8 @@
 #   ├── celld × N       one fleet per awake app, each as the app's own uid
 #   └── bun / sh        builds, as the app's uid
 #
-# Today outer listens on plain HTTP :8080. Origin TLS (Cloudflare Origin CA
-# certificate + Authenticated Origin Pulls) comes with the M0 infra work;
-# until then nothing should point Cloudflare's "Full (strict)" mode here.
+# outer terminates TLS itself (rustls) on OUTER_LISTEN: the Cloudflare
+# Origin CA certificate plus Authenticated Origin Pulls (mTLS).
 ARG CELLD_VERSION=0.6.2
 ARG ESBUILD_VERSION=0.28.2
 
@@ -62,10 +61,10 @@ COPY --from=build /out/outer /usr/local/bin/outer
 COPY LICENSE NOTICE /licenses/
 WORKDIR /data
 ENV OUTER_DATA=/data \
-    OUTER_HTTP_LISTEN=0.0.0.0:8080 \
+    OUTER_LISTEN=[::]:443 \
     CELLD_ESBUILD=/usr/local/bin/esbuild \
     CELLD_VERSION="${CELLD_VERSION}"
 VOLUME /data
-EXPOSE 8080
+EXPOSE 443
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/outer"]
 CMD ["serve"]

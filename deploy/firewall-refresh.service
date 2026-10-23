@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh Cloudflare IP sets in the outer firewall
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/srv/outer/firewall.sh --refresh

@@ -1,0 +1,18 @@
+[Unit]
+Description=Apply the outer nftables firewall from the saved ruleset
+# Before any interface comes up: no boot window with 443 open. The saved
+# ruleset needs only the kernel, not the network.
+DefaultDependencies=no
+Before=network-pre.target docker.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/srv/outer/firewall.sh --apply-saved
+
+[Install]
+WantedBy=multi-user.target
+# Docker (and the host-network outer service) cannot start without the
+# ingress filter: a failed apply blocks it instead of serving unfiltered.
+RequiredBy=docker.service
