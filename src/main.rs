@@ -386,11 +386,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             pool: pool.clone(),
             sync: sync.clone(),
         },
-        http::proxy::ProxyState {
-            pool: pool.clone(),
-            fleets: fleets.clone(),
-            apps_domain: rt.apps_domain.clone(),
-        },
+        http::proxy::ProxyState::new(pool.clone(), fleets.clone(), rt.apps_domain.clone()),
         config.domain.clone(),
     );
     tracing::info!(

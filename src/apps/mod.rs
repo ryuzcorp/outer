@@ -304,21 +304,28 @@ pub async fn create(
 
 /// Delete the app row and quarantine its slug for 30 days. Missing rows are a
 /// quiet no-op (there is no slug to quarantine).
+///
+/// One transaction: a failed quarantine insert rolls the delete back, so the
+/// slug never becomes claimable without its quarantine. A plain `INSERT`
+/// (not `OR REPLACE`) makes a conflicting quarantine row fail the delete
+/// instead of silently refreshing another app's quarantine.
 pub async fn delete_row(pool: &SqlitePool, app_id: &str) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
     let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM app WHERE id = ?1")
         .bind(app_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
     let Some(slug) = slug else { return Ok(()) };
     sqlx::query("DELETE FROM app WHERE id = ?1")
         .bind(app_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT OR REPLACE INTO slug_quarantine (slug, until) VALUES (?1, ?2)")
+    sqlx::query("INSERT INTO slug_quarantine (slug, until) VALUES (?1, ?2)")
         .bind(&slug)
         .bind(now_ms() + QUARANTINE_MS)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -548,5 +555,25 @@ mod tests {
         let got = get_by_slug(&pool, "sleepy").await.unwrap().unwrap();
         assert_eq!(got.asleep_since, None);
         assert_eq!(got.last_deploy_sha.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn delete_row_rolls_back_when_the_quarantine_insert_fails() {
+        let (_dir, pool, owner) = setup().await;
+        let app = create(&pool, &owner, "doomed", None, &alloc())
+            .await
+            .unwrap();
+        // A conflicting quarantine row makes the quarantine INSERT fail.
+        sqlx::query("INSERT INTO slug_quarantine (slug, until) VALUES (?1, ?2)")
+            .bind("doomed")
+            .bind(now_ms() + QUARANTINE_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(delete_row(&pool, &app.id).await.is_err());
+        assert!(
+            get_by_slug(&pool, "doomed").await.unwrap().is_some(),
+            "a failed quarantine must leave the app row (and the slug) claimable by nobody"
+        );
     }
 }

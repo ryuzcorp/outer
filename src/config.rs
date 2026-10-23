@@ -173,9 +173,16 @@ impl Config {
                 1800,
                 &mut problems,
             ),
-            celld_bin: get("OUTER_CELLD_BIN").unwrap_or("celld").to_string(),
-            bun_bin: get("OUTER_BUN_BIN").unwrap_or("bun").to_string(),
-            esbuild_bin: get("OUTER_ESBUILD_BIN").map(str::to_string),
+            celld_bin: resolve_bin(
+                get("OUTER_CELLD_BIN").unwrap_or("celld"),
+                vars.get("PATH").map(String::as_str).unwrap_or(""),
+            ),
+            bun_bin: resolve_bin(
+                get("OUTER_BUN_BIN").unwrap_or("bun"),
+                vars.get("PATH").map(String::as_str).unwrap_or(""),
+            ),
+            esbuild_bin: get("OUTER_ESBUILD_BIN")
+                .map(|bin| resolve_bin(bin, vars.get("PATH").map(String::as_str).unwrap_or(""))),
             build_concurrency: parse_num(
                 get("OUTER_BUILD_CONCURRENCY"),
                 "OUTER_BUILD_CONCURRENCY",
@@ -338,6 +345,46 @@ fn is_hostname(s: &str) -> bool {
         })
 }
 
+/// Resolve `bin` against `path` (the `PATH` search list) at load: bare names
+/// become absolute when an executable is found, explicit paths pass through
+/// as given, and anything missing keeps its raw name so `check-config` and
+/// unit tests never depend on installed tools.
+fn resolve_bin(bin: &str, path: &str) -> String {
+    if bin.contains('/') {
+        return bin.to_string();
+    }
+    let search = if path.is_empty() {
+        "/usr/local/bin:/usr/bin:/bin".to_string()
+    } else {
+        path.to_string()
+    };
+    for dir in std::env::split_paths(&search) {
+        let candidate = dir.join(bin);
+        if is_executable(&candidate) {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    bin.to_string()
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +513,31 @@ mod tests {
                 "missing {name} in {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn tool_bins_resolve_against_path_but_never_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("bun");
+        std::fs::write(&fake, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).unwrap();
+        }
+        let path = dir.path().to_string_lossy().into_owned();
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("PATH", path.as_str()),
+            ("OUTER_ESBUILD_BIN", "/opt/esbuild"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.runtime.bun_bin, fake.to_string_lossy().into_owned());
+        // Missing tools and explicit paths keep their raw names: config load
+        // (and check-config) never depends on installed tools.
+        assert_eq!(cfg.runtime.celld_bin, "celld");
+        assert_eq!(cfg.runtime.esbuild_bin.as_deref(), Some("/opt/esbuild"));
     }
 }

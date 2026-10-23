@@ -130,15 +130,16 @@ impl Deployer {
         let deploy_id = uuid::Uuid::new_v4().to_string();
         insert_deploy_row(pool, &deploy_id, &app.id, sha, apps::now_ms()).await?;
 
-        // Permits after the row: a queued deploy is visible while it waits.
+        // Both after the row: a queued deploy is visible while it waits.
+        // App lock first, so deploys queued behind one app hold no build slot.
+        let app_lock = self.app_lock(&app.id);
+        let _app_guard = app_lock.lock().await;
         let _build_permit = self
             .semaphore
             .clone()
             .acquire_owned()
             .await
             .map_err(|e| anyhow::anyhow!("build semaphore closed: {e}"))?;
-        let app_lock = self.app_lock(&app.id);
-        let _app_guard = app_lock.lock().await;
 
         set_deploy_status(pool, &deploy_id, "building").await?;
 
@@ -232,6 +233,9 @@ impl Deployer {
             }
         }
 
+        // The worktree is outer-owned; the install, build and deploy steps
+        // run as the app uid, so hand it over before they write into it.
+        hand_worktree_to_app(&app.slug, &self.work_dir(&app.slug), app.uid);
         // 2. Install.
         let started = Instant::now();
         match self.install(app, deploy_id).await {
@@ -510,8 +514,10 @@ impl Deployer {
         Ok((out, version))
     }
 
-    /// Run one sandboxed step; resolves the binary, builds the sandbox env,
-    /// and creates the per-step cgroup leaf when containment is on.
+    /// Run one sandboxed step: the binaries come resolved from the config
+    /// (absolute when found on PATH at load, raw names otherwise), and the
+    /// step PATH is built from the bun parent dir so the sandboxed env
+    /// (which starts from `env_clear`) finds the same toolchain.
     async fn run_sandboxed_step(
         &self,
         app: &App,
@@ -521,10 +527,8 @@ impl Deployer {
         args: &[String],
         extra_env: Vec<(String, String)>,
     ) -> anyhow::Result<String> {
-        let program = resolve_bin(bin)?;
-        let program_str = program.to_string_lossy().into_owned();
-        let bun = resolve_bin(&self.settings.bun_bin)?;
-        let parent = bun
+        let program_str = bin.to_string();
+        let parent = Path::new(&self.settings.bun_bin)
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .filter(|p| !p.is_empty())
@@ -772,51 +776,6 @@ fn strip_jsonc_comments(src: &str) -> String {
     out
 }
 
-/// Resolve `bin` to an absolute path: direct paths must exist, bare names are
-/// looked up on `PATH` (the sandboxed env starts from `env_clear`, so the
-/// caller cannot rely on the child inheriting `PATH`).
-fn resolve_bin(bin: &str) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(bin);
-    if path.components().count() > 1 {
-        let absolute = if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        if is_executable(&absolute) {
-            return Ok(absolute);
-        }
-        anyhow::bail!("{bin} is not executable");
-    }
-    let search =
-        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
-    for dir in std::env::split_paths(&search) {
-        let candidate = dir.join(bin);
-        if is_executable(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    anyhow::bail!("{bin} not found on PATH")
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 /// Run git with the sidecar index, capturing both streams; non-zero exits and
 /// timeouts are errors carrying the output.
 async fn run_git(
@@ -851,6 +810,82 @@ async fn run_git(
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(anyhow::anyhow!("git {args:?} timed out after {timeout:?}")),
     }
+}
+
+/// Hand the worktree to the app uid before sandboxed steps run: a root-run
+/// deploy materializes files as outer, and `bun install` / `bun run build`
+/// write into the tree as the app uid. Skipped when not root: an
+/// unprivileged outer cannot chown, and the steps then run as the current
+/// user anyway.
+fn hand_worktree_to_app(slug: &str, work: &Path, uid: u32) {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            tracing::debug!(slug, uid, "not root; leaving the worktree outer-owned");
+            return;
+        }
+        if !chown_tree(work, uid, uid) {
+            tracing::warn!(
+                slug,
+                "chown worktree to app uid failed; continuing (needs CAP_CHOWN)"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (slug, work, uid);
+    }
+}
+
+/// Recursively hand `path` to (`uid`, `gid`) without following symlinks (cf.
+/// Noite's `lchown_tree`): an app-writable tree can link anywhere, and a
+/// following chown run by root would hand platform files to the app uid.
+/// `symlink_metadata` reports a link as a link, so `lchown` changes the link
+/// itself; links are never descended into and paths are never canonicalized.
+/// Returns false when any entry could not be changed.
+#[cfg(unix)]
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> bool {
+    chown_tree_with(path, uid, gid, &|p, uid, gid| {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = CString::new(p.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `lchown` changes the link itself; it never follows it.
+        unsafe { libc::lchown(path.as_ptr(), uid, gid) == 0 }
+    })
+}
+
+/// [`chown_tree`] with the per-entry change injected, so tests can record
+/// the visited paths without privileges.
+#[cfg(unix)]
+fn chown_tree_with(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    chown: &dyn Fn(&Path, u32, u32) -> bool,
+) -> bool {
+    let mut ok = true;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            ok = false;
+            continue;
+        };
+        if !chown(&p, uid, gid) {
+            ok = false;
+        }
+        if meta.file_type().is_dir() {
+            let Ok(rd) = std::fs::read_dir(&p) else {
+                ok = false;
+                continue;
+            };
+            for entry in rd.flatten() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    ok
 }
 
 /// Mark the deploy `deploying` before `celld deploy` runs. A separate
@@ -1345,9 +1380,10 @@ mod tests {
             std::env::var("OUTER_TEST_S3_SECRET").expect("OUTER_TEST_S3_SECRET must be set");
         let bucket =
             std::env::var("OUTER_TEST_S3_BUCKET").unwrap_or_else(|_| "outer-live-test".to_string());
+        let search = std::env::var("PATH").unwrap_or_default();
         for bin in ["bun", "celld"] {
             assert!(
-                resolve_bin(bin).is_ok(),
+                std::env::split_paths(&search).any(|dir| dir.join(bin).is_file()),
                 "{bin} must be on PATH for the live deploy test"
             );
         }
@@ -1437,5 +1473,129 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(last_sha.as_deref(), Some(sha.as_str()));
+    }
+
+    /// A tree with a file, a real dir, a link to an outside file and a link
+    /// to an outside dir. Both tempdirs stay alive in the return value so
+    /// the links never dangle.
+    #[cfg(unix)]
+    fn symlink_tree() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target.txt");
+        std::fs::write(&target, "outside").unwrap();
+        let sub = outside.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "inner").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "file").unwrap();
+        std::fs::create_dir(root.join("realdir")).unwrap();
+        symlink(&target, root.join("link")).unwrap();
+        symlink(&sub, root.join("dirlink")).unwrap();
+        (dir, outside, root, target)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chown_tree_hands_over_links_without_descending_into_them() {
+        use std::cell::RefCell;
+        let (_dir, _outside, root, _target) = symlink_tree();
+        let visited = RefCell::new(Vec::new());
+        let ok = chown_tree_with(&root, 1000, 1000, &|p, uid, gid| {
+            assert_eq!((uid, gid), (1000, 1000));
+            visited.borrow_mut().push(p.to_path_buf());
+            true
+        });
+        assert!(ok);
+        let visited = visited.borrow();
+        for expected in [
+            root.clone(),
+            root.join("file.txt"),
+            root.join("realdir"),
+            root.join("link"),
+            root.join("dirlink"),
+        ] {
+            assert!(
+                visited.contains(&expected),
+                "the link itself is handed over: {expected:?} not in {visited:?}"
+            );
+        }
+        assert_eq!(
+            visited.len(),
+            5,
+            "no traversal outside the tree: {visited:?}"
+        );
+    }
+
+    /// Another group of the current user, if any: an owner may hand entries
+    /// to a member group without privilege, which makes a real handover
+    /// observable without root.
+    #[cfg(unix)]
+    fn alternate_member_group() -> Option<u32> {
+        let mine = unsafe { libc::getegid() };
+        let mut buf = [0 as libc::gid_t; 64];
+        let n = unsafe { libc::getgroups(buf.len() as libc::c_int, buf.as_mut_ptr()) };
+        if n < 0 {
+            return None;
+        }
+        buf[..n as usize]
+            .iter()
+            .map(|g| *g as u32)
+            .find(|g| *g != mine)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chown_tree_moves_the_link_itself_leaving_its_target_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let (_dir, _outside, root, target) = symlink_tree();
+        let me = unsafe { libc::geteuid() };
+        let mine = unsafe { libc::getegid() };
+        let Some(alt) = alternate_member_group() else {
+            // One group only: nothing observable without privilege beyond
+            // the recorder test above; the real call must still leave the
+            // tree structurally intact.
+            chown_tree(&root, me, mine);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
+            return;
+        };
+        // Park every in-tree entry and the outside target on the alternate
+        // group, so the handover back is observable.
+        let lchown = |p: &std::path::Path| {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+            assert!(
+                unsafe { libc::lchown(c.as_ptr(), me, alt) } == 0,
+                "setup chown of {p:?} failed"
+            );
+        };
+        for rel in ["", "file.txt", "realdir", "link", "dirlink"] {
+            lchown(&root.join(rel));
+        }
+        lchown(&target);
+        assert!(chown_tree(&root, me, mine), "handover back must succeed");
+        for rel in ["", "file.txt", "realdir", "link", "dirlink"] {
+            let meta = std::fs::symlink_metadata(root.join(rel)).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (me, mine),
+                "{rel:?} was handed over"
+            );
+        }
+        // The link is still a link to the same target, and the target kept
+        // the alternate group: never followed, never touched.
+        assert_eq!(std::fs::read_link(root.join("link")).unwrap(), target);
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!((meta.uid(), meta.gid()), (me, alt));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
     }
 }

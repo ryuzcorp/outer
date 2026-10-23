@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -24,27 +24,40 @@ pub struct ProxyState {
     pub pool: sqlx::SqlitePool,
     pub fleets: FleetManager,
     pub apps_domain: String,
+    /// Upstream HTTP/1 client: idle pool entries recycled. Per state, never
+    /// global, so tests cannot share connections or throttle entries.
+    pub client: UpstreamClient,
+    /// Last `touch_request` write per app: `touch_request` writes at most
+    /// [`TOUCH_EVERY_MS`] often per app.
+    pub last_touch_ms: Arc<Mutex<HashMap<String, i64>>>,
+}
+
+impl ProxyState {
+    /// Build the per-state upstream client and the per-state touch-throttle
+    /// map alongside the state the integration owner already mounts.
+    pub fn new(pool: sqlx::SqlitePool, fleets: FleetManager, apps_domain: String) -> Self {
+        let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build(connector);
+        Self {
+            pool,
+            fleets,
+            apps_domain,
+            client,
+            last_touch_ms: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 type UpstreamClient =
     hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
-/// One shared client: HTTP/1 only, idle pool entries recycled.
-static CLIENT: LazyLock<UpstreamClient> = LazyLock::new(|| {
-    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(90))
-        .build(connector)
-});
-
-/// Request headers are capped at 16 KiB in total; larger is 431.
-const MAX_HEADER_BYTES: usize = 16 * 1024;
-
 /// `touch_request` writes at most this often per app.
 const TOUCH_EVERY_MS: i64 = 30_000;
-
-static LAST_TOUCH_MS: LazyLock<Mutex<HashMap<String, i64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Requests whose headers total more than this are refused with 431.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 fn text(status: StatusCode, body: &str) -> Response {
     (status, body.to_string()).into_response()
@@ -101,6 +114,30 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+/// Header names nominated by `Connection` (RFC 9110 §7.6.1): comma-separated,
+/// case-insensitive (`Connection: keep-alive, x-internal` nominates both).
+/// Stripped alongside the fixed list in both directions.
+fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(axum::http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Client-supplied forwarding headers: the proxy sets its own values below,
+/// so anything the client sent is dropped. Otherwise upstream sees two
+/// values with the client's first (a spoofed scheme, host or client IP).
+fn is_forwarded_spoof(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "x-forwarded-for" | "x-forwarded-host" | "x-forwarded-proto" | "forwarded"
+    )
+}
+
 fn wants_upgrade(headers: &HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONNECTION)
@@ -112,10 +149,10 @@ fn wants_upgrade(headers: &HeaderMap) -> bool {
         })
 }
 
-async fn touch_once(pool: &sqlx::SqlitePool, app_id: &str) {
+async fn touch_once(state: &ProxyState, app_id: &str) {
     let now = apps::now_ms();
     {
-        let mut last = LAST_TOUCH_MS.lock().unwrap();
+        let mut last = state.last_touch_ms.lock().unwrap();
         match last.get(app_id) {
             Some(prev) if now.saturating_sub(*prev) < TOUCH_EVERY_MS => return,
             _ => {
@@ -123,17 +160,21 @@ async fn touch_once(pool: &sqlx::SqlitePool, app_id: &str) {
             }
         }
     }
-    if let Err(err) = apps::touch_request(pool, app_id, now).await {
+    if let Err(err) = apps::touch_request(&state.pool, app_id, now).await {
         tracing::warn!(app = app_id, error = %err, "touch_request failed");
     }
 }
 
 /// Map an upstream response back onto the downstream connection: status,
-/// end-to-end headers, streaming body. Hop-by-hop headers go both ways;
+/// end-to-end headers, streaming body. Hop-by-hop headers go both ways,
+/// including any the upstream nominates through `Connection`;
 /// on a 101 the upgrade pair stays so the handshake completes.
 fn from_upstream(res: hyper::Response<hyper::body::Incoming>, is_unlisted: bool) -> Response {
     let keep_upgrade = res.status() == StatusCode::SWITCHING_PROTOCOLS;
     let (mut parts, body) = res.into_parts();
+    // Collected before the drain: every name this response's `Connection`
+    // nominates goes with the fixed hop-by-hop list.
+    let nominated = connection_tokens(&parts.headers);
     let mut out = Response::builder().status(parts.status);
     let mut last_name: Option<HeaderName> = None;
     for (name, value) in parts.headers.drain() {
@@ -141,7 +182,7 @@ fn from_upstream(res: hyper::Response<hyper::body::Incoming>, is_unlisted: bool)
             last_name = Some(name);
         }
         let name = last_name.clone().expect("header value without a name");
-        if is_hop_by_hop(name.as_str())
+        if (is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()))
             && !(keep_upgrade
                 && (name == axum::http::header::UPGRADE || name == axum::http::header::CONNECTION))
         {
@@ -199,7 +240,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             .body(Body::from("this app is starting, try again"))
             .unwrap();
     }
-    touch_once(&state.pool, &app.id).await;
+    touch_once(&state, &app.id).await;
 
     let peer = req
         .extensions()
@@ -224,11 +265,17 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         .method(parts.method)
         .uri(uri)
         .version(axum::http::Version::HTTP_11);
+    // Collected up front: every name this request's `Connection` nominates
+    // is hop-by-hop for this hop, alongside the fixed list.
+    let nominated = connection_tokens(&parts.headers);
     for (name, value) in parts.headers.iter() {
         if *name == axum::http::header::HOST {
             continue;
         }
-        if is_hop_by_hop(name.as_str())
+        if is_forwarded_spoof(name) {
+            continue;
+        }
+        if (is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()))
             && !(upgrade
                 && (*name == axum::http::header::UPGRADE
                     || *name == axum::http::header::CONNECTION))
@@ -237,17 +284,10 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         }
         outbound = outbound.header(name, value);
     }
+    // Fresh chain: client-supplied `x-forwarded-for` was dropped above, so
+    // the only value upstream sees is the real peer IP.
     if let Some(peer) = peer {
-        let prior = parts
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .filter(|prev| !prev.is_empty());
-        let value = match prior {
-            Some(prev) => format!("{prev}, {peer}"),
-            None => peer,
-        };
-        outbound = outbound.header("x-forwarded-for", value);
+        outbound = outbound.header("x-forwarded-for", peer);
     }
     outbound = outbound
         .header("x-forwarded-host", raw_host)
@@ -256,7 +296,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         Ok(req) => req,
         Err(_) => return text(StatusCode::BAD_GATEWAY, "app unavailable"),
     };
-    let mut upstream = match CLIENT.request(outbound).await {
+    let mut upstream = match state.client.request(outbound).await {
         Ok(res) => res,
         Err(err) => {
             tracing::warn!(slug = %app.slug, error = %err, "upstream connect failed");
@@ -307,20 +347,39 @@ mod tests {
                 "/.well-known/celld/health",
                 axum::routing::get(|| async { "ok" }),
             )
+            .route(
+                "/nominated",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/plain")
+                        .header("connection", "x-resp-secret")
+                        .header("x-resp-secret", "leak")
+                        .body(Body::from("nominated"))
+                        .unwrap()
+                }),
+            )
             .fallback(move |req: Request| {
                 let echoed = echoed.clone();
                 async move {
                     echoed.fetch_add(1, Ordering::SeqCst);
                     let (parts, body) = req.into_parts();
                     let bytes = to_bytes(body, 1024 * 1024).await.unwrap();
+                    // Joined per name: a proxied duplicate (e.g. a spoofed
+                    // `x-forwarded-proto` next to the proxy's own) stays
+                    // visible instead of collapsing last-wins.
                     let headers = parts
                         .headers
-                        .iter()
-                        .map(|(name, value)| {
-                            (
-                                name.to_string(),
-                                serde_json::Value::String(value.to_str().unwrap_or("").to_string()),
-                            )
+                        .keys()
+                        .map(|name| {
+                            let joined = parts
+                                .headers
+                                .get_all(name)
+                                .iter()
+                                .map(|value| value.to_str().unwrap_or(""))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            (name.to_string(), serde_json::Value::String(joined))
                         })
                         .collect::<serde_json::Map<String, serde_json::Value>>();
                     let payload = serde_json::json!({
@@ -427,11 +486,11 @@ mod tests {
     #[tokio::test]
     async fn host_routing_rejects_foreign_hosts_and_unknown_slugs() {
         let fix = fixture().await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: manager(fix._dir.path()),
-            apps_domain: "outer.test".to_string(),
-        };
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
         for host in [
             "shop.other.com",
             "outer.test",
@@ -462,11 +521,11 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: manager(fix._dir.path()),
-            apps_domain: "outer.test".to_string(),
-        };
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
         let req = Request::builder()
             .method("POST")
             .uri("/items?page=2")
@@ -498,11 +557,11 @@ mod tests {
             "unlisted",
         )
         .await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: manager(fix._dir.path()),
-            apps_domain: "outer.test".to_string(),
-        };
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
         let before = fleet.hits.load(Ordering::SeqCst);
         let req = Request::builder()
             .uri("/robots.txt")
@@ -533,11 +592,11 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-open", "open", fleet.addr.port(), "public").await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: manager(fix._dir.path()),
-            apps_domain: "outer.test".to_string(),
-        };
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
         let req = Request::builder()
             .uri("/robots.txt")
             .header("host", "open.outer.test")
@@ -555,16 +614,17 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-hop", "hop", fleet.addr.port(), "public").await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: manager(fix._dir.path()),
-            apps_domain: "outer.test".to_string(),
-        };
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
         let req = Request::builder()
             .uri("/")
             .header("host", "hop.outer.test")
-            .header("connection", "keep-alive")
+            .header("connection", "keep-alive, x-internal")
             .header("keep-alive", "timeout=5")
+            .header("x-internal", "1")
             .header("te", "trailers")
             .header("trailer", "x-t")
             .header("proxy-authorization", "Basic eA==")
@@ -576,6 +636,8 @@ mod tests {
         for name in [
             "connection",
             "keep-alive",
+            // Nominated by `Connection`, not on the fixed list.
+            "x-internal",
             "te",
             "trailer",
             "proxy-authorization",
@@ -594,11 +656,11 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-touch", "touch", fleet.addr.port(), "public").await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: manager(fix._dir.path()),
-            apps_domain: "outer.test".to_string(),
-        };
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
         let (before,): (Option<i64>,) =
             sqlx::query_as("SELECT last_request_at FROM app WHERE id = 'app-touch'")
                 .fetch_one(&fix.pool)
@@ -625,11 +687,11 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-big", "big", fleet.addr.port(), "public").await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: manager(fix._dir.path()),
-            apps_domain: "outer.test".to_string(),
-        };
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
         let req = Request::builder()
             .uri("/")
             .header("host", "big.outer.test")
@@ -652,9 +714,9 @@ mod tests {
             .unwrap()
             .port();
         insert_app(&fix.pool, "app-down", "down", closed, "public").await;
-        let state = ProxyState {
-            pool: fix.pool.clone(),
-            fleets: FleetManager::new(crate::fleet::manager::ManagerSettings {
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            FleetManager::new(crate::fleet::manager::ManagerSettings {
                 data_dir: fix._dir.path().to_path_buf(),
                 celld_bin: "/nonexistent/celld".to_string(),
                 storage: crate::fleet::manager::FleetStorage {
@@ -672,8 +734,8 @@ mod tests {
                 wake_timeout: Duration::from_secs(2),
                 wake_concurrency: 4,
             }),
-            apps_domain: "outer.test".to_string(),
-        };
+            "outer.test".to_string(),
+        );
         let req = Request::builder()
             .uri("/")
             .header("host", "down.outer.test")
@@ -683,5 +745,81 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(headers.get("retry-after").unwrap(), "2");
         assert_eq!(body, "this app is starting, try again");
+    }
+
+    #[test]
+    fn connection_tokens_split_comma_separated_names_case_insensitively() {
+        let mut headers = HeaderMap::new();
+        let first: axum::http::HeaderValue = "Keep-Alive, X-Internal ".parse().unwrap();
+        headers.insert("connection", first);
+        let second: axum::http::HeaderValue = "x-extra".parse().unwrap();
+        headers.append("connection", second);
+        assert_eq!(
+            connection_tokens(&headers),
+            vec!["keep-alive", "x-internal", "x-extra"]
+        );
+        assert!(connection_tokens(&HeaderMap::new()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_nominated_response_headers_are_stripped() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-nom", "nom", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
+        let req = Request::builder()
+            .uri("/nominated")
+            .header("host", "nom.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        // The fake fleet answers `connection: x-resp-secret` alongside the
+        // nominated header; neither may leak downstream.
+        assert!(headers.get("connection").is_none());
+        assert!(
+            headers.get("x-resp-secret").is_none(),
+            "a Connection-nominated response header must not reach the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_forwarded_headers_never_reach_upstream() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-fwd", "fwd", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+        );
+        let mut req = Request::builder()
+            .uri("/")
+            .header("host", "fwd.outer.test")
+            .header("x-forwarded-for", "evil")
+            .header("x-forwarded-host", "evil.example")
+            .header("x-forwarded-proto", "https")
+            .header("forwarded", "for=1.2.3.4")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("9.9.9.9:1234".parse::<SocketAddr>().unwrap()));
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got = echo(&body);
+        assert_eq!(
+            got["headers"]["x-forwarded-for"], "9.9.9.9",
+            "only the real peer IP reaches upstream, never the client's value"
+        );
+        assert_eq!(got["headers"]["x-forwarded-proto"], "http");
+        assert_eq!(got["headers"]["x-forwarded-host"], "fwd.outer.test");
+        assert!(
+            got["headers"].get("forwarded").is_none(),
+            "a client-sent forwarded header must not reach upstream"
+        );
     }
 }

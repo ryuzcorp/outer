@@ -74,7 +74,16 @@ async fn run_git(
 /// that commit, and upload the bundle plus the `current.json` pointer.
 /// Re-running for the same sha overwrites the same keys: idempotent.
 pub async fn sync(store: &Store, url: &str, sha: &str) -> anyhow::Result<TemplateRef> {
-    anyhow::ensure!(!sha.is_empty(), "template sha is empty");
+    // Full lowercase commit sha only: an abbreviated sha or branch name would
+    // pass `cat-file` and be stored, but `materialize` checks out and compares
+    // `rev-parse HEAD` (always full length), so every later create would fail.
+    anyhow::ensure!(
+        sha.len() == 40
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "template sha {sha:?} must be a full 40-character lowercase commit sha"
+    );
     let tmp = tempfile::tempdir().context("template scratch dir")?;
     let src = tmp.path().join("src");
     let src_str = src.to_string_lossy().into_owned();
@@ -326,6 +335,30 @@ mod tests {
         assert!(
             err.to_string().contains("outer templates sync"),
             "operator-facing error must name the fix, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_abbreviated_shas_and_branch_names() {
+        let (_repo, url, sha) = make_source_repo().await;
+        let store = Store::memory();
+        // The default branch exists and the short sha resolves, but neither
+        // may be stored: `materialize` compares against full-length HEAD.
+        for bad in [
+            sha[..12].to_string(),
+            "main".to_string(),
+            "HEAD".to_string(),
+        ] {
+            let err = sync(&store, &url, &bad).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("full 40-character lowercase commit sha"),
+                "unexpected error for {bad:?}: {err:#}"
+            );
+        }
+        assert!(
+            store.get(CURRENT_KEY).await.unwrap().is_none(),
+            "a refused sync stores no pointer"
         );
     }
 }

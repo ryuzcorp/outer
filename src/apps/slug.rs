@@ -31,10 +31,11 @@ pub fn validate_slug(slug: &str) -> Result<(), SlugError> {
     if slug.is_empty() {
         return Err(SlugError::Empty);
     }
-    if slug.len() > 48 {
+    let chars = slug.chars().count();
+    if chars > 48 {
         return Err(SlugError::TooLong {
             slug: slug.to_string(),
-            len: slug.len(),
+            len: chars,
         });
     }
     if RESERVED_SLUGS.contains(&slug) {
@@ -119,5 +120,26 @@ mod tests {
         for slug in ["outer2", "my-outer", "apiary", "www2"] {
             assert!(validate_slug(slug).is_ok(), "should accept {slug:?}");
         }
+    }
+    #[test]
+    fn length_counts_characters_not_bytes() {
+        // 25 CJK characters are 75 bytes: short enough to keep, but the
+        // shape rule (ASCII only) still refuses them — as BadShape, not
+        // TooLong with a byte count.
+        let short = "あ".repeat(25);
+        assert_eq!(
+            validate_slug(&short),
+            Err(SlugError::BadShape(short.clone())),
+            "25 characters must not be TooLong"
+        );
+        // 49 CJK characters are TooLong, and the error names characters.
+        let long = "あ".repeat(49);
+        assert_eq!(
+            validate_slug(&long),
+            Err(SlugError::TooLong {
+                slug: long.clone(),
+                len: 49,
+            }),
+        );
     }
 }
