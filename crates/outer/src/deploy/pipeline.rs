@@ -839,6 +839,8 @@ fn hand_worktree_to_app(slug: &str, work: &Path, uid: u32) {
                 "chown worktree to app uid failed; continuing (needs CAP_CHOWN)"
             );
         }
+        // Other app uids traverse `work/` too: the tree itself is private.
+        crate::fleet::sandbox::make_private_dir(work);
     }
     #[cfg(not(unix))]
     {

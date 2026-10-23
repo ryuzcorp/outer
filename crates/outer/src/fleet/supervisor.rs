@@ -336,6 +336,7 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
         if !super::sandbox::lchown_one(&opts.state_dir, uid, gid) {
             tracing::warn!(fleet = %spec.slug, "could not hand the fleet state dir to the app user");
         }
+        super::sandbox::make_private_dir(&opts.state_dir);
     }
     let (program, args, env) = fleet_command(spec, opts);
     let mut cmd = tokio::process::Command::new(&program);

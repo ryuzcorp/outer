@@ -43,6 +43,9 @@ async fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             init_tracing(&config.log_filter);
+            if let Err(err) = prepare_host(&config) {
+                return report(Err(err));
+            }
             report(serve(config).await)
         }
         ["check-config"] => match load_config() {
@@ -89,7 +92,21 @@ where
         return ExitCode::from(2);
     };
     init_tracing(&config.log_filter);
+    if let Err(err) = prepare_host(&config) {
+        return report(Err(err));
+    }
     report(command(config).await)
+}
+
+/// Root-only host preparation shared by serve and every command: the data
+/// dir layout app uids may traverse, and a private umask. An unprivileged
+/// (dev) outer runs every step as itself, so there is nothing to protect.
+fn prepare_host(config: &Config) -> anyhow::Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    outer::fleet::sandbox::prepare_data_dir(&config.data_dir)
 }
 
 fn report(result: anyhow::Result<()>) -> ExitCode {
