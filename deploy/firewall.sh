@@ -67,9 +67,6 @@ fail_closed() {
     exit 1
 }
 
-table_exists() {
-    /usr/sbin/nft list table "$FAMILY" "$TABLE" >/dev/null 2>&1
-}
 fetch() { # $1 = url, $2 = family (v4|v6), $3 = outfile
     curl -fsSL --retry 3 --max-time 30 "$1" | tr -d '\r' >"$3" ||
         fail_closed "fetching $1 failed"
@@ -94,11 +91,12 @@ v6_list="${v6_list%,}"
 
 rules="$work/rules.nft"
 {
-    if table_exists; then
-        # One file = one nft transaction: delete + recreate is atomic, so
-        # there is no window with an empty (fail-open) table.
-        printf 'delete table %s %s\n' "$FAMILY" "$TABLE"
-    fi
+    # One file = one nft transaction. `add` + `delete` + recreate is atomic
+    # and valid whether or not the table exists (first install, refresh, or
+    # the boot apply of this same saved file), so there is never a window
+    # with no table or a stale one.
+    printf 'add table %s %s\n' "$FAMILY" "$TABLE"
+    printf 'delete table %s %s\n' "$FAMILY" "$TABLE"
     printf 'table %s %s {\n' "$FAMILY" "$TABLE"
     printf '\tset cf4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n' "$v4_list"
     printf '\tset cf6 {\n\t\ttype ipv6_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n' "$v6_list"

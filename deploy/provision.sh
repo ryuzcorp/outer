@@ -71,7 +71,9 @@ EOF
     echo "provision.sh: refusing to disable password auth with no root authorized_keys" >&2
     exit 1
 }
-cat >/etc/ssh/sshd_config.d/60-outer.conf <<'EOF'
+# sshd takes the FIRST value it sees: 01- sorts ahead of cloud-init's 50-.
+rm -f /etc/ssh/sshd_config.d/60-outer.conf
+cat >/etc/ssh/sshd_config.d/01-outer.conf <<'EOF'
 PubkeyAuthentication yes
 PasswordAuthentication no
 ChallengeResponseAuthentication no
@@ -94,7 +96,9 @@ done
 
 # --- 5. nftables ---------------------------------------------------------------
 apt-get install -y -qq nftables curl
-systemctl enable nftables
+# nftables.service is left disabled on purpose: its /etc/nftables.conf starts
+# with `flush ruleset`, which would wipe Docker's tables and outer's egress
+# table on any restart. firewall.service applies only inet outer_fw.
 
 # --- 6. cgroup v2 ---------------------------------------------------------------
 if [[ ! -e /sys/fs/cgroup/cgroup.controllers ]]; then
