@@ -456,8 +456,8 @@ impl Deployer {
     }
 
     /// Step 5: `celld deploy <root> ... --json`; returns (output, version).
-    /// Bucket credentials are minted fresh for the app's prefix on every
-    /// deploy, so the step env never carries the parent keys.
+    /// Bucket credentials come from the per-prefix cache when fresh (minted
+    /// on a miss), so the step env never carries the parent keys.
     async fn celld_deploy(
         &self,
         app: &App,

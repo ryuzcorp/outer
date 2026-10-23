@@ -18,6 +18,7 @@ use crate::fleet::health;
 use crate::fleet::supervisor::{
     self, FleetOpts, FleetSpec, RunningFleet, SharedLogRing, StopGrace,
 };
+use crate::store::credentials::ScopedCredentials;
 
 /// What the manager needs that is not per-app identity. The integration
 /// owner builds this from the platform config.
@@ -37,9 +38,9 @@ pub struct ManagerSettings {
     pub cpu_max: String,
     /// Idle time after the last request before a fleet sleeps.
     pub sleep_after: Duration,
-    /// Uptime after which a running fleet restarts with freshly minted
-    /// credentials (prod: 6 days for a 7-day TTL). Applies to fleets that
-    /// are not being put to sleep this sweep tick.
+    /// Credential age after which a running fleet restarts with freshly
+    /// minted credentials (prod: 6 days for a 7-day TTL). Applies to fleets
+    /// that are not being put to sleep this sweep tick.
     pub credential_refresh_after: Duration,
     /// How long a wake waits for `/.well-known/celld/health`.
     pub wake_timeout: Duration,
@@ -48,8 +49,9 @@ pub struct ManagerSettings {
 }
 
 /// Bucket and credentials a fleet pulls its deploys from. The credentials
-/// are per-app: `CredentialSource::R2Temp` mints fresh keys scoped to the
-/// app's prefix at every spawn, so fleets never hold the root bucket keys.
+/// are per-app: `CredentialSource::R2Temp` mints keys scoped to the app's
+/// prefix and reuses the cached grant while it stays fresh (see
+/// `store::credentials`), so fleets never hold the root bucket keys.
 #[derive(Debug, Clone)]
 pub struct FleetStorage {
     pub endpoint: String,
@@ -86,12 +88,26 @@ struct Inner {
     wakes: tokio::sync::Mutex<HashMap<String /* slug */, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-/// A tracked fleet and when this process started it. The sweep never sleeps
-/// a fleet younger than `sleep_after`: a just-woken fleet's activity row can
-/// still look stale while its first requests are in flight.
+/// A tracked fleet, when this process started it, and when its bucket
+/// credentials were minted (`None` for Static, which never expires and never
+/// refreshes). The sweep never sleeps a fleet younger than `sleep_after`: a
+/// just-woken fleet's activity row can still look stale while its first
+/// requests are in flight.
 struct LiveFleet {
     fleet: RunningFleet,
     started: std::time::Instant,
+    credential_minted_at: Option<std::time::Instant>,
+}
+
+/// Phase timings for one fleet start, for the wake log line.
+struct WakeReport {
+    mint_ms: u64,
+    spawn_ms: u64,
+    health_ms: u64,
+    total_ms: u64,
+    /// The spawn ran on the cached grant: no Cloudflare round trip, so
+    /// `mint_ms` is 0.
+    reused_credentials: bool,
 }
 
 /// Running fleets, started on demand and slept when idle. Cheap to clone.
@@ -154,10 +170,15 @@ impl FleetManager {
             .clone()
     }
 
-    /// Fleet invocation for `app`, minting fresh credentials scoped to the
-    /// app's prefix. A minting failure is a failed wake/refresh with a clear
-    /// error: never a panic, never a fallback to the parent keys.
-    async fn spec_for(&self, app: &App) -> anyhow::Result<(FleetSpec, FleetOpts)> {
+    /// Fleet invocation for `app`. Credentials come from the per-prefix
+    /// cache when fresh (`fresh` forces a new mint, replacing the entry).
+    /// A minting failure is a failed wake/refresh with a clear error: never
+    /// a panic, never a fallback to the parent keys.
+    async fn spec_for(
+        &self,
+        app: &App,
+        fresh: bool,
+    ) -> anyhow::Result<(FleetSpec, FleetOpts, ScopedCredentials)> {
         let state_dir = self.inner.data_dir.join("fleets").join(&app.slug);
         let (cgroup_leaf, cgroups_active) = match &self.inner.cgroups {
             Some(anchor) => {
@@ -174,16 +195,17 @@ impl FleetManager {
         };
         let storage = &self.inner.storage;
         let prefix = FleetStorage::fleet_prefix(&app.slug);
-        let creds = storage
-            .credentials
-            .for_prefix(&prefix)
-            .await
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "minting scoped R2 credentials for fleet {}: {err:#}",
-                    app.slug
-                )
-            })?;
+        let creds = if fresh {
+            storage.credentials.for_prefix_fresh(&prefix).await
+        } else {
+            storage.credentials.for_prefix(&prefix).await
+        }
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "minting scoped R2 credentials for fleet {}: {err:#}",
+                app.slug
+            )
+        })?;
         let spec = FleetSpec {
             slug: app.slug.clone(),
             uid: app.uid,
@@ -193,9 +215,9 @@ impl FleetManager {
             bucket_url: storage.bucket_url(&app.slug),
             s3_endpoint: storage.endpoint.clone(),
             s3_region: storage.region.clone(),
-            access_key_id: creds.access_key_id,
-            secret_access_key: creds.secret_access_key,
-            session_token: creds.session_token,
+            access_key_id: creds.access_key_id.clone(),
+            secret_access_key: creds.secret_access_key.clone(),
+            session_token: creds.session_token.clone(),
             cgroup_leaf,
             cgroups_active,
             // Checked against `is_reserved_env_name`: RUST_LOG carries no
@@ -210,25 +232,46 @@ impl FleetManager {
             deploy_poll_secs: 30,
             asset_cache_mb: 64,
         };
-        Ok((spec, opts))
+        Ok((spec, opts, creds))
     }
 
-    /// Mint, start and health-gate the app's fleet, tracking it on success.
-    /// The caller holds the slug's wake lock. On an unhealthy fleet the
-    /// child is stopped and removed: a failed start never leaves a tracked
-    /// fleet behind.
-    async fn spawn_and_gate(&self, app: &App) -> anyhow::Result<()> {
-        let (spec, opts) = self.spec_for(app).await?;
+    /// Mint, start and health-gate the app's fleet, tracking it on success
+    /// with its credential mint time. The caller holds the slug's wake lock.
+    /// On an unhealthy fleet the child is stopped and removed: a failed
+    /// start never leaves a tracked fleet behind.
+    async fn spawn_and_gate(
+        &self,
+        app: &App,
+        fresh_credentials: bool,
+    ) -> anyhow::Result<WakeReport> {
+        let total_start = std::time::Instant::now();
+        let mint_start = std::time::Instant::now();
+        let (spec, opts, creds) = self.spec_for(app, fresh_credentials).await?;
+        let mint_ms = if creds.reused {
+            0
+        } else {
+            mint_start.elapsed().as_millis() as u64
+        };
+        let spawn_start = std::time::Instant::now();
         let fleet = supervisor::start(&spec, &opts).await?;
+        let spawn_ms = spawn_start.elapsed().as_millis() as u64;
         self.inner.fleets.lock().await.insert(
             app.slug.clone(),
             LiveFleet {
                 fleet,
                 started: std::time::Instant::now(),
+                credential_minted_at: creds.minted_at,
             },
         );
+        let health_start = std::time::Instant::now();
         if health::wait_healthy("127.0.0.1", app.port, self.inner.wake_timeout).await {
-            return Ok(());
+            return Ok(WakeReport {
+                mint_ms,
+                spawn_ms,
+                health_ms: health_start.elapsed().as_millis() as u64,
+                total_ms: total_start.elapsed().as_millis() as u64,
+                reused_credentials: creds.reused,
+            });
         }
         let mut fleets = self.inner.fleets.lock().await;
         // The sleep sweep may have removed it first (its activity row can
@@ -285,11 +328,24 @@ impl FleetManager {
             apps::set_asleep(pool, &app.id, None).await?;
             return Ok(());
         }
-        self.spawn_and_gate(app)
+        let report = self
+            .spawn_and_gate(app, false)
             .await
             .map_err(|err| anyhow::anyhow!("failed wake for fleet {}: {err:#}", app.slug))?;
         self.mark_wake_activity(pool, app).await?;
         apps::set_asleep(pool, &app.id, None).await?;
+        // One INFO line per successful wake, for the VPS wake-time baseline:
+        // `mint_ms` is 0 when the spawn reused the cached grant. No secrets
+        // in the fields.
+        tracing::info!(
+            slug = %app.slug,
+            mint_ms = report.mint_ms,
+            spawn_ms = report.spawn_ms,
+            health_ms = report.health_ms,
+            total_ms = report.total_ms,
+            reused_credentials = report.reused_credentials,
+            "fleet wake complete",
+        );
         Ok(())
     }
 
@@ -312,11 +368,12 @@ impl FleetManager {
     }
 
     /// Stop every fleet whose app has been quieter than `sleep_after`, drop
-    /// dead fleets from the map, restart fleets older than
-    /// `credential_refresh_after` with freshly minted credentials, and return
-    /// the slugs put to sleep. The app's activity is read fresh from the DB
-    /// per fleet. The sleep check comes first: refresh applies only to fleets
-    /// that are not being put to sleep this tick.
+    /// dead fleets from the map, restart the fleet before ITS credentials
+    /// expire (credential age, not process uptime) with freshly minted
+    /// credentials, and return the slugs put to sleep. The app's activity is
+    /// read fresh from the DB per fleet. The sleep check comes first:
+    /// refresh applies only to fleets that are not being put to sleep this
+    /// tick.
     pub async fn sleep_idle(&self, pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
         let now = apps::now_ms();
         let slugs: Vec<String> = self.inner.fleets.lock().await.keys().cloned().collect();
@@ -377,11 +434,19 @@ impl FleetManager {
                 slept.push(slug);
                 continue;
             }
-            // Credential refresh: a fleet older than `credential_refresh_after`
-            // restarts with freshly minted credentials before they expire.
-            // Only here, never on the sleep path above, and under the same
-            // wake lock, so a wake and a refresh for one app never interleave.
-            if !should_refresh(live.started.elapsed(), self.inner.credential_refresh_after) {
+            // Credential refresh: the fleet restarts before ITS credentials
+            // expire, so the decision uses credential age (when the grant
+            // was minted), not process uptime. A fleet that woke on a reused
+            // grant can be younger than its credentials. Only here, never on
+            // the sleep path above, and under the same wake lock, so a wake
+            // and a refresh for one app never interleave.
+            //
+            // Static fleets (`None`: no expiry) never refresh.
+            let credential_age = live.credential_minted_at.map(|minted| minted.elapsed());
+            let Some(age) = credential_age else {
+                continue;
+            };
+            if !should_refresh(age, self.inner.credential_refresh_after) {
                 continue;
             }
             // Like a wake, a restart takes a start permit; unlike a wake, the
@@ -396,9 +461,12 @@ impl FleetManager {
             let mut fleet = live.fleet;
             drop(fleets);
             fleet.stop(StopGrace::NORMAL).await;
-            match self.spawn_and_gate(&app).await {
-                Ok(()) => tracing::info!(
+            // The restart forces a fresh mint: restarting on the cached grant
+            // would restart on the same near-expiry credentials.
+            match self.spawn_and_gate(&app, true).await {
+                Ok(report) => tracing::info!(
                     slug = %slug,
+                    total_ms = report.total_ms,
                     "fleet restarted with freshly minted R2 credentials"
                 ),
                 Err(err) => tracing::warn!(
@@ -473,12 +541,12 @@ pub fn should_sleep(
 }
 
 /// Whether the fleet should restart with freshly minted credentials: its
-/// uptime has reached `refresh_after` (TTL minus a day in production, so the
-/// restart lands before the minted credentials expire). Unlike
-/// [`should_sleep`], the bound itself refreshes: a fleet exactly
-/// `refresh_after` old restarts this tick rather than the next.
-pub fn should_refresh(uptime: Duration, refresh_after: Duration) -> bool {
-    uptime >= refresh_after
+/// credentials' age has reached `refresh_after` (TTL minus a day in
+/// production, so the restart lands before they expire). Unlike
+/// [`should_sleep`], the bound itself refreshes: credentials exactly
+/// `refresh_after` old restart this tick rather than the next.
+pub fn should_refresh(credential_age: Duration, refresh_after: Duration) -> bool {
+    credential_age >= refresh_after
 }
 
 #[cfg(test)]
@@ -521,9 +589,10 @@ mod tests {
     }
 
     #[test]
-    fn refresh_decision_at_its_boundaries() {
+    fn refresh_by_credential_age_at_its_boundaries() {
         let after = Duration::from_secs(6 * 86400);
-        // Young fleets keep their credentials.
+        // Young credentials keep serving, however old the process is: the
+        // decision is credential age, not fleet uptime.
         assert!(!should_refresh(Duration::ZERO, after));
         assert!(!should_refresh(after - Duration::from_secs(1), after));
         // Exactly at the bound refreshes: no extra tick of expired creds.
