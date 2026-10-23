@@ -1545,10 +1545,7 @@ mod tests {
         if n < 0 {
             return None;
         }
-        buf[..n as usize]
-            .iter()
-            .map(|g| *g as u32)
-            .find(|g| *g != mine)
+        buf[..n as usize].iter().copied().find(|g| *g != mine)
     }
 
     #[test]
