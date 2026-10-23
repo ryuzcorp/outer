@@ -4,6 +4,30 @@ use super::cimd::ClientDoc;
 
 pub const CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'unsafe-inline'";
 
+/// The consent page's CSP: `form-action` also admits the origin the Allow /
+/// Deny redirect goes to (`https://www.perplexity.ai`, `http://127.0.0.1:5555`)
+/// or, for an app's own URI scheme, that scheme (`cursor:`). The redirect URI
+/// was already matched against the client's registered list, so this only
+/// ever names the client's own target. Anything unparsable adds nothing.
+pub fn consent_csp(redirect_uri: &str) -> String {
+    let target = url::Url::parse(redirect_uri)
+        .ok()
+        .and_then(|uri| match uri.scheme() {
+            "https" | "http" => {
+                let origin = uri.origin().ascii_serialization();
+                (origin != "null").then_some(origin)
+            }
+            scheme => Some(format!("{scheme}:")),
+        });
+    match target {
+        Some(target) => CSP.replace(
+            "form-action 'self'",
+            &format!("form-action 'self' {target}"),
+        ),
+        None => CSP.to_string(),
+    }
+}
+
 fn layout(title: &str, body: Markup) -> Markup {
     html! {
         (maud::DOCTYPE)
@@ -151,4 +175,28 @@ pub fn friendly_error(code: &str) -> &str {
 
 pub fn render(page: Markup) -> String {
     page.into_string()
+}
+
+#[cfg(test)]
+mod csp_tests {
+    use super::consent_csp;
+
+    #[test]
+    fn consent_form_may_redirect_to_the_client_only() {
+        let csp = consent_csp("https://www.perplexity.ai/rest/connections/oauth_callback");
+        assert!(
+            csp.contains("form-action 'self' https://www.perplexity.ai;"),
+            "{csp}"
+        );
+        let csp = consent_csp("http://127.0.0.1:5555/callback");
+        assert!(
+            csp.contains("form-action 'self' http://127.0.0.1:5555;"),
+            "{csp}"
+        );
+        let csp = consent_csp("cursor://anysphere.cursor-retrieval/oauth/callback");
+        assert!(csp.contains("form-action 'self' cursor:;"), "{csp}");
+        let csp = consent_csp("not a url");
+        assert!(csp.contains("form-action 'self';"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    }
 }
