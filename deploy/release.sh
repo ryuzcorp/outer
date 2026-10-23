@@ -32,7 +32,10 @@ SHA="$(git rev-parse --short HEAD)"
     echo "release.sh: unexpected sha: $SHA" >&2
     exit 1
 }
+IMAGE="outer:$SHA"
 if command -v podman >/dev/null 2>&1; then
+    # podman names unqualified tags localhost/outer:<sha>, and docker load
+    # keeps that name; the remote script retags it to the plain name.
     podman build --format docker -t "$IMAGE" -f docker/Dockerfile .
     podman save "$IMAGE" | ssh "$TARGET" docker load
 elif command -v docker >/dev/null 2>&1; then
@@ -54,6 +57,11 @@ ssh "$TARGET" bash -s -- "$SHA" <<'EOF'
 set -euo pipefail
 SHA="$1"
 cd /srv/outer
+
+if ! docker image inspect "outer:$SHA" >/dev/null 2>&1; then
+    docker tag "localhost/outer:$SHA" "outer:$SHA"
+    docker rmi "localhost/outer:$SHA" >/dev/null
+fi
 
 [[ -f /srv/outer/outer.env ]] || {
     echo "remote: /srv/outer/outer.env missing (copy deploy/outer.env.example and fill it)" >&2
