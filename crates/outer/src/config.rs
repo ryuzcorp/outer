@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Where platform objects (git bundles, app storage, the state snapshot) live.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,33 @@ impl std::fmt::Debug for R2Config {
     }
 }
 
+/// Cloudflare credentials for minting scoped R2 temporary credentials
+/// (spec §12.6). `None` means the parent R2 keys are used directly, which is
+/// allowed only on localhost dev.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CloudflareConfig {
+    /// `CLOUDFLARE_ACCOUNT_ID`.
+    pub account_id: String,
+    /// `CLOUDFLARE_API_TOKEN`.
+    pub api_token: String,
+    /// `OUTER_R2_CREDENTIAL_TTL_S`: minted credential lifetime.
+    pub credential_ttl: Duration,
+    /// `credential_ttl` minus one day, at least `credential_ttl / 2`: fleets
+    /// older than this restart with fresh credentials before they expire.
+    pub credential_refresh_after: Duration,
+}
+
+impl std::fmt::Debug for CloudflareConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudflareConfig")
+            .field("account_id", &self.account_id)
+            .field("api_token", &"<redacted>")
+            .field("credential_ttl", &self.credential_ttl)
+            .field("credential_refresh_after", &self.credential_refresh_after)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Platform host; apps live at `<slug>.<domain>` (`OUTER_DOMAIN`).
@@ -57,6 +85,9 @@ pub struct Config {
     pub host_id: String,
     /// `OUTER_STORE=r2|memory` plus the R2 variables.
     pub store: StoreKind,
+    /// Cloudflare pair for scoped R2 credentials (`None` = parent keys
+    /// directly, localhost dev only). Read only with `OUTER_STORE=r2`.
+    pub cloudflare: Option<CloudflareConfig>,
     /// Log filter directives (`RUST_LOG`, default `info`).
     pub log_filter: String,
     /// Running apps: allocation ranges, binaries, limits, sleep.
@@ -154,6 +185,51 @@ impl Config {
             }
         };
 
+        // Scoped R2 credentials (spec §12.6): read only with OUTER_STORE=r2,
+        // so a stray CLOUDFLARE_* in a local memory-store env stays silent.
+        let cloudflare = match &store {
+            StoreKind::R2(_) => {
+                let account_id = get("CLOUDFLARE_ACCOUNT_ID").map(str::to_string);
+                let api_token = get("CLOUDFLARE_API_TOKEN").map(str::to_string);
+                let ttl_secs = parse_num(
+                    get("OUTER_R2_CREDENTIAL_TTL_S"),
+                    "OUTER_R2_CREDENTIAL_TTL_S",
+                    604_800u64,
+                    &mut problems,
+                );
+                if !(3600..=604_800).contains(&ttl_secs) {
+                    problems.push(format!(
+                        "OUTER_R2_CREDENTIAL_TTL_S={ttl_secs} must be between 3600 and 604800 (Cloudflare caps temporary-credential TTL at 7 days)"
+                    ));
+                }
+                let ttl = Duration::from_secs(ttl_secs);
+                match (account_id, api_token) {
+                    (Some(account_id), Some(api_token)) => Some(CloudflareConfig {
+                        account_id,
+                        api_token,
+                        credential_ttl: ttl,
+                        credential_refresh_after: credential_refresh_after(ttl),
+                    }),
+                    (None, None) => {
+                        if !is_local_domain(&domain) {
+                            for name in ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"] {
+                                problems.push(format!(
+                                    "{name} is required when OUTER_STORE=r2 off localhost (fleets mint scoped R2 credentials; the parent keys never leave outer)"
+                                ));
+                            }
+                        }
+                        None
+                    }
+                    _ => {
+                        problems.push(
+                            "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN must both be set or both be empty (got one of two)".to_string(),
+                        );
+                        None
+                    }
+                }
+            }
+            StoreKind::Memory => None,
+        };
         let log_filter = get("RUST_LOG").unwrap_or("info").to_string();
         if let Err(err) = tracing_subscriber::EnvFilter::try_new(&log_filter) {
             problems.push(format!(
@@ -225,6 +301,7 @@ impl Config {
             origin_pull_ca,
             host_id,
             store,
+            cloudflare,
             log_filter,
             runtime,
         };
@@ -308,7 +385,7 @@ impl Config {
 
     /// The `localhost` family: dev-only settings are allowed here and nowhere else.
     pub fn is_local(&self) -> bool {
-        self.domain == "localhost" || self.domain.ends_with(".localhost")
+        is_local_domain(&self.domain)
     }
 
     /// TLS terminates locally with an origin-pull client-CA: the full triple is set.
@@ -319,6 +396,18 @@ impl Config {
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("outer.sqlite")
     }
+}
+
+/// The `localhost` family: bare `localhost` plus anything under it.
+fn is_local_domain(domain: &str) -> bool {
+    domain == "localhost" || domain.ends_with(".localhost")
+}
+
+/// How long after a fleet starts it restarts with fresh credentials: the
+/// minted TTL minus a day, floored at half the TTL so a short TTL still
+/// leaves a sane margin. Production: 604800 s − 86400 s = 518400 s (6 days).
+fn credential_refresh_after(ttl: Duration) -> Duration {
+    ttl.saturating_sub(Duration::from_secs(86400)).max(ttl / 2)
 }
 
 /// `lo-hi`, inclusive, `lo <= hi`. A malformed value is reported and the
@@ -477,6 +566,8 @@ mod tests {
             "OUTER_R2_BUCKET",
             "R2_ACCESS_KEY_ID",
             "R2_SECRET_ACCESS_KEY",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_API_TOKEN",
         ] {
             assert!(
                 err.iter().any(|p| p.starts_with(name)),
@@ -496,6 +587,8 @@ mod tests {
             ("OUTER_R2_BUCKET", "outer"),
             ("R2_ACCESS_KEY_ID", "key"),
             ("R2_SECRET_ACCESS_KEY", "s3cret"),
+            ("CLOUDFLARE_ACCOUNT_ID", "acct"),
+            ("CLOUDFLARE_API_TOKEN", "cf-token"),
             ("OUTER_TLS_CERT", "/tls/cert.pem"),
             ("OUTER_TLS_KEY", "/tls/key.pem"),
             ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
@@ -505,7 +598,119 @@ mod tests {
             panic!("expected r2")
         };
         assert_eq!(r2.bucket, "outer");
-        assert!(!format!("{cfg:?}").contains("s3cret"));
+        let cf = cfg.cloudflare.as_ref().expect("cloudflare pair set");
+        assert_eq!(cf.account_id, "acct");
+        assert_eq!(cf.credential_ttl, Duration::from_secs(604_800));
+        assert_eq!(cf.credential_refresh_after, Duration::from_secs(518_400));
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("cf-token"), "{shown}");
+    }
+
+    #[test]
+    fn r2_localhost_without_cloudflare_uses_the_parent_keys() {
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_R2_ENDPOINT", "http://127.0.0.1:19000"),
+            ("OUTER_R2_BUCKET", "outer-dev"),
+            ("R2_ACCESS_KEY_ID", "key"),
+            ("R2_SECRET_ACCESS_KEY", "secret"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.domain, "outer.localhost");
+        assert!(cfg.cloudflare.is_none());
+    }
+
+    #[test]
+    fn r2_off_localhost_without_cloudflare_refuses_to_boot() {
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            (
+                "OUTER_R2_ENDPOINT",
+                "https://acct.eu.r2.cloudflarestorage.com",
+            ),
+            ("OUTER_R2_BUCKET", "outer"),
+            ("R2_ACCESS_KEY_ID", "key"),
+            ("R2_SECRET_ACCESS_KEY", "secret"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+        ]))
+        .unwrap_err();
+        for name in ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"] {
+            assert!(err.iter().any(|p| p.starts_with(name)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn cloudflare_half_pair_is_rejected() {
+        for present in ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"] {
+            let pairs = vec![
+                ("OUTER_R2_ENDPOINT", "http://127.0.0.1:19000"),
+                ("OUTER_R2_BUCKET", "outer-dev"),
+                ("R2_ACCESS_KEY_ID", "key"),
+                ("R2_SECRET_ACCESS_KEY", "secret"),
+                (present, "something"),
+            ];
+            let err = Config::from_vars(&vars(&pairs)).unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains("both be set or both be empty")),
+                "half pair with {present} set must be refused: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_ttl_defaults_and_derives_refresh() {
+        fn ttl_vars(ttl: Option<&str>) -> BTreeMap<String, String> {
+            let mut pairs = vec![
+                (
+                    "OUTER_R2_ENDPOINT".to_string(),
+                    "http://127.0.0.1:19000".to_string(),
+                ),
+                ("OUTER_R2_BUCKET".to_string(), "outer-dev".to_string()),
+                ("R2_ACCESS_KEY_ID".to_string(), "key".to_string()),
+                ("R2_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+                ("CLOUDFLARE_ACCOUNT_ID".to_string(), "acct".to_string()),
+                ("CLOUDFLARE_API_TOKEN".to_string(), "token".to_string()),
+            ];
+            if let Some(ttl) = ttl {
+                pairs.push(("OUTER_R2_CREDENTIAL_TTL_S".to_string(), ttl.to_string()));
+            }
+            pairs.into_iter().collect()
+        }
+        // Default 7 days, refresh 6 days.
+        let cf = Config::from_vars(&ttl_vars(None))
+            .unwrap()
+            .cloudflare
+            .unwrap();
+        assert_eq!(cf.credential_ttl, Duration::from_secs(604_800));
+        assert_eq!(cf.credential_refresh_after, Duration::from_secs(518_400));
+        // Minimum TTL: a day no longer fits, so refresh floors at half.
+        let cf = Config::from_vars(&ttl_vars(Some("3600")))
+            .unwrap()
+            .cloudflare
+            .unwrap();
+        assert_eq!(cf.credential_refresh_after, Duration::from_secs(1800));
+        // A 1-day TTL refreshes at half a day; a 2-day TTL at a day.
+        let cf = Config::from_vars(&ttl_vars(Some("86400")))
+            .unwrap()
+            .cloudflare
+            .unwrap();
+        assert_eq!(cf.credential_refresh_after, Duration::from_secs(43_200));
+        let cf = Config::from_vars(&ttl_vars(Some("172800")))
+            .unwrap()
+            .cloudflare
+            .unwrap();
+        assert_eq!(cf.credential_refresh_after, Duration::from_secs(86_400));
+        // Out of range (and garbage) refuse to boot.
+        for bad in ["0", "3599", "604801", "9999999", "an-hour"] {
+            let err = Config::from_vars(&ttl_vars(Some(bad))).unwrap_err();
+            assert!(
+                err.iter().any(|p| p.contains("OUTER_R2_CREDENTIAL_TTL_S")),
+                "TTL {bad:?} must be refused: {err:?}"
+            );
+        }
     }
 
     #[test]

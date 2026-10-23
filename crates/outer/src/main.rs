@@ -10,6 +10,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use outer::apps::{self, Allocation};
@@ -18,6 +19,7 @@ use outer::deploy::{DeploySettings, Deployer};
 use outer::fleet::manager::{FleetManager, FleetStorage, ManagerSettings};
 use outer::git::{GitConfig, GitSync};
 use outer::ops::{self, Platform};
+use outer::store::credentials::{r2_jurisdiction, CredentialSource, R2TempConfig, R2TempMinter};
 use outer::store::{S3Config, Store};
 use outer::{db, http, store, templates};
 use tracing_subscriber::EnvFilter;
@@ -143,25 +145,41 @@ fn build_store(config: &Config) -> anyhow::Result<Store> {
 /// What fleets and `celld deploy` use to reach the bucket. celld only speaks
 /// S3, so apps can't run on the memory store.
 ///
-/// Fleets hold the root bucket keys until R2 temporary credentials scoped to
-/// `fleets/{slug}/` land (M0 infra); that's refused off localhost.
+/// With the Cloudflare pair set, fleets and deploys mint scoped R2 temporary
+/// credentials per spawn/deploy and never hold the parent keys; on localhost
+/// dev without the pair they use the parent keys directly.
 fn fleet_storage(config: &Config) -> anyhow::Result<FleetStorage> {
     let StoreKind::R2(r2) = &config.store else {
         anyhow::bail!(
             "apps need an S3-compatible bucket (celld has no in-memory store); set OUTER_STORE=r2"
         );
     };
-    anyhow::ensure!(
-        config.is_local(),
-        "fleets would hold the root bucket keys; scoped R2 credentials are required off localhost and not built yet"
-    );
+    let credentials = match &config.cloudflare {
+        Some(cf) => CredentialSource::R2Temp(Arc::new(R2TempMinter::new(R2TempConfig {
+            api_base: "https://api.cloudflare.com/client/v4".to_string(),
+            account_id: cf.account_id.clone(),
+            api_token: cf.api_token.clone(),
+            bucket: r2.bucket.clone(),
+            jurisdiction: r2_jurisdiction(&r2.endpoint),
+            parent_access_key_id: r2.access_key_id.clone(),
+            ttl: cf.credential_ttl,
+        })?)),
+        None => {
+            anyhow::ensure!(
+                config.is_local(),
+                "fleets would hold the root bucket keys; set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to mint scoped R2 credentials off localhost"
+            );
+            CredentialSource::Static {
+                access_key_id: r2.access_key_id.clone(),
+                secret_access_key: r2.secret_access_key.clone(),
+            }
+        }
+    };
     Ok(FleetStorage {
         endpoint: r2.endpoint.clone(),
         region: r2.region.clone(),
         bucket: r2.bucket.clone(),
-        access_key_id: r2.access_key_id.clone(),
-        secret_access_key: r2.secret_access_key.clone(),
-        session_token: None,
+        credentials,
     })
 }
 
@@ -373,22 +391,14 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     );
 
     let rt = &config.runtime;
-    let storage = match fleet_storage(&config) {
-        Ok(storage) => storage,
-        Err(err) => {
-            tracing::warn!("apps can't run: {err:#}");
-            // A manager whose fleets can't start: every app answers 503
-            // with the reason in the log, and the platform host still serves.
-            FleetStorage {
-                endpoint: String::new(),
-                region: String::new(),
-                bucket: String::new(),
-                access_key_id: String::new(),
-                secret_access_key: String::new(),
-                session_token: None,
-            }
-        }
-    };
+    let storage = fleet_storage(&config)?;
+    // Static local credentials never expire, but the sweep still recycles
+    // long-lived dev fleets on the same schedule.
+    let credential_refresh_after = config
+        .cloudflare
+        .as_ref()
+        .map(|cf| cf.credential_refresh_after)
+        .unwrap_or(Duration::from_secs(6 * 86400));
     let fleets = FleetManager::new(ManagerSettings {
         data_dir: config.data_dir.clone(),
         celld_bin: rt.celld_bin.clone(),
@@ -397,6 +407,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         memory_max_bytes: rt.fleet_memory_mb * 1024 * 1024,
         cpu_max: rt.fleet_cpu_max.clone(),
         sleep_after: Duration::from_secs(rt.sleep_after_secs),
+        credential_refresh_after,
         wake_timeout: Duration::from_secs(30),
         wake_concurrency: rt.wake_concurrency,
     });
