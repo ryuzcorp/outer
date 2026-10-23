@@ -258,7 +258,10 @@ impl Deployer {
         }
     }
 
-    fn app_lock(&self, app_id: &str) -> Arc<AsyncMutex<()>> {
+    /// The per-app deploy mutex. `deploy` holds it across a whole pipeline
+    /// run; `delete_app` (MCP and the `outer app delete` CLI) holds it
+    /// across the whole deletion so no deploy can start mid-delete.
+    pub fn app_lock(&self, app_id: &str) -> Arc<AsyncMutex<()>> {
         self.app_locks
             .lock()
             .expect("app lock map poisoned")

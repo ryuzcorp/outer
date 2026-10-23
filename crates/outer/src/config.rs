@@ -49,6 +49,9 @@ pub struct CloudflareConfig {
     pub account_id: String,
     /// `CLOUDFLARE_API_TOKEN`.
     pub api_token: String,
+    /// `CLOUDFLARE_ZONE_ID` (optional): cache purge and custom hostnames
+    /// target this zone. `None` skips the purge with a warn (localhost dev).
+    pub zone_id: Option<String>,
     /// `OUTER_R2_CREDENTIAL_TTL_S`: minted credential lifetime.
     pub credential_ttl: Duration,
     /// `credential_ttl` minus one day, at least `credential_ttl / 2`: fleets
@@ -61,6 +64,7 @@ impl std::fmt::Debug for CloudflareConfig {
         f.debug_struct("CloudflareConfig")
             .field("account_id", &self.account_id)
             .field("api_token", &"<redacted>")
+            .field("zone_id", &self.zone_id)
             .field("credential_ttl", &self.credential_ttl)
             .field("credential_refresh_after", &self.credential_refresh_after)
             .finish()
@@ -251,6 +255,7 @@ impl Config {
                     (Some(account_id), Some(api_token)) => Some(CloudflareConfig {
                         account_id,
                         api_token,
+                        zone_id: get("CLOUDFLARE_ZONE_ID").map(str::to_string),
                         credential_ttl: ttl,
                         credential_refresh_after: credential_refresh_after(ttl),
                     }),

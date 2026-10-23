@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use outer::apps::{self, Allocation};
 use outer::config::{Config, StoreKind};
 use outer::deploy::{DeploySettings, Deployer};
@@ -30,6 +31,7 @@ const USAGE: &str = "usage:
   outer templates sync [--sha SHA] [--url URL]
   outer app create SLUG --owner EMAIL [--name NAME]
   outer app deploy SLUG
+  outer app delete SLUG
   outer app list
   outer docs tools
   outer version";
@@ -66,6 +68,10 @@ async fn main() -> ExitCode {
         ["app", "deploy", slug] => {
             let slug = slug.to_string();
             run(move |config| app_deploy(config, slug)).await
+        }
+        ["app", "delete", slug] => {
+            let slug = slug.to_string();
+            run(move |config| app_delete(config, slug)).await
         }
         ["app", "list"] => run(app_list).await,
         ["docs", "tools"] => {
@@ -330,6 +336,44 @@ async fn app_deploy(config: Config, slug: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Delete an app: the same core the MCP tool runs (the slug itself is the
+/// confirmation). Prints the outcome as JSON.
+async fn app_delete(config: Config, slug: String) -> anyhow::Result<()> {
+    let p = platform(&config).await?;
+    let app = apps::get_by_slug(&p.pool, &slug)
+        .await?
+        .with_context(|| format!("no app {slug:?}"))?;
+    let deploy = p.deployer.app_lock(&app.id).lock_owned().await;
+    let locks = outer::apps::delete::DeleteLocks {
+        deploy: &deploy,
+        rollback: None,
+        wake: None,
+    };
+    let cfg = outer::apps::delete::DeleteConfig {
+        data_dir: config.data_dir.clone(),
+        cgroups: cgroups(),
+        apps_domain: config.runtime.apps_domain.clone(),
+        cache_purge: config.cloudflare.as_ref().and_then(|cf| {
+            cf.zone_id
+                .clone()
+                .map(|zone_id| outer::apps::delete::CachePurge {
+                    zone_id,
+                    api_token: cf.api_token.clone(),
+                })
+        }),
+    };
+    let out = ops::delete_app(&p, &cfg, &slug, &slug, locks).await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "deleted": true,
+            "slug": out.slug,
+            "quarantined_until": out.quarantined_until,
+        })
+    );
+    Ok(())
+}
+
 /// The CLI prints the whole outcome as JSON first; the exit status then
 /// distinguishes a gate block (nothing reached the fleet) from a failure.
 fn end_outcome(outcome: &outer::deploy::DeployOutcome) -> anyhow::Result<()> {
@@ -553,6 +597,19 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         app_port_suffix: port_suffix(config.listen, config.tls_enabled()),
         tool_wait: config.tool_wait,
         rollback_locks: outer::mcp::RollbackLocks::default(),
+        delete_cfg: outer::apps::delete::DeleteConfig {
+            data_dir: config.data_dir.clone(),
+            cgroups: cgroups(),
+            apps_domain: rt.apps_domain.clone(),
+            cache_purge: config.cloudflare.as_ref().and_then(|cf| {
+                cf.zone_id
+                    .clone()
+                    .map(|zone_id| outer::apps::delete::CachePurge {
+                        zone_id,
+                        api_token: cf.api_token.clone(),
+                    })
+            }),
+        },
     };
     let app = http::app(
         http::AppState {

@@ -732,6 +732,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "share_app" => apps::share_app(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
+        "delete_app" => apps::delete_app(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
         "list_files" => code::list_files(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),

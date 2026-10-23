@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 25);
+    assert_eq!(anon.len(), 26);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 23);
+    assert_eq!(authed.len(), 24);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -1434,4 +1434,283 @@ async fn untrusted_notice_covers_findings_and_scores_round() {
         .as_str()
         .unwrap()
         .contains("pages/index.tsx"));
+}
+
+async fn app_id(state: &McpState, slug: &str) -> String {
+    sqlx::query_scalar::<_, String>("SELECT id FROM app WHERE slug = ?1")
+        .bind(slug)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn delete_app_refuses_confirm_mismatch_and_deletes_nothing() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "delete_app",
+        json!({"app": "groceries", "confirm": "groceries-x"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("confirm \"groceries\""));
+
+    // Nothing deleted: the app still lists, its bucket prefix still holds
+    // the manifest and bundle, and the row still exists.
+    let (_, list) = call(&state, Some(&token), "list_apps", json!({})).await;
+    assert_eq!(
+        result(&list)["structuredContent"]["apps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!state.store.list("git/groceries/").await.unwrap().is_empty());
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn delete_app_unknown_and_foreign_slugs_are_not_found() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+
+    // Missing entirely, even with a matching confirm.
+    let (_, missing) = call(
+        &state,
+        Some(&ana),
+        "delete_app",
+        json!({"app": "nope", "confirm": "nope"}),
+    )
+    .await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+    // Foreign: Bob's correct confirm still answers exactly like missing.
+    let (_, foreign) = call(
+        &state,
+        Some(&bob),
+        "delete_app",
+        json!({"app": "groceries", "confirm": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&foreign)["error"], "not_found");
+}
+
+#[tokio::test]
+async fn delete_app_removes_everything_and_quarantines_the_slug() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    create_app(&state, &bob, "bobapp").await;
+    let groceries_id = app_id(&state, "groceries").await;
+
+    // Fake deploys write no bucket objects, so seed both prefixes by hand.
+    state
+        .store
+        .put("fleets/groceries/deploy/current.json", b"{}".to_vec())
+        .await
+        .unwrap();
+    state
+        .store
+        .put("fleets/bobapp/deploy/current.json", b"{}".to_vec())
+        .await
+        .unwrap();
+    // Every app-scoped table with no cascade gets a row (deploys, secrets
+    // and cron rows already exist from create/fake-deploy; add the rest).
+    for sql in [
+        "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) VALUES (?1, 0, 1, 0, 0, '', 0, 0)",
+        "INSERT INTO path_hour (app_id, hour, path, requests, s5xx) VALUES (?1, 0, '/', 1, 0)",
+        "INSERT INTO app_log (app_id, seq, ts, stream, line) VALUES (?1, 0, 0, 'stdout', 'x')",
+        "INSERT INTO error_issue (app_id, fingerprint, message, count, first_seen, last_seen) VALUES (?1, 'f', 'm', 1, 0, 0)",
+        "INSERT INTO moderation_text (app_id, text_hash, verdict, checked_at) VALUES (?1, 'h', 'clear', 0)",
+        "INSERT INTO moderation_check (id, app_id, stage, created_at) VALUES ('m1', ?1, 'gate', 0)",
+        "INSERT INTO rollback_day (app_id, day, count) VALUES (?1, '2026-10-23', 1)",
+    ] {
+        sqlx::query(sql)
+            .bind(&groceries_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+    // Local state the pipeline would have left behind.
+    let data = &state.delete_cfg.data_dir;
+    tokio::fs::create_dir_all(data.join("work/groceries"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("work/groceries.index"), b"i")
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("work/groceries.install-hash"), b"h")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("cache/groceries"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("fleets/groceries"))
+        .await
+        .unwrap();
+    assert!(state.git.repos_dir.join("groceries.git").exists());
+
+    let (_, body) = call(
+        &state,
+        Some(&ana),
+        "delete_app",
+        json!({"app": "groceries", "confirm": "groceries"}),
+    )
+    .await;
+    let out = &result(&body)["structuredContent"];
+    assert_eq!(out["deleted"], true);
+    assert_eq!(out["slug"], "groceries");
+    let user_message = out["user_message"].as_str().unwrap();
+    assert_eq!(
+        user_message,
+        "groceries.outer.localhost is deleted. The name stays reserved for 30 days."
+    );
+    assert_eq!(
+        result(&body)["content"][0]["text"].as_str().unwrap(),
+        user_message
+    );
+    let quarantined_until = out["quarantined_until"].as_i64().unwrap();
+    assert!(quarantined_until > crate::apps::now_ms());
+
+    // Bucket: both prefixes empty, the sibling app untouched.
+    assert!(state.store.list("git/groceries/").await.unwrap().is_empty());
+    assert!(state
+        .store
+        .list("fleets/groceries/")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!state.store.list("fleets/bobapp/").await.unwrap().is_empty());
+    assert!(!state.store.list("git/bobapp/").await.unwrap().is_empty());
+    // Local: worktree, sidecars, caches, fleet state and mirror gone.
+    assert!(!data.join("work/groceries").exists());
+    assert!(!data.join("work/groceries.index").exists());
+    assert!(!data.join("work/groceries.install-hash").exists());
+    assert!(!data.join("cache/groceries").exists());
+    assert!(!data.join("fleets/groceries").exists());
+    assert!(!state.git.repos_dir.join("groceries.git").exists());
+    // Rows: the app, every child table, and the quarantine row to prove it.
+    for table in [
+        "app",
+        "deploy",
+        "app_secret",
+        "app_domain",
+        "app_collaborator",
+        "moderation_text",
+        "moderation_check",
+        "app_cron",
+        "rollback_day",
+        "metric_minute",
+        "path_hour",
+        "app_log",
+        "error_issue",
+    ] {
+        // `table` comes from the literal list above, never agent input.
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {} = ?1",
+            if table == "app" { "id" } else { "app_id" },
+        )))
+        .bind(&groceries_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "table {table}");
+    }
+    let until: i64 =
+        sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = 'groceries'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(until, quarantined_until);
+
+    // The slug is quarantined: recreating it is refused.
+    let (_, again) = call(
+        &state,
+        Some(&ana),
+        "create_app",
+        json!({"slug": "groceries"}),
+    )
+    .await;
+    let err = is_error(&again);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("taken or quarantined"));
+    // And Bob's app still serves its summary.
+    let (_, kept) = call(&state, Some(&bob), "get_app", json!({"app": "bobapp"})).await;
+    assert_eq!(result(&kept)["structuredContent"]["slug"], "bobapp");
+}
+
+#[tokio::test]
+async fn delete_app_retry_completes_after_a_partial_first_attempt() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    state
+        .store
+        .put("fleets/groceries/deploy/current.json", b"{}".to_vec())
+        .await
+        .unwrap();
+
+    // A first attempt that crashed after the bucket and local steps but
+    // before the row delete: redo those steps by hand, then the retry must
+    // finish the job (every step tolerates already-gone state).
+    state
+        .store
+        .delete_prefix("fleets/groceries/")
+        .await
+        .unwrap();
+    state.store.delete_prefix("git/groceries/").await.unwrap();
+    let data = &state.delete_cfg.data_dir;
+    let _ = tokio::fs::remove_dir_all(data.join("work/groceries")).await;
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "delete_app",
+        json!({"app": "groceries", "confirm": "groceries"}),
+    )
+    .await;
+    let out = &result(&body)["structuredContent"];
+    assert_eq!(out["deleted"], true);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn delete_app_shows_as_destructive_in_tools_list() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (_, _, authed) = post(
+        &state,
+        Some(&token),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    let tools = result(&authed)["tools"].as_array().unwrap();
+    let delete = tools
+        .iter()
+        .find(|t| t["name"] == "delete_app")
+        .expect("delete_app is listed");
+    assert_eq!(delete["annotations"]["destructiveHint"], true);
+    assert_eq!(delete["annotations"]["readOnlyHint"], false);
 }

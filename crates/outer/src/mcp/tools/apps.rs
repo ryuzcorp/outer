@@ -42,6 +42,13 @@ pub struct ShareAppInput {
     pub app: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteAppInput {
+    /// The app slug.
+    pub app: String,
+    /// Type the slug again to confirm: must equal `app` exactly.
+    pub confirm: String,
+}
 /// Seed `slug` from the vendored template and create its repo. Mirrors
 /// `ops::create_app` without the deploy: the MCP layer runs deploys through
 /// its own [`super::Deploys`] so tests can substitute a fake.
@@ -222,5 +229,68 @@ pub async fn share_app(input: ShareAppInput, ctx: &Ctx<'_>) -> Result<Value, Too
     Ok(ok(
         text.clone(),
         json!({"url": url, "text": text, "qr": qr}),
+    ))
+}
+
+/// Delete an app forever (spec §7.6, owner only): stops the fleet, wipes
+/// its bucket prefixes and local state, drops its rows (quarantining the
+/// slug for 30 days), and purges its edge cache. `confirm` must equal the
+/// slug exactly; anything else is refused with what to confirm. A slug the
+/// caller has no role on answers `not_found`, exactly like a missing one.
+pub async fn delete_app(input: DeleteAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    // `not_found` first: a foreign slug never reaches the confirm check.
+    let app = owned_app(ctx, &input.app).await?;
+    // Serialize against a racing rollback, deploy and wake: rollback waits
+    // on its guard instead of failing, while a deploy or wake holds its own
+    // lock and runs to a state the idempotent steps tolerate.
+    let rollback = ctx.state.rollback_locks.lock(&app.id).await;
+    let deploy = ctx.state.deploys.app_lock(&app.id).lock_owned().await;
+    let wake_key = ctx.state.fleets.wake_lock(&app.slug).await;
+    let wake = wake_key.lock_owned().await;
+    let locks = crate::apps::delete::DeleteLocks {
+        deploy: &deploy,
+        rollback: Some(&rollback),
+        wake: Some(&wake),
+    };
+    let deps = crate::apps::delete::DeleteDeps {
+        pool: &ctx.state.pool,
+        store: &ctx.state.store,
+        git: &ctx.state.git,
+        sync: &ctx.state.sync,
+        fleets: Some(&ctx.state.fleets),
+    };
+    let out = crate::apps::delete::delete_app(
+        &deps,
+        &ctx.state.delete_cfg,
+        &app.slug,
+        &input.confirm,
+        locks,
+    )
+    .await
+    .map_err(|err| match err {
+        crate::apps::delete::DeleteError::ConfirmMismatch(slug, _) => {
+            ToolError::invalid_argument(format!(
+                "confirm {input:?} does not match the slug {slug:?}",
+                input = input.confirm,
+            ))
+            .with_user(format!(
+                "To delete {slug}, call delete_app with confirm {slug:?} (the slug, exactly)."
+            ))
+        }
+        crate::apps::delete::DeleteError::NotFound(slug) => {
+            ToolError::not_found(format!("no app named {slug:?}"))
+        }
+        crate::apps::delete::DeleteError::Internal(err) => internal(err),
+    })?;
+    let host = format!("{}.{}", out.slug, ctx.state.delete_cfg.apps_domain);
+    let user_message = format!("{host} is deleted. The name stays reserved for 30 days.");
+    Ok(ok(
+        user_message.clone(),
+        json!({
+            "deleted": true,
+            "slug": out.slug,
+            "quarantined_until": out.quarantined_until,
+            "user_message": user_message,
+        }),
     ))
 }

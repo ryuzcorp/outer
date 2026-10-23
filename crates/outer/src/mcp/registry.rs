@@ -97,7 +97,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             open_world: true,
             ..Hints::WRITE
         },
-        "revoke_api_key" | "revoke_connection" => Hints::DESTRUCTIVE,
+        "revoke_api_key" | "revoke_connection" | "delete_app" => Hints::DESTRUCTIVE,
         _ => return None,
     })
 }
@@ -216,6 +216,11 @@ pub fn registry() -> Vec<ToolDef> {
             "Share an app: its url, a one-line share text and a QR code.",
             Account, false,
         ),
+        tool::<app_inputs::DeleteAppInput>(
+            "delete_app",
+            "Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. Pass confirm equal to the slug. The name stays reserved for 30 days.",
+            Account, false,
+        ),
         tool::<code_inputs::ListFilesInput>(
             "list_files",
             "List an app's files at a commit: {app, sha?, path_prefix?}.",
@@ -292,7 +297,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 26);
     }
 }
 
@@ -301,7 +306,7 @@ mod hint_tests {
     use super::*;
 
     #[test]
-    fn every_tool_is_classified_and_only_revocations_are_destructive() {
+    fn every_tool_is_classified_and_only_revoke_and_delete_are_destructive() {
         for tool in registry() {
             let hints = hints_for(tool.name)
                 .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
@@ -310,7 +315,10 @@ mod hint_tests {
                 "{} can't be both read-only and destructive",
                 tool.name
             );
-            let destructive = matches!(tool.name, "revoke_api_key" | "revoke_connection");
+            let destructive = matches!(
+                tool.name,
+                "revoke_api_key" | "revoke_connection" | "delete_app"
+            );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);
             // Untrusted tools return app content; they must never change state.
             if tool.untrusted {
