@@ -1,0 +1,1013 @@
+//! OAuth 2.1 authorization server: discovery, DCR, the sign-in page,
+//! token issuance and revocation. Mounted on the platform router only; app
+//! hosts never see these routes.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Form, Json, Router};
+use serde_json::json;
+use sqlx::SqlitePool;
+use url::Url;
+
+use super::cimd;
+use super::{limits, pages, tokens};
+use super::{now_ms, AuthState};
+use crate::http::client_ip::client_ip;
+
+/// Pending authorization TTL: 10 minutes to finish the flow.
+const PENDING_TTL_MS: i64 = 10 * 60_000;
+/// Authorization code TTL: single use, 60 s.
+const AUTH_CODE_TTL_MS: i64 = 60_000;
+/// Registrations with no token for 30 days are pruned.
+const STALE_DCR_MS: i64 = 30 * 86_400_000;
+
+pub fn router(state: AuthState) -> Router {
+    Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(authorization_server),
+        )
+        .route("/oauth/register", post(register))
+        .route("/oauth/authorize", get(authorize_get).post(authorize_post))
+        .route("/oauth/token", post(token))
+        .route("/oauth/revoke", post(revoke))
+        .with_state(state)
+}
+
+fn json_nostore(value: serde_json::Value) -> Response {
+    (
+        StatusCode::OK,
+        [
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+            ("content-type", "application/json"),
+        ],
+        Json(value).0.to_string(),
+    )
+        .into_response()
+}
+
+fn oauth_error(status: StatusCode, code: &str, description: &str) -> Response {
+    (
+        status,
+        [
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+            ("content-type", "application/json"),
+        ],
+        Json(json!({ "error": code, "error_description": description }))
+            .0
+            .to_string(),
+    )
+        .into_response()
+}
+
+fn html(status: StatusCode, page: maud::Markup, cookie: Option<String>) -> Response {
+    let mut response = (
+        status,
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-security-policy", pages::CSP),
+        ],
+        pages::render(page),
+    )
+        .into_response();
+    if let Some(cookie) = cookie {
+        response.headers_mut().insert(
+            "set-cookie",
+            cookie.parse().expect("session cookie is header-safe"),
+        );
+    }
+    response
+}
+
+fn request_ip(
+    headers: &HeaderMap,
+    origin_locked: bool,
+    peer: Option<SocketAddr>,
+) -> Option<String> {
+    client_ip(headers, origin_locked, peer)
+}
+
+/// `GET /.well-known/oauth-protected-resource[/mcp]` (spec §6.1).
+async fn protected_resource(State(state): State<AuthState>) -> Response {
+    json_nostore(json!({
+        "resource": state.config.resource,
+        "authorization_servers": [state.config.issuer],
+        "scopes_supported": ["apps"],
+        "bearer_methods_supported": ["header"],
+    }))
+}
+
+/// `GET /.well-known/oauth-authorization-server` (spec §6.1).
+async fn authorization_server(State(state): State<AuthState>) -> Response {
+    let issuer = &state.config.issuer;
+    json_nostore(json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/oauth/authorize"),
+        "token_endpoint": format!("{issuer}/oauth/token"),
+        "registration_endpoint": format!("{issuer}/oauth/register"),
+        "revocation_endpoint": format!("{issuer}/oauth/revoke"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "client_id_metadata_supported": true,
+        "authorization_response_iss_parameter_supported": true,
+        "scopes_supported": ["apps", "offline_access"],
+    }))
+}
+
+#[derive(Debug)]
+struct PendingRequest {
+    id: String,
+    client_id: String,
+    redirect_uri: String,
+    state: Option<String>,
+    scope: String,
+    account_id: Option<String>,
+    csrf: String,
+}
+
+/// One pending authorization row: id, client_id, redirect_uri, state,
+/// code_challenge, scope, resource, account_id, csrf, expires_at.
+type PendingRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+);
+/// One issued authorization code row: id, client_id, redirect_uri, state,
+/// code_challenge, scope, resource, account_id, expires_at.
+type CodeRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+/// One refresh token row: grant_id, account_id, client_id, scope, resource,
+/// expires_at, rotated_at.
+type RefreshRow = (String, String, String, String, String, i64, Option<i64>);
+
+async fn load_request(
+    pool: &SqlitePool,
+    id: &str,
+    now: i64,
+) -> anyhow::Result<Option<PendingRequest>> {
+    let row: Option<PendingRow> =
+        sqlx::query_as(
+            "SELECT id, client_id, redirect_uri, state, code_challenge, scope, resource, account_id, csrf, expires_at \
+             FROM oauth_request WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.filter(|row| now <= row.9).map(
+        |(id, client_id, redirect_uri, state, _, scope, _, account_id, csrf, _)| PendingRequest {
+            id,
+            client_id,
+            redirect_uri,
+            state,
+            scope: scope.unwrap_or_else(|| "apps".to_string()),
+            account_id,
+            csrf,
+        },
+    ))
+}
+
+/// Every scope must come from the fixed set; the stored scope is normalized
+/// to the requested subset (default `apps`).
+fn normalize_scope(raw: Option<&str>) -> Option<String> {
+    let raw = raw.unwrap_or("apps");
+    let mut scopes = raw
+        .split(' ')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|part| *part != "apps" && *part != "offline_access")
+    {
+        return None;
+    }
+    scopes.sort_unstable();
+    scopes.dedup();
+    Some(scopes.join(" "))
+}
+
+/// `GET /oauth/authorize`: validate, stash the pending request, and show the
+/// email page (or skip to terms/consent on a returning session).
+async fn authorize_get(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let _ = request_ip(&headers, state.config.origin_locked, Some(peer));
+    let now = now_ms();
+    let error = |message: &str| {
+        html(
+            StatusCode::BAD_REQUEST,
+            pages::error_page("Sign in failed", message),
+            None,
+        )
+    };
+    if query.get("response_type").map(String::as_str) != Some("code") {
+        return error("response_type must be code");
+    }
+    let (Some(client_id), Some(redirect_uri), Some(challenge)) = (
+        query.get("client_id"),
+        query.get("redirect_uri"),
+        query.get("code_challenge"),
+    ) else {
+        return error("client_id, redirect_uri and code_challenge are required");
+    };
+    if query.get("code_challenge_method").map(String::as_str) != Some("S256") {
+        return error("code_challenge_method must be S256");
+    }
+    let Some(scope) = normalize_scope(query.get("scope").map(String::as_str)) else {
+        return error("scope must be a subset of \"apps offline_access\"");
+    };
+    let resource = query.get("resource").cloned();
+    if let Some(resource) = &resource {
+        if *resource != state.config.resource {
+            return error("resource must be the Outer MCP URL");
+        }
+    }
+    let client =
+        match cimd::resolve_client(&state.pool, &state.config, client_id, redirect_uri).await {
+            Ok(client) => client,
+            Err(err) => return error(&clinic_error(&err)),
+        };
+    let id = tokens::new_id();
+    let csrf = tokens::new_csrf();
+    if sqlx::query(
+        "INSERT INTO oauth_request (id, client_id, redirect_uri, state, code_challenge, scope, resource, csrf, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(client_id)
+    .bind(redirect_uri)
+    .bind(query.get("state"))
+    .bind(challenge)
+    .bind(&scope)
+    .bind(&resource)
+    .bind(&csrf)
+    .bind(now + PENDING_TTL_MS)
+    .execute(&state.pool)
+    .await
+    .is_err()
+    {
+        return error("sign-in is unavailable right now");
+    }
+    // Returning session: the sign-in already happened, skip email and code.
+    if let Some(session_id) = super::session_from_headers(&headers) {
+        if let Ok(Some(account)) = super::account_from_session(&state.pool, &session_id).await {
+            sqlx::query("UPDATE oauth_request SET account_id = ? WHERE id = ?")
+                .bind(&account.id)
+                .bind(&id)
+                .execute(&state.pool)
+                .await
+                .ok();
+            if !account.terms_accepted(&state.config) {
+                return html(
+                    StatusCode::OK,
+                    pages::terms_page(&state.config.terms_version, &id, &csrf, None),
+                    None,
+                );
+            }
+            return html(
+                StatusCode::OK,
+                pages::consent_page(&client, &scope, &id, &csrf),
+                None,
+            );
+        }
+    }
+    html(
+        StatusCode::OK,
+        pages::email_page(&client, &id, &csrf, None),
+        None,
+    )
+}
+
+fn clinic_error(err: &cimd::ClientError) -> String {
+    match err {
+        cimd::ClientError::RedirectMismatch => {
+            "redirect_uri is not registered for this client".to_string()
+        }
+        cimd::ClientError::UnknownClient => "unknown client".to_string(),
+        other => format!("client check failed: {other}"),
+    }
+}
+
+/// `POST /oauth/authorize`: one step per form (`email` → `code` → `terms` →
+/// `decision`). Pending state and CSRF live in `oauth_request`, not cookies.
+async fn authorize_post(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let now = now_ms();
+    let ip = request_ip(&headers, state.config.origin_locked, Some(peer));
+    let error = |message: &str| {
+        html(
+            StatusCode::BAD_REQUEST,
+            pages::error_page("Sign in failed", message),
+            None,
+        )
+    };
+    let (Some(request_id), Some(csrf), Some(step)) =
+        (form.get("request_id"), form.get("csrf"), form.get("step"))
+    else {
+        return error("request_id, csrf and step are required");
+    };
+    let Some(pending) = load_request(&state.pool, request_id, now)
+        .await
+        .unwrap_or(None)
+    else {
+        return error("this sign-in expired, start over from the app");
+    };
+    if !tokens::ct_eq(csrf, &pending.csrf) {
+        return html(
+            StatusCode::FORBIDDEN,
+            pages::error_page(
+                "Sign in failed",
+                "session mismatch, start over from the app",
+            ),
+            None,
+        );
+    }
+    let client = match cimd::resolve_client(
+        &state.pool,
+        &state.config,
+        &pending.client_id,
+        &pending.redirect_uri,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(err) => return error(&clinic_error(&err)),
+    };
+    match step.as_str() {
+        "email" => {
+            let email = form.get("email").cloned().unwrap_or_default();
+            match super::send_code(&state.pool, &state.config, &email, ip.as_deref()).await {
+                Ok(_) => html(
+                    StatusCode::OK,
+                    pages::code_page(
+                        &super::normalize_email(&email),
+                        &pending.id,
+                        &pending.csrf,
+                        None,
+                    ),
+                    None,
+                ),
+                Err(err) => {
+                    let status = if err.code == "rate_limited" {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    html(
+                        status,
+                        pages::email_page(
+                            &client,
+                            &pending.id,
+                            &pending.csrf,
+                            Some(pages::friendly_error(err.code)),
+                        ),
+                        None,
+                    )
+                }
+            }
+        }
+        "code" => {
+            let email = form.get("email").cloned().unwrap_or_default();
+            let code = form.get("code").cloned().unwrap_or_default();
+            match super::verify_code_core(&state.pool, &state.config, &email, &code, ip.as_deref())
+                .await
+            {
+                Ok((account_id, terms_ok)) => {
+                    sqlx::query("UPDATE oauth_request SET account_id = ? WHERE id = ?")
+                        .bind(&account_id)
+                        .bind(&pending.id)
+                        .execute(&state.pool)
+                        .await
+                        .ok();
+                    let session = super::create_session(&state.pool, &account_id)
+                        .await
+                        .ok()
+                        .map(|id| super::set_session_cookie(&id));
+                    if !terms_ok {
+                        return html(
+                            StatusCode::OK,
+                            pages::terms_page(
+                                &state.config.terms_version,
+                                &pending.id,
+                                &pending.csrf,
+                                None,
+                            ),
+                            session,
+                        );
+                    }
+                    html(
+                        StatusCode::OK,
+                        pages::consent_page(&client, &pending.scope, &pending.id, &pending.csrf),
+                        session,
+                    )
+                }
+                Err(err) => html(
+                    StatusCode::BAD_REQUEST,
+                    pages::code_page(
+                        &super::normalize_email(&email),
+                        &pending.id,
+                        &pending.csrf,
+                        Some(pages::friendly_error(err.code)),
+                    ),
+                    None,
+                ),
+            }
+        }
+        "terms" => {
+            let Some(account_id) = &pending.account_id else {
+                return error("sign in with email first");
+            };
+            if form.get("accept").map(String::as_str) != Some("yes") {
+                return html(
+                    StatusCode::BAD_REQUEST,
+                    pages::terms_page(
+                        &state.config.terms_version,
+                        &pending.id,
+                        &pending.csrf,
+                        Some("Accept the Terms and Privacy Policy to continue."),
+                    ),
+                    None,
+                );
+            }
+            if super::record_terms_acceptance(&state.pool, &state.config, account_id)
+                .await
+                .is_err()
+            {
+                return error("sign-in is unavailable right now");
+            }
+            html(
+                StatusCode::OK,
+                pages::consent_page(&client, &pending.scope, &pending.id, &pending.csrf),
+                None,
+            )
+        }
+        "decision" => {
+            if pending.account_id.is_none() {
+                return error("sign in with email first");
+            }
+            if form.get("allow").map(String::as_str) == Some("yes") {
+                let (code, code_hash) = tokens::new_auth_code();
+                sqlx::query("UPDATE oauth_request SET code_hash = ?, expires_at = ? WHERE id = ?")
+                    .bind(&code_hash)
+                    .bind(now + AUTH_CODE_TTL_MS)
+                    .bind(&pending.id)
+                    .execute(&state.pool)
+                    .await
+                    .ok();
+                redirect(
+                    &pending.redirect_uri,
+                    &[("code", &code)],
+                    pending.state.as_deref(),
+                    &state.config.issuer,
+                )
+            } else {
+                redirect(
+                    &pending.redirect_uri,
+                    &[("error", "access_denied")],
+                    pending.state.as_deref(),
+                    &state.config.issuer,
+                )
+            }
+        }
+        _ => error("unknown step"),
+    }
+}
+
+/// Allow and deny redirects carry `iss` (RFC 9207) plus `state` when sent.
+fn redirect(base: &str, params: &[(&str, &str)], state: Option<&str>, issuer: &str) -> Response {
+    let mut url = match Url::parse(base) {
+        Ok(url) => url,
+        Err(_) => {
+            return html(
+                StatusCode::BAD_REQUEST,
+                pages::error_page("Sign in failed", "redirect_uri is not a URL"),
+                None,
+            )
+        }
+    };
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in params {
+            pairs.append_pair(key, value);
+        }
+        if let Some(state) = state {
+            pairs.append_pair("state", state);
+        }
+        pairs.append_pair("iss", issuer);
+    }
+    (StatusCode::FOUND, [("location", url.to_string())], "").into_response()
+}
+
+/// `POST /oauth/register` (RFC 7591): public clients only, HTTPS or loopback
+/// redirects, 20/h per IP. Prunes registrations with no token for 30 days.
+async fn register(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let now = now_ms();
+    let ip = request_ip(&headers, state.config.origin_locked, Some(peer))
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Some(retry_after_s) = limits::check_and_record(
+        &state.pool,
+        &format!("ip:{ip}"),
+        "dcr_register",
+        20,
+        3_600_000,
+        now,
+    )
+    .await
+    .unwrap_or(None)
+    {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("retry-after", retry_after_s.to_string().parse().unwrap());
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            Json(json!({ "error": "rate_limited", "error_description": "too many registrations" }))
+                .0
+                .to_string(),
+        )
+            .into_response();
+    }
+    sqlx::query(
+        "DELETE FROM oauth_client WHERE kind = 'dcr' AND last_token_at IS NULL AND created_at < ?",
+    )
+    .bind(now - STALE_DCR_MS)
+    .execute(&state.pool)
+    .await
+    .ok();
+    let uris = body
+        .get("redirect_uris")
+        .and_then(|uris| uris.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if uris.is_empty() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            "redirect_uris must not be empty",
+        );
+    }
+    let mut redirect_uris = Vec::with_capacity(uris.len());
+    for uri in &uris {
+        let Some(uri) = uri.as_str() else {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_redirect_uri",
+                "redirect_uris must be strings",
+            );
+        };
+        let Ok(parsed) = Url::parse(uri) else {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_redirect_uri",
+                format!("{uri} is not a URL").as_str(),
+            );
+        };
+        let loopback = cimd::is_loopback_host(parsed.host_str());
+        if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_redirect_uri",
+                "redirect URIs must be https or loopback http",
+            );
+        }
+        redirect_uris.push(uri.to_string());
+    }
+    if let Some(method) = body
+        .get("token_endpoint_auth_method")
+        .and_then(|method| method.as_str())
+    {
+        if method != "none" {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                "only public clients (token_endpoint_auth_method none) are supported",
+            );
+        }
+    }
+    let name = body
+        .get("client_name")
+        .and_then(|name| name.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.chars().take(200).collect::<String>());
+    let host = redirect_uris
+        .first()
+        .and_then(|uri| Url::parse(uri).ok())
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let client_id = format!("dcr_{}", hex::encode(rand::random::<[u8; 16]>()));
+    sqlx::query(
+        "INSERT INTO oauth_client (client_id, kind, name, host, redirect_uris, verified, created_at) \
+         VALUES (?, 'dcr', ?, ?, ?, 0, ?)",
+    )
+    .bind(&client_id)
+    .bind(&name)
+    .bind(&host)
+    .bind(serde_json::to_string(&redirect_uris).unwrap_or_default())
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .ok();
+    let mut response = json!({
+        "client_id": client_id,
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    });
+    if let Some(name) = name {
+        response["client_name"] = json!(name);
+    }
+    (
+        StatusCode::CREATED,
+        [("content-type", "application/json")],
+        Json(response).0.to_string(),
+    )
+        .into_response()
+}
+
+/// `POST /oauth/token` (form): authorization_code (single use, 60 s TTL,
+/// PKCE S256 required, redirect_uri match, `resource` checked when sent) and
+/// refresh_token (rotated every use, 90-day sliding; reusing a rotated token
+/// revokes the whole grant). Proper OAuth JSON errors + `Cache-Control:
+/// no-store`.
+async fn token(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let _ = request_ip(&headers, state.config.origin_locked, Some(peer));
+    let now = now_ms();
+    sqlx::query("DELETE FROM oauth_token WHERE expires_at < ?")
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .ok();
+    match form.get("grant_type").map(String::as_str) {
+        Some("authorization_code") => exchange_code(&state, form, now).await,
+        Some("refresh_token") => exchange_refresh(&state, form, now).await,
+        _ => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "grant_type must be authorization_code or refresh_token",
+        ),
+    }
+}
+
+async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i64) -> Response {
+    let bad =
+        |code: &str, description: &str| oauth_error(StatusCode::BAD_REQUEST, code, description);
+    let (Some(code), Some(redirect_uri), Some(verifier)) = (
+        form.get("code"),
+        form.get("redirect_uri"),
+        form.get("code_verifier"),
+    ) else {
+        return bad(
+            "invalid_request",
+            "code, redirect_uri and code_verifier are required",
+        );
+    };
+    if verifier.is_empty() {
+        return bad(
+            "invalid_request",
+            "code_verifier is required (PKCE S256 only)",
+        );
+    }
+    let hash = tokens::sha256_hex(code);
+    let row: Option<CodeRow> =
+        sqlx::query_as(
+            "SELECT id, client_id, redirect_uri, state, code_challenge, scope, resource, account_id, expires_at \
+             FROM oauth_request WHERE code_hash = ?",
+        )
+        .bind(&hash)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+    let Some((
+        id,
+        client_id,
+        stored_redirect,
+        _,
+        challenge,
+        scope,
+        stored_resource,
+        account_id,
+        expires_at,
+    )) = row
+    else {
+        return bad("invalid_grant", "the authorization code is unknown");
+    };
+    // Single use: the row goes before any other check.
+    sqlx::query("DELETE FROM oauth_request WHERE id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .ok();
+    if now > expires_at {
+        return bad("invalid_grant", "the authorization code expired");
+    }
+    if redirect_uri != &stored_redirect {
+        return bad(
+            "invalid_grant",
+            "redirect_uri does not match the authorize request",
+        );
+    }
+    if !tokens::ct_eq(&tokens::pkce_s256(verifier), &challenge) {
+        return bad("invalid_grant", "PKCE verification failed");
+    }
+    if let Some(resource) = form.get("resource") {
+        if stored_resource.as_ref() != Some(resource) && *resource != state.config.resource {
+            return bad(
+                "invalid_target",
+                "resource does not match the authorize request",
+            );
+        }
+    }
+    let Some(account_id) = account_id else {
+        return bad("invalid_grant", "the authorization was never completed");
+    };
+    let scope = scope.unwrap_or_else(|| "apps".to_string());
+    let resource = stored_resource.unwrap_or_else(|| state.config.resource.clone());
+    issue_grant(state, &client_id, &account_id, &scope, &resource, now).await
+}
+
+async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now: i64) -> Response {
+    let bad =
+        |code: &str, description: &str| oauth_error(StatusCode::BAD_REQUEST, code, description);
+    let Some(refresh) = form.get("refresh_token") else {
+        return bad("invalid_request", "refresh_token is required");
+    };
+    let hash = tokens::sha256_hex(refresh);
+    let row: Option<RefreshRow> = sqlx::query_as(
+        "SELECT t.grant_id, g.account_id, g.client_id, g.scope, g.resource, t.expires_at, t.rotated_at \
+         FROM oauth_token t JOIN oauth_grant g ON g.id = t.grant_id \
+         WHERE t.token_hash = ? AND t.kind = 'refresh'",
+    )
+    .bind(&hash)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    let Some((
+        grant_id,
+        account_id,
+        client_id,
+        grant_scope,
+        grant_resource,
+        expires_at,
+        rotated_at,
+    )) = row
+    else {
+        return bad("invalid_grant", "the refresh token is unknown");
+    };
+    // Reusing a rotated refresh token revokes the whole grant.
+    if rotated_at.is_some() {
+        sqlx::query("UPDATE oauth_grant SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+            .bind(now)
+            .bind(&grant_id)
+            .execute(&state.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM oauth_token WHERE grant_id = ?")
+            .bind(&grant_id)
+            .execute(&state.pool)
+            .await
+            .ok();
+        return bad("invalid_grant", "the refresh token was already used");
+    }
+    if now > expires_at {
+        sqlx::query("DELETE FROM oauth_token WHERE token_hash = ?")
+            .bind(&hash)
+            .execute(&state.pool)
+            .await
+            .ok();
+        return bad("invalid_grant", "the refresh token expired");
+    }
+    if grant_revoked(&state.pool, &grant_id).await {
+        return bad("invalid_grant", "the grant was revoked");
+    }
+    let scope = match form.get("scope") {
+        Some(requested) => {
+            let requested_parts = requested
+                .split(' ')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            if requested_parts
+                .iter()
+                .any(|part| !grant_scope.split(' ').any(|allowed| allowed == *part))
+            {
+                return bad("invalid_scope", "requested scope exceeds the grant");
+            }
+            requested.to_string()
+        }
+        None => grant_scope.clone(),
+    };
+    // Rotate: the old refresh dies, the sliding window restarts now.
+    let (access, access_hash) = tokens::new_access_token();
+    let (refresh, refresh_hash) = tokens::new_refresh_token();
+    let access_ttl_ms = ttl_ms(state.config.access_ttl, 3_600_000);
+    let refresh_ttl_ms = ttl_ms(state.config.refresh_ttl, 90 * 86_400_000);
+    sqlx::query("UPDATE oauth_token SET rotated_at = ? WHERE token_hash = ?")
+        .bind(now)
+        .bind(&hash)
+        .execute(&state.pool)
+        .await
+        .ok();
+    sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'access', ?)")
+        .bind(&access_hash)
+        .bind(&grant_id)
+        .bind(now + access_ttl_ms)
+        .execute(&state.pool)
+        .await
+        .ok();
+    sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'refresh', ?)")
+        .bind(&refresh_hash)
+        .bind(&grant_id)
+        .bind(now + refresh_ttl_ms)
+        .execute(&state.pool)
+        .await
+        .ok();
+    sqlx::query("UPDATE oauth_client SET last_token_at = ? WHERE client_id = ?")
+        .bind(now)
+        .bind(&client_id)
+        .execute(&state.pool)
+        .await
+        .ok();
+    let _ = (account_id, grant_resource);
+    json_nostore(json!({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": access_ttl_ms / 1000,
+        "scope": scope,
+        "refresh_token": refresh,
+    }))
+}
+
+async fn grant_revoked(pool: &SqlitePool, grant_id: &str) -> bool {
+    sqlx::query_as::<_, (Option<i64>,)>("SELECT revoked_at FROM oauth_grant WHERE id = ?")
+        .bind(grant_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .is_none_or(|(revoked,)| revoked.is_some())
+}
+
+/// Mint a grant plus access token (and a refresh token when the scope asks
+/// for `offline_access`).
+async fn issue_grant(
+    state: &AuthState,
+    client_id: &str,
+    account_id: &str,
+    scope: &str,
+    resource: &str,
+    now: i64,
+) -> Response {
+    let grant_id = tokens::new_id();
+    sqlx::query(
+        "INSERT INTO oauth_grant (id, account_id, client_id, scope, resource, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&grant_id)
+    .bind(account_id)
+    .bind(client_id)
+    .bind(scope)
+    .bind(resource)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .ok();
+    let (access, access_hash) = tokens::new_access_token();
+    let access_ttl_ms = ttl_ms(state.config.access_ttl, 3_600_000);
+    sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'access', ?)")
+        .bind(&access_hash)
+        .bind(&grant_id)
+        .bind(now + access_ttl_ms)
+        .execute(&state.pool)
+        .await
+        .ok();
+    let mut response = json!({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": access_ttl_ms / 1000,
+        "scope": scope,
+    });
+    if scope.split(' ').any(|part| part == "offline_access") {
+        let (refresh, refresh_hash) = tokens::new_refresh_token();
+        let refresh_ttl_ms = ttl_ms(state.config.refresh_ttl, 90 * 86_400_000);
+        sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'refresh', ?)")
+            .bind(&refresh_hash)
+            .bind(&grant_id)
+            .bind(now + refresh_ttl_ms)
+            .execute(&state.pool)
+            .await
+            .ok();
+        response["refresh_token"] = json!(refresh);
+    }
+    sqlx::query("UPDATE oauth_client SET last_token_at = ? WHERE client_id = ?")
+        .bind(now)
+        .bind(client_id)
+        .execute(&state.pool)
+        .await
+        .ok();
+    json_nostore(response)
+}
+
+fn ttl_ms(ttl: std::time::Duration, fallback_ms: i64) -> i64 {
+    let ms = ttl.as_millis().min(i64::MAX as u128) as i64;
+    if ms > 0 {
+        ms
+    } else {
+        fallback_ms
+    }
+}
+
+/// `POST /oauth/revoke` (RFC 7009): always 200, even for unknown tokens.
+async fn revoke(
+    State(state): State<AuthState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if let Some(token) = form.get("token") {
+        let hash = tokens::sha256_hex(token.trim());
+        let grant: Option<(String,)> =
+            sqlx::query_as("SELECT grant_id FROM oauth_token WHERE token_hash = ?")
+                .bind(&hash)
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap_or(None);
+        if let Some((grant_id,)) = grant {
+            sqlx::query(
+                "UPDATE oauth_grant SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(&grant_id)
+            .execute(&state.pool)
+            .await
+            .ok();
+            sqlx::query("DELETE FROM oauth_token WHERE grant_id = ?")
+                .bind(&grant_id)
+                .execute(&state.pool)
+                .await
+                .ok();
+        } else {
+            sqlx::query(
+                "UPDATE api_key SET revoked_at = ? WHERE key_hash = ? AND revoked_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(&hash)
+            .execute(&state.pool)
+            .await
+            .ok();
+        }
+    }
+    (
+        StatusCode::OK,
+        [("cache-control", "no-store"), ("pragma", "no-cache")],
+        "",
+    )
+        .into_response()
+}

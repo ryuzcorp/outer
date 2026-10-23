@@ -342,6 +342,42 @@ fn print_outcome(
     Ok(())
 }
 
+/// Build the auth module's state from config: issuer from scheme + domain +
+/// port, Cloudflare Email Service when the Cloudflare pair is set, log-only
+/// codes on localhost without it.
+fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> outer::auth::AuthState {
+    let issuer = format!(
+        "{}://{}{}",
+        scheme(config),
+        config.domain,
+        port_suffix(config.listen, config.tls_enabled())
+    );
+    let email = match &config.cloudflare {
+        Some(cf) => outer::auth::EmailSender::cloudflare(
+            cf.account_id.clone(),
+            cf.api_token.clone(),
+            outer::auth::EmailFrom::parse(&config.email_from),
+        ),
+        None => outer::auth::EmailSender::Log,
+    };
+    outer::auth::AuthState {
+        pool: pool.clone(),
+        config: outer::auth::AuthConfig {
+            issuer: issuer.clone(),
+            resource: format!("{issuer}/mcp"),
+            admin_emails: config.admin_emails.clone(),
+            signup_open: config.signup_open,
+            terms_version: config.terms_version.clone(),
+            access_ttl: config.oauth_access_ttl,
+            refresh_ttl: config.oauth_refresh_ttl,
+            email,
+            is_local: config.is_local(),
+            allow_loopback_fetch: false,
+            origin_locked: config.tls_enabled(),
+        },
+    }
+}
+
 /// `:8080` unless the listener is on the scheme's default port.
 fn port_suffix(listen: SocketAddr, tls: bool) -> String {
     match (listen.port(), tls) {
@@ -454,6 +490,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         http::AppState {
             pool: pool.clone(),
             sync: sync.clone(),
+            auth: auth_state(&config, &pool),
         },
         http::proxy::ProxyState::new(
             pool.clone(),

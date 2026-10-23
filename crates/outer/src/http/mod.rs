@@ -1,6 +1,7 @@
 //! HTTP surface: the platform host (operator probes now; MCP and OAuth
 //! later) and every app host through [`proxy`].
 
+pub mod client_ip;
 pub mod proxy;
 pub mod tls;
 
@@ -18,12 +19,14 @@ use crate::store::snapshot::StateSync;
 pub struct AppState {
     pub pool: SqlitePool,
     pub sync: StateSync,
+    pub auth: crate::auth::AuthState,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .fallback_service(crate::auth::router(state.auth.clone()))
         .with_state(state)
 }
 
@@ -94,6 +97,7 @@ mod tests {
         let app = router(AppState {
             pool: pool.clone(),
             sync: StateSync::new("test"),
+            auth: crate::auth::test_support::test_state(pool.clone()),
         });
 
         let ok = app
