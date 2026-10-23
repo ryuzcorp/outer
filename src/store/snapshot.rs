@@ -397,9 +397,17 @@ async fn try_restore_once(
     let packed = tokio::fs::read(partial).await?;
     let raw = zstd::decode_all(&packed[..])?;
     // Rename into place only once complete: a crash mid-write must not leave
-    // a truncated database that "exists".
+    // a truncated database that "exists". The data must reach the disk
+    // before the rename — without the fsync a power loss right after the
+    // rename can leave a zero-length file, which reads as a valid empty
+    // SQLite database and would then be uploaded over the good snapshot.
     let decoded = cfg.db_path.with_extension("sqlite.decoded");
-    tokio::fs::write(&decoded, raw).await?;
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::File::create(&decoded).await?;
+        f.write_all(&raw).await?;
+        f.sync_all().await?;
+    }
     tokio::fs::rename(&decoded, &cfg.db_path).await?;
     tracing::info!(path = %cfg.db_path.display(), "outer state restored from bucket");
     Ok(true)

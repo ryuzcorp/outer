@@ -65,6 +65,8 @@ pub fn is_reserved_env_name(name: &str) -> bool {
 /// child into that leaf right after spawn. A leaf means cgroups are active:
 /// a refused move fails the step (the group is killed) instead of running
 /// uncapped. `None` is dev (no cgroups), where no move is attempted.
+/// Each step needs its own leaf: cleanup kills the whole leaf (`cgroup.kill`
+/// plus the process group), so a shared leaf would kill sibling steps.
 pub struct Sandbox<'a> {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
@@ -91,46 +93,22 @@ pub(crate) fn resolve_drop_id(want: u32) -> Option<u32> {
     None
 }
 
-/// Recursively hand `path` to (uid, gid) without following symlinks: an app
-/// tree can link at platform paths, and a following chown run as root would
-/// hand the app the platform database. Returns false when any entry could
-/// not be changed.
+/// Hand one path that outer itself created to (uid, gid), without following
+/// it and without traversal: `lchown` never follows the final component, so
+/// an app-uid process racing outer cannot redirect this outside the tree the
+/// way a recursive walk could (a checked directory swapped for a symlink
+/// mid-walk would have root list and chown entries outside the tree).
+/// Contents already belong to the app user from previous steps; only dirs
+/// outer creates need handing over. Returns false when the change failed.
 #[cfg(unix)]
-pub(crate) fn lchown_tree(path: &Path, uid: u32, gid: u32) -> bool {
+pub(crate) fn lchown_one(path: &Path, uid: u32, gid: u32) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    let mut ok = true;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let meta = match std::fs::symlink_metadata(&p) {
-            Ok(meta) => meta,
-            Err(_) => {
-                ok = false;
-                continue;
-            }
-        };
-        match CString::new(p.as_os_str().as_bytes()) {
-            Ok(path) => {
-                if unsafe { libc::lchown(path.as_ptr(), uid, gid) } != 0 {
-                    ok = false;
-                }
-            }
-            Err(_) => ok = false,
-        }
-        // `symlink_metadata` never reports a symlink as a dir, so links are
-        // never descended into.
-        if meta.file_type().is_dir() {
-            match std::fs::read_dir(&p) {
-                Ok(entries) => {
-                    for entry in entries.flatten() {
-                        stack.push(entry.path());
-                    }
-                }
-                Err(_) => ok = false,
-            }
-        }
-    }
-    ok
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `lchown` does not follow the final component.
+    unsafe { libc::lchown(path.as_ptr(), uid, gid) == 0 }
 }
 
 /// Move `pid` into a cgroup leaf: the child's whole tree is contained from
@@ -153,23 +131,67 @@ fn move_target_gone(error: &anyhow::Error) -> bool {
         .any(|io| io.raw_os_error() == Some(libc::ESRCH))
 }
 
+/// Cut `capped` (already truncated to its cap) back to the last whole UTF-8
+/// char. Only a multi-byte char split by the cut is dropped: earlier invalid
+/// bytes are left for `from_utf8_lossy` to replace, not treated as a cut.
+pub(crate) fn trim_split_tail(capped: &[u8]) -> &[u8] {
+    if let Err(e) = std::str::from_utf8(capped) {
+        if e.error_len().is_none() {
+            return &capped[..e.valid_up_to()];
+        }
+    }
+    capped
+}
+
 /// Truncate captured output at a UTF-8 boundary.
 fn cap_output(output: &[u8]) -> String {
     let mut capped = output;
     if capped.len() > MAX_OUTPUT_BYTES {
-        capped = &capped[..MAX_OUTPUT_BYTES];
-        while !capped.is_empty() && std::str::from_utf8(capped).is_err() {
-            capped = &capped[..capped.len() - 1];
-        }
+        capped = trim_split_tail(&capped[..MAX_OUTPUT_BYTES]);
     }
     String::from_utf8_lossy(capped).into_owned()
 }
 
+/// Kill every process in a cgroup leaf. `killpg` cannot reach members that
+/// called `setsid`/`setpgid` to leave the group, but nothing escapes the
+/// leaf without a further move, so the leaf kill is the backstop keeping a
+/// detached watcher from outliving the step as the app uid. Best-effort: a
+/// missing leaf or a fully reaped one is success. `cgroup.kill` (Linux
+/// 5.14+) kills the leaf in one write; older kernels fall back to signaling
+/// each pid in `cgroup.procs` until it stays empty.
+fn kill_leaf(leaf: &Path) {
+    if std::fs::write(leaf.join("cgroup.kill"), "1").is_ok() {
+        return;
+    }
+    // Pre-5.14: signal the listed members directly, re-reading until the
+    // leaf stays empty. Zombies stay listed but cannot fork, so a bounded
+    // number of rounds always terminates.
+    for _ in 0..5 {
+        let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
+        let mut any = false;
+        for pid in procs
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        {
+            any = true;
+            // SAFETY: pids come from our own step leaf; SIGKILL only. ESRCH
+            // (exited between listing and kill) is fine.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        if !any {
+            return;
+        }
+    }
+}
+
 /// Sandboxed step: `env_clear`, base env plus caller vars, uid/gid drop, its
 /// own process group (the whole tree dies on timeout via killpg), rlimits
-/// (NPROC, FSIZE 4 GiB), and capped output. Network egress for the sandbox
-/// uid is closed by the nft policy in `super::nft`, which also covers this
-/// uid.
+/// (NPROC only without a leaf, FSIZE 4 GiB always), and capped output.
+/// Network egress for the sandbox uid is closed by the nft policy in
+/// `super::nft`, which also covers this uid.
 pub async fn run_sandboxed(
     program: &str,
     args: &[&str],
@@ -184,15 +206,27 @@ pub async fn run_sandboxed(
         let _ = std::fs::create_dir_all(sb.cache_root.join(sub));
     }
     // Created by outer after the worktree was handed over: give them to the
-    // sandbox user too, or TMPDIR and the cache are unwritable.
+    // sandbox user too, or TMPDIR and the cache are unwritable. Only the
+    // dirs outer itself created: a recursive walk as root over an
+    // app-writable tree is a symlink race, and contents already belong to
+    // the app user from previous steps. Nested root-owned files seeded by
+    // other means stay root-owned (documented tradeoff).
     if let Some(uid) = sb.uid {
         let gid = sb.gid.unwrap_or(uid);
-        lchown_tree(&tmp, uid, gid);
-        lchown_tree(sb.cache_root, uid, gid);
+        lchown_one(&tmp, uid, gid);
+        lchown_one(sb.cache_root, uid, gid);
+        for sub in ["bun", "home"] {
+            lchown_one(&sb.cache_root.join(sub), uid, gid);
+        }
     }
     let uid = sb.uid.and_then(resolve_drop_id);
     let gid = sb.gid.or(sb.uid).and_then(resolve_drop_id);
     let drops_uid = uid.is_some();
+    // The uid-wide NPROC cap only where no leaf bounds the step (dev): with
+    // a leaf, `pids.max` on the leaf caps the step without counting the
+    // fleet's tasks, which share the app uid and would otherwise starve
+    // builds with EAGAIN.
+    let cap_nproc = drops_uid && sb.cgroup_leaf.is_none();
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
@@ -220,9 +254,9 @@ pub async fn run_sandboxed(
         // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
         // libc calls. The ids are set here (not via CommandExt::uid/gid,
         // which would apply them before this hook, after which setgroups is
-        // EPERM): setgroups first so the child never keeps outer's
         // supplementary groups, then setgid, then setuid. setrlimit bounds
-        // fork bombs (NPROC) and runaway outputs (FSIZE 4 GiB).
+        // runaway outputs (FSIZE 4 GiB) always and fork bombs (NPROC) where
+        // no leaf bounds the step (with a leaf the pids.max cap applies).
         unsafe {
             std_cmd.pre_exec(move || {
                 if drops_priv {
@@ -241,9 +275,10 @@ pub async fn run_sandboxed(
                     }
                 }
                 // RLIMIT_NPROC counts every process of the real uid, so it is
-                // only meaningful for a dedicated app uid; on outer's own uid
-                // (dev) it would cap outer and its fleets too.
-                if drops_uid {
+                // only meaningful where no leaf bounds the step (dev); with a
+                // leaf the step is capped by the leaf's `pids.max` instead,
+                // which does not count the fleet's tasks sharing the app uid.
+                if cap_nproc {
                     let nproc = libc::rlimit {
                         rlim_cur: 512,
                         rlim_max: 512,
@@ -288,6 +323,12 @@ pub async fn run_sandboxed(
         unsafe {
             libc::killpg(pid as libc::pid_t, libc::SIGKILL);
         }
+    }
+    // A step that called `setsid`/`setpgid` escaped the group but not the
+    // leaf: kill the whole leaf so nothing outlives the step. Each step
+    // needs its own leaf — a shared leaf would kill sibling steps here.
+    if let Some(leaf) = sb.cgroup_leaf {
+        kill_leaf(leaf);
     }
     match result {
         Ok(Ok(output)) => {
@@ -493,5 +534,149 @@ mod tests {
             !seen.contains_key("OUTER_SECRET"),
             "reserved env leaked into sandbox env"
         );
+    }
+    #[test]
+    fn cap_output_keeps_early_invalid_bytes() {
+        // One invalid byte near the start plus valid output past the cap:
+        // only a split tail char may be trimmed, the early byte becomes
+        // U+FFFD instead of eating the whole megabyte.
+        let mut output = vec![0xFF];
+        output.extend(std::iter::repeat_n(b'x', MAX_OUTPUT_BYTES));
+        let capped = cap_output(&output);
+        assert!(
+            capped.starts_with('\u{FFFD}'),
+            "early invalid byte must survive as a replacement char"
+        );
+        assert!(
+            capped.len() >= MAX_OUTPUT_BYTES,
+            "must not trim back to the early invalid byte, got {} bytes",
+            capped.len()
+        );
+    }
+
+    #[test]
+    fn cap_output_trims_only_a_split_tail_char() {
+        // The cut splits `é`: only its first byte is dropped.
+        let mut output = vec![b'x'; MAX_OUTPUT_BYTES - 1];
+        output.extend_from_slice("é".as_bytes());
+        output.extend_from_slice(b"tail");
+        assert_eq!(cap_output(&output), "x".repeat(MAX_OUTPUT_BYTES - 1));
+    }
+
+    #[test]
+    fn lchown_one_hands_over_without_following() {
+        let dir = tempfile::tempdir().unwrap();
+        let euid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let target = dir.path().join("outside");
+        std::fs::write(&target, "platform").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // The link itself is handed over; the target keeps its owner.
+        assert!(lchown_one(&link, euid, gid));
+        assert!(lchown_one(&target, euid, gid));
+        assert!(lchown_one(dir.path(), euid, gid));
+        // Nothing exists here: a clean false, never a panic.
+        assert!(!lchown_one(&dir.path().join("missing"), euid, gid));
+    }
+
+    #[test]
+    fn kill_leaf_prefers_cgroup_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.kill"), "").unwrap();
+        kill_leaf(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cgroup.kill")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn kill_leaf_falls_back_to_procs() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the kill file would go: the write fails, so the
+        // per-pid fallback runs. Dead pids (ESRCH) are fine.
+        std::fs::create_dir(dir.path().join("cgroup.kill")).unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "999999991\n999999992\n").unwrap();
+        kill_leaf(dir.path());
+        // An unreadable leaf is success too: nothing is known to outlive.
+        kill_leaf(&dir.path().join("missing"));
+    }
+
+    /// A step running in its own leaf is capped by the leaf's `pids.max`,
+    /// not by the uid-wide RLIMIT_NPROC (which also counts the fleet's
+    /// tasks sharing the app uid): `ulimit -u` must not read 512.
+    #[tokio::test]
+    async fn build_step_with_a_leaf_keeps_the_system_nproc() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let leaf = dir.path().join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let euid = unsafe { libc::geteuid() };
+        let sb = Sandbox {
+            uid: Some(euid),
+            gid: Some(euid),
+            env: &[],
+            cache_root: &cache,
+            cgroup_leaf: Some(&leaf),
+        };
+        let out = run_sandboxed(
+            "sh",
+            &["-c", "ulimit -u"],
+            dir.path(),
+            &sb,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            out.trim(),
+            "512",
+            "leaf step must not carry the uid-wide 512 cap"
+        );
+    }
+
+    /// End to end: a step that detaches with `setsid` still dies with the
+    /// step when the step runs in its own real leaf.
+    #[tokio::test]
+    #[ignore = "needs a writable cgroupfs mount plus cgroup delegation to make a real leaf"]
+    async fn cgroup_kill_reaps_setsid_escapees() {
+        let root = Path::new("/sys/fs/cgroup");
+        let leaf = root.join(format!("outer-kill-test-{}", std::process::id()));
+        std::fs::create_dir_all(&leaf).unwrap();
+        struct Remove<'a>(&'a Path);
+        impl Drop for Remove<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(self.0);
+            }
+        }
+        let _rm = Remove(&leaf);
+        let marker = "31337999";
+        let script = format!("setsid sleep {marker} & sleep 2");
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let sb = Sandbox {
+            uid: None,
+            gid: None,
+            env: &[],
+            cache_root: &cache,
+            cgroup_leaf: Some(&leaf),
+        };
+        let _ = run_sandboxed(
+            "sh",
+            &["-c", &script],
+            dir.path(),
+            &sb,
+            Duration::from_secs(20),
+        )
+        .await;
+        // Whatever the step result, nothing detached may outlive it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cmdline_has(marker) {
+            if std::time::Instant::now() >= deadline {
+                panic!("setsid-detached sleep {marker} survived the step");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }

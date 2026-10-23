@@ -19,6 +19,15 @@ const PRESIGN_SECS: u64 = 3600;
 /// How many times an idempotent S3 call is attempted before giving up.
 const S3_MAX_ATTEMPTS: u32 = 3;
 
+/// Bound on TCP+TLS connect for every request, streamed or not.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// No-progress bound on streamed bodies (and on time-to-first-byte): each
+/// body read must yield within this, so a large bundle on a slow link fails
+/// only when it stalls — never at a fixed total wall. Small objects keep
+/// their own total deadlines at each call site.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// True when an S3 error means "the object does not exist", as opposed
 /// to the store being unreachable. Callers that treat "missing" as "start
 /// fresh" must not do so on a transport error, or they overwrite good state.
@@ -27,10 +36,12 @@ const S3_MAX_ATTEMPTS: u32 = 3;
 /// message, so a `"NoSuchKey"`/`"NotFound"` substring match reads a 5xx or a
 /// transport failure on a key named `NotFound...` as "missing", and the
 /// manifest reader would restart the seq and lose history. Instead the
-/// backend attaches an [`S3NotFound`] marker when it saw a 404 (or the
-/// store's `<Code>NoSuchKey</Code>` / `<Code>NoSuchBucket</Code>`), and this
-/// matches that marker by downcast. Callers that learn "missing" another way
-/// (a `Store::get` that returned `None`) build their error with
+/// backend attaches an [`S3NotFound`] marker when it saw the object answer
+/// 404 / `<Code>NoSuchKey</Code>`, and this matches that marker by downcast.
+/// A `<Code>NoSuchBucket</Code>` body is a configuration error (wrong bucket),
+/// never "missing": reading it as absent would start fresh and upload an
+/// empty database over the good snapshot. Callers that learn "missing"
+/// another way (a `Store::get` that returned `None`) build their error with
 /// [`not_found_error`], so there is exactly one signal.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
     err.downcast_ref::<S3NotFound>().is_some()
@@ -41,9 +52,11 @@ pub fn not_found_error(key: &str) -> anyhow::Error {
     anyhow::Error::new(S3NotFound).context(format!("{key} not found"))
 }
 
-/// Marker for "the store answered 404 / NoSuchKey / NoSuchBucket": the key
+/// Marker for "the store answered 404 / NoSuchKey for the object": the key
 /// is absent, not the store unreachable. Attached at construction by
 /// [`s3_err_msg`], matched by [`is_not_found`] through the anyhow chain.
+/// Never attached for `<Code>NoSuchBucket</Code>`, which is a wrong-bucket
+/// configuration error even when its status is 404.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct S3NotFound;
 
@@ -90,6 +103,8 @@ impl S3Backend {
             None => Credentials::new(cfg.access_key_id.clone(), cfg.secret_access_key.clone()),
         };
         let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(STREAM_IDLE_TIMEOUT)
             .build()
             .context("reqwest client")?;
         Ok(Self {
@@ -164,6 +179,10 @@ impl S3Backend {
     /// Stream one object to `dest` (bundles, snapshots). The body is
     /// written chunk by chunk, never buffered whole. Returns false on 404.
     ///
+    /// No total deadline: a large object on a slow link must fail only when
+    /// it stalls. Connect and time-to-first-byte are bounded by the client's
+    /// timeouts, and every body read must yield within `STREAM_IDLE_TIMEOUT`.
+    ///
     /// Retried on 5xx/SlowDown/transport only, never on 4xx: a missing key
     /// comes back identically every time.
     pub async fn get_to_file(&self, key: &str, dest: &Path) -> anyhow::Result<bool> {
@@ -178,13 +197,10 @@ impl S3Backend {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
         let url = self.get_url(key);
-        let resp = match self
-            .client
-            .get(url)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-        {
+        // No `.timeout()` here: the client's connect/read timeouts bound
+        // idle time, and a fixed total would fail a large body that is
+        // still making progress.
+        let resp = match self.client.get(url).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 return Err(S3Fail::Retryable(anyhow::anyhow!(
@@ -258,6 +274,11 @@ impl S3Backend {
     /// The file is read in 32 KiB pieces as the request drains, so bundles
     /// and snapshots never sit whole in memory.
     ///
+    /// The total bound scales with the file size (see `upload_timeout`): a
+    /// large bundle on a slow link must fail only when it stalls below the
+    /// floor throughput, not at a fixed wall. Connect and time-to-first-byte
+    /// still come from the client's timeouts.
+    ///
     /// Retried like the download: a full-key PUT is an overwrite, so
     /// repeating one is idempotent.
     pub async fn put_file(&self, key: &str, src: &Path) -> anyhow::Result<()> {
@@ -281,7 +302,7 @@ impl S3Backend {
             .put(url)
             .header(reqwest::header::CONTENT_LENGTH, len)
             .body(reqwest::Body::wrap_stream(FileChunks { file }))
-            .timeout(Duration::from_secs(70))
+            .timeout(upload_timeout(len))
             .send()
             .await
         {
@@ -487,10 +508,13 @@ async fn s3_err(
     s3_err_msg(op, target, status, &body)
 }
 
-/// Body read bounded by the request's own timeout. reqwest's total timeout
-/// already covers streaming, but the bound stays explicit at each call site
-/// instead of relying on client internals — a stalled body after delivered
-/// headers must fail like a stalled send, never hang the caller.
+/// Body read with its own explicit bound. Small bodies (error pages, LIST
+/// XML) and small-object requests carry their own total deadlines, and the
+/// bound stays explicit at each of those call sites instead of relying on
+/// client internals — a stalled body after delivered headers must fail like
+/// a stalled send, never hang the caller. Large streamed bodies instead rely
+/// on the client's idle read timeout (see `STREAM_IDLE_TIMEOUT`), which has
+/// no total wall.
 async fn bounded_text(
     resp: reqwest::Response,
     timeout: Duration,
@@ -517,17 +541,18 @@ async fn bounded_text_or_empty(resp: reqwest::Response, timeout: Duration) -> St
 /// Same failure without the response: the retryable attempts classify before
 /// they would consume the body, so the message is built from parts.
 ///
-/// A 404 status — or a body carrying the store's `<Code>NoSuchKey</Code>` /
-/// `<Code>NoSuchBucket</Code>` — attaches the [`S3NotFound`] marker. The
-/// code match runs on `body`, not on the composed message, so a key that
-/// merely contains those words can never count as missing.
+/// Only the object answering 404 — or a body carrying the store's
+/// `<Code>NoSuchKey</Code>` — attaches the [`S3NotFound`] marker. A body
+/// naming `<Code>NoSuchBucket</Code>` is a wrong-bucket configuration error
+/// and stays a hard error even when its status is 404, so boot refuses to
+/// start past it. The code match runs on `body`, not on the composed
+/// message, so a key that merely contains those words can never count as
+/// missing.
 fn s3_err_msg(op: &str, target: &str, status: u16, body: &str) -> anyhow::Error {
     let snippet: String = body.trim().chars().take(300).collect();
     let err = anyhow::anyhow!("s3 {op} {target} failed: HTTP {status} {snippet}");
-    if status == 404
-        || body.contains("<Code>NoSuchKey</Code>")
-        || body.contains("<Code>NoSuchBucket</Code>")
-    {
+    let missing_bucket = body.contains("<Code>NoSuchBucket</Code>");
+    if !missing_bucket && (status == 404 || body.contains("<Code>NoSuchKey</Code>")) {
         err.context(S3NotFound)
     } else {
         err
@@ -544,6 +569,17 @@ fn s3_retry_delay(failed: u32) -> Duration {
         .map(|d| u64::from(d.subsec_nanos()) % (base_ms + 1))
         .unwrap_or(0);
     Duration::from_millis(base_ms + jitter_ms)
+}
+
+/// Total bound for one streaming-upload attempt: a fixed headroom plus a
+/// floor throughput, so a large bundle on a slow link fails only when it
+/// stalls below the floor — not at a fixed wall. At 32 KiB/s a 25 MiB
+/// snapshot gets ~14 minutes; anything slower is a stuck connection, not a
+/// slow one.
+fn upload_timeout(len: u64) -> Duration {
+    const HEADROOM: Duration = Duration::from_secs(60);
+    const FLOOR_BPS: u64 = 32 * 1024;
+    HEADROOM + Duration::from_secs(len.div_ceil(FLOOR_BPS))
 }
 
 /// One S3 attempt's outcome. Only idempotent calls retry — GET, PUT of a full
@@ -735,17 +771,28 @@ mod tests {
         ));
     }
 
-    /// Only the store's own 404 / missing-key codes count as missing — never
-    /// the key text. A 503 on a key named `NotFound...` is unreachable, and
-    /// reading it as "start fresh" would restart the seq over live history.
+    /// Only the object's own 404 / NoSuchKey counts as missing — never the
+    /// key text, and never a missing bucket. A 503 on a key named
+    /// `NotFound...` is unreachable, and reading a wrong bucket as "start
+    /// fresh" would restart the seq over live history and upload an empty
+    /// database over the good snapshot.
     #[test]
     fn not_found_ignores_key_names_and_transport_failures() {
         let missing = s3_err_msg("download", "tip.bundle", 404, "<Code>NoSuchKey</Code>");
         assert!(is_not_found(&missing));
+        // A missing bucket is a configuration error, never "absent" — even
+        // when its status is 404. Restore and claim must refuse to boot past
+        // it instead of starting fresh.
         let missing_bucket = s3_err_msg("download", "tip.bundle", 404, "<Code>NoSuchBucket</Code>");
-        assert!(is_not_found(&missing_bucket));
+        assert!(!is_not_found(&missing_bucket));
+        let missing_bucket_status =
+            s3_err_msg("download", "tip.bundle", 403, "<Code>NoSuchBucket</Code>");
+        assert!(!is_not_found(&missing_bucket_status));
+        // NoSuchKey in the body counts even when the status is not 404.
+        let key_code_on_403 = s3_err_msg("download", "tip.bundle", 403, "<Code>NoSuchKey</Code>");
+        assert!(is_not_found(&key_code_on_403));
         // A 404 with an empty body (HeadObject-style) still counts: the
-        // status alone marks it.
+        // status alone marks it, as long as the body does not name a bucket.
         let bare_404 = s3_err_msg("download", "tip.bundle", 404, "");
         assert!(is_not_found(&bare_404));
         // A missing key learned another way (a `get` that returned `None`)
@@ -780,5 +827,45 @@ mod tests {
         assert!(first >= Duration::from_millis(250));
         assert!(second >= Duration::from_millis(500));
         assert!(second <= Duration::from_millis(2500));
+    }
+
+    /// The streaming upload bound grows with the file instead of failing a
+    /// large bundle at a fixed wall: empty files get only headroom, and a
+    /// bigger file always gets more time at the floor throughput.
+    #[test]
+    fn upload_timeout_scales_with_file_size() {
+        assert_eq!(upload_timeout(0), Duration::from_secs(60));
+        assert_eq!(upload_timeout(32 * 1024), Duration::from_secs(61));
+        let small = upload_timeout(1024 * 1024);
+        let large = upload_timeout(100 * 1024 * 1024);
+        assert!(small > Duration::from_secs(60));
+        assert!(large > small);
+        assert_eq!(
+            large,
+            Duration::from_secs(60 + 100 * 1024 * 1024 / (32 * 1024))
+        );
+    }
+
+    /// The client bounds streamed bodies by idle time, not by a total wall:
+    /// connect and per-read timeouts are configured, so removing the fixed
+    /// `.timeout()` on the streamed paths cannot hang the caller on a stall.
+    /// (`Client`'s `Debug` prints the read timeout; the builder's prints the
+    /// connect timeout — neither prints both.)
+    #[test]
+    fn client_bounds_streaming_by_idle_time() {
+        let backend = S3Backend::new(&test_cfg(None)).expect("backend");
+        let debug = format!("{:?}", backend.client);
+        assert!(
+            debug.contains("read_timeout"),
+            "no idle read bound: {debug}"
+        );
+        let builder = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(STREAM_IDLE_TIMEOUT);
+        let debug = format!("{builder:?}");
+        assert!(
+            debug.contains("connect_timeout"),
+            "no connect bound: {debug}"
+        );
     }
 }

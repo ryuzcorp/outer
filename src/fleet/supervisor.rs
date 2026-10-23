@@ -26,10 +26,10 @@ pub struct FleetSpec {
     pub secret_access_key: String,
     pub session_token: Option<String>,
     pub cgroup_leaf: PathBuf,
-    /// Whether `cgroups::setup()` succeeded: the caller sets this from its
-    /// return. Active means the leaf carries real limits, so a refused move
-    /// fails the start instead of running uncapped; inactive (dev machines)
-    /// only warns.
+    /// Whether `cgroups::setup()` succeeded: the caller sets this from
+    /// `setup().is_some()`. Active means the leaf carries real limits, so a
+    /// refused move fails the start instead of running uncapped; inactive
+    /// (dev machines) only warns.
     pub cgroups_active: bool,
     pub extra_env: Vec<(String, String)>,
 }
@@ -231,11 +231,15 @@ impl StopGrace {
 }
 
 /// A running fleet: the child plus the ring its stdout/stderr drain into.
+/// `pgid` is the group id saved at spawn (the child's pid): `child.id()` is
+/// `None` once the child is reaped (see `is_alive`), so `stop` must use the
+/// saved id for its group kills instead of skipping them after an early reap.
 pub struct RunningFleet {
     pub slug: String,
     pub internal_port: u16,
     pub logs: SharedLogRing,
     child: tokio::process::Child,
+    pgid: u32,
 }
 
 /// Cap on one stored log line: a hostile fleet printing a newline-less flood
@@ -293,9 +297,10 @@ where
         line.pop();
     }
     if truncated {
-        while !line.is_empty() && std::str::from_utf8(&line).is_err() {
-            line.pop();
-        }
+        // Drop only a multi-byte char split by the cap; earlier invalid
+        // bytes are left to `from_utf8_lossy`.
+        let keep = super::sandbox::trim_split_tail(&line).len();
+        line.truncate(keep);
         line.extend_from_slice(TRUNC_MARK.as_bytes());
     }
     Ok(Some(String::from_utf8_lossy(&line).into_owned()))
@@ -322,11 +327,13 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
     tokio::fs::create_dir_all(&opts.state_dir)
         .await
         .with_context(|| format!("create {}", opts.state_dir.display()))?;
-    // celld runs as the app user: the whole state dir must be its own.
-    // A zero gid means "same as the uid".
+    // celld runs as the app user: the state dir outer created must be its
+    // own. A zero gid means "same as the uid". Only the dir itself: a
+    // recursive walk as root over an app-writable tree is a symlink race,
+    // and contents already belong to the app user from previous runs.
     let gid = if spec.gid == 0 { spec.uid } else { spec.gid };
     if let Some(uid) = super::sandbox::resolve_drop_id(spec.uid) {
-        if !super::sandbox::lchown_tree(&opts.state_dir, uid, gid) {
+        if !super::sandbox::lchown_one(&opts.state_dir, uid, gid) {
             tracing::warn!(fleet = %spec.slug, "could not hand the fleet state dir to the app user");
         }
     }
@@ -379,10 +386,17 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
         }
     }
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    // Read before any wait: `id()` goes `None` once the child is reaped (see
+    // `is_alive`), and the group kills in `stop` need this pid. A spawn that
+    // already has no pid never really started.
+    let pgid = child
+        .id()
+        .with_context(|| format!("fleet {} has no pid right after spawn", spec.slug))?;
     // Move the fleet into its leaf at once: between spawn and this write a
     // sliver of startup memory is charged to the shared cgroup instead —
     // negligible next to the fleet's lifetime, and documented, not hidden.
-    if let Some(pid) = child.id() {
+    {
+        let pid = pgid;
         if let Err(e) = std::fs::write(spec.cgroup_leaf.join("cgroup.procs"), pid.to_string()) {
             if spec.cgroups_active {
                 // Fail closed when the leaf carries real limits: a refused
@@ -418,6 +432,7 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
         internal_port: spec.internal_port,
         logs,
         child,
+        pgid,
     })
 }
 
@@ -439,12 +454,12 @@ impl RunningFleet {
 
     /// Stop the fleet: SIGTERM to the process group, a bounded grace, then
     /// SIGKILL to the group, then a final group SIGKILL so whatever survived
-    /// — a worker that ignored SIGTERM — cannot outlive the stop.
+    /// — a worker that ignored SIGTERM — cannot outlive the stop. The group
+    /// id is the pid saved at spawn: `child.id()` is `None` once an earlier
+    /// `is_alive` reaped the child, and that must not skip the group kills,
+    /// or an orphaned worker keeps the fleet's port into the next spawn.
     pub async fn stop(&mut self, grace: StopGrace) {
-        let Some(pid) = self.child.id() else {
-            let _ = self.child.wait().await;
-            return;
-        };
+        let pid = self.pgid;
         // SAFETY: signals only the process group this supervisor created
         // (process_group(0) makes the group id the child's pid).
         unsafe {
@@ -689,5 +704,86 @@ mod tests {
                 kill: Duration::from_secs(5),
             })
             .await;
+    }
+    fn cmdline_has(marker: &str) -> bool {
+        let Ok(proc) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in proc.flatten() {
+            if let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) {
+                if bytes
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A flood line with an early invalid byte is stored capped with a
+    /// replacement char, not trimmed back to the invalid byte; the line
+    /// after it still arrives intact.
+    #[tokio::test]
+    async fn capture_keeps_early_invalid_bytes_in_a_flood_line() {
+        let mut flood = vec![0xFF];
+        flood.extend(std::iter::repeat_n(b'x', MAX_LINE_BYTES + 100));
+        flood.push(b'\n');
+        flood.extend_from_slice(b"hello\n");
+        let mut reader = tokio::io::BufReader::new(&flood[..]);
+        let first = next_capped_line(&mut reader).await.unwrap().unwrap();
+        assert!(
+            first.starts_with('\u{FFFD}'),
+            "early invalid byte must survive as a replacement char"
+        );
+        assert!(first.ends_with(TRUNC_MARK), "flood marked truncated");
+        assert!(
+            first.len() <= MAX_LINE_BYTES + TRUNC_MARK.len() + 3,
+            "flood stored capped, got {} bytes",
+            first.len()
+        );
+        let second = next_capped_line(&mut reader).await.unwrap().unwrap();
+        assert_eq!(second, "hello");
+    }
+
+    /// A fleet whose leader already exited (reaped via `is_alive`, which
+    /// flips `child.id()` to `None`) must still have its group killed on
+    /// stop: the orphaned sleeper keeps the group — and the fleet's port —
+    /// alive, and the old early return left it running.
+    #[tokio::test]
+    async fn stop_after_reap_still_kills_the_group() {
+        // A sleep duration no other process on the machine can plausibly
+        // share, so the /proc scan below cannot false-positive.
+        let marker = "31337977";
+        let dir = tempfile::tempdir().unwrap();
+        let (mut spec, mut opts) = test_spec(dir.path());
+        // The leader exits at once, leaving a group member behind.
+        opts.celld_bin = fake_celld(&dir, &format!("#!/bin/sh\nsleep {marker} &\n"));
+        spec.cgroup_leaf = dir.path().to_path_buf();
+        let mut fleet = start(&spec, &opts).await.unwrap();
+        assert_eq!(fleet.pgid, fleet.child.id().unwrap_or(fleet.pgid));
+        // Reap the exited leader, like a liveness poll would.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fleet.is_alive() {
+            if std::time::Instant::now() >= deadline {
+                panic!("fake celld never exited");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        fleet
+            .stop(StopGrace {
+                term: Duration::from_secs(2),
+                kill: Duration::from_secs(2),
+            })
+            .await;
+        assert!(!fleet.is_alive());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cmdline_has(marker) {
+            if std::time::Instant::now() >= deadline {
+                panic!("orphaned sleep {marker} survived the stop");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }

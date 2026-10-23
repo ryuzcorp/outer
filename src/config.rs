@@ -48,6 +48,8 @@ pub struct Config {
     pub host_id: String,
     /// `OUTER_STORE=r2|memory` plus the R2 variables.
     pub store: StoreKind,
+    /// Log filter directives (`RUST_LOG`, default `info`).
+    pub log_filter: String,
 }
 
 const DEFAULT_DOMAIN: &str = "outer.localhost";
@@ -113,12 +115,20 @@ impl Config {
             }
         };
 
+        let log_filter = get("RUST_LOG").unwrap_or("info").to_string();
+        if let Err(err) = tracing_subscriber::EnvFilter::try_new(&log_filter) {
+            problems.push(format!(
+                "RUST_LOG={log_filter:?} is not a valid filter: {err}"
+            ));
+        }
+
         let config = Config {
             domain,
             data_dir,
             http_listen,
             host_id,
             store,
+            log_filter,
         };
         problems.extend(config.validate());
         if problems.is_empty() {

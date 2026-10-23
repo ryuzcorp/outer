@@ -8,13 +8,13 @@ Outer is a personal software forge for AI agents. An agent talks MCP to Outer, O
 ## Commands
 
 ```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all --check            # `cargo fmt --all` fixes it
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 OUTER_STORE=memory cargo run -- serve   # http://127.0.0.1:8080/health
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly these checks. A PR is ready when all three pass locally.
+CI (`.github/workflows/ci.yml`) runs exactly the first three. A PR is ready when they pass locally.
 
 ## Layout
 

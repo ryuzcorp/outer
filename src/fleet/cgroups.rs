@@ -292,19 +292,21 @@ fn ensure_writable(root: &Path, own: &Path) -> anyhow::Result<()> {
 /// Set up the fleet anchor under `root`: capture outer's own cgroup BEFORE
 /// moving (its path changes with the move), drain every member into the
 /// platform leaf, enable the controllers on the way down, move this process
-/// into the platform leaf, and apply `memory.min` there. Returns the anchor.
-pub fn setup(cfg: &CgroupConfig) -> bool {
+/// into the platform leaf, and apply `memory.min` there. Returns the anchor
+/// on success (`None` when cgroups are unavailable and fleets share the
+/// container cgroup): the `ensure_*` helpers need that path.
+pub fn setup(cfg: &CgroupConfig) -> Option<PathBuf> {
     let placement = read_self_cgroup().unwrap_or_default();
     match setup_inner(cfg, &placement, std::process::id()) {
         Ok(anchor) => {
             tracing::info!(anchor = %anchor.display(), "per-fleet cgroups active");
-            true
+            Some(anchor)
         }
         Err(e) => {
             tracing::warn!(
                 "per-fleet cgroups unavailable ({e:#}); fleets share the container cgroup"
             );
-            false
+            None
         }
     }
 }
@@ -463,8 +465,14 @@ pub fn ensure_build_parent(
     Ok(dir)
 }
 
+/// Cap on a build leaf's tasks: the fork-bomb cap the uid-wide RLIMIT_NPROC
+/// used to provide before build and fleet shared one app uid. A leaf-level
+/// cap does not count the fleet's tasks, so a busy fleet can never starve a
+/// build with EAGAIN.
+pub const BUILD_PIDS_MAX: u64 = 512;
+
 /// One build's own leaf under the build parent, carrying its own
-/// `memory.max`.
+/// `memory.max` and `pids.max`.
 pub fn ensure_build_leaf(
     parent: &Path,
     build_id: &str,
@@ -473,6 +481,7 @@ pub fn ensure_build_leaf(
     let dir = parent.join(fleet_dir_name(build_id));
     std::fs::create_dir_all(&dir)?;
     write_limit(&dir, "memory.max", &memory_max_bytes.to_string())?;
+    write_limit(&dir, "pids.max", &BUILD_PIDS_MAX.to_string())?;
     Ok(dir)
 }
 
@@ -721,6 +730,14 @@ mod tests {
                 .trim(),
             (1024u64 * 1024 * 1024).to_string()
         );
+        // The leaf caps the build's own tasks (not the uid-wide count, which
+        // includes the fleet sharing the app uid).
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("pids.max"))
+                .unwrap()
+                .trim(),
+            BUILD_PIDS_MAX.to_string()
+        );
     }
 
     #[test]
@@ -739,6 +756,6 @@ mod tests {
     #[test]
     #[ignore = "needs a writable cgroupfs mount and CAP_SYS_ADMIN"]
     fn setup_on_real_cgroupfs() {
-        assert!(setup(&CgroupConfig::default()));
+        assert!(setup(&CgroupConfig::default()).is_some());
     }
 }

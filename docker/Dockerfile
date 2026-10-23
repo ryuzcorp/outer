@@ -6,7 +6,9 @@
 #   ├── celld × N       one fleet per awake app, each as the app's own uid
 #   └── bun / sh        builds, as the app's uid
 #
-# Cloudflare terminates public TLS. outer serves origin TLS itself.
+# Today outer listens on plain HTTP :8080. Origin TLS (Cloudflare Origin CA
+# certificate + Authenticated Origin Pulls) comes with the M0 infra work;
+# until then nothing should point Cloudflare's "Full (strict)" mode here.
 ARG CELLD_VERSION=0.6.2
 ARG ESBUILD_VERSION=0.28.2
 

@@ -432,8 +432,13 @@ async fn rehydrate_inner(
 /// push: tip bundle, one manifest write (the commit point, `seq + 1`), then
 /// prune of the superseded bundle. `expected_old = None` asserts the ref does
 /// not exist yet. A CAS mismatch is an error whose message contains
-/// "tip moved". If anything fails before the manifest upload, the mirror's
-/// ref is restored and the error returned.
+/// "tip moved". The manifest is read before the CAS under the same lock, so
+/// a failed read leaves the mirror untouched instead of stranding it on an
+/// unpublished commit. If the manifest write fails, the outcome is ambiguous
+/// (a response lost after the store applied it), so the manifest is re-read:
+/// when it already names the new tip the flip is adopted, otherwise the ref
+/// is restored and the bundle is kept — never deleted, since it may be the
+/// live tip.
 pub async fn publish(
     store: &Store,
     cfg: &GitConfig,
@@ -451,6 +456,8 @@ pub async fn publish(
     if !bare.join("HEAD").exists() {
         rehydrate_inner(store, cfg, sync, slug).await?;
     }
+    // Read before the CAS: a failed read must leave the mirror untouched.
+    let old = read_manifest(store, slug).await?;
     cas_update(&bare, expected_old, new_sha).await?;
     let bundle = bundle_key(slug, new_sha);
     let uploaded = async {
@@ -476,11 +483,15 @@ pub async fn publish(
     .await;
     if let Err(e) = uploaded {
         let _ = set_ref(&bare, expected_old).await;
-        let _ = store.delete(&bundle).await;
+        // Only a true orphan: bundle keys are content-addressed, so a
+        // republish of the live tip reuses its key — deleting what the
+        // manifest still names would remove the live bundle.
+        if !bundle_is_live(old.as_ref(), &bundle) {
+            let _ = store.delete(&bundle).await;
+        }
         return Err(e);
     }
-    let old = read_manifest(store, slug).await?;
-    let seq = old.map(|m| m.seq + 1).unwrap_or(1);
+    let seq = old.as_ref().map(|m| m.seq + 1).unwrap_or(1);
     let manifest = Manifest {
         version: MANIFEST_VERSION,
         seq,
@@ -490,13 +501,52 @@ pub async fn publish(
         }),
     };
     if let Err(e) = write_manifest(store, slug, &manifest).await {
-        let _ = set_ref(&bare, expected_old).await;
-        let _ = store.delete(&bundle).await;
+        // The write may have landed despite the error (a response lost after
+        // the store applied it). Re-read to learn the truth instead of
+        // rolling back blindly: a manifest that already names our tip means
+        // the flip happened, so adopt it. Otherwise — or when the truth is
+        // unreadable — restore the ref; the kept bundle lets the next sync
+        // rebuild the mirror from the manifest either way.
+        match read_manifest(store, slug).await {
+            Ok(current) if manifest_names_tip(current.as_ref(), seq, new_sha) => {
+                sync.set_applied_seq(slug, seq).await;
+                prune_superseded(store, slug, &bundle).await;
+                return Ok(new_sha.to_string());
+            }
+            _ => {
+                let _ = set_ref(&bare, expected_old).await;
+            }
+        }
         return Err(e);
     }
     sync.set_applied_seq(slug, seq).await;
     // Prune superseded bundles only after the flip, so concurrent readers
     // already moved on.
+    prune_superseded(store, slug, &bundle).await;
+    Ok(new_sha.to_string())
+}
+
+/// Whether the store's manifest already reflects this publish: it names our
+/// tip at our seq. A failed write that still landed must be adopted, not
+/// rolled back — otherwise the mirror is reset under a manifest that points
+/// at a bundle the rollback just deleted.
+fn manifest_names_tip(current: Option<&Manifest>, seq: u64, sha: &str) -> bool {
+    current.is_some_and(|m| m.seq == seq && m.main.as_ref().is_some_and(|main| main.sha == sha))
+}
+
+/// Whether the manifest names `bundle` as its tip. Such a bundle is live and
+/// must never be deleted as an "orphan": bundle keys are content-addressed,
+/// so a republish of the same sha reuses the live key.
+fn bundle_is_live(manifest: Option<&Manifest>, bundle: &str) -> bool {
+    manifest
+        .as_ref()
+        .is_some_and(|m| m.main.as_ref().is_some_and(|main| main.bundle == bundle))
+}
+
+/// Delete superseded tip bundles, keeping only the live one. Runs only after
+/// the manifest flip, so concurrent readers already moved on; every delete
+/// is best-effort.
+async fn prune_superseded(store: &Store, slug: &str, bundle: &str) {
     let prefix = format!("git/{slug}/main/");
     if let Ok(keys) = store.list(&prefix).await {
         for key in keys {
@@ -505,7 +555,6 @@ pub async fn publish(
             }
         }
     }
-    Ok(new_sha.to_string())
 }
 
 /// Delete the mirror and the whole `git/{slug}/` prefix, and forget the
@@ -620,5 +669,136 @@ mod tests {
         let head = rehydrate(&store, &cfg, &sync, "empty").await.unwrap();
         assert_eq!(head, None);
         assert!(mirror_path(&cfg, "empty").join("HEAD").exists());
+    }
+
+    /// Build a commit on the empty tree in the mirror without touching refs,
+    /// so `publish` has something to point at.
+    async fn commit_on_empty_tree(bare: &Path, parent: Option<&str>) -> String {
+        let git_dir = format!("--git-dir={}", bare.display());
+        let tree = run_git_stdin(&[&git_dir, "mktree"], &[], &[], Duration::from_secs(15))
+            .await
+            .map(|b| String::from_utf8(b).unwrap())
+            .unwrap();
+        let tree = tree.trim().to_string();
+        let mut args = vec![git_dir.as_str(), "commit-tree", tree.as_str(), "-m", "test"];
+        if let Some(p) = parent {
+            args.extend(["-p", p]);
+        }
+        run_git(
+            &args,
+            &[
+                ("GIT_AUTHOR_NAME", "outer-test"),
+                ("GIT_AUTHOR_EMAIL", "outer-test@example.com"),
+                ("GIT_COMMITTER_NAME", "outer-test"),
+                ("GIT_COMMITTER_EMAIL", "outer-test@example.com"),
+            ],
+            Duration::from_secs(15),
+        )
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap()
+    }
+
+    /// Publish flips the manifest to seq+1, records the bundle and prunes the
+    /// superseded one; a second publish builds on the first.
+    #[tokio::test]
+    async fn publish_advances_manifest_and_prunes_old_bundle() {
+        let (_dir, cfg, store, sync) = setup("publish").await;
+        let bare = mirror_path(&cfg, "publish");
+        let first = commit_on_empty_tree(&bare, None).await;
+        assert_eq!(
+            publish(&store, &cfg, &sync, "publish", None, &first)
+                .await
+                .unwrap(),
+            first
+        );
+        let manifest = read_manifest(&store, "publish").await.unwrap().unwrap();
+        assert_eq!(manifest.seq, 1);
+        assert_eq!(manifest.main.as_ref().unwrap().sha, first);
+        assert_eq!(sync.applied_seq("publish").await, Some(1));
+        assert_eq!(
+            head_of(&bare).await.unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        let first_bundle = bundle_key("publish", &first);
+        assert!(store.get(&first_bundle).await.unwrap().is_some());
+
+        let second = commit_on_empty_tree(&bare, Some(&first)).await;
+        assert_eq!(
+            publish(&store, &cfg, &sync, "publish", Some(&first), &second)
+                .await
+                .unwrap(),
+            second
+        );
+        let manifest = read_manifest(&store, "publish").await.unwrap().unwrap();
+        assert_eq!(manifest.seq, 2);
+        assert_eq!(manifest.main.as_ref().unwrap().sha, second);
+        assert!(store
+            .get(&bundle_key("publish", &second))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            store.get(&first_bundle).await.unwrap().is_none(),
+            "the superseded bundle is pruned after the flip"
+        );
+    }
+
+    /// A manifest that cannot be read must fail the publish before the CAS:
+    /// the mirror keeps its old ref and no bundle is uploaded.
+    #[tokio::test]
+    async fn failed_manifest_read_leaves_mirror_untouched() {
+        let (_dir, cfg, store, sync) = setup("unreadable").await;
+        let bare = mirror_path(&cfg, "unreadable");
+        let sha = commit_on_empty_tree(&bare, None).await;
+        store
+            .put(&manifest_key("unreadable"), b"{not json".to_vec())
+            .await
+            .unwrap();
+        assert!(publish(&store, &cfg, &sync, "unreadable", None, &sha)
+            .await
+            .is_err());
+        assert!(head_of(&bare).await.unwrap().is_none());
+        assert!(
+            store.list("git/unreadable/main/").await.unwrap().is_empty(),
+            "no bundle is uploaded when the old manifest cannot be read"
+        );
+    }
+
+    /// The reconcile predicate adopts only a manifest that already names our
+    /// tip at our seq; a stale, diverged or missing manifest rolls back.
+    #[test]
+    fn manifest_reconcile_adopts_only_our_landed_tip() {
+        let landed = Manifest {
+            version: MANIFEST_VERSION,
+            seq: 3,
+            main: Some(ManifestRef {
+                sha: "a".repeat(40),
+                bundle: bundle_key("s", &"a".repeat(40)),
+            }),
+        };
+        let sha = "a".repeat(40);
+        assert!(manifest_names_tip(Some(&landed), 3, &sha));
+        assert!(!manifest_names_tip(Some(&landed), 4, &sha), "stale seq");
+        assert!(
+            !manifest_names_tip(Some(&landed), 3, &"b".repeat(40)),
+            "diverged tip"
+        );
+        assert!(!manifest_names_tip(None, 3, &sha), "missing manifest");
+        assert!(
+            !manifest_names_tip(
+                Some(&Manifest {
+                    version: MANIFEST_VERSION,
+                    seq: 3,
+                    main: None
+                }),
+                3,
+                &sha
+            ),
+            "empty manifest"
+        );
+        assert!(bundle_is_live(Some(&landed), &bundle_key("s", &sha)));
+        assert!(!bundle_is_live(Some(&landed), "git/s/main/deadbeef.bundle"));
+        assert!(!bundle_is_live(None, &bundle_key("s", &sha)));
     }
 }

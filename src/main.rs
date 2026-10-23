@@ -18,10 +18,10 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("serve") {
         "serve" => {
-            init_tracing();
             let Some(config) = load_config() else {
                 return ExitCode::from(2);
             };
+            init_tracing(&config.log_filter);
             match serve(config).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -52,11 +52,9 @@ async fn main() -> ExitCode {
     }
 }
 
-fn init_tracing() {
+fn init_tracing(filter: &str) {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::new(filter))
         .init();
 }
 
@@ -78,7 +76,7 @@ fn build_store(config: &Config) -> anyhow::Result<Store> {
     match &config.store {
         StoreKind::Memory => {
             tracing::warn!(
-                "OUTER_STORE=memory: nothing survives a restart (local development only)"
+                "OUTER_STORE=memory: bucket objects (git bundles, snapshots) vanish on restart; only the SQLite file in OUTER_DATA persists (local development only)"
             );
             Ok(Store::memory())
         }
@@ -106,6 +104,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("restored platform state from the bucket snapshot");
     }
     let pool = db::open(&config.db_path()).await?;
+    // Bind before claiming the bucket: a second instance that can't listen
+    // must not take ownership away from the one that's serving.
+    let listener = tokio::net::TcpListener::bind(config.http_listen).await?;
     let sync = store::snapshot::StateSync::new(config.host_id.clone());
     sync.claim(&store, &snapshot_cfg).await?;
     store::snapshot::spawn_sync_task(
@@ -119,7 +120,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         pool: pool.clone(),
         sync: sync.clone(),
     });
-    let listener = tokio::net::TcpListener::bind(config.http_listen).await?;
     tracing::info!(
         "outer {} listening on http://{}",
         env!("CARGO_PKG_VERSION"),

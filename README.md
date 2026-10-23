@@ -17,7 +17,7 @@ OUTER_STORE=memory cargo run -- serve
 curl http://127.0.0.1:8080/ready
 ```
 
-`OUTER_STORE=memory` keeps everything in process, which is fine for local development. Production uses a Cloudflare R2 bucket (`OUTER_R2_ENDPOINT`, `OUTER_R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`). `outer check-config` prints every configuration problem at once.
+`OUTER_STORE=memory` keeps bucket objects (git bundles, state snapshots) in process, so they vanish on restart. Only the SQLite file in `OUTER_DATA` persists. That's fine for local development. Production uses a Cloudflare R2 bucket (`OUTER_R2_ENDPOINT`, `OUTER_R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`). `outer check-config` prints every configuration problem at once.
 
 ## License
 
