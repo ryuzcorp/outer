@@ -1,5 +1,5 @@
 //! One tool registry: every tool is defined once (name, description, input
-//! type, access, `untrusted` flag). `tools/list`, `/llms.txt` and the M3
+//! type, access, `untrusted` flag). `tools/list`, the Blume site and the M3
 //! codemode declarations all render from here.
 
 use serde_json::Value;

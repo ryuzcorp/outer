@@ -1,4 +1,7 @@
-# Quickstart
+---
+title: Quickstart
+description: Create an app, change code, share the link — the Outer loop in five steps.
+---
 
 Outer hosts your Ilha app: you describe changes, your agent calls Outer's
 tools, Outer builds and deploys, and you get a live link to share.

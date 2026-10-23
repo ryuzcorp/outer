@@ -72,6 +72,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("domain", &self.domain)
             .field("data_dir", &self.data_dir)
+            .field("site_dir", &self.site_dir)
             .field("listen", &self.listen)
             .field("tls_cert", &self.tls_cert)
             .field("tls_key", &self.tls_key)
@@ -94,6 +95,8 @@ impl std::fmt::Debug for Config {
 pub struct Config {
     /// Platform host; apps live at `<slug>.<domain>` (`OUTER_DOMAIN`).
     pub domain: String,
+    /// Built docs site served on the platform host (`OUTER_SITE_DIR`).
+    pub site_dir: PathBuf,
     /// SQLite, git mirrors, worktrees and caches (`OUTER_DATA`).
     pub data_dir: PathBuf,
     /// Listener (`OUTER_LISTEN`); TLS when the TLS triple below is set.
@@ -175,6 +178,7 @@ impl Config {
             .unwrap_or(DEFAULT_DOMAIN)
             .to_ascii_lowercase();
         let data_dir = PathBuf::from(get("OUTER_DATA").unwrap_or("./data"));
+        let site_dir = PathBuf::from(get("OUTER_SITE_DIR").unwrap_or("./dist"));
         let listen = match get("OUTER_LISTEN").unwrap_or(DEFAULT_LISTEN).parse() {
             Ok(addr) => addr,
             Err(_) => {
@@ -378,6 +382,7 @@ impl Config {
         let config = Config {
             domain,
             data_dir,
+            site_dir,
             listen,
             tls_cert,
             tls_key,
@@ -630,6 +635,18 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn site_dir_defaults_to_dist_and_overrides() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert_eq!(cfg.site_dir, PathBuf::from("./dist"));
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_SITE_DIR", "/usr/share/outer/site"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.site_dir, PathBuf::from("/usr/share/outer/site"));
     }
 
     #[test]
