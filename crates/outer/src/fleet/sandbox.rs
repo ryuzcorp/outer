@@ -143,6 +143,15 @@ pub fn prepare_data_dir(data_dir: &Path) -> anyhow::Result<()> {
         let dir = data_dir.join(root);
         std::fs::create_dir_all(&dir)?;
         set(&dir, 0o711)?;
+        // Outer's own sidecars next to the per-app dirs (`<slug>.index`,
+        // `<slug>.install-hash`) have guessable names under a traversable
+        // dir: private, whatever umask created them.
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                set(&entry.path(), 0o600)?;
+            }
+        }
     }
     for entry in std::fs::read_dir(data_dir)? {
         let entry = entry?;
@@ -640,6 +649,12 @@ mod tests {
         let data = dir.path().join("data");
         std::fs::create_dir_all(data.join("git/apps")).unwrap();
         std::fs::create_dir_all(data.join("work/hello")).unwrap();
+        std::fs::write(data.join("work/hello.index"), "index").unwrap();
+        std::fs::set_permissions(
+            data.join("work/hello.index"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         std::fs::write(data.join("outer.sqlite"), "db").unwrap();
         for p in [&data, &data.join("git"), &data.join("work")] {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -659,6 +674,7 @@ mod tests {
         }
         assert_eq!(mode(&data.join("git")), 0o700);
         assert_eq!(mode(&data.join("outer.sqlite")), 0o600);
+        assert_eq!(mode(&data.join("work/hello.index")), 0o600, "sidecars too");
         assert_eq!(after, 0o077, "later files start private");
 
         assert!(make_private_dir(&data.join("work/hello")));
