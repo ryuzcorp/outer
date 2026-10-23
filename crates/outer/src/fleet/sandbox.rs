@@ -118,6 +118,70 @@ pub(crate) fn lchown_one(path: &Path, uid: u32, gid: u32) -> bool {
     unsafe { libc::lchown(path.as_ptr(), uid, gid) == 0 }
 }
 
+/// Top-level dirs under the data dir that app uids must traverse into (their
+/// own `<root>/<slug>` only). Everything else there is platform-private.
+pub const APP_ROOTS: [&str; 3] = ["work", "cache", "fleets"];
+
+/// Lock down the data dir before anything else touches it, when outer runs
+/// as root (production). The dir is `0711`: app uids can reach their own
+/// worktree, cache and fleet state by path but cannot list or open anything
+/// else. App roots are `0711` too (each `<slug>` below them is `0700` and
+/// owned by the app uid); every other top-level entry (SQLite, git mirrors,
+/// templates) is `0700` / `0600`. The process umask becomes `077`, so
+/// whatever outer or a sandboxed step creates later starts private.
+pub fn prepare_data_dir(data_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: umask only swaps the process file-creation mask.
+    unsafe { libc::umask(0o077) };
+    std::fs::create_dir_all(data_dir)?;
+    let set = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {mode:o} {}", path.display()))
+    };
+    set(data_dir, 0o711)?;
+    for root in APP_ROOTS {
+        let dir = data_dir.join(root);
+        std::fs::create_dir_all(&dir)?;
+        set(&dir, 0o711)?;
+        // Outer's own sidecars next to the per-app dirs (`<slug>.index`,
+        // `<slug>.install-hash`) have guessable names under a traversable
+        // dir: private, whatever umask created them.
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                set(&entry.path(), 0o600)?;
+            }
+        }
+    }
+    for entry in std::fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if APP_ROOTS.iter().any(|root| name == *root) {
+            continue;
+        }
+        // `file_type` does not follow links: a link is left alone.
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            set(&entry.path(), 0o700)?;
+        } else if kind.is_file() {
+            set(&entry.path(), 0o600)?;
+        }
+    }
+    Ok(())
+}
+
+/// Make an outer-created per-app dir (`work/<slug>`, `cache/<slug>`,
+/// `fleets/<slug>`) private to its owner. Never follows a link.
+pub(crate) fn make_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Move `pid` into a cgroup leaf: the child's whole tree is contained from
 /// here, since containment is inherited across fork and exec. Returns the
 /// refusal so the caller fails the step instead of running uncapped.
@@ -222,6 +286,7 @@ pub async fn run_sandboxed(
         let gid = sb.gid.unwrap_or(uid);
         lchown_one(&tmp, uid, gid);
         lchown_one(sb.cache_root, uid, gid);
+        make_private_dir(sb.cache_root);
         for sub in ["bun", "home"] {
             lchown_one(&sb.cache_root.join(sub), uid, gid);
         }
@@ -575,6 +640,49 @@ mod tests {
         output.extend_from_slice("é".as_bytes());
         output.extend_from_slice(b"tail");
         assert_eq!(cap_output(&output), "x".repeat(MAX_OUTPUT_BYTES - 1));
+    }
+
+    #[test]
+    fn data_dir_is_traversable_but_platform_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("git/apps")).unwrap();
+        std::fs::create_dir_all(data.join("work/hello")).unwrap();
+        std::fs::write(data.join("work/hello.index"), "index").unwrap();
+        std::fs::set_permissions(
+            data.join("work/hello.index"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::write(data.join("outer.sqlite"), "db").unwrap();
+        for p in [&data, &data.join("git"), &data.join("work")] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::set_permissions(
+            data.join("outer.sqlite"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let old = unsafe { libc::umask(0o022) };
+        prepare_data_dir(&data).unwrap();
+        let after = unsafe { libc::umask(old) };
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&data), 0o711, "traversable, not listable");
+        for root in APP_ROOTS {
+            assert_eq!(mode(&data.join(root)), 0o711, "{root}");
+        }
+        assert_eq!(mode(&data.join("git")), 0o700);
+        assert_eq!(mode(&data.join("outer.sqlite")), 0o600);
+        assert_eq!(mode(&data.join("work/hello.index")), 0o600, "sidecars too");
+        assert_eq!(after, 0o077, "later files start private");
+
+        assert!(make_private_dir(&data.join("work/hello")));
+        assert_eq!(mode(&data.join("work/hello")), 0o700);
+        let link = data.join("work/link");
+        std::os::unix::fs::symlink(data.join("git"), &link).unwrap();
+        assert!(!make_private_dir(&link), "links are never followed");
+        assert!(!make_private_dir(&data.join("work/missing")));
     }
 
     #[test]

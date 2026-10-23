@@ -10,8 +10,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// One celld fleet per app.
-#[derive(Debug, Clone)]
+/// One celld fleet per app. `Debug` redacts the minted secret, the session
+/// token and `extra_env` values.
+#[derive(Clone)]
 pub struct FleetSpec {
     pub slug: String,
     pub uid: u32,
@@ -32,6 +33,37 @@ pub struct FleetSpec {
     /// (dev machines) only warns.
     pub cgroups_active: bool,
     pub extra_env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for FleetSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetSpec")
+            .field("slug", &self.slug)
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .field("public_port", &self.public_port)
+            .field("internal_port", &self.internal_port)
+            .field("bucket_url", &self.bucket_url)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_region", &self.s3_region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("cgroup_leaf", &self.cgroup_leaf)
+            .field("cgroups_active", &self.cgroups_active)
+            .field(
+                "extra_env",
+                &self
+                    .extra_env
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 /// Tunables for the celld invocation that are not per-app identity.
@@ -336,6 +368,7 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
         if !super::sandbox::lchown_one(&opts.state_dir, uid, gid) {
             tracing::warn!(fleet = %spec.slug, "could not hand the fleet state dir to the app user");
         }
+        super::sandbox::make_private_dir(&opts.state_dir);
     }
     let (program, args, env) = fleet_command(spec, opts);
     let mut cmd = tokio::process::Command::new(&program);
@@ -564,6 +597,17 @@ mod tests {
             !env.contains_key("OUTER_SECRET"),
             "reserved env leaked into fleet env"
         );
+    }
+
+    #[test]
+    fn debug_never_prints_minted_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, _) = test_spec(dir.path());
+        let shown = format!("{spec:?}");
+        assert!(!shown.contains("secret\""), "{shown}");
+        assert!(!shown.contains("\"token\""), "{shown}");
+        assert!(!shown.contains("milk"), "extra_env values: {shown}");
+        assert!(shown.contains("GROCERY"), "names stay visible: {shown}");
     }
 
     #[test]

@@ -37,27 +37,37 @@ pub struct ManagerSettings {
     pub cpu_max: String,
     /// Idle time after the last request before a fleet sleeps.
     pub sleep_after: Duration,
+    /// Uptime after which a running fleet restarts with freshly minted
+    /// credentials (prod: 6 days for a 7-day TTL). Applies to fleets that
+    /// are not being put to sleep this sweep tick.
+    pub credential_refresh_after: Duration,
     /// How long a wake waits for `/.well-known/celld/health`.
     pub wake_timeout: Duration,
     /// How many fleets may start at once.
     pub wake_concurrency: usize,
 }
 
-/// Bucket and credentials a fleet pulls its deploys from.
+/// Bucket and credentials a fleet pulls its deploys from. The credentials
+/// are per-app: `CredentialSource::R2Temp` mints fresh keys scoped to the
+/// app's prefix at every spawn, so fleets never hold the root bucket keys.
 #[derive(Debug, Clone)]
 pub struct FleetStorage {
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: Option<String>,
+    pub credentials: crate::store::credentials::CredentialSource,
 }
 
 impl FleetStorage {
     /// `s3://{bucket}/fleets/{slug}`.
     pub fn bucket_url(&self, slug: &str) -> String {
         format!("s3://{}/fleets/{slug}", self.bucket)
+    }
+
+    /// `fleets/{slug}/`: the prefix every scoped credential is minted for,
+    /// matching [`FleetStorage::bucket_url`].
+    pub fn fleet_prefix(slug: &str) -> String {
+        format!("fleets/{slug}/")
     }
 }
 
@@ -69,6 +79,7 @@ struct Inner {
     memory_max_bytes: u64,
     cpu_max: String,
     sleep_after: Duration,
+    credential_refresh_after: Duration,
     wake_timeout: Duration,
     wake_permits: tokio::sync::Semaphore,
     fleets: tokio::sync::Mutex<HashMap<String /* slug */, LiveFleet>>,
@@ -99,6 +110,7 @@ impl FleetManager {
             memory_max_bytes: settings.memory_max_bytes,
             cpu_max: settings.cpu_max,
             sleep_after: settings.sleep_after,
+            credential_refresh_after: settings.credential_refresh_after,
             wake_timeout: settings.wake_timeout,
             wake_permits: tokio::sync::Semaphore::new(settings.wake_concurrency.max(1)),
             fleets: tokio::sync::Mutex::new(HashMap::new()),
@@ -142,7 +154,10 @@ impl FleetManager {
             .clone()
     }
 
-    fn spec_for(&self, app: &App) -> anyhow::Result<(FleetSpec, FleetOpts)> {
+    /// Fleet invocation for `app`, minting fresh credentials scoped to the
+    /// app's prefix. A minting failure is a failed wake/refresh with a clear
+    /// error: never a panic, never a fallback to the parent keys.
+    async fn spec_for(&self, app: &App) -> anyhow::Result<(FleetSpec, FleetOpts)> {
         let state_dir = self.inner.data_dir.join("fleets").join(&app.slug);
         let (cgroup_leaf, cgroups_active) = match &self.inner.cgroups {
             Some(anchor) => {
@@ -158,6 +173,17 @@ impl FleetManager {
             None => (state_dir.clone(), false),
         };
         let storage = &self.inner.storage;
+        let prefix = FleetStorage::fleet_prefix(&app.slug);
+        let creds = storage
+            .credentials
+            .for_prefix(&prefix)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "minting scoped R2 credentials for fleet {}: {err:#}",
+                    app.slug
+                )
+            })?;
         let spec = FleetSpec {
             slug: app.slug.clone(),
             uid: app.uid,
@@ -167,9 +193,9 @@ impl FleetManager {
             bucket_url: storage.bucket_url(&app.slug),
             s3_endpoint: storage.endpoint.clone(),
             s3_region: storage.region.clone(),
-            access_key_id: storage.access_key_id.clone(),
-            secret_access_key: storage.secret_access_key.clone(),
-            session_token: storage.session_token.clone(),
+            access_key_id: creds.access_key_id,
+            secret_access_key: creds.secret_access_key,
+            session_token: creds.session_token,
             cgroup_leaf,
             cgroups_active,
             // Checked against `is_reserved_env_name`: RUST_LOG carries no
@@ -185,6 +211,48 @@ impl FleetManager {
             asset_cache_mb: 64,
         };
         Ok((spec, opts))
+    }
+
+    /// Mint, start and health-gate the app's fleet, tracking it on success.
+    /// The caller holds the slug's wake lock. On an unhealthy fleet the
+    /// child is stopped and removed: a failed start never leaves a tracked
+    /// fleet behind.
+    async fn spawn_and_gate(&self, app: &App) -> anyhow::Result<()> {
+        let (spec, opts) = self.spec_for(app).await?;
+        let fleet = supervisor::start(&spec, &opts).await?;
+        self.inner.fleets.lock().await.insert(
+            app.slug.clone(),
+            LiveFleet {
+                fleet,
+                started: std::time::Instant::now(),
+            },
+        );
+        if health::wait_healthy("127.0.0.1", app.port, self.inner.wake_timeout).await {
+            return Ok(());
+        }
+        let mut fleets = self.inner.fleets.lock().await;
+        // The sleep sweep may have removed it first (its activity row can
+        // still look stale while no request has completed): stopping
+        // nothing is still a failed start, never a panic.
+        let Some(live) = fleets.remove(&app.slug) else {
+            anyhow::bail!("fleet {} never became healthy", app.slug);
+        };
+        let mut fleet = live.fleet;
+        drop(fleets);
+        let tail = fleet.logs.lock().await.tail(20);
+        let mut detail = tail
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if detail.is_empty() {
+            detail = "(no log output)".to_string();
+        }
+        fleet.stop(StopGrace::NORMAL).await;
+        anyhow::bail!(
+            "fleet {} never became healthy; last log lines:\n{detail}",
+            app.slug
+        )
     }
 
     /// Start the app's fleet when it is not running and wait for its health
@@ -217,40 +285,9 @@ impl FleetManager {
             apps::set_asleep(pool, &app.id, None).await?;
             return Ok(());
         }
-        let (spec, opts) = self.spec_for(app)?;
-        let fleet = supervisor::start(&spec, &opts).await?;
-        self.inner.fleets.lock().await.insert(
-            app.slug.clone(),
-            LiveFleet {
-                fleet,
-                started: std::time::Instant::now(),
-            },
-        );
-        if !health::wait_healthy("127.0.0.1", app.port, self.inner.wake_timeout).await {
-            let mut fleets = self.inner.fleets.lock().await;
-            // The sleep sweep may have removed it first (its activity row can
-            // still look stale while no request has completed): stopping
-            // nothing is still a failed wake, never a panic.
-            let Some(live) = fleets.remove(&app.slug) else {
-                anyhow::bail!("fleet {} never became healthy", app.slug);
-            };
-            let mut fleet = live.fleet;
-            drop(fleets);
-            let tail = fleet.logs.lock().await.tail(20);
-            let mut detail = tail
-                .iter()
-                .map(|entry| entry.line.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if detail.is_empty() {
-                detail = "(no log output)".to_string();
-            }
-            fleet.stop(StopGrace::NORMAL).await;
-            anyhow::bail!(
-                "fleet {} never became healthy; last log lines:\n{detail}",
-                app.slug
-            );
-        }
+        self.spawn_and_gate(app)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed wake for fleet {}: {err:#}", app.slug))?;
         self.mark_wake_activity(pool, app).await?;
         apps::set_asleep(pool, &app.id, None).await?;
         Ok(())
@@ -275,8 +312,11 @@ impl FleetManager {
     }
 
     /// Stop every fleet whose app has been quieter than `sleep_after`, drop
-    /// dead fleets from the map, and return the slugs put to sleep. The
-    /// app's activity is read fresh from the DB per fleet.
+    /// dead fleets from the map, restart fleets older than
+    /// `credential_refresh_after` with freshly minted credentials, and return
+    /// the slugs put to sleep. The app's activity is read fresh from the DB
+    /// per fleet. The sleep check comes first: refresh applies only to fleets
+    /// that are not being put to sleep this tick.
     pub async fn sleep_idle(&self, pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
         let now = apps::now_ms();
         let slugs: Vec<String> = self.inner.fleets.lock().await.keys().cloned().collect();
@@ -335,6 +375,37 @@ impl FleetManager {
                 fleet.stop(StopGrace::NORMAL).await;
                 apps::set_asleep(pool, &app.id, Some(now)).await?;
                 slept.push(slug);
+                continue;
+            }
+            // Credential refresh: a fleet older than `credential_refresh_after`
+            // restarts with freshly minted credentials before they expire.
+            // Only here, never on the sleep path above, and under the same
+            // wake lock, so a wake and a refresh for one app never interleave.
+            if !should_refresh(live.started.elapsed(), self.inner.credential_refresh_after) {
+                continue;
+            }
+            // Like a wake, a restart takes a start permit; unlike a wake, the
+            // sweep never waits for one — a full permit set means this tick
+            // skips the refresh and the next tick retries.
+            let Ok(_permit) = self.inner.wake_permits.try_acquire() else {
+                continue;
+            };
+            let Some(live) = fleets.remove(&slug) else {
+                continue;
+            };
+            let mut fleet = live.fleet;
+            drop(fleets);
+            fleet.stop(StopGrace::NORMAL).await;
+            match self.spawn_and_gate(&app).await {
+                Ok(()) => tracing::info!(
+                    slug = %slug,
+                    "fleet restarted with freshly minted R2 credentials"
+                ),
+                Err(err) => tracing::warn!(
+                    slug = %slug,
+                    error = %format!("{err:#}"),
+                    "credential refresh failed; fleet stays stopped until the next wake"
+                ),
             }
         }
         Ok(slept)
@@ -401,6 +472,15 @@ pub fn should_sleep(
     now_ms.saturating_sub(activity) as i128 > sleep_after.as_millis() as i128
 }
 
+/// Whether the fleet should restart with freshly minted credentials: its
+/// uptime has reached `refresh_after` (TTL minus a day in production, so the
+/// restart lands before the minted credentials expire). Unlike
+/// [`should_sleep`], the bound itself refreshes: a fleet exactly
+/// `refresh_after` old restarts this tick rather than the next.
+pub fn should_refresh(uptime: Duration, refresh_after: Duration) -> bool {
+    uptime >= refresh_after
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +520,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn refresh_decision_at_its_boundaries() {
+        let after = Duration::from_secs(6 * 86400);
+        // Young fleets keep their credentials.
+        assert!(!should_refresh(Duration::ZERO, after));
+        assert!(!should_refresh(after - Duration::from_secs(1), after));
+        // Exactly at the bound refreshes: no extra tick of expired creds.
+        assert!(should_refresh(after, after));
+        assert!(should_refresh(after + Duration::from_secs(1), after));
+    }
+
     #[tokio::test]
     async fn wake_in_progress_peeks_without_creating_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -453,14 +544,16 @@ mod tests {
                 endpoint: "https://example.com".to_string(),
                 region: "auto".to_string(),
                 bucket: "outer-dev".to_string(),
-                access_key_id: "key".to_string(),
-                secret_access_key: "secret".to_string(),
-                session_token: None,
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: "key".to_string(),
+                    secret_access_key: "secret".to_string(),
+                },
             },
             cgroups: None,
             memory_max_bytes: 0,
             cpu_max: "50000 100000".to_string(),
             sleep_after: Duration::from_secs(60),
+            credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
         });
@@ -529,14 +622,16 @@ mod tests {
                 endpoint: "https://example.com".to_string(),
                 region: "auto".to_string(),
                 bucket: "outer-dev".to_string(),
-                access_key_id: "key".to_string(),
-                secret_access_key: "secret".to_string(),
-                session_token: None,
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: "key".to_string(),
+                    secret_access_key: "secret".to_string(),
+                },
             },
             cgroups: None,
             memory_max_bytes: 0,
             cpu_max: "50000 100000".to_string(),
             sleep_after: Duration::from_secs(60),
+            credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
         });
@@ -625,14 +720,16 @@ mod tests {
                 endpoint,
                 region: "auto".to_string(),
                 bucket,
-                access_key_id: access_key,
-                secret_access_key: secret_key,
-                session_token: None,
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: access_key,
+                    secret_access_key: secret_key,
+                },
             },
             cgroups: None,
             memory_max_bytes: 256 * 1024 * 1024,
             cpu_max: "50000 100000".to_string(),
             sleep_after: Duration::from_secs(300),
+            credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(60),
             wake_concurrency: 2,
         });

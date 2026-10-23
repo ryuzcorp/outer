@@ -456,29 +456,38 @@ impl Deployer {
     }
 
     /// Step 5: `celld deploy <root> ... --json`; returns (output, version).
+    /// Bucket credentials are minted fresh for the app's prefix on every
+    /// deploy, so the step env never carries the parent keys.
     async fn celld_deploy(
         &self,
         app: &App,
         deploy_id: &str,
         root: &Path,
     ) -> anyhow::Result<(String, Option<String>)> {
+        let prefix = FleetStorage::fleet_prefix(&app.slug);
+        let creds = self
+            .settings
+            .storage
+            .credentials
+            .for_prefix(&prefix)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "minting scoped R2 credentials for deploy of {}: {err:#}",
+                    app.slug
+                )
+            })?;
         let bucket = self.settings.storage.bucket_url(&app.slug);
         let endpoint = self.settings.storage.endpoint.clone();
         let region = self.settings.storage.region.clone();
         let mut env = vec![
-            (
-                "AWS_ACCESS_KEY_ID".to_string(),
-                self.settings.storage.access_key_id.clone(),
-            ),
-            (
-                "AWS_SECRET_ACCESS_KEY".to_string(),
-                self.settings.storage.secret_access_key.clone(),
-            ),
+            ("AWS_ACCESS_KEY_ID".to_string(), creds.access_key_id),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), creds.secret_access_key),
             ("AWS_REGION".to_string(), region.clone()),
             ("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string()),
             ("S3_ENDPOINT".to_string(), endpoint.clone()),
         ];
-        if let Some(token) = &self.settings.storage.session_token {
+        if let Some(token) = &creds.session_token {
             env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
         }
         if let Some(esbuild) = &self.settings.esbuild_bin {
@@ -830,6 +839,8 @@ fn hand_worktree_to_app(slug: &str, work: &Path, uid: u32) {
                 "chown worktree to app uid failed; continuing (needs CAP_CHOWN)"
             );
         }
+        // Other app uids traverse `work/` too: the tree itself is private.
+        crate::fleet::sandbox::make_private_dir(work);
     }
     #[cfg(not(unix))]
     {
@@ -1161,9 +1172,10 @@ mod tests {
                 endpoint: "http://127.0.0.1:19000".to_string(),
                 region: "us-east-1".to_string(),
                 bucket: "outer-live-test".to_string(),
-                access_key_id: "outeraccess".to_string(),
-                secret_access_key: "outersecretoutersecretoutersecret12".to_string(),
-                session_token: None,
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: "outeraccess".to_string(),
+                    secret_access_key: "outersecretoutersecretoutersecret12".to_string(),
+                },
             },
             step_timeout: Duration::from_secs(120),
             cgroups: None,
@@ -1453,9 +1465,10 @@ mod tests {
                 endpoint,
                 region: "us-east-1".to_string(),
                 bucket,
-                access_key_id: key,
-                secret_access_key: secret,
-                session_token: None,
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: key,
+                    secret_access_key: secret,
+                },
             },
             step_timeout: Duration::from_secs(120),
             cgroups: None,

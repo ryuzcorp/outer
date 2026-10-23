@@ -4,6 +4,7 @@
 //! The git slice reads and writes bundles through [`Store`]; the snapshot
 //! module keeps the SQLite state in the same bucket.
 
+pub mod credentials;
 pub mod s3;
 pub mod snapshot;
 
