@@ -666,8 +666,8 @@ async fn codes_are_single_use_expiring_and_pkce_bound() {
 #[tokio::test]
 async fn dcr_validates_and_rate_limits() {
     let flow = flow().await;
-    // Non-https, non-loopback redirects are refused.
-    for redirect in ["http://app.example/cb", "custom://app/cb", "not-a-url"] {
+    // Plain http to a remote host, script URLs and garbage are refused.
+    for redirect in ["http://app.example/cb", "javascript:alert(1)", "not-a-url"] {
         let (status, _, body) = send(
             &flow.app,
             post_json(
@@ -678,7 +678,18 @@ async fn dcr_validates_and_rate_limits() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{redirect}: {body}");
     }
-    // Public clients only.
+    // Desktop apps register their own scheme (RFC 8252), e.g. Cursor.
+    let (status, _, body) = send(
+        &flow.app,
+        post_json(
+            "/oauth/register",
+            &serde_json::json!({ "redirect_uris": ["cursor://anysphere.cursor-retrieval/oauth/user-outer/callback"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // A client defaulting to a secret method is registered public, not
+    // refused: the answer tells it so.
     let (status, _, body) = send(
         &flow.app,
         post_json(
@@ -687,7 +698,9 @@ async fn dcr_validates_and_rate_limits() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let registered: serde_json::Value = body.parse().unwrap();
+    assert_eq!(registered["token_endpoint_auth_method"], "none");
 
     // Loopback http is fine.
     let (status, _, _) = send(
@@ -700,9 +713,9 @@ async fn dcr_validates_and_rate_limits() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     // 20 registrations per hour per IP: the failed validations above count
-    // too (5 events so far), so 14 more succeed, the 20th succeeds, the 21st
+    // too (6 events so far), so 13 more succeed, the 20th succeeds, the 21st
     // fails.
-    for _ in 0..14 {
+    for _ in 0..13 {
         let (status, _, _) = send(
             &flow.app,
             post_json(
@@ -1257,7 +1270,10 @@ async fn cimd_loopback_redirect_ignores_port() {
         .await
         .unwrap();
     assert_eq!(client.name, "Loopback App");
-    assert!(!client.verified);
+    assert!(
+        client.verified,
+        "a CIMD client is bound to its https domain"
+    );
     assert!(client.loopback_only);
     // The second resolve hits the oauth_client cache (the doc is fetched once).
     let again = cimd::resolve_client(&pool, &config, &doc_url, "http://127.0.0.1:7777/cb")
@@ -1384,4 +1400,31 @@ async fn cloudflare_sender_shape_bounce_and_retry() {
         .unwrap_err();
     assert!(matches!(err, EmailError::Permanent(_)), "{err}");
     assert!(err.to_string().contains("10001"));
+}
+
+/// Every app that identifies itself by an https document (Claude, ChatGPT,
+/// Perplexity, any other CIMD client) gets a plain consent page; only a
+/// self-registered app carries a neutral note. No page warns or refuses.
+#[test]
+fn consent_page_never_warns_and_notes_only_self_registered_apps() {
+    use crate::auth::cimd::ClientDoc;
+    use crate::auth::pages;
+    let doc = |verified: bool| ClientDoc {
+        client_id: "https://www.perplexity.ai/.well-known/mcp-client.json".to_string(),
+        name: "Perplexity".to_string(),
+        host: "www.perplexity.ai".to_string(),
+        redirect_uris: vec!["https://www.perplexity.ai/rest/connections/oauth_callback".to_string()],
+        verified,
+        loopback_only: false,
+    };
+    let cimd = pages::render(pages::consent_page(&doc(true), "apps", "rid", "csrf"));
+    assert!(cimd.contains("Perplexity"), "{cimd}");
+    assert!(cimd.contains("www.perplexity.ai"), "{cimd}");
+    assert!(!cimd.contains("registered itself"), "{cimd}");
+    let dcr = pages::render(pages::consent_page(&doc(false), "apps", "rid", "csrf"));
+    assert!(dcr.contains("registered itself"), "{dcr}");
+    for page in [&cimd, &dcr] {
+        assert!(!page.to_lowercase().contains("unverified"), "{page}");
+        assert!(!page.contains("Only continue if you trust"), "{page}");
+    }
 }

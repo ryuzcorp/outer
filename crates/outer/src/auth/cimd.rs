@@ -3,8 +3,8 @@
 //! The `client_id` is either an HTTPS URL (a client-instance metadata
 //! document, fetched with HTTPS only to public IPs only, 3 s timeout,
 //! ≤ 16 KiB, cached in `oauth_client`) or a `dcr_…` id from `POST
-//! /oauth/register`. Known clients skip the fetch with pinned redirects and
-//! a verified label; anything else shows as "Unverified app at `<host>`".
+//! /oauth/register`. Known clients only get a friendlier label; their
+//! redirects always come from their own document.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -15,6 +15,13 @@ use url::Url;
 use super::{now_ms, AuthConfig};
 
 /// ≤ 16 KiB per spec.
+///
+/// Trust model (owner, 2026-10-23: every popular chat app must connect
+/// without a scary warning): a CIMD client's identity is its HTTPS domain —
+/// Outer fetched the document from that domain and only redirects to the
+/// URIs it lists — so it is shown by name and host like any known app. Only
+/// self-registered (DCR) clients, whose name nobody vouches for, get a
+/// neutral note. Nothing is refused for being unfamiliar.
 pub const MAX_DOC_BYTES: usize = 16 * 1024;
 /// Cache TTL for a fetched document without a shorter `Cache-Control`.
 const DOC_TTL_MS: i64 = 86_400_000;
@@ -26,13 +33,15 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct ClientDoc {
     /// The `client_id` as sent: an https URL or a `dcr_…` id.
     pub client_id: String,
-    /// Consent-page label: the known name, or "Unverified app at `<host>`".
+    /// Consent-page label: a known name, the document's `client_name`, or
+    /// the host.
     pub name: String,
     /// Redirect host shown on the consent page.
     pub host: String,
     /// Allowed redirect URIs (CIMD doc, DCR row or pinned table).
     pub redirect_uris: Vec<String>,
-    /// Known clients only.
+    /// Identity bound to an HTTPS domain (CIMD, known or not). False only
+    /// for self-registered (DCR) clients.
     pub verified: bool,
     /// Every allowed redirect is loopback: extra warning on the consent page.
     pub loopback_only: bool,
@@ -69,18 +78,12 @@ impl std::fmt::Display for ClientError {
 }
 
 /// Pinned clients: metadata URL → (display name, redirect URIs).
-pub fn known_client(client_id: &str) -> Option<(&'static str, &'static [&'static str])> {
+pub fn known_client(client_id: &str) -> Option<&'static str> {
     match client_id {
-        "https://claude.ai/oauth/mcp-oauth-client-metadata" => {
-            Some(("Claude", &["https://claude.ai/api/mcp/auth_callback"]))
-        }
-        "https://claude.ai/oauth/claude-code-client-metadata" => {
-            Some(("Claude Code", &["http://localhost/callback"]))
-        }
-        "https://chatgpt.com/oauth/client.json" => Some((
-            "ChatGPT",
-            &["https://chatgpt.com/connector_platform_oauth_redirect"],
-        )),
+        "https://claude.ai/oauth/mcp-oauth-client-metadata" => Some("Claude"),
+        "https://claude.ai/oauth/claude-code-client-metadata" => Some("Claude Code"),
+        "https://chatgpt.com/oauth/client.json" => Some("ChatGPT"),
+        "https://www.perplexity.ai/.well-known/mcp-client.json" => Some("Perplexity"),
         _ => None,
     }
 }
@@ -174,26 +177,6 @@ pub async fn resolve_client(
     {
         return check_redirect(row, redirect_uri);
     }
-    if let Some((name, uris)) = known_client(client_id) {
-        let redirect_uris = uris.iter().map(|uri| uri.to_string()).collect::<Vec<_>>();
-        let host = redirect_host(
-            redirect_uris
-                .first()
-                .map(String::as_str)
-                .unwrap_or(client_id),
-        );
-        return check_redirect(
-            ClientDoc {
-                client_id: client_id.to_string(),
-                name: name.to_string(),
-                host,
-                redirect_uris,
-                verified: true,
-                loopback_only: uris.iter().all(|uri| is_loopback_uri(uri)),
-            },
-            redirect_uri,
-        );
-    }
     let url = Url::parse(client_id).map_err(|_| ClientError::UnknownClient)?;
     // Tests run a fake CIMD on loopback over plain HTTP; production always
     // requires https. The flag never comes from the environment.
@@ -204,7 +187,10 @@ pub async fn resolve_client(
     if url.scheme() != "https" && !(loopback_test && url.scheme() == "http") {
         return Err(ClientError::NonHttps);
     }
-    let doc = fetch_cimd(pool, cfg, client_id, &url, now).await?;
+    let mut doc = fetch_cimd(pool, cfg, client_id, &url, now).await?;
+    if let Some(label) = known_client(client_id) {
+        doc.name = label.to_string();
+    }
     check_redirect(doc, redirect_uri)
 }
 
@@ -246,7 +232,7 @@ async fn dcr_client(pool: &SqlitePool, client_id: &str) -> anyhow::Result<Option
         let loopback_only =
             !redirect_uris.is_empty() && redirect_uris.iter().all(|uri| is_loopback_uri(uri));
         ClientDoc {
-            name: name.unwrap_or_else(|| format!("Unverified app at {host}")),
+            name: name.unwrap_or_else(|| host.clone()),
             host,
             redirect_uris,
             verified: false,
@@ -340,7 +326,7 @@ async fn fetch_cimd(
         .get("client_name")
         .and_then(|name| name.as_str())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("Unverified app at {host}"));
+        .unwrap_or_else(|| host.clone());
     let loopback_only = redirect_uris.iter().all(|uri| is_loopback_uri(uri));
     // Backdate so `fetched_at + 24 h` is the exact expiry.
     let fetched_at = now - (DOC_TTL_MS - ttl_ms);
@@ -364,7 +350,7 @@ async fn fetch_cimd(
         name,
         host,
         redirect_uris,
-        verified: false,
+        verified: true,
         loopback_only,
     })
 }
@@ -400,10 +386,10 @@ async fn cached_doc(
         !redirect_uris.is_empty() && redirect_uris.iter().all(|uri| is_loopback_uri(uri));
     Ok(Some(ClientDoc {
         client_id: client_id.to_string(),
-        name: name.unwrap_or_else(|| format!("Unverified app at {host}")),
+        name: name.unwrap_or_else(|| host.clone()),
         host,
         redirect_uris,
-        verified: false,
+        verified: true,
         loopback_only,
     }))
 }

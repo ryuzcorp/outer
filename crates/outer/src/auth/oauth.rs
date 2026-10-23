@@ -60,7 +60,28 @@ fn json_nostore(value: serde_json::Value) -> Response {
         .into_response()
 }
 
+/// Redirect targets a self-registered client may use: https anywhere,
+/// plain http on loopback (CLI tools on an ephemeral port), and an app's own
+/// URI scheme (RFC 8252 §7.1: desktop apps such as Cursor or VS Code). Never
+/// script, data or file URLs, and never plain http to a remote host.
+fn dcr_redirect_allowed(uri: &Url) -> bool {
+    match uri.scheme() {
+        "https" => true,
+        "http" => cimd::is_loopback_host(uri.host_str()),
+        "javascript" | "data" | "file" | "vbscript" | "about" | "blob" | "ftp" | "ws" | "wss" => {
+            false
+        }
+        _ => true,
+    }
+}
+
 fn oauth_error(status: StatusCode, code: &str, description: &str) -> Response {
+    tracing::info!(
+        status = status.as_u16(),
+        error = code,
+        description,
+        "oauth error answered"
+    );
     (
         status,
         [
@@ -264,7 +285,11 @@ async fn authorize_get(
     let client =
         match cimd::resolve_client(&state.pool, &state.config, client_id, redirect_uri).await {
             Ok(client) => client,
-            Err(err) => return error(&clinic_error(&err)),
+            Err(err) => {
+                // A client the matrix doesn't cover yet shows up here first.
+                tracing::info!(client_id, redirect_uri, error = %err, "oauth client refused");
+                return error(&clinic_error(&err));
+            }
         };
     let id = tokens::new_id();
     let csrf = tokens::new_csrf();
@@ -610,28 +635,20 @@ async fn register(
                 format!("{uri} is not a URL").as_str(),
             );
         };
-        let loopback = cimd::is_loopback_host(parsed.host_str());
-        if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        if !dcr_redirect_allowed(&parsed) {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_redirect_uri",
-                "redirect URIs must be https or loopback http",
+                "redirect URIs must be https, loopback http, or an app's own scheme (cursor://, vscode://, …)",
             );
         }
         redirect_uris.push(uri.to_string());
     }
-    if let Some(method) = body
-        .get("token_endpoint_auth_method")
-        .and_then(|method| method.as_str())
-    {
-        if method != "none" {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_client_metadata",
-                "only public clients (token_endpoint_auth_method none) are supported",
-            );
-        }
-    }
+    // Every client is registered public (`none`) whatever it asked for:
+    // RFC 7591 lets the server answer with the metadata it actually
+    // registered, PKCE protects the code, and the token endpoint ignores a
+    // client secret or Basic header a client sends anyway. Refusing a
+    // client that defaults to `client_secret_basic` would lock it out.
     let name = body
         .get("client_name")
         .and_then(|name| name.as_str())
