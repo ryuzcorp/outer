@@ -1,0 +1,14 @@
+Outer
+Copyright 2026 the Outer authors
+
+Outer is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+
+Noite
+https://github.com/ryuzcorp/noite
+Copyright 2026 the Noite authors
+
+Parts of Outer's source are derived from Noite's runner
+(apps/runner/src/host/). Each derived file names its Noite source and commit
+in its first line. Noite is licensed under the Apache License, Version 2.0.
