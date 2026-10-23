@@ -5,6 +5,7 @@
 
 pub mod apps;
 pub mod config;
+pub mod cron;
 pub mod db;
 pub mod deploy;
 pub mod fleet;

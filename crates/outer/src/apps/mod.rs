@@ -340,6 +340,17 @@ pub async fn get_by_slug(pool: &SqlitePool, slug: &str) -> anyhow::Result<Option
     row.map(AppRow::into_app).transpose()
 }
 
+/// The app with `id`, if any.
+pub async fn get_by_id(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<App>> {
+    let row: Option<AppRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {APP_COLS} FROM app WHERE id = ?1"
+    )))
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(AppRow::into_app).transpose()
+}
+
 /// Every app, in slug order.
 pub async fn list(pool: &SqlitePool) -> anyhow::Result<Vec<App>> {
     let rows: Vec<AppRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
