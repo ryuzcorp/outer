@@ -24,10 +24,10 @@ cd /srv/outer
     echo "remote: /srv/outer/release.env missing (nothing ever released?)" >&2
     exit 1
 }
+# Sourced, NOT exported: an exported OUTER_IMAGE would override
+# --env-file below and compose would keep the current image.
 # shellcheck disable=SC1091
-set -a
 . /srv/outer/release.env
-set +a
 # One-way: a retry after a failed rollout re-applies the same target instead
 # of flipping back. Going forward again is a fresh release.sh.
 if [[ -n "${OUTER_PREVIOUS_IMAGE:-}" ]]; then
@@ -61,7 +61,8 @@ cid="$(docker compose --env-file /srv/outer/release.env \
 }
 deadline=$((SECONDS + 60))
 while true; do
-    if [[ "$(docker inspect -f '{{.State.Running}}' "$cid")" == "true" ]] \
+    # The image check catches a compose that kept the old container.
+    if [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$cid")" == "true $target" ]] \
         && docker logs "$cid" 2>&1 | grep -q 'listening on'; then
         break
     fi

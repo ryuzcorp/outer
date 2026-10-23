@@ -58,7 +58,7 @@ set -euo pipefail
 SHA="$1"
 cd /srv/outer
 
-if ! docker image inspect "outer:$SHA" >/dev/null 2>&1; then
+if docker image inspect "localhost/outer:$SHA" >/dev/null 2>&1; then
     docker tag "localhost/outer:$SHA" "outer:$SHA"
     docker rmi "localhost/outer:$SHA" >/dev/null
 fi
@@ -117,7 +117,8 @@ cid="$(docker compose --env-file /srv/outer/release.env \
 }
 deadline=$((SECONDS + 60))
 while true; do
-    if [[ "$(docker inspect -f '{{.State.Running}}' "$cid")" == "true" ]] \
+    # The image check catches a compose that kept the old container.
+    if [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$cid")" == "true outer:$SHA" ]] \
         && docker logs "$cid" 2>&1 | grep -q 'listening on'; then
         break
     fi
