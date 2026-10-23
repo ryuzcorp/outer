@@ -80,25 +80,32 @@ done
 touch /srv/outer/release.env
 chmod 600 /srv/outer/release.env
 prev="$(grep -E '^OUTER_IMAGE=' /srv/outer/release.env | tail -n 1 | cut -d= -f2- || true)"
+prev_rollback="$(grep -E '^OUTER_PREVIOUS_IMAGE=' /srv/outer/release.env | tail -n 1 | cut -d= -f2- || true)"
 tmp="$(mktemp)"
-grep -v -E '^(OUTER_IMAGE|OUTER_PREVIOUS_IMAGE)=' /srv/outer/release.env >"$tmp" || true
+grep -v -E '^(OUTER_IMAGE|OUTER_PREVIOUS_IMAGE|OUTER_ROLLED_BACK_FROM)=' \
+    /srv/outer/release.env >"$tmp" || true
 {
     cat "$tmp"
     echo "OUTER_IMAGE=outer:$SHA"
     if [[ -n "$prev" && "$prev" != "outer:$SHA" ]]; then
         echo "OUTER_PREVIOUS_IMAGE=$prev"
+    elif [[ -n "$prev_rollback" ]]; then
+        # Re-releasing the running image keeps the existing rollback target.
+        echo "OUTER_PREVIOUS_IMAGE=$prev_rollback"
     fi
 } > /srv/outer/release.env
 rm -f "$tmp"
 
-docker compose --env-file /srv/outer/release.env \
-    -f /srv/outer/compose.yaml up -d
-
-# First install may predate the firewall (provision.sh without deploy files):
-# ensure the table exists, failing closed like a first install.
+# outer runs on the host network: the ingress filter must be in place before
+# it starts (a first install may predate it). firewall.sh exits nonzero on
+# failure, which stops the rollout here.
 if ! nft list table inet outer_fw >/dev/null 2>&1; then
     /srv/outer/firewall.sh
 fi
+
+docker compose --env-file /srv/outer/release.env \
+    -f /srv/outer/compose.yaml up -d
+
 
 # Wait for the rollout: container running + outer's boot line. mTLS means no
 # HTTP probe is possible without a client key, so the log line is the signal.

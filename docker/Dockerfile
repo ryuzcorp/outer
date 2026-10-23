@@ -61,7 +61,7 @@ COPY --from=build /out/outer /usr/local/bin/outer
 COPY LICENSE NOTICE /licenses/
 WORKDIR /data
 ENV OUTER_DATA=/data \
-    OUTER_LISTEN=0.0.0.0:443 \
+    OUTER_LISTEN=[::]:443 \
     CELLD_ESBUILD=/usr/local/bin/esbuild \
     CELLD_VERSION="${CELLD_VERSION}"
 VOLUME /data

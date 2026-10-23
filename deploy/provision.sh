@@ -67,8 +67,11 @@ APT::Periodic::Unattended-Upgrade "1";
 EOF
 
 # --- 3. sshd: key-only, no root password login -------------------------------
-[[ -s /root/.ssh/authorized_keys ]] || {
-    echo "provision.sh: refusing to disable password auth with no root authorized_keys" >&2
+# The account that will log in afterwards must hold a key: the sudo caller's,
+# or root's when run as root directly.
+admin_home="$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)"
+[[ -s "$admin_home/.ssh/authorized_keys" ]] || {
+    echo "provision.sh: refusing to disable password auth: no authorized_keys for ${SUDO_USER:-root}" >&2
     exit 1
 }
 # sshd takes the FIRST value it sees: 01- sorts ahead of cloud-init's 50-.

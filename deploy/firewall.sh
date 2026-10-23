@@ -60,8 +60,48 @@ fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# Nothing has been applied when this runs: an existing table (refresh) stays
-# as it was, and a first install leaves 443 unopened.
+# The whole table as one nft transaction. `add` + `delete` + recreate is
+# atomic and valid whether or not the table exists (first install, refresh,
+# or the boot apply of the saved file), so there is never a window with no
+# table or a stale one. Empty lists leave a set empty: 443 closed.
+emit_rules() { # $1 = v4 list, $2 = v6 list (comma-separated, may be empty)
+    printf 'add table %s %s\n' "$FAMILY" "$TABLE"
+    printf 'delete table %s %s\n' "$FAMILY" "$TABLE"
+    printf 'table %s %s {\n' "$FAMILY" "$TABLE"
+    printf '\tset cf4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n'
+    [[ -z "$1" ]] || printf '\t\telements = { %s }\n' "$1"
+    printf '\t}\n'
+    printf '\tset cf6 {\n\t\ttype ipv6_addr\n\t\tflags interval\n'
+    [[ -z "$2" ]] || printf '\t\telements = { %s }\n' "$2"
+    printf '\t}\n'
+    cat <<'EOF'
+	chain input {
+		type filter hook input priority 0; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
+		icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
+		udp sport 67 udp dport 68 accept
+		udp sport 547 udp dport 546 accept
+		tcp dport 22 accept
+		tcp dport 443 ip saddr @cf4 accept
+		tcp dport 443 ip6 saddr @cf6 accept
+	}
+}
+EOF
+}
+
+# First install: drop everything but ssh before touching the network, so a
+# failed fetch below leaves the host closed rather than unfiltered. Not saved:
+# the boot apply only ever loads a complete ruleset.
+if [[ "$mode" == "install" ]] && ! /usr/sbin/nft list table "$FAMILY" "$TABLE" >/dev/null 2>&1; then
+    emit_rules "" "" >"$work/bootstrap.nft"
+    /usr/sbin/nft --check -f "$work/bootstrap.nft"
+    /usr/sbin/nft -f "$work/bootstrap.nft"
+fi
+
+# Nothing new is applied when this runs: the current table (bootstrap or the
+# previous ruleset) stays as it was.
 fail_closed() {
     echo "firewall.sh ($mode): $1; ruleset unchanged" >&2
     exit 1
@@ -90,32 +130,7 @@ v6_list="$(tr '\n' ',' <"$work/ips-v6")"
 v6_list="${v6_list%,}"
 
 rules="$work/rules.nft"
-{
-    # One file = one nft transaction. `add` + `delete` + recreate is atomic
-    # and valid whether or not the table exists (first install, refresh, or
-    # the boot apply of this same saved file), so there is never a window
-    # with no table or a stale one.
-    printf 'add table %s %s\n' "$FAMILY" "$TABLE"
-    printf 'delete table %s %s\n' "$FAMILY" "$TABLE"
-    printf 'table %s %s {\n' "$FAMILY" "$TABLE"
-    printf '\tset cf4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n' "$v4_list"
-    printf '\tset cf6 {\n\t\ttype ipv6_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n' "$v6_list"
-    cat <<'EOF'
-	chain input {
-		type filter hook input priority 0; policy drop;
-		iifname "lo" accept
-		ct state established,related accept
-		icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
-		icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
-		udp sport 67 udp dport 68 accept
-		udp sport 547 udp dport 546 accept
-		tcp dport 22 accept
-		tcp dport 443 ip saddr @cf4 accept
-		tcp dport 443 ip6 saddr @cf6 accept
-	}
-}
-EOF
-} >"$rules"
+emit_rules "$v4_list" "$v6_list" >"$rules"
 
 /usr/sbin/nft --check -f "$rules"
 /usr/sbin/nft -f "$rules"

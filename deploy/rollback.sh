@@ -4,8 +4,9 @@
 #
 #   deploy/rollback.sh <ssh-target>
 #
-# Swaps OUTER_IMAGE and OUTER_PREVIOUS_IMAGE in /srv/outer/release.env, runs
-# `docker compose up -d`, and waits for the same signal as release.sh
+# Points OUTER_IMAGE at OUTER_PREVIOUS_IMAGE in /srv/outer/release.env
+# (recording the abandoned image as OUTER_ROLLED_BACK_FROM, and leaving no
+# rollback target behind), runs `docker compose up -d`, and waits for the same signal as release.sh
 # (container running + outer's "listening on" log line — mTLS admits no
 # unauthenticated HTTP probe).
 #
@@ -27,20 +28,27 @@ cd /srv/outer
 set -a
 . /srv/outer/release.env
 set +a
-[[ -n "${OUTER_PREVIOUS_IMAGE:-}" ]] || {
+# One-way: a retry after a failed rollout re-applies the same target instead
+# of flipping back. Going forward again is a fresh release.sh.
+if [[ -n "${OUTER_PREVIOUS_IMAGE:-}" ]]; then
+    target="$OUTER_PREVIOUS_IMAGE"
+    tmp="$(mktemp)"
+    grep -v -E '^(OUTER_IMAGE|OUTER_PREVIOUS_IMAGE|OUTER_ROLLED_BACK_FROM)=' \
+        /srv/outer/release.env >"$tmp" || true
+    {
+        cat "$tmp"
+        echo "OUTER_IMAGE=$target"
+        echo "OUTER_ROLLED_BACK_FROM=${OUTER_IMAGE:-}"
+    } > /srv/outer/release.env
+    rm -f "$tmp"
+elif [[ -n "${OUTER_ROLLED_BACK_FROM:-}" ]]; then
+    target="$OUTER_IMAGE"
+    echo "remote: already rolled back from $OUTER_ROLLED_BACK_FROM; re-applying $target"
+else
     echo "remote: OUTER_PREVIOUS_IMAGE is unset (nothing to roll back to)" >&2
     exit 1
-}
-
-tmp="$(mktemp)"
-grep -v -E '^(OUTER_IMAGE|OUTER_PREVIOUS_IMAGE)=' /srv/outer/release.env >"$tmp" || true
-{
-    cat "$tmp"
-    echo "OUTER_IMAGE=$OUTER_PREVIOUS_IMAGE"
-    echo "OUTER_PREVIOUS_IMAGE=${OUTER_IMAGE:-}"
-} > /srv/outer/release.env
-rm -f "$tmp"
-echo "remote: rolling back to $OUTER_PREVIOUS_IMAGE"
+fi
+echo "remote: rolling back to $target"
 
 docker compose --env-file /srv/outer/release.env \
     -f /srv/outer/compose.yaml up -d
@@ -64,5 +72,5 @@ while true; do
     fi
     sleep 2
 done
-echo "remote: rolled back to $OUTER_PREVIOUS_IMAGE ($cid)"
+echo "remote: rolled back to $target ($cid)"
 EOF

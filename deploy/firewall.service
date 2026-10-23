@@ -13,3 +13,6 @@ ExecStart=/srv/outer/firewall.sh --apply-saved
 
 [Install]
 WantedBy=multi-user.target
+# Docker (and the host-network outer service) cannot start without the
+# ingress filter: a failed apply blocks it instead of serving unfiltered.
+RequiredBy=docker.service

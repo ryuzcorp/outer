@@ -436,7 +436,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
-            shutdown_handle.graceful_shutdown(None);
+            // Bounded drain: stop_all and the final snapshot run after
+            // serve returns, all inside compose's 35 s stop_grace_period.
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
         });
         axum_server::tls_rustls::from_tcp_rustls(std_listener, rustls_config)?
             .handle(handle)
