@@ -55,7 +55,8 @@ pub struct Deploys {
 }
 
 enum DeploysInner {
-    Live(Deployer),
+    Live(Box<Deployer>),
+    #[cfg(test)]
     Fake(FakeDeploys),
 }
 
@@ -63,11 +64,12 @@ impl Deploys {
     /// Run real deploys through the pipeline.
     pub fn live(deployer: Deployer) -> Self {
         Self {
-            inner: Arc::new(DeploysInner::Live(deployer)),
+            inner: Arc::new(DeploysInner::Live(Box::new(deployer))),
         }
     }
 
     /// A fake that answers every deploy with `outcome`, for tests.
+    #[cfg(test)]
     pub fn fake(outcome: FakeOutcome) -> Self {
         Self {
             inner: Arc::new(DeploysInner::Fake(FakeDeploys {
@@ -77,6 +79,7 @@ impl Deploys {
     }
 
     /// Change what the fake answers (tests drive blocked/failed paths).
+    #[cfg(test)]
     pub fn set_fake(&self, outcome: FakeOutcome) {
         if let DeploysInner::Fake(fake) = &*self.inner {
             *fake.outcome.lock().expect("fake outcome poisoned") = outcome;
@@ -92,11 +95,13 @@ impl Deploys {
     ) -> anyhow::Result<DeployOutcome> {
         match &*self.inner {
             DeploysInner::Live(deployer) => deployer.deploy(pool, git, app, sha).await,
+            #[cfg(test)]
             DeploysInner::Fake(fake) => fake.deploy(pool, app, sha).await,
         }
     }
 }
 /// What the fake deploy answers with.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct FakeOutcome {
     pub status: &'static str,
@@ -109,6 +114,7 @@ pub struct FakeOutcome {
     pub delay: Duration,
 }
 
+#[cfg(test)]
 impl FakeOutcome {
     pub fn success() -> Self {
         Self {
@@ -152,9 +158,10 @@ impl FakeOutcome {
             findings: vec![crate::moderation::gate::Finding {
                 path: "pages/index.tsx".to_string(),
                 line: 42,
-                excerpt: "this list is f*** awesome".to_string(),
+                excerpt: "this list is fucking awesome".to_string(),
                 category: "profanity",
-                signal: "wordlist",
+                signal: "jev",
+                score: 0.95,
             }],
             user_message: Some(
                 "Outer didn't publish this change because the page text has strong profanity (pages/index.tsx, line 42). Your app still shows the previous version.",
@@ -164,10 +171,12 @@ impl FakeOutcome {
     }
 }
 
+#[cfg(test)]
 struct FakeDeploys {
     outcome: std::sync::Mutex<FakeOutcome>,
 }
 
+#[cfg(test)]
 impl FakeDeploys {
     async fn deploy(
         &self,

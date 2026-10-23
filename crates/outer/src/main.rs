@@ -223,24 +223,28 @@ fn git_config(config: &Config) -> GitConfig {
 /// The app-operation context for CLI commands: the same DB and bucket
 /// `serve` uses. Commands never restore or claim the snapshot; that's
 /// `serve`'s job.
+/// The pre-live gate classifies through Jev on AI Gateway with the same
+/// Cloudflare pair that mints R2 credentials. Without the pair (localhost dev
+/// only; config refuses it elsewhere) the gate logs a warning and passes.
+fn jev_client(config: &Config) -> anyhow::Result<Option<outer::moderation::JevClient>> {
+    let Some(cf) = &config.cloudflare else {
+        return Ok(None);
+    };
+    Ok(Some(outer::moderation::JevClient::new(
+        outer::moderation::JevConfig::new(
+            cf.account_id.clone(),
+            cf.api_token.clone(),
+            config.ai_gateway.clone(),
+        ),
+    )?))
+}
+
 async fn platform(config: &Config) -> anyhow::Result<Platform> {
     std::fs::create_dir_all(&config.data_dir)?;
     let store = build_store(config)?;
     let pool = db::open(&config.db_path()).await?;
     let rt = &config.runtime;
-    // The pre-live gate classifies through Jev on AI Gateway with the same
-    // Cloudflare pair that mints R2 credentials. Without the pair (localhost
-    // dev only) the gate logs a warning and passes unchecked.
-    let jev = match &config.cloudflare {
-        Some(cf) => Some(outer::moderation::JevClient::new(
-            outer::moderation::JevConfig::new(
-                cf.account_id.clone(),
-                cf.api_token.clone(),
-                config.ai_gateway.clone(),
-            ),
-        )?),
-        None => None,
-    };
+    let jev = jev_client(config)?;
     let deployer = Deployer::new(
         DeploySettings {
             data_dir: config.data_dir.clone(),
@@ -514,6 +518,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             storage,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
+            jev: jev_client(&config)?,
         },
         rt.build_concurrency,
     );
