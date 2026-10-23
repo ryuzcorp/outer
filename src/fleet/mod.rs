@@ -3,6 +3,7 @@
 
 pub mod cgroups;
 pub mod health;
+pub mod manager;
 pub mod nft;
 pub mod sandbox;
 pub mod supervisor;

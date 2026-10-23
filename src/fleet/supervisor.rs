@@ -64,7 +64,7 @@ pub fn fleet_command(
         "--region".to_string(),
         spec.s3_region.clone(),
         "--listen".to_string(),
-        format!("0.0.0.0:{}", spec.public_port),
+        format!("127.0.0.1:{}", spec.public_port),
         // Advertise on loopback: a fleet is a single node, and outer already
         // reaches it at 127.0.0.1:{internal} (reload). A hostname advertise
         // would not resolve and breaks celld node discovery.
@@ -539,8 +539,8 @@ mod tests {
             argv.contains("--endpoint https://account.eu.r2.cloudflarestorage.com"),
             "{argv}"
         );
-        assert!(argv.contains("--region auto"), "{argv}");
-        assert!(argv.contains("--listen 0.0.0.0:22001"), "{argv}");
+        // The proxy is the only way in: the public listener binds loopback.
+        assert!(argv.contains("--listen 127.0.0.1:22001"), "{argv}");
         assert!(argv.contains("--internal-listen 127.0.0.1:23001"), "{argv}");
         assert!(argv.contains("--advertise 127.0.0.1:23001"), "{argv}");
         let env: std::collections::HashMap<_, _> = env.into_iter().collect();
