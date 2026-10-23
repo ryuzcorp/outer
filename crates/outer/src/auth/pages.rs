@@ -108,10 +108,10 @@ pub fn consent_page(client: &ClientDoc, scope: &str, request_id: &str, csrf: &st
             p {
                 "Allow " strong { (client.name) } " (" (client.host) ") to " (scopes) "?"
             }
-            @if client.verified {
-                p { "Verified client." }
-            } @else {
-                p role="note" style="color:#a00;" { "Unverified app: Outer doesn't recognize this client. Only continue if you trust it." }
+            @if !client.verified {
+                p role="note" style="color:#555;" {
+                    "This app registered itself with Outer, so its name comes from the app. After you allow it, you return to " (client.host) "."
+                }
             }
             @if client.loopback_only {
                 p role="note" { "This app runs on your own computer (a local address)." }
