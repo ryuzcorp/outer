@@ -18,8 +18,9 @@ FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY migrations ./migrations
+COPY crates/outer/Cargo.toml ./crates/outer/
+COPY crates/outer/src ./crates/outer/src
+COPY crates/outer/migrations ./crates/outer/migrations
 RUN --mount=type=cache,id=outer-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=outer-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=outer-target,target=/src/target,sharing=locked \
