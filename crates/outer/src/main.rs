@@ -451,6 +451,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("restored platform state from the bucket snapshot");
     }
     let pool = db::open(&config.db_path()).await?;
+    let interrupted = outer::deploy::fail_interrupted(&pool).await?;
+    if interrupted > 0 {
+        tracing::warn!(
+            interrupted,
+            "closed deploy rows a restart cut off (marked failed)"
+        );
+    }
     // Bind before claiming the bucket: a second instance that can't listen
     // must not take ownership away from the one that's serving.
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

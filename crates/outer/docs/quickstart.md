@@ -14,5 +14,5 @@ tools, Outer builds and deploys, and you get a live link to share.
 
 Rules: no strong profanity in page text, seed data or the app name — the
 deploy will be blocked and the previous version keeps serving. After
-deploying server code, check `app_errors`. Undo with `rollback`.
+deploying server code, check `app_logs`. Undo with `rollback`.
 Relay any `user_message` you receive to your human verbatim.

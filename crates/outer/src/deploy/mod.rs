@@ -6,4 +6,4 @@
 
 pub mod pipeline;
 
-pub use pipeline::{DeployOutcome, DeploySettings, Deployer, Step};
+pub use pipeline::{fail_interrupted, DeployOutcome, DeploySettings, Deployer, Step};

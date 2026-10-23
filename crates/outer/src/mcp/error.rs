@@ -131,7 +131,7 @@ impl ToolError {
 
     /// Map app-creation failures. A taken slug is the agent's to fix, so it
     /// is `invalid_argument`, not `conflict` (no `current_sha` exists).
-    pub fn from_create(err: crate::apps::CreateError) -> Self {
+    pub fn from_create(err: crate::apps::CreateError, plan: &str) -> Self {
         use crate::apps::CreateError as E;
         match err {
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
@@ -139,7 +139,7 @@ impl ToolError {
             E::Exhausted(what) => Self::internal(format!("no free {what} left; ask the operator")),
             E::Quota { limit, used } => Self::quota_exceeded(
                 format!("app quota: {limit} allowed, {used} owned"),
-                format!("You've used your {limit} app slot(s) on Outer."),
+                crate::mcp::tools::app_slots_message(plan, limit),
                 "apps_owned",
                 limit,
                 used,

@@ -712,7 +712,7 @@ async fn free_plan_caps_apps_at_one() {
     assert!(err["user_message"]
         .as_str()
         .unwrap()
-        .contains("free app slot"));
+        .contains("all 1 app slot on your Outer free plan"));
 
     let (_, who) = call(&state, Some(&token), "whoami", json!({})).await;
     let who = &result(&who)["structuredContent"];

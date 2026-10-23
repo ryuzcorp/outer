@@ -210,7 +210,7 @@ pub async fn claim_change(pool: &sqlx::SqlitePool, account_id: &str) -> Result<C
         return Err(ToolError::quota_exceeded(
             format!("{plan} plan: {limit} code changes per day, {used} used"),
             format!(
-                "You've used today's {limit} free changes on Outer. They reset at midnight UTC."
+                "You've used today's {limit} code changes on your Outer {plan} plan. They reset at midnight UTC."
             ),
             "code_changes_per_day",
             limit,
@@ -247,6 +247,13 @@ pub async fn apps_owned(pool: &sqlx::SqlitePool, account_id: &str) -> Result<u64
     Ok(count.max(0) as u64)
 }
 
+/// The human-facing text when every app slot is taken, shared by the early
+/// check and the in-lock recheck so both sides of a create race read alike.
+pub fn app_slots_message(plan: &str, limit: u64) -> String {
+    let slots = if limit == 1 { "app slot" } else { "app slots" };
+    format!("You've used all {limit} {slots} on your Outer {plan} plan.")
+}
+
 /// Refuse `create_app` when the owner's app slots are full.
 pub async fn check_app_quota(
     pool: &sqlx::SqlitePool,
@@ -258,7 +265,7 @@ pub async fn check_app_quota(
     if used >= limit {
         return Err(ToolError::quota_exceeded(
             format!("{plan} plan: {limit} app(s) owned, {used} used"),
-            format!("You've used your {limit} free app slot on Outer."),
+            app_slots_message(&plan, limit),
             "apps_owned",
             limit,
             used,
@@ -526,15 +533,12 @@ fn blocked_user_message(row: &DeployRow) -> Option<String> {
         .and_then(|s| serde_json::from_str(s).ok())?;
     let first = findings.as_array()?.first()?;
     let path = first.get("path").and_then(Value::as_str)?;
-    let line = first.get("line");
-    Some(match line {
-        Some(line) => format!(
-            "Outer didn't publish this change because the page text has strong profanity ({path}, line {line}). Your app still shows the previous version."
-        ),
-        None => format!(
-            "Outer didn't publish this change because the page text has strong profanity ({path}). Your app still shows the previous version."
-        ),
-    })
+    let category = first
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("profanity");
+    let line = first.get("line").and_then(Value::as_u64);
+    Some(crate::moderation::user_message_for(category, path, line))
 }
 
 /// The `commit`/`create_app`/`rollback` deploy object from a live outcome.

@@ -354,8 +354,12 @@ async fn run_capped(args: &[&str], cap: usize) -> anyhow::Result<CappedOutput> {
             }
         }
     }
-    // The child is done (EOF) or cut off: make sure it dies, then reap it.
-    let _ = child.start_kill();
+    // Kill only a child the cap cut off. One that reached EOF on its own may
+    // still be between closing stdout and exiting: a SIGKILL in that gap
+    // turns a clean exit (or grep's "no match" 1) into "killed by signal".
+    if truncated {
+        let _ = child.start_kill();
+    }
     let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
         .await
         .map_err(|_| anyhow::anyhow!("git {args:?} would not die"))?

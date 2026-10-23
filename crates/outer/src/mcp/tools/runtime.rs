@@ -92,10 +92,11 @@ pub async fn app_logs(input: AppLogsInput, ctx: &Ctx<'_>) -> Result<Value, ToolE
                 Some(seq) => ring.since(seq),
                 None => ring.tail(limit),
             };
-            // tail() returns the newest N in order; since() is unbounded, so
-            // cap it the same way (oldest of the window drops first).
-            let entries = if input.since.is_some() && entries.len() > limit {
-                entries[entries.len() - limit..].to_vec()
+            // tail() returns the newest N in order; since() is unbounded and
+            // feeds a cursor: keep the OLDEST `limit` after `since`, so the
+            // next poll from `next_since` picks up where this one stopped.
+            let entries = if input.since.is_some() {
+                cursor_page(entries, limit)
             } else {
                 entries
             };
@@ -127,4 +128,32 @@ pub async fn app_logs(input: AppLogsInput, ctx: &Ctx<'_>) -> Result<Value, ToolE
         },
         json!({"lines": lines, "next_since": next_since}),
     ))
+}
+
+/// One page of a `since` cursor: the OLDEST `limit` entries, so the next
+/// poll from the last returned seq continues without a gap.
+fn cursor_page<T>(mut entries: Vec<T>, limit: usize) -> Vec<T> {
+    entries.truncate(limit);
+    entries
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::cursor_page;
+
+    #[test]
+    fn polling_pages_through_every_line() {
+        let ring: Vec<u64> = (1..=7).collect();
+        let mut seen = Vec::new();
+        let mut since = 0;
+        loop {
+            let page = cursor_page(ring.iter().copied().filter(|seq| *seq > since).collect(), 3);
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            seen.extend(page);
+            since = last;
+        }
+        assert_eq!(seen, ring, "no line falls behind the cursor");
+    }
 }

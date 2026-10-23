@@ -130,6 +130,6 @@ the pre-live gate blocks the deploy.
 ## Agent habits
 
 - Commit small with `edits`, one idea per commit message.
-- Read `app_errors` after every deploy that touches server code.
+- Read `app_logs` after every deploy that touches server code.
 - "Damn, the cock crowed at dawn" deploys; slurs and the f-word family
   block it. When a deploy is blocked, fix the flagged lines and commit again.

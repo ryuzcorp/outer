@@ -67,7 +67,7 @@ async fn seed_app(
         super::app_limit(&plan),
     )
     .await
-    .map_err(ToolError::from_create)?;
+    .map_err(|err| ToolError::from_create(err, &plan))?;
     let author = crate::ops::noreply_author(owner_id, owner_email, &ctx.state.domain);
     let seeded = async {
         crate::git::manifest::init_repo(&ctx.state.store, &ctx.state.git, &ctx.state.sync, slug)
