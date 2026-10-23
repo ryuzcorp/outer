@@ -29,6 +29,87 @@ pub struct ToolDef {
     /// own text block.
     pub untrusted: bool,
     pub input_schema: Value,
+    /// MCP tool annotations: clients decide from these whether a call needs
+    /// the human's confirmation (read-only tools run without asking).
+    pub hints: Hints,
+}
+
+/// MCP `ToolAnnotations` (2025-06-18). Clients treat a tool without hints
+/// as possibly destructive and ask before every call, which turned a first
+/// session in Perplexity into a string of "yes" / "yes to all" prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hints {
+    pub read_only: bool,
+    pub destructive: bool,
+    pub idempotent: bool,
+    pub open_world: bool,
+}
+
+impl Hints {
+    /// Reads Outer's own state only.
+    const READ: Self = Self {
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    };
+    /// Adds or changes state that the next call (or `rollback`) can undo:
+    /// commits append history, nothing is lost.
+    const WRITE: Self = Self {
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    };
+    /// Ends access for good (a revoked key or connection can't come back).
+    const DESTRUCTIVE: Self = Self {
+        read_only: false,
+        destructive: true,
+        idempotent: true,
+        open_world: false,
+    };
+
+    pub fn to_json(self, title: &str) -> Value {
+        serde_json::json!({
+            "title": title,
+            "readOnlyHint": self.read_only,
+            "destructiveHint": self.destructive,
+            "idempotentHint": self.idempotent,
+            "openWorldHint": self.open_world,
+        })
+    }
+}
+
+/// Every tool's hints, by name. `None` for a name not classified here: the
+/// registry test fails on it, so a new tool can't ship without a decision.
+pub fn hints_for(name: &str) -> Option<Hints> {
+    Some(match name {
+        "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
+        | "get_app" | "share_app" | "list_files" | "read_file" | "search_code" | "history"
+        | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" => Hints::READ,
+        "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" => Hints::WRITE,
+        "set_visibility" => Hints {
+            idempotent: true,
+            ..Hints::WRITE
+        },
+        // Emails a code to an address outside Outer.
+        "sign_in" => Hints {
+            open_world: true,
+            ..Hints::WRITE
+        },
+        "revoke_api_key" | "revoke_connection" => Hints::DESTRUCTIVE,
+        _ => return None,
+    })
+}
+
+/// `create_app` → `Create app`, for the annotation title.
+pub fn title_of(name: &str) -> String {
+    let words = name.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => words,
+    }
 }
 
 fn schema_of<T: schemars::JsonSchema>() -> Value {
@@ -50,6 +131,9 @@ fn tool<T: schemars::JsonSchema>(
         access,
         untrusted,
         input_schema,
+        // Unclassified names fall back to the cautious default; the
+        // registry test refuses them, so this never ships.
+        hints: hints_for(name).unwrap_or(Hints::DESTRUCTIVE),
     }
 }
 
@@ -209,5 +293,36 @@ mod tests {
     fn registry_shapes() {
         let tools = registry();
         assert_eq!(tools.len(), 25);
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn every_tool_is_classified_and_only_revocations_are_destructive() {
+        for tool in registry() {
+            let hints = hints_for(tool.name)
+                .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
+            assert!(
+                !(hints.read_only && hints.destructive),
+                "{} can't be both read-only and destructive",
+                tool.name
+            );
+            let destructive = matches!(tool.name, "revoke_api_key" | "revoke_connection");
+            assert_eq!(hints.destructive, destructive, "{}", tool.name);
+            // Untrusted tools return app content; they must never change state.
+            if tool.untrusted {
+                assert!(
+                    hints.read_only,
+                    "{} is untrusted but not read-only",
+                    tool.name
+                );
+            }
+        }
+        assert!(hints_for("commit").is_some_and(|h| !h.read_only && !h.destructive));
+        assert!(hints_for("list_apps").is_some_and(|h| h.read_only));
+        assert_eq!(title_of("create_app"), "Create app");
     }
 }

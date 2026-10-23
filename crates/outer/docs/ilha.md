@@ -61,8 +61,7 @@ export const loader: Loader = async ({ db, params }) => {
 export const action: Action = async ({ db, form, request }) => {
   const label = String(form.get("label") ?? "").trim();
   if (!label) return { error: "Give the item a name." };
-  const clean = moderate(label); // mask strong profanity before storing
-  await db.execute("INSERT INTO item (label) VALUES (?)", [clean]);
+  await db.execute("INSERT INTO item (label) VALUES (?)", [label]);
   return { ok: true };
 };
 ```
@@ -100,19 +99,22 @@ export default function Items({ data }: Props<typeof loader>) {
 
 ## Visitor text
 
-Anything a visitor can type must go through `moderate()` from
-`lib/moderate.ts` before it is stored — it masks the gate's strong
-wordlist matches. The D1-backed grocery-list example in the template shows
-the pattern. No strong profanity in page text, seed data or the app name:
-the pre-live gate blocks the deploy.
+Store what visitors type as plain, parameterized values and validate it
+(required, length). Outer doesn't filter it at write time and there is no
+moderation helper to import. No strong profanity in page text, seed data or
+the app name: the pre-live gate blocks the deploy.
 
-## Worked examples in the template
+## What the template ships
 
-- A D1-backed list (the grocery list): loader + action + `moderate()`.
-- A form with validation (error returned from the action, shown with
-  `useForm`).
-- A page with an island (JSON props, `atom.lazy` per-instance state).
-- Fetching an external API through a secret.
+- `pages/index.tsx` + `pages/index.server.ts`: a server-rendered list with a
+  loader and a form action (`useForm`, controls disabled until hydration).
+- `pages/about.island.tsx`: an island with JSON props.
+- `pages/_counter.tsx`: per-instance state with `atom`.
+- `pages/layout.tsx`, `pages/app.css`, `public/favicon.svg`.
+
+Read them with `read_file` before writing a new page: they are the house
+style. The template has no D1 binding yet: Void infers bindings from use
+(`import { db } from "void/db"`); see https://void.cloud/guide/database/d1.
 
 ## Commands and checks
 

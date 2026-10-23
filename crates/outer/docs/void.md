@@ -34,7 +34,7 @@ import type { Action } from "void";
 export const action: Action = async ({ db, form, request }) => {
   const label = String(form.get("label") ?? "").trim();
   if (!label || label.length > 80) return { error: "Name it (max 80 chars)." };
-  await db.execute("INSERT INTO item (label) VALUES (?)", [moderate(label)]);
+  await db.execute("INSERT INTO item (label) VALUES (?)", [label]);
   return { ok: true };
 };
 ```
