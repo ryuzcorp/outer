@@ -223,24 +223,28 @@ fn git_config(config: &Config) -> GitConfig {
 /// The app-operation context for CLI commands: the same DB and bucket
 /// `serve` uses. Commands never restore or claim the snapshot; that's
 /// `serve`'s job.
+/// The pre-live gate classifies through Jev on AI Gateway with the same
+/// Cloudflare pair that mints R2 credentials. Without the pair (localhost dev
+/// only; config refuses it elsewhere) the gate logs a warning and passes.
+fn jev_client(config: &Config) -> anyhow::Result<Option<outer::moderation::JevClient>> {
+    let Some(cf) = &config.cloudflare else {
+        return Ok(None);
+    };
+    Ok(Some(outer::moderation::JevClient::new(
+        outer::moderation::JevConfig::new(
+            cf.account_id.clone(),
+            cf.api_token.clone(),
+            config.ai_gateway.clone(),
+        ),
+    )?))
+}
+
 async fn platform(config: &Config) -> anyhow::Result<Platform> {
     std::fs::create_dir_all(&config.data_dir)?;
     let store = build_store(config)?;
     let pool = db::open(&config.db_path()).await?;
     let rt = &config.runtime;
-    // The pre-live gate classifies through Jev on AI Gateway with the same
-    // Cloudflare pair that mints R2 credentials. Without the pair (localhost
-    // dev only) the gate logs a warning and passes unchecked.
-    let jev = match &config.cloudflare {
-        Some(cf) => Some(outer::moderation::JevClient::new(
-            outer::moderation::JevConfig::new(
-                cf.account_id.clone(),
-                cf.api_token.clone(),
-                config.ai_gateway.clone(),
-            ),
-        )?),
-        None => None,
-    };
+    let jev = jev_client(config)?;
     let deployer = Deployer::new(
         DeploySettings {
             data_dir: config.data_dir.clone(),
@@ -447,6 +451,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("restored platform state from the bucket snapshot");
     }
     let pool = db::open(&config.db_path()).await?;
+    let interrupted = outer::deploy::fail_interrupted(&pool).await?;
+    if interrupted > 0 {
+        tracing::warn!(
+            interrupted,
+            "closed deploy rows a restart cut off (marked failed)"
+        );
+    }
     // Bind before claiming the bucket: a second instance that can't listen
     // must not take ownership away from the one that's serving.
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -485,7 +496,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let fleets = FleetManager::new(ManagerSettings {
         data_dir: config.data_dir.clone(),
         celld_bin: rt.celld_bin.clone(),
-        storage,
+        storage: storage.clone(),
         cgroups: cgroups(),
         memory_max_bytes: rt.fleet_memory_mb * 1024 * 1024,
         cpu_max: rt.fleet_cpu_max.clone(),
@@ -505,11 +516,45 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         outer::cron::WAKE_LEAD,
     );
 
+    let deployer = outer::deploy::Deployer::new(
+        outer::deploy::DeploySettings {
+            data_dir: config.data_dir.clone(),
+            celld_bin: rt.celld_bin.clone(),
+            esbuild_bin: rt.esbuild_bin.clone(),
+            bun_bin: rt.bun_bin.clone(),
+            storage,
+            step_timeout: Duration::from_secs(120),
+            cgroups: cgroups(),
+            jev: jev_client(&config)?,
+        },
+        rt.build_concurrency,
+    );
+    let auth = auth_state(&config, &pool)?;
+    let mcp = outer::mcp::McpState {
+        pool: pool.clone(),
+        auth: auth.clone(),
+        store: store.clone(),
+        git: git_config(&config),
+        sync: outer::git::GitSync::default(),
+        deploys: outer::mcp::Deploys::live(deployer),
+        fleets: fleets.clone(),
+        alloc: outer::apps::Allocation {
+            uid_range: rt.app_uid_range,
+            port_range: rt.fleet_ports,
+        },
+        domain: config.domain.clone(),
+        apps_domain: rt.apps_domain.clone(),
+        app_scheme: scheme(&config).to_string(),
+        app_port_suffix: port_suffix(config.listen, config.tls_enabled()),
+        tool_wait: config.tool_wait,
+        rollback_locks: outer::mcp::RollbackLocks::default(),
+    };
     let app = http::app(
         http::AppState {
             pool: pool.clone(),
             sync: sync.clone(),
-            auth: auth_state(&config, &pool)?,
+            auth,
+            mcp,
         },
         http::proxy::ProxyState::new(
             pool.clone(),

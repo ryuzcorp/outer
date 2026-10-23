@@ -12,6 +12,7 @@ pub mod deploy;
 pub mod fleet;
 pub mod git;
 pub mod http;
+pub mod mcp;
 pub mod moderation;
 pub mod ops;
 pub mod store;

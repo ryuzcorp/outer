@@ -17,9 +17,10 @@ FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/outer/Cargo.toml ./crates/outer/
-COPY crates/outer/src ./crates/outer/src
-COPY crates/outer/migrations ./crates/outer/migrations
+# The whole crates/ tree: sources pull files in with include_str!/sqlx
+# migrate! (docs, migrations), and listing subdirectories here broke the
+# image twice when a new one appeared.
+COPY crates ./crates
 RUN --mount=type=cache,id=outer-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=outer-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=outer-target,target=/src/target,sharing=locked \

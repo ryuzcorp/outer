@@ -125,6 +125,25 @@ const ACCEPTED_CONFIG_KEYS: &[&str] = &[
     "rules",
 ];
 
+/// Close deploy rows a restart cut off. `serve` owns the deploy pipeline, so
+/// at its boot no deploy can still be running: a row left `queued`,
+/// `building`, `reviewing` or `deploying` would otherwise read as in flight
+/// forever (rollback coalesces onto it, `deploy_status wait` polls it).
+/// Returns how many rows were closed.
+pub async fn fail_interrupted(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let closed = sqlx::query(
+        "UPDATE deploy SET status = 'failed', \
+         error = 'interrupted: outer restarted before this deploy finished', \
+         finished_at = ? \
+         WHERE status NOT IN ('success', 'failed', 'blocked')",
+    )
+    .bind(apps::now_ms())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(closed)
+}
+
 impl Deployer {
     pub fn new(settings: DeploySettings, build_concurrency: usize) -> Self {
         Self {
@@ -2243,5 +2262,52 @@ mod tests {
         assert!(!meta.file_type().is_symlink());
         assert_eq!((meta.uid(), meta.gid()), (me, alt));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside");
+    }
+
+    /// A restart leaves in-flight rows behind; boot closes exactly those.
+    #[tokio::test]
+    async fn boot_fails_only_rows_a_restart_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'o@example.com', 0, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, visibility, last_activity_at, created_at) \
+             VALUES ('app1', 'boot', 'a1', 210002, 32121, 32122, 'unlisted', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, status) in [
+            ("d1", "success"),
+            ("d2", "blocked"),
+            ("d3", "failed"),
+            ("d4", "queued"),
+            ("d5", "building"),
+            ("d6", "deploying"),
+        ] {
+            sqlx::query("INSERT INTO deploy (id, app_id, sha, status, created_at) VALUES (?, 'app1', 'abc', ?, 0)")
+                .bind(id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(fail_interrupted(&pool).await.unwrap(), 3);
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM deploy ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let statuses: Vec<&str> = rows.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(
+            statuses,
+            ["success", "blocked", "failed", "failed", "failed", "failed"]
+        );
+        assert_eq!(fail_interrupted(&pool).await.unwrap(), 0, "idempotent");
     }
 }

@@ -62,6 +62,16 @@ pub struct Allocation {
     pub port_range: (u16, u16),
 }
 
+/// App slots per plan (spec §3): Free owns 1 app, Pro 10. Enforced in
+/// [`create`]; the MCP layer's early check uses the same numbers.
+pub fn app_limit_for_plan(plan: &str) -> u64 {
+    if plan == "pro" {
+        10
+    } else {
+        1
+    }
+}
+
 /// Why [`create`] refused the app. Each message tells the agent what to change.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
@@ -74,6 +84,9 @@ pub enum CreateError {
     /// The range has no room left: `"uids"` or `"ports"`.
     #[error("no free {0} left in the configured range; ask the operator to widen it")]
     Exhausted(&'static str),
+    /// The owner's plan allows no more apps (`limit` slots, `used` taken).
+    #[error("plan allows {limit} app(s), {used} owned")]
+    Quota { limit: u64, used: u64 },
     /// Anything else: the database or the pool failed.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -202,6 +215,7 @@ fn lowest_free(used: &[i64], lo: i64, hi: i64, n: usize) -> Option<Vec<i64>> {
 }
 
 /// Create an app: validate the slug, refuse taken and quarantined slugs,
+/// re-check the owner's plan quota under the lock (a pre-check races), then
 /// allocate the lowest free uid and the two lowest free ports no app row uses,
 /// and insert with `last_activity_at` = now and `desired_state` 'running'.
 ///
@@ -213,6 +227,7 @@ pub async fn create(
     slug: &str,
     name: Option<&str>,
     alloc: &Allocation,
+    app_limit: u64,
 ) -> Result<App, CreateError> {
     let _guard = CREATE_LOCK.lock().await;
     validate_slug(slug)?;
@@ -240,6 +255,21 @@ pub async fn create(
             .execute(pool)
             .await
             .map_err(internal)?;
+    }
+    // The plan quota re-checked under the lock: an earlier check races with
+    // concurrent creates, so the count here is the one that counts.
+    let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE owner_id = ?1")
+        .bind(owner_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal)?
+        .unwrap_or(0);
+    let used = owned.max(0) as u64;
+    if used >= app_limit {
+        return Err(CreateError::Quota {
+            limit: app_limit,
+            used,
+        });
     }
     let mut uids: Vec<i64> = sqlx::query_scalar("SELECT uid FROM app")
         .fetch_all(pool)
@@ -396,6 +426,21 @@ pub async fn set_last_deploy(pool: &SqlitePool, app_id: &str, sha: &str) -> anyh
     Ok(())
 }
 
+/// Change who may discover the app: `unlisted` (default, kept out of search
+/// engines) or `public`. Owner-only; the MCP layer enforces the role.
+pub async fn set_visibility(
+    pool: &SqlitePool,
+    app_id: &str,
+    visibility: Visibility,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE app SET visibility = ?1 WHERE id = ?2")
+        .bind(visibility.as_str())
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn create_round_trips_through_get_and_list() {
         let (_dir, pool, owner) = setup().await;
-        let app = create(&pool, &owner, "grocery", Some("Groceries"), &alloc())
+        let app = create(&pool, &owner, "grocery", Some("Groceries"), &alloc(), 10)
             .await
             .unwrap();
         assert_eq!(app.slug, "grocery");
@@ -457,23 +502,25 @@ mod tests {
     async fn create_refuses_bad_slugs_taken_and_quarantine() {
         let (_dir, pool, owner) = setup().await;
         assert!(matches!(
-            create(&pool, &owner, "Bad Slug!", None, &alloc()).await,
+            create(&pool, &owner, "Bad Slug!", None, &alloc(), 10).await,
             Err(CreateError::InvalidSlug(_))
         ));
         assert!(matches!(
-            create(&pool, &owner, "api", None, &alloc()).await,
+            create(&pool, &owner, "api", None, &alloc(), 10).await,
             Err(CreateError::InvalidSlug(SlugError::Reserved(_)))
         ));
-        let app = create(&pool, &owner, "gone", None, &alloc()).await.unwrap();
+        let app = create(&pool, &owner, "gone", None, &alloc(), 10)
+            .await
+            .unwrap();
         assert!(matches!(
-            create(&pool, &owner, "gone", None, &alloc()).await,
+            create(&pool, &owner, "gone", None, &alloc(), 10).await,
             Err(CreateError::Taken)
         ));
         delete_row(&pool, &app.id).await.unwrap();
         assert!(get_by_slug(&pool, "gone").await.unwrap().is_none());
         assert!(
             matches!(
-                create(&pool, &owner, "gone", None, &alloc()).await,
+                create(&pool, &owner, "gone", None, &alloc(), 10).await,
                 Err(CreateError::Taken)
             ),
             "a deleted slug stays quarantined"
@@ -483,11 +530,17 @@ mod tests {
     #[tokio::test]
     async fn allocation_reuses_the_lowest_free_uid_and_ports() {
         let (_dir, pool, owner) = setup().await;
-        let a = create(&pool, &owner, "aaa", None, &alloc()).await.unwrap();
-        let b = create(&pool, &owner, "bbb", None, &alloc()).await.unwrap();
+        let a = create(&pool, &owner, "aaa", None, &alloc(), 10)
+            .await
+            .unwrap();
+        let b = create(&pool, &owner, "bbb", None, &alloc(), 10)
+            .await
+            .unwrap();
         assert_eq!((b.uid, b.port, b.internal_port), (210001, 18002, 18003));
         delete_row(&pool, &a.id).await.unwrap();
-        let c = create(&pool, &owner, "ccc", None, &alloc()).await.unwrap();
+        let c = create(&pool, &owner, "ccc", None, &alloc(), 10)
+            .await
+            .unwrap();
         assert_eq!(
             (c.uid, c.port, c.internal_port),
             (210000, 18000, 18001),
@@ -502,23 +555,23 @@ mod tests {
             uid_range: (500000, 500000),
             port_range: (18000, 18100),
         };
-        create(&pool, &owner, "first", None, &tiny_uid)
+        create(&pool, &owner, "first", None, &tiny_uid, 10)
             .await
             .unwrap();
         assert!(matches!(
-            create(&pool, &owner, "second", None, &tiny_uid).await,
+            create(&pool, &owner, "second", None, &tiny_uid, 10).await,
             Err(CreateError::Exhausted("uids"))
         ));
         let tiny_ports = Allocation {
             uid_range: (500000, 500100),
             port_range: (19000, 19001),
         };
-        create(&pool, &owner, "third", None, &tiny_ports)
+        create(&pool, &owner, "third", None, &tiny_ports, 10)
             .await
             .unwrap();
         assert!(
             matches!(
-                create(&pool, &owner, "fourth", None, &tiny_ports).await,
+                create(&pool, &owner, "fourth", None, &tiny_ports, 10).await,
                 Err(CreateError::Exhausted("ports"))
             ),
             "one app takes both ports, so a two-port range fits exactly one"
@@ -533,7 +586,7 @@ mod tests {
             let (pool, owner, alloc) = (pool.clone(), owner.clone(), alloc());
             let name = format!("racer-{i}");
             tasks.push(tokio::spawn(async move {
-                create(&pool, &owner, "race", Some(&name), &alloc).await
+                create(&pool, &owner, "race", Some(&name), &alloc, 10).await
             }));
         }
         let mut wins = 0;
@@ -546,9 +599,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_enforces_the_plan_quota_under_its_lock() {
+        let (_dir, pool, owner) = setup().await;
+        create(&pool, &owner, "only", None, &alloc(), 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                create(&pool, &owner, "second", None, &alloc(), 1).await,
+                Err(CreateError::Quota { limit: 1, used: 1 })
+            ),
+            "the second app is refused even though nothing else changed"
+        );
+    }
+    #[tokio::test]
     async fn touch_asleep_and_last_deploy_round_trip() {
         let (_dir, pool, owner) = setup().await;
-        let app = create(&pool, &owner, "sleepy", None, &alloc())
+        let app = create(&pool, &owner, "sleepy", None, &alloc(), 10)
             .await
             .unwrap();
         touch_request(&pool, &app.id, 123).await.unwrap();
@@ -571,7 +638,7 @@ mod tests {
     #[tokio::test]
     async fn delete_row_rolls_back_when_the_quarantine_insert_fails() {
         let (_dir, pool, owner) = setup().await;
-        let app = create(&pool, &owner, "doomed", None, &alloc())
+        let app = create(&pool, &owner, "doomed", None, &alloc(), 10)
             .await
             .unwrap();
         // A conflicting quarantine row makes the quarantine INSERT fail.
