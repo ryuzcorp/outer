@@ -8,6 +8,7 @@
 use anyhow::Context as _;
 use sqlx::SqlitePool;
 
+pub mod delete;
 mod slug;
 pub use slug::{validate_slug, SlugError};
 

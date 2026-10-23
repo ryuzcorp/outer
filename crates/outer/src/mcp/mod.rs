@@ -75,6 +75,7 @@ impl Deploys {
         Self {
             inner: Arc::new(DeploysInner::Fake(FakeDeploys {
                 outcome: std::sync::Mutex::new(outcome),
+                locks: std::sync::Mutex::new(HashMap::new()),
             })),
         }
     }
@@ -84,6 +85,18 @@ impl Deploys {
     pub fn set_fake(&self, outcome: FakeOutcome) {
         if let DeploysInner::Fake(fake) = &*self.inner {
             *fake.outcome.lock().expect("fake outcome poisoned") = outcome;
+        }
+    }
+
+    /// The per-app deploy mutex. Live runs serialize on the pipeline's own
+    /// lock; the fake has no pipeline, so it keeps an equivalent map.
+    /// `delete_app` holds it across the whole deletion so no deploy can
+    /// start mid-delete.
+    pub(crate) fn app_lock(&self, app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        match &*self.inner {
+            DeploysInner::Live(deployer) => deployer.app_lock(app_id),
+            #[cfg(test)]
+            DeploysInner::Fake(fake) => fake.app_lock(app_id),
         }
     }
 
@@ -175,10 +188,20 @@ impl FakeOutcome {
 #[cfg(test)]
 struct FakeDeploys {
     outcome: std::sync::Mutex<FakeOutcome>,
+    locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[cfg(test)]
 impl FakeDeploys {
+    fn app_lock(&self, app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("fake deploy locks poisoned")
+            .entry(app_id.to_string())
+            .or_default()
+            .clone()
+    }
+
     async fn deploy(
         &self,
         pool: &SqlitePool,
@@ -238,16 +261,24 @@ pub struct RollbackLocks {
 }
 
 impl RollbackLocks {
-    /// The app's rollback guard, or `None` when one is already in flight.
-    pub fn try_lock(&self, app_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        let slot = self
-            .inner
+    fn slot(&self, app_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
             .lock()
             .expect("rollback locks poisoned")
             .entry(app_id.to_string())
             .or_default()
-            .clone();
-        slot.try_lock_owned().ok()
+            .clone()
+    }
+
+    pub fn try_lock(&self, app_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.slot(app_id).try_lock_owned().ok()
+    }
+
+    /// The app's rollback guard, waiting. `delete_app` holds it across the
+    /// whole deletion so no rollback can start (or be mid-commit) mid-delete;
+    /// a rollback racing a delete fails fast on `try_lock` instead.
+    pub async fn lock(&self, app_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.slot(app_id).lock_owned().await
     }
 }
 
@@ -275,8 +306,9 @@ pub struct McpState {
     pub tool_wait: Duration,
     /// At most one rollback runs per app (fails fast otherwise).
     pub rollback_locks: RollbackLocks,
+    /// What `delete_app` wipes and purges: dirs, edge host, zone.
+    pub delete_cfg: crate::apps::delete::DeleteConfig,
 }
-
 impl McpState {
     /// `https://<slug>.outer.now`, or the localhost equivalent in dev.
     pub fn app_url(&self, slug: &str) -> String {
@@ -378,6 +410,12 @@ impl McpState {
             app_port_suffix: String::new(),
             tool_wait: Duration::from_millis(200),
             rollback_locks: RollbackLocks::default(),
+            delete_cfg: crate::apps::delete::DeleteConfig {
+                data_dir: data_dir.clone(),
+                cgroups: None,
+                apps_domain: "outer.localhost".to_string(),
+                cache_purge: None,
+            },
         }
     }
 }

@@ -119,3 +119,26 @@ pub async fn reload_if_awake(app: &App) -> bool {
         .await
         .is_ok_and(|r| r.status().is_success())
 }
+/// Delete `slug`: the operator CLI's path to the same core the MCP
+/// `delete_app` tool runs. `confirm` is the slug itself there (the operator
+/// typed the command). No fleet manager runs in this process: the serve
+/// loop's sleep sweep stops the orphaned fleet once its row is gone (it
+/// already does for missing rows).
+pub async fn delete_app(
+    p: &Platform,
+    cfg: &crate::apps::delete::DeleteConfig,
+    slug: &str,
+    confirm: &str,
+    locks: crate::apps::delete::DeleteLocks<'_>,
+) -> anyhow::Result<crate::apps::delete::DeleteOutput> {
+    let deps = crate::apps::delete::DeleteDeps {
+        pool: &p.pool,
+        store: &p.store,
+        git: &p.git,
+        sync: &p.sync,
+        fleets: None,
+    };
+    crate::apps::delete::delete_app(&deps, cfg, slug, confirm, locks)
+        .await
+        .map_err(|err| anyhow::anyhow!("{err:#}"))
+}

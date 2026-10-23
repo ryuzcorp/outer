@@ -161,8 +161,9 @@ impl FleetManager {
     /// The per-slug wake lock: concurrent `ensure_awake` calls for one app
     /// share a single start. Entries live as long as the manager; slugs are
     /// bounded by the app table. The sleep sweep takes the same lock, so a
-    /// wake and a sleep for one app never interleave.
-    async fn wake_lock(&self, slug: &str) -> Arc<tokio::sync::Mutex<()>> {
+    /// wake and a sleep for one app never interleave. `delete_app` holds it
+    /// across the whole deletion so no wake can start mid-delete.
+    pub(crate) async fn wake_lock(&self, slug: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut wakes = self.inner.wakes.lock().await;
         wakes
             .entry(slug.to_string())
@@ -365,6 +366,38 @@ impl FleetManager {
             return Ok(());
         }
         live.fleet.reload().await
+    }
+    /// Stop and untrack the fleet for `slug`, and drop its cached scoped
+    /// credentials so a recreated slug mints fresh. A missing fleet is a
+    /// no-op. Caller holds the slug's wake lock (see [`Self::wake_lock`]):
+    /// `delete_app` takes it across the whole deletion, and this must not
+    /// block on it again.
+    pub(crate) async fn stop_tracked(&self, slug: &str) {
+        let mut fleets = self.inner.fleets.lock().await;
+        let Some(live) = fleets.remove(slug) else {
+            drop(fleets);
+            self.inner
+                .storage
+                .credentials
+                .forget_prefix(&FleetStorage::fleet_prefix(slug));
+            return;
+        };
+        let mut fleet = live.fleet;
+        drop(fleets);
+        fleet.stop(StopGrace::NORMAL).await;
+        self.inner
+            .storage
+            .credentials
+            .forget_prefix(&FleetStorage::fleet_prefix(slug));
+    }
+
+    /// Stop the fleet for `slug` (no-op when asleep or missing) and drop its
+    /// cached scoped credentials. Takes the slug's wake lock; callers that
+    /// already hold it use [`Self::stop_tracked`].
+    pub async fn stop_app(&self, slug: &str) {
+        let key = self.wake_lock(slug).await;
+        let _wake = key.lock_owned().await;
+        self.stop_tracked(slug).await;
     }
 
     /// Stop every fleet whose app has been quieter than `sleep_after`, drop

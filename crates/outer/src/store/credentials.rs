@@ -111,6 +111,15 @@ impl CredentialSource {
             CredentialSource::R2Temp(minter) => minter.mint_fresh(prefix).await,
         }
     }
+    /// Drop the cached grant for `prefix`, if any. `delete_app` calls this
+    /// after stopping the fleet: a deleted app must never hand out its old
+    /// grant again (a recreated slug mints fresh). Static holds no cache.
+    /// Best effort: an unknown prefix is a no-op, never an error.
+    pub fn forget_prefix(&self, prefix: &str) {
+        if let CredentialSource::R2Temp(minter) = self {
+            minter.forget(prefix);
+        }
+    }
 }
 
 /// `fleets/{slug}/`: the only prefix shape outer ever mints for. Must be
@@ -394,6 +403,12 @@ impl R2TempMinter {
         let creds = self.mint(prefix).await?;
         self.cache_lock().insert(prefix.to_string(), creds.clone());
         Ok(creds)
+    }
+
+    /// Drop the cached grant for `prefix`. `delete_app` calls this after the
+    /// fleet stops; removing (never minting) cannot fail.
+    pub fn forget(&self, prefix: &str) {
+        self.cache_lock().remove(prefix);
     }
 }
 
