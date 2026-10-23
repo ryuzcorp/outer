@@ -853,11 +853,12 @@ async fn rollback_redeploys_an_earlier_success() {
         .unwrap()
         .to_string();
 
+    // A short sha, as agents quote it from history, names the target.
     let (_, rolled) = call(
         &state,
         Some(&token),
         "rollback",
-        json!({"app": "groceries", "sha": sha1}),
+        json!({"app": "groceries", "sha": &sha1[..8]}),
     )
     .await;
     let rolled = &result(&rolled)["structuredContent"];

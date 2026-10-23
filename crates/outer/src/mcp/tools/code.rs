@@ -499,20 +499,33 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
     }
     // The target must be an earlier successful deploy: its tree is known
     // good, so review is a cache hit and the fleet can adopt it.
-    let target_ok = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM deploy WHERE app_id = ?1 AND sha = ?2 AND status = 'success'",
+    // Agents quote short shas from `history`: a prefix names the target when
+    // it matches exactly one successfully deployed commit. `check_rev` above
+    // already limited the input to hex, so it carries no LIKE wildcards.
+    let matches = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT sha FROM deploy \
+         WHERE app_id = ?1 AND status = 'success' AND sha LIKE ?2 || '%' LIMIT 2",
     )
     .bind(&app.id)
-    .bind(&input.sha)
-    .fetch_one(&ctx.state.pool)
+    .bind(input.sha.to_ascii_lowercase())
+    .fetch_all(&ctx.state.pool)
     .await
     .map_err(internal)?;
-    if target_ok == 0 {
-        return Err(ToolError::invalid_argument(format!(
-            "{:?} is not a successfully deployed commit of {:?}; pick a sha from history whose deploy succeeded",
-            input.sha, input.app
-        )));
-    }
+    let target = match matches.as_slice() {
+        [one] => one.clone(),
+        [] => {
+            return Err(ToolError::invalid_argument(format!(
+                "{:?} is not a successfully deployed commit of {:?}; pick a sha from history whose deploy succeeded",
+                input.sha, input.app
+            )))
+        }
+        _ => {
+            return Err(ToolError::invalid_argument(format!(
+                "{:?} matches more than one deployed commit of {:?}; give more of the sha",
+                input.sha, input.app
+            )))
+        }
+    };
     // The daily budget is claimed after the cheap checks and before the git
     // work: a refused or redundant rollback costs nothing, and a rollback
     // whose commit never happens gives the claim back.
@@ -523,7 +536,7 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
         &ctx.state.git,
         &ctx.state.sync,
         &app.slug,
-        &input.sha,
+        &target,
         &author,
     )
     .await
@@ -545,7 +558,7 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
     let summary = format!(
         "Rolled back to {} ({}).",
-        &input.sha[..12.min(input.sha.len())],
+        &target[..12.min(target.len())],
         deploy["status"].as_str().unwrap_or("")
     );
     let structured = json!({"commit": {"sha": sha}, "deploy": deploy});
