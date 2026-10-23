@@ -485,7 +485,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let fleets = FleetManager::new(ManagerSettings {
         data_dir: config.data_dir.clone(),
         celld_bin: rt.celld_bin.clone(),
-        storage,
+        storage: storage.clone(),
         cgroups: cgroups(),
         memory_max_bytes: rt.fleet_memory_mb * 1024 * 1024,
         cpu_max: rt.fleet_cpu_max.clone(),
@@ -505,11 +505,43 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         outer::cron::WAKE_LEAD,
     );
 
+    let deployer = outer::deploy::Deployer::new(
+        outer::deploy::DeploySettings {
+            data_dir: config.data_dir.clone(),
+            celld_bin: rt.celld_bin.clone(),
+            esbuild_bin: rt.esbuild_bin.clone(),
+            bun_bin: rt.bun_bin.clone(),
+            storage,
+            step_timeout: Duration::from_secs(120),
+            cgroups: cgroups(),
+        },
+        rt.build_concurrency,
+    );
+    let auth = auth_state(&config, &pool)?;
+    let mcp = outer::mcp::McpState {
+        pool: pool.clone(),
+        auth: auth.clone(),
+        store: store.clone(),
+        git: git_config(&config),
+        sync: outer::git::GitSync::default(),
+        deploys: outer::mcp::Deploys::live(deployer),
+        fleets: fleets.clone(),
+        alloc: outer::apps::Allocation {
+            uid_range: rt.app_uid_range,
+            port_range: rt.fleet_ports,
+        },
+        domain: config.domain.clone(),
+        apps_domain: rt.apps_domain.clone(),
+        app_scheme: scheme(&config).to_string(),
+        app_port_suffix: port_suffix(config.listen, config.tls_enabled()),
+        tool_wait: config.tool_wait,
+    };
     let app = http::app(
         http::AppState {
             pool: pool.clone(),
             sync: sync.clone(),
-            auth: auth_state(&config, &pool)?,
+            auth,
+            mcp,
         },
         http::proxy::ProxyState::new(
             pool.clone(),

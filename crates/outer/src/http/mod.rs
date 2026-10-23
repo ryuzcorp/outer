@@ -8,7 +8,7 @@ pub mod tls;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -20,12 +20,18 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub sync: StateSync,
     pub auth: crate::auth::AuthState,
+    pub mcp: crate::mcp::McpState,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        // The MCP endpoint lives on the platform host only: this router
+        // never serves app hosts. GET/DELETE on /mcp answer 405 from the
+        // method router; the handler refuses bodies over 32 MiB (§8.1).
+        .route("/mcp", post(crate::mcp::mcp_handler))
+        .route("/llms.txt", get(crate::mcp::llms_handler))
         .fallback_service(crate::auth::router(state.auth.clone()))
         .with_state(state)
 }
@@ -94,10 +100,12 @@ mod tests {
         let pool = crate::db::open(&dir.path().join("outer.sqlite"))
             .await
             .unwrap();
+        let auth = crate::auth::test_support::test_state(pool.clone());
         let app = router(AppState {
             pool: pool.clone(),
             sync: StateSync::new("test"),
-            auth: crate::auth::test_support::test_state(pool.clone()),
+            auth: auth.clone(),
+            mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
         });
 
         let ok = app

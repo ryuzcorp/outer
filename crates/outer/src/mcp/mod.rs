@@ -1,0 +1,572 @@
+//! The MCP endpoint (spec §8): a hand-written Axum handler for `POST /mcp`
+//! on the platform host only, plus `GET /llms.txt`.
+//!
+//! One JSON-RPC message per POST, one JSON response, no SSE, no sessions.
+//! `initialize`, `ping`, `tools/list` and `tools/call` are the only methods;
+//! `GET`/`DELETE` on `/mcp` answer `405` via the method router, unknown
+//! methods `−32601`, bad envelopes `−32600`, bad JSON `−32700` and bad
+//! params (including unknown tools) `−32602`.
+
+pub mod docs;
+pub mod error;
+pub mod llms;
+pub mod registry;
+pub mod tools;
+
+#[cfg(test)]
+mod tests;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde_json::{json, Value};
+use sqlx::SqlitePool;
+
+use crate::apps::{Allocation, App};
+use crate::auth::{AuthState, Principal};
+use crate::deploy::{DeployOutcome, Deployer};
+use crate::fleet::manager::FleetManager;
+use crate::git::GitConfig;
+use crate::git::GitSync;
+use crate::store::Store;
+
+/// Protocol revisions the handler speaks. The server answers the client's
+/// revision when it knows it, else the newest one.
+pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
+pub const LATEST_PROTOCOL: &str = "2025-11-25";
+
+/// Exactly the §8.1 text (Codex reads only this much). The length test pins
+/// it at or under 512 chars.
+pub const INSTRUCTIONS: &str = "Outer hosts Ilha apps. Call `docs {topic: \"ilha\"}` before writing code. `create_app` → `commit` (prefer `edits`); every code tool waits for the deploy. Relay `user_message` verbatim.";
+
+/// Largest `POST /mcp` body: one `commit` at the caps fits (spec §8.1).
+pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// How the MCP layer runs deploys. Production wraps the real pipeline;
+/// tests substitute a fake that writes terminal deploy rows without
+/// touching celld or the network.
+#[derive(Clone)]
+pub struct Deploys {
+    inner: Arc<DeploysInner>,
+}
+
+enum DeploysInner {
+    Live(Deployer),
+    Fake(FakeDeploys),
+}
+
+impl Deploys {
+    /// Run real deploys through the pipeline.
+    pub fn live(deployer: Deployer) -> Self {
+        Self {
+            inner: Arc::new(DeploysInner::Live(deployer)),
+        }
+    }
+
+    /// A fake that answers every deploy with `outcome`, for tests.
+    pub fn fake(outcome: FakeOutcome) -> Self {
+        Self {
+            inner: Arc::new(DeploysInner::Fake(FakeDeploys {
+                outcome: std::sync::Mutex::new(outcome),
+            })),
+        }
+    }
+
+    /// Change what the fake answers (tests drive blocked/failed paths).
+    pub fn set_fake(&self, outcome: FakeOutcome) {
+        if let DeploysInner::Fake(fake) = &*self.inner {
+            *fake.outcome.lock().expect("fake outcome poisoned") = outcome;
+        }
+    }
+
+    pub async fn deploy(
+        &self,
+        pool: &SqlitePool,
+        git: &GitConfig,
+        app: &App,
+        sha: &str,
+    ) -> anyhow::Result<DeployOutcome> {
+        match &*self.inner {
+            DeploysInner::Live(deployer) => deployer.deploy(pool, git, app, sha).await,
+            DeploysInner::Fake(fake) => fake.deploy(pool, app, sha).await,
+        }
+    }
+}
+/// What the fake deploy answers with.
+#[derive(Debug, Clone)]
+pub struct FakeOutcome {
+    pub status: &'static str,
+    pub failed_step: Option<&'static str>,
+    pub error: Option<&'static str>,
+    pub reason: Option<&'static str>,
+    pub findings: Vec<crate::moderation::gate::Finding>,
+    pub user_message: Option<&'static str>,
+    /// Answer only after this long (timeout-path tests).
+    pub delay: Duration,
+}
+
+impl FakeOutcome {
+    pub fn success() -> Self {
+        Self {
+            status: "success",
+            failed_step: None,
+            error: None,
+            reason: None,
+            findings: Vec::new(),
+            user_message: None,
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// A successful deploy that answers only after 30 s: longer than any
+    /// test `tool_wait`, so awaited calls take the in-progress path.
+    pub fn slow() -> Self {
+        Self {
+            delay: Duration::from_secs(30),
+            ..Self::success()
+        }
+    }
+
+    pub fn failed() -> Self {
+        Self {
+            status: "failed",
+            failed_step: Some("build"),
+            error: Some("bun run build failed"),
+            reason: None,
+            findings: Vec::new(),
+            user_message: None,
+            delay: Duration::ZERO,
+        }
+    }
+
+    pub fn blocked() -> Self {
+        Self {
+            status: "blocked",
+            failed_step: Some("gate"),
+            error: Some("profanity"),
+            reason: Some("profanity"),
+            findings: vec![crate::moderation::gate::Finding {
+                path: "pages/index.tsx".to_string(),
+                line: 42,
+                excerpt: "this list is f*** awesome".to_string(),
+                category: "profanity",
+                signal: "wordlist",
+            }],
+            user_message: Some(
+                "Outer didn't publish this change because the page text has strong profanity (pages/index.tsx, line 42). Your app still shows the previous version.",
+            ),
+            delay: Duration::ZERO,
+        }
+    }
+}
+
+struct FakeDeploys {
+    outcome: std::sync::Mutex<FakeOutcome>,
+}
+
+impl FakeDeploys {
+    async fn deploy(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        sha: &str,
+    ) -> anyhow::Result<DeployOutcome> {
+        let outcome = self.outcome.lock().expect("fake outcome poisoned").clone();
+        if !outcome.delay.is_zero() {
+            tokio::time::sleep(outcome.delay).await;
+        }
+        let deploy_id = uuid::Uuid::new_v4().to_string();
+        let now = crate::apps::now_ms();
+        let steps_json = r#"[{"name":"fake","ms":1,"skipped":false}]"#;
+        let findings_json = serde_json::to_string(&outcome.findings)?;
+        sqlx::query(
+            "INSERT INTO deploy (id, app_id, sha, status, steps, error, findings, log_tail, created_at, finished_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'fake deploy ok', ?8, ?8)",
+        )
+        .bind(&deploy_id)
+        .bind(&app.id)
+        .bind(sha)
+        .bind(outcome.status)
+        .bind(steps_json)
+        .bind(outcome.error)
+        .bind(if outcome.findings.is_empty() { None } else { Some(findings_json) })
+        .bind(now)
+        .execute(pool)
+        .await?;
+        if outcome.status == "success" {
+            crate::apps::set_last_deploy(pool, &app.id, sha).await?;
+        }
+        Ok(DeployOutcome {
+            deploy_id,
+            sha: sha.to_string(),
+            status: outcome.status,
+            failed_step: outcome.failed_step.map(str::to_string),
+            error: outcome.error.map(str::to_string),
+            reason: outcome.reason.map(str::to_string),
+            findings: outcome.findings,
+            user_message: outcome.user_message.map(str::to_string),
+            steps: vec![crate::deploy::Step {
+                name: "fake".to_string(),
+                ms: 1,
+                skipped: false,
+            }],
+            log_tail: "fake deploy ok".to_string(),
+            version: None,
+        })
+    }
+}
+
+/// Everything one MCP call touches. Built once in `main.rs` from config;
+/// no globals.
+#[derive(Clone)]
+pub struct McpState {
+    pub pool: SqlitePool,
+    pub auth: AuthState,
+    pub store: Store,
+    pub git: GitConfig,
+    pub sync: GitSync,
+    pub deploys: Deploys,
+    pub fleets: FleetManager,
+    pub alloc: Allocation,
+    /// Noreply identities are `<account-id>@users.noreply.<domain>`.
+    pub domain: String,
+    /// Apps live at `<slug>.<apps_domain>`.
+    pub apps_domain: String,
+    /// `http` on localhost dev, `https` behind Cloudflare.
+    pub app_scheme: String,
+    /// `:port` when the listener is off the scheme's default port, else "".
+    pub app_port_suffix: String,
+    /// Awaited calls return the in-progress status after this long (§10.3).
+    pub tool_wait: Duration,
+}
+
+impl McpState {
+    /// `https://<slug>.outer.now`, or the localhost equivalent in dev.
+    pub fn app_url(&self, slug: &str) -> String {
+        format!(
+            "{}://{}.{}{}",
+            self.app_scheme, slug, self.apps_domain, self.app_port_suffix
+        )
+    }
+
+    /// The absolute MCP endpoint clients connect to.
+    pub fn mcp_url(&self) -> String {
+        self.auth.config.resource.clone()
+    }
+}
+
+/// `Authorization: Bearer <token>`, or `None` when the request carries none.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+async fn resolve_caller(state: &McpState, headers: &HeaderMap) -> Option<Principal> {
+    let token = bearer_token(headers)?;
+    crate::auth::resolve_bearer(&state.pool, &state.auth.config, token)
+        .await
+        .unwrap_or(None)
+}
+
+fn rpc_error(id: Option<Value>, code: i64, message: impl Into<String>) -> Response {
+    let id = id.unwrap_or(Value::Null);
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message.into()},
+        })),
+    )
+        .into_response()
+}
+fn rpc_result(id: Value, result: Value) -> Response {
+    (
+        StatusCode::OK,
+        axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result})),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+impl McpState {
+    /// A live state for tests: memory store, temp dirs, fake deploys, no
+    /// network. The data dir is leaked so mirrors survive the whole test.
+    pub fn for_tests(pool: SqlitePool, auth: AuthState) -> Self {
+        let dir = tempfile::tempdir().expect("mcp test dir");
+        let data_dir = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let fleets = FleetManager::new(crate::fleet::manager::ManagerSettings {
+            data_dir: data_dir.clone(),
+            celld_bin: "celld".to_string(),
+            storage: crate::fleet::manager::FleetStorage {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "outer-mcp-test".to_string(),
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: "outeraccess".to_string(),
+                    secret_access_key: "outersecretoutersecretoutersecret12".to_string(),
+                },
+            },
+            cgroups: None,
+            memory_max_bytes: 512 * 1024 * 1024,
+            cpu_max: "50000 100000".to_string(),
+            sleep_after: Duration::from_secs(1800),
+            credential_refresh_after: Duration::from_secs(6 * 86400),
+            wake_timeout: Duration::from_secs(30),
+            wake_concurrency: 4,
+        });
+        Self {
+            pool,
+            auth,
+            store: Store::memory(),
+            git: GitConfig {
+                repos_dir: data_dir.join("git"),
+            },
+            sync: GitSync::default(),
+            deploys: Deploys::fake(FakeOutcome::success()),
+            fleets,
+            alloc: Allocation {
+                uid_range: (210000, 210003),
+                port_range: (18000, 18003),
+            },
+            domain: "outer.localhost".to_string(),
+            apps_domain: "outer.localhost".to_string(),
+            app_scheme: "http".to_string(),
+            app_port_suffix: String::new(),
+            tool_wait: Duration::from_millis(200),
+        }
+    }
+}
+
+/// `POST /mcp`: one JSON-RPC message in, one JSON response out. The whole
+/// request is taken so oversized bodies are refused before they load.
+pub async fn mcp_handler(
+    State(app): State<crate::http::AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let state = &app.mcp;
+    let (parts, body) = req.into_parts();
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body over the 32 MiB cap",
+            )
+                .into_response();
+        }
+    };
+    let headers = parts.headers;
+    let message: Value = match serde_json::from_slice(&body) {
+        Ok(message) => message,
+        Err(_) => return rpc_error(extract_id(&body), -32700, "Parse error"),
+    };
+    let Some(message) = message.as_object() else {
+        return rpc_error(None, -32600, "Invalid Request: expected an object");
+    };
+    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return rpc_error(
+            clone_id(message),
+            -32600,
+            "Invalid Request: jsonrpc must be \"2.0\"",
+        );
+    }
+    let id = clone_id(message);
+    let notification = id.is_none();
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        if notification {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        return rpc_error(id, -32600, "Invalid Request: missing method");
+    };
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+
+    match method {
+        "initialize" => {
+            let id = match id {
+                Some(id) => id,
+                None => return StatusCode::ACCEPTED.into_response(),
+            };
+            handle_initialize(state, &headers, id, &params).await
+        }
+        "ping" => {
+            let id = match id {
+                Some(id) => id,
+                None => return StatusCode::ACCEPTED.into_response(),
+            };
+            rpc_result(id, json!({}))
+        }
+        "tools/list" => {
+            let id = match id {
+                Some(id) => id,
+                None => return StatusCode::ACCEPTED.into_response(),
+            };
+            let caller = resolve_caller(state, &headers).await;
+            let tools: Vec<Value> = registry::visible_tools(caller.is_some())
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    })
+                })
+                .collect();
+            rpc_result(id, json!({"tools": tools}))
+        }
+        "tools/call" => {
+            let id = match id {
+                Some(id) => id,
+                None => return StatusCode::ACCEPTED.into_response(),
+            };
+            handle_call(state, &headers, peer, id, &params).await
+        }
+        _ if method.starts_with("notifications/") => StatusCode::ACCEPTED.into_response(),
+        _ => {
+            if notification {
+                return StatusCode::ACCEPTED.into_response();
+            }
+            rpc_error(id, -32601, format!("Method not found: {method}"))
+        }
+    }
+}
+
+/// The `id` of a body that failed to parse as JSON: best effort, else null.
+fn extract_id(body: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+}
+
+fn clone_id(message: &serde_json::Map<String, Value>) -> Option<Value> {
+    match message.get("id") {
+        None | Some(Value::Null) => None,
+        Some(id) => Some(id.clone()),
+    }
+}
+
+async fn handle_initialize(
+    state: &McpState,
+    headers: &HeaderMap,
+    id: Value,
+    params: &Value,
+) -> Response {
+    let requested = params.get("protocolVersion").and_then(Value::as_str);
+    let Some(requested) = requested else {
+        return rpc_error(
+            Some(id),
+            -32602,
+            "Invalid params: protocolVersion is required",
+        );
+    };
+    let negotiated = if PROTOCOL_VERSIONS.contains(&requested) {
+        requested.to_string()
+    } else {
+        LATEST_PROTOCOL.to_string()
+    };
+    // Record who is connecting, for the validation stats (spec §8.1).
+    if let Some(caller) = resolve_caller(state, headers).await {
+        if let (Some(name), Some(version)) = (
+            params
+                .get("clientInfo")
+                .and_then(|c| c.get("name"))
+                .and_then(Value::as_str),
+            params
+                .get("clientInfo")
+                .and_then(|c| c.get("version"))
+                .and_then(Value::as_str),
+        ) {
+            if !name.is_empty() {
+                let _ =
+                    crate::auth::record_client_info(&state.pool, &caller.credential, name, version)
+                        .await;
+            }
+        }
+    }
+    rpc_result(
+        id,
+        json!({
+            "protocolVersion": negotiated,
+            "capabilities": {"tools": {"listChanged": false}},
+            "serverInfo": {"name": "outer", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": INSTRUCTIONS,
+        }),
+    )
+}
+
+async fn handle_call(
+    state: &McpState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    id: Value,
+    params: &Value,
+) -> Response {
+    let name = params.get("name").and_then(Value::as_str);
+    let Some(name) = name else {
+        return rpc_error(Some(id), -32602, "Invalid params: name is required");
+    };
+    let Some(def) = registry::registry()
+        .iter()
+        .find(|t| t.name == name)
+        .cloned()
+    else {
+        return rpc_error(Some(id), -32602, format!("unknown tool {name:?}"));
+    };
+    let args = params.get("arguments").cloned();
+    // Lazy auth (spec §6.1): the gate lives in the HTTP handler, before the
+    // tool runs. Anonymous callers may still list account tools — only
+    // calling one without a token answers 401.
+    let caller = resolve_caller(state, headers).await;
+    if def.access != registry::Access::Public && caller.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                crate::auth::www_authenticate(&state.auth.config),
+            )],
+            "Sign in to Outer to use this tool",
+        )
+            .into_response();
+    }
+    let client_ip =
+        crate::http::client_ip::client_ip(headers, state.auth.config.origin_locked, peer);
+    let ctx = tools::Ctx {
+        state,
+        principal: caller,
+        client_ip,
+    };
+    match tools::dispatch(name, args, &ctx).await {
+        Ok(result) => rpc_result(id, result),
+        Err(tools::CallError::Rpc(code, message)) => rpc_error(Some(id), code, message),
+        Err(tools::CallError::Tool(err)) => rpc_result(id, err.into_result()),
+    }
+}
+
+/// `GET /llms.txt`: the Appendix A page, rendered from the registry.
+pub async fn llms_handler(State(app): State<crate::http::AppState>) -> Response {
+    let state = &app.mcp;
+    let page = llms::render(&state.mcp_url(), &state.apps_domain, &registry::registry());
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
+        page,
+    )
+        .into_response()
+}
