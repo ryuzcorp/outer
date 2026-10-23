@@ -3,7 +3,7 @@
 Outer is a personal software forge for AI agents. An agent talks MCP to Outer, Outer builds the user's Ilha + Void app and runs it on [celld](https://celld.dev), and serves it at `https://<slug>.outer.now`.
 
 - **Design record:** the maintainer's spec at `~/Developer/vault/outer/spec.md` (not in this repo). Read it before changing behavior, and say so when a change departs from it.
-- **Status:** prototype, milestone M0 (foundations).
+- **Status:** live at `outer.now` (M0 done); milestone M1 (owner alpha) in progress.
 
 ## Commands
 
@@ -36,4 +36,4 @@ CI (`.github/workflows/ci.yml`) runs exactly the first three. A PR is ready when
 - **Errors.** `anyhow` inside modules. Typed `thiserror` enums where a caller must branch (for example `git::commit::CommitError`).
 - **Style** (Noite's "ryu" dialect): `let … else` over `?` inside expressions, positional `format!` arguments, early returns.
 - **Tests.** Deterministic, no network, no root. Privileged paths (uid drop, real cgroupfs, nft) are `#[ignore]` with a reason. Test behavior a caller would notice, never wiring.
-- **Git.** One branch and one PR per item. Never push to `main`. The owner merges.
+- **Git.** One branch and one PR per item. Never push to `main`. The agent squash-merges its own PR once CI is green and review threads are handled (owner, 2026-10-23); an item is done only when it is on `main`.
