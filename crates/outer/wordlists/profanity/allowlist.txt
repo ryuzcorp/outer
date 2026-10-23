@@ -1,0 +1,26 @@
+# Allowlist: ordinary words containing a listed term as a substring
+# (the Scunthorpe problem). A match whose containing word is listed here
+# is dropped, in both whole-word and evasion matching. Normalized the
+# same way as text (lowercase, no diacritics), one per line.
+scunthorpe
+cockpit
+cockpits
+cocktail
+cocktails
+cockerel
+assassin
+assassins
+assassinate
+dickens
+pussyfoot
+pussycat
+bitchy
+passion
+class
+classic
+asset
+assets
+assistant
+cockatoo
+shuttlecock
+peacock

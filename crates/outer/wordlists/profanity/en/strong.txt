@@ -1,0 +1,30 @@
+# Strong tier: slurs, the f-word family, explicit sexual terms. Whole-word
+# matches block the deploy (spec §15.1). Lowercase, one term per line.
+# Launch seed (M1); tune from moderation_check rows.
+fuck
+fucked
+fucker
+fucking
+motherfucker
+shit
+shitty
+bullshit
+cunt
+nigger
+nigga
+faggot
+fag
+whore
+slut
+twat
+rape
+rapist
+cum
+blowjob
+handjob
+dildo
+porn
+masturbate
+masturbation
+orgy
+bestiality

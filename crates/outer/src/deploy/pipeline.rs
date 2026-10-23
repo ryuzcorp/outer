@@ -55,6 +55,10 @@ pub struct Step {
 }
 
 /// The deploy result returned to the caller (and mirrored into the row).
+/// `status` is `success`, `failed` or `blocked`. A blocked deploy carries
+/// `reason` (`profanity` | `too_large_to_review`), `findings` and a
+/// `user_message` written for the human; the CLI prints the whole outcome
+/// as JSON.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeployOutcome {
     pub deploy_id: String,
@@ -62,6 +66,12 @@ pub struct DeployOutcome {
     pub status: &'static str,
     pub failed_step: Option<String>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<crate::moderation::gate::Finding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_message: Option<String>,
     pub steps: Vec<Step>,
     pub log_tail: String,
     pub version: Option<String>,
@@ -117,10 +127,13 @@ impl Deployer {
         }
     }
 
-    /// Deploy `sha` of `app`: row `queued` → `building` → `deploying` →
-    /// `success`|`failed`. On success calls `apps::set_last_deploy` and
-    /// replaces the app's cron rows. Returns the outcome for both success
-    /// and step failure; only bookkeeping failures (the row itself) are `Err`.
+    /// Deploy `sha` of `app`: row `queued` → `building` → `reviewing` →
+    /// `deploying` → `success`|`failed`|`blocked`. A blocked deploy writes
+    /// `status = 'blocked'` with findings JSON, leaves `last_deploy_sha`
+    /// alone (the previous version keeps serving), and returns normally —
+    /// it is not an `Err`. On success calls `apps::set_last_deploy` and
+    /// replaces the app's cron rows. Returns the outcome for success, step
+    /// failure and blocks; only bookkeeping failures (the row itself) are `Err`.
     pub async fn deploy(
         &self,
         pool: &SqlitePool,
@@ -162,12 +175,35 @@ impl Deployer {
                     status: "success",
                     failed_step: None,
                     error: None,
+                    reason: None,
+                    findings: Vec::new(),
+                    user_message: None,
                     steps,
                     log_tail,
                     version,
                 })
             }
-            Err(failed) => {
+            Err(StepEnd::Blocked(blocked)) => {
+                // Nothing was uploaded and the fleet is untouched: the
+                // previous version keeps serving.
+                let log_tail = tail_cap(&log);
+                let steps_json = steps_json(&steps);
+                finish_blocked(pool, &deploy_id, &blocked, &steps_json, &log_tail).await?;
+                Ok(DeployOutcome {
+                    deploy_id,
+                    sha: sha.to_string(),
+                    status: "blocked",
+                    failed_step: Some("gate".to_string()),
+                    error: Some(blocked.reason.to_string()),
+                    reason: Some(blocked.reason.to_string()),
+                    findings: blocked.findings,
+                    user_message: Some(blocked.user_message),
+                    steps,
+                    log_tail,
+                    version: None,
+                })
+            }
+            Err(StepEnd::Failed(failed)) => {
                 if failed.step == "build" {
                     // A failed build may leave half-written output; drop it so
                     // the next deploy starts from a clean checkout.
@@ -185,6 +221,9 @@ impl Deployer {
                     status: "failed",
                     failed_step: Some(failed.step.to_string()),
                     error: Some(failed.error),
+                    reason: None,
+                    findings: Vec::new(),
+                    user_message: None,
                     steps,
                     log_tail,
                     version: None,
@@ -211,7 +250,9 @@ impl Deployer {
     }
 
     /// Rows run in order; the first failure stops the pipeline. `Ok` carries
-    /// the celld version and the validated cron schedules on success.
+    /// the celld version and the validated cron schedules on success. The
+    /// review runs before `deploy-root`, and before migrations, so a blocked
+    /// deploy never touches the app's data or uploads anything.
     async fn run_steps(
         &self,
         pool: &SqlitePool,
@@ -220,7 +261,7 @@ impl Deployer {
         app: &App,
         sha: &str,
         journal: &mut Journal,
-    ) -> Result<(Option<String>, Vec<String>), StepFailed> {
+    ) -> Result<(Option<String>, Vec<String>), StepEnd> {
         let Journal { steps, log } = journal;
         // 1. Worktree.
         let started = Instant::now();
@@ -231,7 +272,7 @@ impl Deployer {
             Err(e) => {
                 let ms = push_step(steps, log, "worktree", started, false, &format!("{e:#}"));
                 tracing::warn!(slug = %app.slug, sha, ms, error = %format!("{e:#}"), "deploy failed at worktree");
-                return Err(StepFailed::plain("worktree", &e));
+                return Err(StepEnd::Failed(StepFailed::plain("worktree", &e)));
             }
         }
 
@@ -246,7 +287,7 @@ impl Deployer {
             }
             Err(e) => {
                 push_step(steps, log, "install", started, false, &format!("{e:#}"));
-                return Err(StepFailed::sandboxed("install", &e));
+                return Err(StepEnd::Failed(StepFailed::sandboxed("install", &e)));
             }
         }
 
@@ -258,11 +299,32 @@ impl Deployer {
             }
             Err(e) => {
                 push_step(steps, log, "build", started, false, &format!("{e:#}"));
-                return Err(StepFailed::sandboxed("build", &e));
+                return Err(StepEnd::Failed(StepFailed::sandboxed("build", &e)));
             }
         }
 
-        // 4. Deploy root.
+        // 4. Review: the pre-live profanity gate (spec §15.1). A block
+        // stops the pipeline here: nothing is uploaded, the fleet is
+        // untouched, and the outcome returns normally as `blocked`.
+        set_deploy_status(pool, deploy_id, "reviewing")
+            .await
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("gate", &e)))?;
+        let started = Instant::now();
+        match self.review_gate(pool, app, deploy_id, sha).await {
+            Ok((None, out)) => {
+                push_step(steps, log, "gate", started, false, &out);
+            }
+            Ok((Some(blocked), out)) => {
+                push_step(steps, log, "gate", started, false, &out);
+                return Err(StepEnd::Blocked(blocked));
+            }
+            Err(e) => {
+                push_step(steps, log, "gate", started, false, &format!("{e:#}"));
+                return Err(StepEnd::Failed(StepFailed::plain("gate", &e)));
+            }
+        }
+
+        // 5. Deploy root.
         let started = Instant::now();
         let (root, crons) = match self.deploy_root(app) {
             Ok((root, crons, out)) => {
@@ -271,12 +333,14 @@ impl Deployer {
             }
             Err(e) => {
                 push_step(steps, log, "deploy-root", started, false, &format!("{e:#}"));
-                return Err(StepFailed::plain("deploy-root", &e));
+                return Err(StepEnd::Failed(StepFailed::plain("deploy-root", &e)));
             }
         };
 
-        // 5. `celld deploy`.
-        set_status_blocking(pool, deploy_id).await?;
+        // 6. `celld deploy`.
+        set_status_blocking(pool, deploy_id)
+            .await
+            .map_err(StepEnd::Failed)?;
         let started = Instant::now();
         match self.celld_deploy(app, deploy_id, &root).await {
             Ok((out, version)) => {
@@ -285,7 +349,7 @@ impl Deployer {
             }
             Err(e) => {
                 push_step(steps, log, "deploy", started, false, &format!("{e:#}"));
-                Err(StepFailed::sandboxed("deploy", &e))
+                Err(StepEnd::Failed(StepFailed::sandboxed("deploy", &e)))
             }
         }
     }
@@ -601,6 +665,93 @@ impl Deployer {
             BUILD_LEAF_MEMORY_MAX,
         )?))
     }
+
+    /// Step 4: the pre-live profanity gate over the built worktree.
+    /// Returns the block with a journal line, or `None` with a journal
+    /// line when the deploy passes. Jev is `None` in M1 (no API key):
+    /// the wordlists decide, fail closed.
+    async fn review_gate(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        deploy_id: &str,
+        sha: &str,
+    ) -> anyhow::Result<(Option<BlockedInfo>, String)> {
+        use crate::moderation::{extract, gate};
+        let work = self.work_dir(&app.slug);
+        let chunks = match extract::collect(&work, &app.slug, app.name.as_deref()) {
+            Ok(chunks) => chunks,
+            Err(too_large) => {
+                let outcome =
+                    gate::run_too_large(pool, &app.id, deploy_id, sha, &too_large).await?;
+                let gate::GateOutcome::Block {
+                    findings,
+                    user_message,
+                    ..
+                } = outcome
+                else {
+                    unreachable!("over-caps always blocks");
+                };
+                let line = format!(
+                    "gate: over caps ({} files, {} bytes) → blocked too_large_to_review",
+                    too_large.files, too_large.bytes
+                );
+                return Ok((
+                    Some(BlockedInfo {
+                        reason: "too_large_to_review",
+                        findings,
+                        user_message,
+                    }),
+                    line,
+                ));
+            }
+        };
+        let outcome = gate::run_gate(pool, &app.id, deploy_id, sha, chunks, None).await?;
+        match outcome {
+            gate::GateOutcome::Pass { stats } => Ok((
+                None,
+                format!(
+                    "gate: {} files, {} chunks ({} checked, {} cached) → pass",
+                    stats.files, stats.chunks, stats.checked, stats.skipped
+                ),
+            )),
+            gate::GateOutcome::Block {
+                reason,
+                findings,
+                user_message,
+                stats,
+            } => Ok((
+                Some(BlockedInfo {
+                    reason: match reason {
+                        gate::BlockReason::Profanity => "profanity",
+                        gate::BlockReason::TooLarge => "too_large_to_review",
+                    },
+                    findings,
+                    user_message,
+                }),
+                format!(
+                    "gate: {} files, {} chunks ({} checked, {} cached) → blocked",
+                    stats.files, stats.chunks, stats.checked, stats.skipped
+                ),
+            )),
+        }
+    }
+}
+
+/// How `run_steps` ends without a version: a step failure, or a gate
+/// block. Blocks are not failures: nothing was uploaded, the fleet is
+/// untouched, and the outcome returns normally as `blocked`.
+enum StepEnd {
+    Failed(StepFailed),
+    Blocked(BlockedInfo),
+}
+
+/// A gate block: the deploy row's `error` column carries `reason`, and
+/// `findings` go to the row as JSON.
+struct BlockedInfo {
+    reason: &'static str,
+    findings: Vec<crate::moderation::gate::Finding>,
+    user_message: String,
 }
 
 /// A step that failed: its name and the first meaningful output line.
@@ -983,6 +1134,32 @@ async fn finish_failed(
     Ok(())
 }
 
+/// A blocked deploy: `status = 'blocked'` with the findings JSON. The
+/// `moderation_check` row (stage `gate`) was already written by the gate
+/// itself; `last_deploy_sha` is untouched so the previous version serves.
+async fn finish_blocked(
+    pool: &SqlitePool,
+    deploy_id: &str,
+    blocked: &BlockedInfo,
+    steps_json: &str,
+    log_tail: &str,
+) -> anyhow::Result<()> {
+    let findings_json =
+        serde_json::to_string(&blocked.findings).unwrap_or_else(|_| "[]".to_string());
+    sqlx::query(
+        "UPDATE deploy SET status = 'blocked', error = ?, findings = ?, steps = ?, log_tail = ?, finished_at = ? WHERE id = ?",
+    )
+    .bind(blocked.reason)
+    .bind(findings_json)
+    .bind(steps_json)
+    .bind(log_tail)
+    .bind(apps::now_ms())
+    .bind(deploy_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,13 +1508,17 @@ mod tests {
             outcome.error
         );
         let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["worktree", "install", "build", "deploy-root"]);
+        assert_eq!(
+            names,
+            ["worktree", "install", "build", "gate", "deploy-root"]
+        );
         assert!(!outcome.steps[0].skipped, "worktree always runs");
         assert!(
             outcome.steps[1..3].iter().all(|s| s.skipped),
             "no package.json skips install and build: {:?}",
             outcome.steps
         );
+        assert!(!outcome.steps[3].skipped, "the gate always runs");
 
         let row: (String, Option<String>, Option<String>, Option<String>) =
             sqlx::query_as("SELECT status, error, steps, log_tail FROM deploy WHERE app_id = ?")
@@ -1349,7 +1530,7 @@ mod tests {
         assert!(row.1.as_deref().unwrap_or("").contains("wrangler"));
         let steps: Vec<serde_json::Value> =
             serde_json::from_str(row.2.as_deref().unwrap_or("[]")).unwrap();
-        assert_eq!(steps.len(), 4, "the failed step is the last steps entry");
+        assert_eq!(steps.len(), 5, "the failed step is the last steps entry");
         assert!(row.3.unwrap_or_default().contains("deploy-root"));
 
         let (last_sha,): (Option<String>,) =
@@ -1361,6 +1542,129 @@ mod tests {
         assert_eq!(
             last_sha, None,
             "a failed deploy never touches last_deploy_sha"
+        );
+
+        let check: (String, String) =
+            sqlx::query_as("SELECT stage, verdict FROM moderation_check WHERE app_id = ?")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(check, ("gate".to_string(), "pass".to_string()));
+    }
+    #[tokio::test]
+    async fn blocked_deploy_never_reaches_the_deploy_step() {
+        // A profane JSX line with a valid deploy-root config behind it.
+        // Install and build are no-op `true`; `celld` is missing, so a
+        // pass-through would fail at `deploy`: `blocked` proves the gate
+        // stopped the pipeline, with nothing uploaded.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig {
+            repos_dir: dir.path().join("git"),
+        };
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "profane".to_string(),
+                base: None,
+                writes: vec![
+                    write(
+                        "package.json",
+                        r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
+                    ),
+                    write(
+                        "pages/index.tsx",
+                        "export default () => <h1>this list is fuck awesome</h1>;",
+                    ),
+                    write(
+                        "dist/wrangler.json",
+                        r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                    ),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10010);
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = test_settings(data.path().to_path_buf());
+        settings.bun_bin = "/bin/true".to_string();
+        settings.celld_bin = "/nonexistent/celld-binary".to_string();
+        let deployer = Deployer::new(settings, 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "blocked");
+        assert_eq!(outcome.failed_step.as_deref(), Some("gate"));
+        assert_eq!(outcome.reason.as_deref(), Some("profanity"));
+        assert_eq!(outcome.findings.len(), 1);
+        assert_eq!(outcome.findings[0].path, "pages/index.tsx");
+        assert_eq!(outcome.findings[0].line, 1);
+        assert_eq!(outcome.findings[0].excerpt, "this list is f*** awesome");
+        let message = outcome.user_message.as_deref().unwrap_or("");
+        assert!(
+            message.contains("pages/index.tsx, line 1"),
+            "agent-facing line names path and line: {message}"
+        );
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["worktree", "install", "build", "gate"]);
+
+        let row: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error, findings FROM deploy WHERE app_id = ?")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "blocked");
+        assert_eq!(row.1.as_deref(), Some("profanity"));
+        assert!(
+            row.2.as_deref().unwrap_or("").contains("pages/index.tsx"),
+            "findings JSON is in the row"
+        );
+        let check: (String, String, String) = sqlx::query_as(
+            "SELECT stage, verdict, findings FROM moderation_check WHERE app_id = ?",
+        )
+        .bind(&app.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(check.0, "gate");
+        assert_eq!(check.1, "blocked");
+        assert!(check.2.contains("pages/index.tsx"));
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            last_sha, None,
+            "a blocked deploy never touches last_deploy_sha: the previous version serves"
         );
     }
 

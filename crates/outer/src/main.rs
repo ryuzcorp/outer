@@ -291,7 +291,7 @@ async fn app_create(config: Config, slug: String, rest: Vec<&str>) -> anyhow::Re
     let (app, outcome) = ops::create_app(&p, owner, &slug, flag(&flags, "--name")).await?;
     let reloaded = outcome.status == "success" && ops::reload_if_awake(&app).await;
     print_outcome(&config, &app, &outcome, reloaded)?;
-    anyhow::ensure!(outcome.status == "success", "deploy failed");
+    end_outcome(&outcome)?;
     Ok(())
 }
 
@@ -303,8 +303,18 @@ async fn app_deploy(config: Config, slug: String) -> anyhow::Result<()> {
         .expect("deployed app exists");
     let reloaded = outcome.status == "success" && ops::reload_if_awake(&app).await;
     print_outcome(&config, &app, &outcome, reloaded)?;
-    anyhow::ensure!(outcome.status == "success", "deploy failed");
+    end_outcome(&outcome)?;
     Ok(())
+}
+
+/// The CLI prints the whole outcome as JSON first; the exit status then
+/// distinguishes a gate block (nothing reached the fleet) from a failure.
+fn end_outcome(outcome: &outer::deploy::DeployOutcome) -> anyhow::Result<()> {
+    match outcome.status {
+        "success" => Ok(()),
+        "blocked" => anyhow::bail!("deploy blocked"),
+        _ => anyhow::bail!("deploy failed"),
+    }
 }
 
 fn print_outcome(
