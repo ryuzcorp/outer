@@ -180,6 +180,7 @@ fn fleet_storage(config: &Config) -> anyhow::Result<FleetStorage> {
             jurisdiction: r2_jurisdiction(&r2.endpoint),
             parent_access_key_id: r2.access_key_id.clone(),
             ttl: cf.credential_ttl,
+            refresh_after: cf.credential_refresh_after,
         })?)),
         None => {
             anyhow::ensure!(
