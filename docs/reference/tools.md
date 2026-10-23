@@ -158,6 +158,18 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
 
+## `delete_app`
+
+- **Access:** signed in
+- **Description:** Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. Pass confirm equal to the slug. The name stays reserved for 30 days.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `confirm` | string | yes | Type the slug again to confirm: must equal `app` exactly. |
+
 ## `list_files`
 
 - **Access:** signed in
