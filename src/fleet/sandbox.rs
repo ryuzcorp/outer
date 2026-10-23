@@ -605,34 +605,38 @@ mod tests {
 
     /// A step running in its own leaf is capped by the leaf's `pids.max`,
     /// not by the uid-wide RLIMIT_NPROC (which also counts the fleet's
-    /// tasks sharing the app uid): `ulimit -u` must not read 512.
+    /// tasks sharing the app uid): the step's "Max processes" must not be
+    /// 512. Only root drops to an app uid, which is when the cap applies.
     #[tokio::test]
+    #[ignore = "needs root: RLIMIT_NPROC is only set when dropping to an app uid"]
     async fn build_step_with_a_leaf_keeps_the_system_nproc() {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
         let leaf = dir.path().join("leaf");
         std::fs::create_dir_all(&leaf).unwrap();
-        let euid = unsafe { libc::geteuid() };
         let sb = Sandbox {
-            uid: Some(euid),
-            gid: Some(euid),
+            uid: Some(200_000),
+            gid: Some(200_000),
             env: &[],
             cache_root: &cache,
             cgroup_leaf: Some(&leaf),
         };
         let out = run_sandboxed(
-            "sh",
-            &["-c", "ulimit -u"],
+            "cat",
+            &["/proc/self/limits"],
             dir.path(),
             &sb,
             Duration::from_secs(10),
         )
         .await
         .unwrap();
-        assert_ne!(
-            out.trim(),
-            "512",
-            "leaf step must not carry the uid-wide 512 cap"
+        let max_processes = out
+            .lines()
+            .find(|line| line.starts_with("Max processes"))
+            .expect("limits list Max processes");
+        assert!(
+            !max_processes.split_whitespace().any(|field| field == "512"),
+            "leaf step must not carry the uid-wide 512 cap: {max_processes}"
         );
     }
 
