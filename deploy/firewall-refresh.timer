@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Cloudflare IP sets in the outer firewall weekly
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

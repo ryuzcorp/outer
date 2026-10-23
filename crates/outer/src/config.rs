@@ -45,8 +45,14 @@ pub struct Config {
     pub domain: String,
     /// SQLite, git mirrors, worktrees and caches (`OUTER_DATA`).
     pub data_dir: PathBuf,
-    /// Plain-HTTP listener (`OUTER_HTTP_LISTEN`).
-    pub http_listen: SocketAddr,
+    /// Listener (`OUTER_LISTEN`); TLS when the TLS triple below is set.
+    pub listen: SocketAddr,
+    /// Origin-cert PEM chain (`OUTER_TLS_CERT`); all three TLS paths set or none.
+    pub tls_cert: Option<PathBuf>,
+    /// Origin-cert private key PEM (`OUTER_TLS_KEY`).
+    pub tls_key: Option<PathBuf>,
+    /// Origin-pull client-CA PEM (`OUTER_ORIGIN_PULL_CA`).
+    pub origin_pull_ca: Option<PathBuf>,
     /// This host's identity for the snapshot owner fence (`OUTER_HOST_ID`).
     pub host_id: String,
     /// `OUTER_STORE=r2|memory` plus the R2 variables.
@@ -98,18 +104,22 @@ impl Config {
             .unwrap_or(DEFAULT_DOMAIN)
             .to_ascii_lowercase();
         let data_dir = PathBuf::from(get("OUTER_DATA").unwrap_or("./data"));
-        let http_listen = match get("OUTER_HTTP_LISTEN").unwrap_or(DEFAULT_LISTEN).parse() {
+        let listen = match get("OUTER_LISTEN").unwrap_or(DEFAULT_LISTEN).parse() {
             Ok(addr) => addr,
             Err(_) => {
                 problems.push(format!(
-                    "OUTER_HTTP_LISTEN={:?} is not a socket address (expected host:port, e.g. {DEFAULT_LISTEN})",
-                    get("OUTER_HTTP_LISTEN").unwrap_or_default()
+                    "OUTER_LISTEN={:?} is not a socket address (expected host:port, e.g. {DEFAULT_LISTEN})",
+                    get("OUTER_LISTEN").unwrap_or_default()
                 ));
                 DEFAULT_LISTEN
                     .parse()
                     .expect("default listen address parses")
             }
         };
+        let opt_path = |name: &str| get(name).map(PathBuf::from);
+        let tls_cert = opt_path("OUTER_TLS_CERT");
+        let tls_key = opt_path("OUTER_TLS_KEY");
+        let origin_pull_ca = opt_path("OUTER_ORIGIN_PULL_CA");
         let host_id = get("OUTER_HOST_ID")
             .map(str::to_string)
             .or_else(|| {
@@ -209,7 +219,10 @@ impl Config {
         let config = Config {
             domain,
             data_dir,
-            http_listen,
+            listen,
+            tls_cert,
+            tls_key,
+            origin_pull_ca,
             host_id,
             store,
             log_filter,
@@ -228,6 +241,29 @@ impl Config {
         let mut problems = Vec::new();
         if !is_hostname(&self.domain) {
             problems.push(format!("OUTER_DOMAIN={:?} is not a hostname", self.domain));
+        }
+        let tls = [
+            ("OUTER_TLS_CERT", &self.tls_cert),
+            ("OUTER_TLS_KEY", &self.tls_key),
+            ("OUTER_ORIGIN_PULL_CA", &self.origin_pull_ca),
+        ];
+        let tls_set = tls.iter().filter(|(_, p)| p.is_some()).count();
+        if tls_set > 0 && tls_set < 3 {
+            let missing = tls
+                .iter()
+                .filter(|(_, p)| p.is_none())
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            problems.push(format!(
+                "partial TLS config: OUTER_TLS_CERT, OUTER_TLS_KEY and OUTER_ORIGIN_PULL_CA must all be set or all be empty (missing {missing})"
+            ));
+        }
+        if !self.is_local() && tls_set < 3 {
+            problems.push(format!(
+                "OUTER_TLS_CERT, OUTER_TLS_KEY and OUTER_ORIGIN_PULL_CA are required when OUTER_DOMAIN={} is not a localhost dev domain",
+                self.domain
+            ));
         }
         if self.store == StoreKind::Memory && !self.is_local() {
             problems.push(format!(
@@ -273,6 +309,11 @@ impl Config {
     /// The `localhost` family: dev-only settings are allowed here and nowhere else.
     pub fn is_local(&self) -> bool {
         self.domain == "localhost" || self.domain.ends_with(".localhost")
+    }
+
+    /// TLS terminates locally with an origin-pull client-CA: the full triple is set.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some() && self.origin_pull_ca.is_some()
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -401,7 +442,8 @@ mod tests {
         let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
         assert_eq!(cfg.domain, "outer.localhost");
         assert_eq!(cfg.store, StoreKind::Memory);
-        assert_eq!(cfg.http_listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(cfg.listen, "127.0.0.1:8080".parse().unwrap());
+        assert!(!cfg.tls_enabled());
         assert_eq!(cfg.db_path(), PathBuf::from("./data/outer.sqlite"));
     }
 
@@ -410,6 +452,9 @@ mod tests {
         let err = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
             ("OUTER_STORE", "memory"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
         ]))
         .unwrap_err();
         assert!(
@@ -420,7 +465,13 @@ mod tests {
 
     #[test]
     fn r2_reports_every_missing_variable_at_once() {
-        let err = Config::from_vars(&vars(&[("OUTER_DOMAIN", "outer.now")])).unwrap_err();
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+        ]))
+        .unwrap_err();
         for name in [
             "OUTER_R2_ENDPOINT",
             "OUTER_R2_BUCKET",
@@ -445,6 +496,9 @@ mod tests {
             ("OUTER_R2_BUCKET", "outer"),
             ("R2_ACCESS_KEY_ID", "key"),
             ("R2_SECRET_ACCESS_KEY", "s3cret"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
         ]))
         .unwrap();
         let StoreKind::R2(r2) = &cfg.store else {
@@ -459,13 +513,10 @@ mod tests {
         let err = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
             ("OUTER_DOMAIN", "Not A Host"),
-            ("OUTER_HTTP_LISTEN", "eighty"),
+            ("OUTER_LISTEN", "eighty"),
         ]))
         .unwrap_err();
-        assert!(
-            err.iter().any(|p| p.starts_with("OUTER_HTTP_LISTEN")),
-            "{err:?}"
-        );
+        assert!(err.iter().any(|p| p.starts_with("OUTER_LISTEN")), "{err:?}");
         assert!(err.iter().any(|p| p.starts_with("OUTER_DOMAIN")), "{err:?}");
     }
 
@@ -539,5 +590,63 @@ mod tests {
         // (and check-config) never depends on installed tools.
         assert_eq!(cfg.runtime.celld_bin, "celld");
         assert_eq!(cfg.runtime.esbuild_bin.as_deref(), Some("/opt/esbuild"));
+    }
+
+    #[test]
+    fn partial_tls_triple_is_rejected() {
+        for missing in ["OUTER_TLS_CERT", "OUTER_TLS_KEY", "OUTER_ORIGIN_PULL_CA"] {
+            let mut pairs = vec![
+                ("OUTER_STORE", "memory"),
+                ("OUTER_TLS_CERT", "/tls/cert.pem"),
+                ("OUTER_TLS_KEY", "/tls/key.pem"),
+                ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+            ];
+            pairs.retain(|(name, _)| *name != missing);
+            let err = Config::from_vars(&vars(&pairs)).unwrap_err();
+            assert!(
+                err.iter().any(|p| p.contains("partial TLS config")),
+                "missing partial-triple problem without {missing}: {err:?}"
+            );
+            assert!(
+                err.iter().any(|p| p.contains(missing)),
+                "missing variable name {missing} in {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_localhost_domain_requires_tls() {
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_STORE", "memory"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+        ]))
+        .unwrap_err();
+        assert!(
+            !err.iter().any(|p| p.contains("OUTER_TLS_CERT")),
+            "full triple on a non-localhost domain must not raise TLS problems: {err:?}"
+        );
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_STORE", "memory"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.contains("OUTER_TLS_CERT") && p.contains("outer.now")),
+            "non-localhost domain without TLS must be refused: {err:?}"
+        );
+    }
+
+    #[test]
+    fn localhost_without_tls_stays_valid() {
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "apps.localhost"),
+            ("OUTER_STORE", "memory"),
+        ]))
+        .unwrap();
+        assert!(!cfg.tls_enabled());
     }
 }

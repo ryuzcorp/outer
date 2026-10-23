@@ -24,6 +24,10 @@ pub struct ProxyState {
     pub pool: sqlx::SqlitePool,
     pub fleets: FleetManager,
     pub apps_domain: String,
+    /// Behind Cloudflare origin pull (TLS + required client cert): trust the
+    /// `CF-Connecting-IP` header Cloudflare attests and report `https`.
+    /// Otherwise the header is spoofable and the peer address is used.
+    pub origin_locked: bool,
     /// Upstream HTTP/1 client: idle pool entries recycled. Per state, never
     /// global, so tests cannot share connections or throttle entries.
     pub client: UpstreamClient,
@@ -35,7 +39,12 @@ pub struct ProxyState {
 impl ProxyState {
     /// Build the per-state upstream client and the per-state touch-throttle
     /// map alongside the state the integration owner already mounts.
-    pub fn new(pool: sqlx::SqlitePool, fleets: FleetManager, apps_domain: String) -> Self {
+    pub fn new(
+        pool: sqlx::SqlitePool,
+        fleets: FleetManager,
+        apps_domain: String,
+        origin_locked: bool,
+    ) -> Self {
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let client =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -45,6 +54,7 @@ impl ProxyState {
             pool,
             fleets,
             apps_domain,
+            origin_locked,
             client,
             last_touch_ms: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -136,6 +146,18 @@ fn is_forwarded_spoof(name: &HeaderName) -> bool {
         name.as_str(),
         "x-forwarded-for" | "x-forwarded-host" | "x-forwarded-proto" | "forwarded"
     )
+}
+
+/// The client IP Cloudflare attests in `CF-Connecting-IP`, when the header
+/// holds a single valid IP. Only trustworthy behind origin pull: otherwise
+/// the header is spoofable and callers must use the peer address instead.
+fn cf_connecting_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("cf-connecting-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty() && ip.parse::<std::net::IpAddr>().is_ok())
+        .map(str::to_string)
 }
 
 fn wants_upgrade(headers: &HeaderMap) -> bool {
@@ -246,7 +268,16 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip().to_string());
+    // Origin-locked (behind Cloudflare origin pull): the `CF-Connecting-IP`
+    // header Cloudflare attests is the client IP. Otherwise it is spoofable
+    // and the peer address is used; an invalid value falls back to the peer.
     let upgrade = wants_upgrade(req.headers());
+    let cf_ip = cf_connecting_ip(req.headers());
+    let client_ip = if state.origin_locked {
+        cf_ip.clone().or(peer.clone())
+    } else {
+        peer.clone()
+    };
     // Grabbed before the request is split: the future resolves once the
     // handshake completes, after the 101 goes back downstream.
     let server_upgrade = if upgrade {
@@ -275,6 +306,11 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         if is_forwarded_spoof(name) {
             continue;
         }
+        // Spoofable off origin pull, attested on it (re-added below only
+        // when valid): never forward what the client sent.
+        if name.as_str() == "cf-connecting-ip" {
+            continue;
+        }
         if (is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()))
             && !(upgrade
                 && (*name == axum::http::header::UPGRADE
@@ -285,13 +321,20 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         outbound = outbound.header(name, value);
     }
     // Fresh chain: client-supplied `x-forwarded-for` was dropped above, so
-    // the only value upstream sees is the real peer IP.
-    if let Some(peer) = peer {
-        outbound = outbound.header("x-forwarded-for", peer);
+    // upstream sees exactly one value: the attested client IP when
+    // origin-locked, else the real peer IP.
+    if let Some(ip) = client_ip {
+        outbound = outbound.header("x-forwarded-for", ip);
     }
-    outbound = outbound
-        .header("x-forwarded-host", raw_host)
-        .header("x-forwarded-proto", "http");
+    if state.origin_locked {
+        if let Some(cf) = cf_ip {
+            outbound = outbound.header("cf-connecting-ip", cf);
+        }
+    }
+    outbound = outbound.header("x-forwarded-host", raw_host).header(
+        "x-forwarded-proto",
+        if state.origin_locked { "https" } else { "http" },
+    );
     let outbound = match outbound.body(body) {
         Ok(req) => req,
         Err(_) => return text(StatusCode::BAD_GATEWAY, "app unavailable"),
@@ -490,6 +533,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         for host in [
             "shop.other.com",
@@ -525,6 +569,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let req = Request::builder()
             .method("POST")
@@ -561,6 +606,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let before = fleet.hits.load(Ordering::SeqCst);
         let req = Request::builder()
@@ -596,6 +642,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let req = Request::builder()
             .uri("/robots.txt")
@@ -618,6 +665,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let req = Request::builder()
             .uri("/")
@@ -660,6 +708,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let (before,): (Option<i64>,) =
             sqlx::query_as("SELECT last_request_at FROM app WHERE id = 'app-touch'")
@@ -691,6 +740,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let req = Request::builder()
             .uri("/")
@@ -735,6 +785,7 @@ mod tests {
                 wake_concurrency: 4,
             }),
             "outer.test".to_string(),
+            false,
         );
         let req = Request::builder()
             .uri("/")
@@ -770,6 +821,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let req = Request::builder()
             .uri("/nominated")
@@ -796,6 +848,7 @@ mod tests {
             fix.pool.clone(),
             manager(fix._dir.path()),
             "outer.test".to_string(),
+            false,
         );
         let mut req = Request::builder()
             .uri("/")
@@ -820,6 +873,95 @@ mod tests {
         assert!(
             got["headers"].get("forwarded").is_none(),
             "a client-sent forwarded header must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_locked_uses_cf_connecting_ip() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-cf", "cf", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            true,
+        );
+        let mut req = Request::builder()
+            .uri("/")
+            .header("host", "cf.outer.test")
+            .header("cf-connecting-ip", "203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("9.9.9.9:1234".parse::<SocketAddr>().unwrap()));
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got = echo(&body);
+        assert_eq!(got["headers"]["x-forwarded-for"], "203.0.113.7");
+        assert_eq!(got["headers"]["cf-connecting-ip"], "203.0.113.7");
+        assert_eq!(got["headers"]["x-forwarded-proto"], "https");
+    }
+
+    #[tokio::test]
+    async fn unlocked_strips_spoofable_cf_connecting_ip() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-plain", "plain", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+        );
+        let mut req = Request::builder()
+            .uri("/")
+            .header("host", "plain.outer.test")
+            .header("cf-connecting-ip", "203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("9.9.9.9:1234".parse::<SocketAddr>().unwrap()));
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got = echo(&body);
+        assert_eq!(
+            got["headers"]["x-forwarded-for"], "9.9.9.9",
+            "off origin pull the peer IP wins, never the spoofable header"
+        );
+        assert!(
+            got["headers"].get("cf-connecting-ip").is_none(),
+            "a client-sent cf-connecting-ip must not reach upstream when unlocked"
+        );
+        assert_eq!(got["headers"]["x-forwarded-proto"], "http");
+    }
+
+    #[tokio::test]
+    async fn invalid_cf_connecting_ip_falls_back_to_peer() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-badcf", "badcf", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            true,
+        );
+        let mut req = Request::builder()
+            .uri("/")
+            .header("host", "badcf.outer.test")
+            .header("cf-connecting-ip", "not-an-ip")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("9.9.9.9:1234".parse::<SocketAddr>().unwrap()));
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got = echo(&body);
+        assert_eq!(got["headers"]["x-forwarded-for"], "9.9.9.9");
+        assert!(
+            got["headers"].get("cf-connecting-ip").is_none(),
+            "an invalid cf-connecting-ip must not reach upstream"
         );
     }
 }

@@ -278,10 +278,11 @@ fn print_outcome(
     reloaded: bool,
 ) -> anyhow::Result<()> {
     let url = format!(
-        "http://{}.{}{}",
+        "{}://{}.{}{}",
+        scheme(config),
         app.slug,
         config.runtime.apps_domain,
-        port_suffix(config.http_listen)
+        port_suffix(config.listen, config.tls_enabled())
     );
     println!(
         "{}",
@@ -295,11 +296,20 @@ fn print_outcome(
     Ok(())
 }
 
-/// `:8080` unless the listener is on the default HTTP port.
-fn port_suffix(listen: SocketAddr) -> String {
-    match listen.port() {
-        80 => String::new(),
-        port => format!(":{port}"),
+/// `:8080` unless the listener is on the scheme's default port.
+fn port_suffix(listen: SocketAddr, tls: bool) -> String {
+    match (listen.port(), tls) {
+        (80, false) | (443, true) => String::new(),
+        (port, _) => format!(":{port}"),
+    }
+}
+
+/// `https` when TLS terminates locally, else `http`.
+fn scheme(config: &Config) -> &'static str {
+    if config.tls_enabled() {
+        "https"
+    } else {
+        "http"
     }
 }
 
@@ -338,7 +348,21 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let pool = db::open(&config.db_path()).await?;
     // Bind before claiming the bucket: a second instance that can't listen
     // must not take ownership away from the one that's serving.
-    let listener = tokio::net::TcpListener::bind(config.http_listen).await?;
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    // Read the TLS triple right after binding (still before the bucket
+    // claim): an unreadable cert must fail the boot, never the claim.
+    let tls_files = match (&config.tls_cert, &config.tls_key, &config.origin_pull_ca) {
+        (Some(cert), Some(key), Some(ca)) => Some(http::tls::TlsFiles {
+            cert: cert.clone(),
+            key: key.clone(),
+            ca: ca.clone(),
+        }),
+        _ => None,
+    };
+    let rustls_config = tls_files
+        .as_ref()
+        .map(http::tls::load_server_config)
+        .transpose()?;
     let sync = store::snapshot::StateSync::new(config.host_id.clone());
     sync.claim(&store, &snapshot_cfg).await?;
     store::snapshot::spawn_sync_task(
@@ -386,22 +410,46 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             pool: pool.clone(),
             sync: sync.clone(),
         },
-        http::proxy::ProxyState::new(pool.clone(), fleets.clone(), rt.apps_domain.clone()),
+        http::proxy::ProxyState::new(
+            pool.clone(),
+            fleets.clone(),
+            rt.apps_domain.clone(),
+            config.tls_enabled(),
+        ),
         config.domain.clone(),
     );
     tracing::info!(
-        "outer {} listening on http://{} (platform {}, apps *.{})",
+        "outer {} listening on {}://{} (platform {}, apps *.{})",
         env!("CARGO_PKG_VERSION"),
-        config.http_listen,
+        scheme(&config),
+        config.listen,
         config.domain,
         rt.apps_domain
     );
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    if let Some(rustls_config) = rustls_config {
+        // Origin pull (mTLS): axum-server owns the accept loop, so a failed
+        // handshake drops just that connection and never stops serving.
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(rustls_config));
+        let std_listener = listener.into_std()?;
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(None);
+        });
+        axum_server::tls_rustls::from_tcp_rustls(std_listener, rustls_config)?
+            .handle(handle)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
+    } else {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    }
 
     tracing::info!("shutting down: stopping fleets, then writing the final state snapshot");
     fleets.stop_all().await;

@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -30,11 +31,15 @@ reqwest = { version = "0.13", default-features = false, features = [
   "rustls",
   "stream",
 ] }
+rustls = { version = "0.23", default-features = false, features = [
+  "std",
+  "tls12",
+  "aws_lc_rs",
+] }
 rusty-s3 = "0.10.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-tempfile = "3"
 sqlx = { version = "0.9", features = [
   "runtime-tokio",
   "sqlite",
@@ -42,6 +47,7 @@ sqlx = { version = "0.9", features = [
   "uuid",
   "migrate",
 ] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
@@ -53,7 +59,4 @@ zstd = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-
-[profile.release]
-codegen-units = 1
-lto = "thin"
+rcgen = "0.14"

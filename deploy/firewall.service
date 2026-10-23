@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply the outer nftables firewall from the saved ruleset
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# A stale table (unclean shutdown) must not fail the boot apply.
+ExecStartPre=-/usr/sbin/nft delete table inet outer_fw
+ExecStart=/srv/outer/firewall.sh --apply-saved
+
+[Install]
+WantedBy=multi-user.target
