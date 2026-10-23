@@ -1,0 +1,16 @@
+# Mild tier: never blocks, and chunks with only mild hits are cached as
+# clear (the Jev question explicitly excludes these words).
+damn
+damned
+hell
+crap
+crappy
+bloody
+piss
+pissed
+fart
+darn
+suck
+sucks
+sucky
+poop

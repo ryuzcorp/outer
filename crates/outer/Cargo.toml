@@ -9,6 +9,7 @@ repository = "https://github.com/ryuzcorp/outer"
 publish = false
 
 [dependencies]
+aho-corasick = "1.1.5"
 anyhow = "1"
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
@@ -25,6 +26,11 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 libc = "0.2"
+oxc_allocator = "0.155"
+oxc_ast = "0.155"
+oxc_ast_visit = "0.155"
+oxc_parser = "0.155"
+oxc_span = "0.155"
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = [
@@ -55,6 +61,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1.26"
 uuid = { version = "1", features = ["serde", "v4"] }
 zstd = "0.14"
 
