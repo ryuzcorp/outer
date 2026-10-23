@@ -117,9 +117,23 @@ impl FleetManager {
         live.fleet.is_alive()
     }
 
+    /// True when a wake currently holds this slug's wake lock. Peek only:
+    /// never creates a map entry.
+    fn wake_in_progress(&self, slug: &str) -> bool {
+        match self.inner.wakes.try_lock() {
+            Ok(wakes) => match wakes.get(slug) {
+                Some(lock) => lock.try_lock().is_err(),
+                None => false,
+            },
+            // A lock holder is mutating the map; treat as busy.
+            Err(_) => true,
+        }
+    }
+
     /// The per-slug wake lock: concurrent `ensure_awake` calls for one app
     /// share a single start. Entries live as long as the manager; slugs are
-    /// bounded by the app table.
+    /// bounded by the app table. The sleep sweep takes the same lock, so a
+    /// wake and a sleep for one app never interleave.
     async fn wake_lock(&self, slug: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut wakes = self.inner.wakes.lock().await;
         wakes
@@ -178,10 +192,9 @@ impl FleetManager {
     /// share a single start; concurrent wakes across apps are bounded by
     /// `wake_concurrency`.
     pub async fn ensure_awake(&self, pool: &SqlitePool, app: &App) -> anyhow::Result<()> {
-        if Self::alive(&self.inner.fleets, &app.slug).await {
-            self.mark_wake_activity(pool, app).await?;
-            return Ok(());
-        }
+        // The wake lock comes first: the alive checks and the activity write
+        // below must not interleave with the sweep's evaluate-and-stop for
+        // this slug.
         let key = self.wake_lock(&app.slug).await;
         let _wake = key.lock().await;
         if Self::alive(&self.inner.fleets, &app.slug).await {
@@ -269,6 +282,21 @@ impl FleetManager {
         let slugs: Vec<String> = self.inner.fleets.lock().await.keys().cloned().collect();
         let mut slept = Vec::new();
         for slug in slugs {
+            // A wake holds this slug's wake lock from its first liveness
+            // check to its activity write. Skipping while it is held (and
+            // holding it across the evaluate-and-stop below) keeps a wake
+            // and a sleep for one app from interleaving, even when
+            // `sleep_after` is shorter than `wake_timeout`.
+            // Fast path; the guard held across the act below is the real
+            // guarantee (a wake starting after this peek still loses the
+            // try_lock race and the sweep skips it).
+            if self.wake_in_progress(&slug) {
+                continue;
+            }
+            let key = self.wake_lock(&slug).await;
+            let Ok(_wake) = key.try_lock() else {
+                continue;
+            };
             let app = match apps::get_by_slug(pool, &slug).await? {
                 Some(app) => app,
                 // The app row is gone: its fleet serves nothing, so stop it
@@ -412,6 +440,42 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn wake_in_progress_peeks_without_creating_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        let manager = FleetManager::new(ManagerSettings {
+            data_dir: dir.path().to_path_buf(),
+            celld_bin: "/nonexistent/celld".to_string(),
+            storage: FleetStorage {
+                endpoint: "https://example.com".to_string(),
+                region: "auto".to_string(),
+                bucket: "outer-dev".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+            },
+            cgroups: None,
+            memory_max_bytes: 0,
+            cpu_max: "50000 100000".to_string(),
+            sleep_after: Duration::from_secs(60),
+            wake_timeout: Duration::from_secs(2),
+            wake_concurrency: 4,
+        });
+        assert!(!manager.wake_in_progress("ghost"));
+        // Peeking must not create a map entry either.
+        assert!(!manager.wake_in_progress("ghost"));
+        let key = manager.wake_lock("busy").await;
+        assert!(!manager.wake_in_progress("busy"));
+        let _held = key.lock().await;
+        assert!(manager.wake_in_progress("busy"));
+        drop(_held);
+        assert!(!manager.wake_in_progress("busy"));
+        pool.close().await;
+    }
+
     /// A wake counts as activity: `ensure_awake` against an already-healthy
     /// port touches `last_request_at` without spawning celld. Uses a fake
     /// health endpoint, no fleet involved.
@@ -486,11 +550,59 @@ mod tests {
         assert!(app.asleep_since.is_none());
     }
 
-    /// Needs a real celld binary and an S3-compatible bucket (RustFS): starts
-    /// the fleet for an app row and waits for its health gate.
+    /// Needs a real celld binary and an S3-compatible bucket (RustFS, with
+    /// OUTER_TEST_S3_* set as in tests/store_live.rs): deploys a minimal
+    /// worker, then starts the fleet for an app row and waits for its health
+    /// gate.
     #[tokio::test]
     #[ignore = "needs celld + RustFS"]
     async fn wake_starts_a_real_fleet() {
+        fn test_env(name: &str, fallback: &str) -> String {
+            std::env::var(name).unwrap_or_else(|_| fallback.to_string())
+        }
+        let endpoint = test_env("OUTER_TEST_S3_ENDPOINT", "http://127.0.0.1:19000");
+        let bucket = test_env("OUTER_TEST_S3_BUCKET", "outer-dev");
+        let access_key = test_env("OUTER_TEST_S3_KEY", "outeraccess");
+        let secret_key = test_env("OUTER_TEST_S3_SECRET", "outersecretoutersecret12");
+        let celld = test_env("CELLD_BIN", "celld");
+        // A minimal worker so the fleet has something to serve.
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proj.path().join("index.js"),
+            "export default { fetch: () => new Response(\"real\") };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.path().join("wrangler.json"),
+            "{\"name\": \"real\", \"main\": \"index.js\", \"compatibility_date\": \"2026-09-01\"}",
+        )
+        .unwrap();
+        let deploy = tokio::process::Command::new(&celld)
+            .arg("deploy")
+            .arg(proj.path())
+            .arg("--bucket")
+            .arg(format!("s3://{bucket}/fleets/real"))
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .arg("--region")
+            .arg("us-east-1")
+            .env("AWS_ACCESS_KEY_ID", &access_key)
+            .env("AWS_SECRET_ACCESS_KEY", &secret_key)
+            .env("AWS_REGION", "us-east-1")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("S3_ENDPOINT", &endpoint)
+            .env(
+                "CELLD_ESBUILD",
+                test_env("CELLD_ESBUILD", "/usr/local/bin/esbuild"),
+            )
+            .output()
+            .await
+            .expect("celld deploy runs");
+        assert!(
+            deploy.status.success(),
+            "celld deploy failed: {}",
+            String::from_utf8_lossy(&deploy.stderr)
+        );
         let dir = tempfile::tempdir().unwrap();
         let pool = crate::db::open(&dir.path().join("outer.sqlite"))
             .await
@@ -508,13 +620,13 @@ mod tests {
         .unwrap();
         let manager = FleetManager::new(ManagerSettings {
             data_dir: dir.path().to_path_buf(),
-            celld_bin: "celld".to_string(),
+            celld_bin: test_env("CELLD_BIN", "celld"),
             storage: FleetStorage {
-                endpoint: "http://127.0.0.1:19000".to_string(),
+                endpoint,
                 region: "auto".to_string(),
-                bucket: "outer-dev".to_string(),
-                access_key_id: "outeraccess".to_string(),
-                secret_access_key: "outersecretoutersecret12".to_string(),
+                bucket,
+                access_key_id: access_key,
+                secret_access_key: secret_key,
                 session_token: None,
             },
             cgroups: None,
