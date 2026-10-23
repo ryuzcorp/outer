@@ -143,6 +143,8 @@ pub fn friendly_error(code: &str) -> &str {
         "closed_beta" => "Outer is in closed beta. You're on the waitlist.",
         "rate_limited" => "Too many attempts. Try again shortly.",
         "invalid_email" => "That doesn't look like an email address.",
+        "email_retry" => "Outer couldn't send the code. Try again shortly.",
+        "email_failed" => "Outer couldn't send the code to that address.",
         _ => "Something went wrong signing in. Start over from the app.",
     }
 }

@@ -297,7 +297,13 @@ pub async fn send_code(
     .execute(pool)
     .await
     .map_err(|err| AuthError::new("db", format!("code store failed: {err}")))?;
-    match cfg.email.send_code(&email, &code).await {
+    let sent = cfg.email.send_code(&email, &code).await;
+    if let Err(err) = &sent {
+        // The operator must see a broken sender; the address stays out of
+        // the log line (the error detail carries no secret either).
+        tracing::warn!(error = %err, "sign-in code email failed");
+    }
+    match sent {
         Ok(()) => Ok(EXPIRES_IN_S),
         Err(email::EmailError::Retryable(detail)) => Err(AuthError {
             code: "email_retry",
