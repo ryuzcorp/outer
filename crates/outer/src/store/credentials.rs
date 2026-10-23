@@ -275,6 +275,16 @@ impl R2TempMinter {
                 config.ttl.as_secs()
             );
         }
+        // Reuse and the refresh restart both key off `refresh_after`: it must
+        // land before Cloudflare expires the grant, or a cached credential
+        // could be handed out (or a fleet kept running) past its TTL.
+        if config.refresh_after.is_zero() || config.refresh_after >= config.ttl {
+            anyhow::bail!(
+                "R2TempConfig.refresh_after of {}s must be positive and below the {}s ttl",
+                config.refresh_after.as_secs(),
+                config.ttl.as_secs()
+            );
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
@@ -502,6 +512,33 @@ mod tests {
         assert!(R2TempMinter::new(config(Duration::from_secs(3600))).is_ok());
     }
 
+    #[test]
+    fn minter_rejects_a_refresh_at_or_past_the_ttl() {
+        let config = |ttl: u64, refresh_after: u64| R2TempConfig {
+            api_base: "https://api.cloudflare.com/client/v4".to_string(),
+            account_id: "acct".to_string(),
+            api_token: "token".to_string(),
+            bucket: "outer".to_string(),
+            jurisdiction: None,
+            parent_access_key_id: "parent".to_string(),
+            ttl: Duration::from_secs(ttl),
+            refresh_after: Duration::from_secs(refresh_after),
+        };
+        assert!(
+            R2TempMinter::new(config(3600, 6 * 86400)).is_err(),
+            "refresh past ttl"
+        );
+        assert!(
+            R2TempMinter::new(config(3600, 3600)).is_err(),
+            "refresh at ttl"
+        );
+        assert!(R2TempMinter::new(config(3600, 0)).is_err(), "zero refresh");
+        assert!(
+            R2TempMinter::new(config(7 * 86400, 6 * 86400)).is_ok(),
+            "production shape"
+        );
+    }
+
     /// What the fake Cloudflare API saw, how many mints it served, and how
     /// it should answer.
     #[derive(Default)]
@@ -627,7 +664,7 @@ mod tests {
             bucket: "outer".to_string(),
             jurisdiction: with_jurisdiction.then(|| "eu".to_string()),
             parent_access_key_id: "parent-key-id".to_string(),
-            ttl: Duration::from_secs(3600),
+            ttl: Duration::from_secs(7 * 86400),
             refresh_after,
         })
         .unwrap()
@@ -665,7 +702,7 @@ mod tests {
                 "bucket": "outer",
                 "parentAccessKeyId": "parent-key-id",
                 "permission": "object-read-write",
-                "ttlSeconds": 3600,
+                "ttlSeconds": 604800,
                 "prefixes": ["fleets/grocery/"],
             })
         );
