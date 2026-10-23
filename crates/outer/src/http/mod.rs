@@ -37,11 +37,8 @@ pub fn app(platform: AppState, apps: proxy::ProxyState, platform_host: String) -
         let apps = apps.clone();
         let platform_host = platform_host.clone();
         async move {
-            let host = req
-                .headers()
-                .get(axum::http::header::HOST)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase());
+            let host = proxy::request_host(&req)
+                .map(|h| h.split(':').next().unwrap_or(&h).to_ascii_lowercase());
             match host {
                 Some(host) if host != platform_host => proxy::handle(apps, req).await,
                 _ => {

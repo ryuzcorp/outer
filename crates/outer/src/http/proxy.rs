@@ -218,14 +218,20 @@ fn from_upstream(res: hyper::Response<hyper::body::Incoming>, is_unlisted: bool)
     out.body(Body::new(body)).unwrap()
 }
 
-/// Route `<slug>.<apps_domain>` to the app's fleet on loopback.
-pub async fn handle(state: ProxyState, mut req: Request) -> Response {
-    let Some(raw_host) = req
-        .headers()
+/// The host a request is for: the `Host` header (HTTP/1.1), else the URI
+/// authority, which is where HTTP/2 carries it (`:authority`, no `Host`
+/// header). Cloudflare speaks HTTP/2 to the origin.
+pub fn request_host(req: &Request) -> Option<String> {
+    req.headers()
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
-    else {
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()))
+}
+
+/// Route `<slug>.<apps_domain>` to the app's fleet on loopback.
+pub async fn handle(state: ProxyState, mut req: Request) -> Response {
+    let Some(raw_host) = request_host(&req) else {
         return text(StatusCode::NOT_FOUND, "no such app");
     };
     let Some(slug) = slug_for(strip_port(&raw_host), &state.apps_domain) else {
@@ -526,6 +532,27 @@ mod tests {
 
     fn echo(body: &str) -> serde_json::Value {
         serde_json::from_str(body).unwrap()
+    }
+
+    /// HTTP/2 (Cloudflare to the origin) has no `Host` header: the host
+    /// comes from the URI authority, both for app routing and the platform
+    /// split.
+    #[test]
+    fn http2_requests_take_the_host_from_the_authority() {
+        let h2 = Request::builder()
+            .version(axum::http::Version::HTTP_2)
+            .uri("https://shop.outer.test/items?page=2")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(request_host(&h2).as_deref(), Some("shop.outer.test"));
+        let h1 = Request::builder()
+            .uri("/items")
+            .header("host", "shop.outer.test:8443")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(request_host(&h1).as_deref(), Some("shop.outer.test:8443"));
+        let none = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert_eq!(request_host(&none), None);
     }
 
     #[tokio::test]
