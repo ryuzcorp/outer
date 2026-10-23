@@ -71,8 +71,16 @@ struct Inner {
     sleep_after: Duration,
     wake_timeout: Duration,
     wake_permits: tokio::sync::Semaphore,
-    fleets: tokio::sync::Mutex<HashMap<String /* slug */, RunningFleet>>,
+    fleets: tokio::sync::Mutex<HashMap<String /* slug */, LiveFleet>>,
     wakes: tokio::sync::Mutex<HashMap<String /* slug */, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// A tracked fleet and when this process started it. The sweep never sleeps
+/// a fleet younger than `sleep_after`: a just-woken fleet's activity row can
+/// still look stale while its first requests are in flight.
+struct LiveFleet {
+    fleet: RunningFleet,
+    started: std::time::Instant,
 }
 
 /// Running fleets, started on demand and slept when idle. Cheap to clone.
@@ -101,12 +109,12 @@ impl FleetManager {
         }
     }
 
-    async fn alive(fleets: &tokio::sync::Mutex<HashMap<String, RunningFleet>>, slug: &str) -> bool {
+    async fn alive(fleets: &tokio::sync::Mutex<HashMap<String, LiveFleet>>, slug: &str) -> bool {
         let mut fleets = fleets.lock().await;
-        let Some(fleet) = fleets.get_mut(slug) else {
+        let Some(live) = fleets.get_mut(slug) else {
             return false;
         };
-        fleet.is_alive()
+        live.fleet.is_alive()
     }
 
     /// The per-slug wake lock: concurrent `ensure_awake` calls for one app
@@ -171,11 +179,13 @@ impl FleetManager {
     /// `wake_concurrency`.
     pub async fn ensure_awake(&self, pool: &SqlitePool, app: &App) -> anyhow::Result<()> {
         if Self::alive(&self.inner.fleets, &app.slug).await {
+            self.mark_wake_activity(pool, app).await?;
             return Ok(());
         }
         let key = self.wake_lock(&app.slug).await;
         let _wake = key.lock().await;
         if Self::alive(&self.inner.fleets, &app.slug).await {
+            self.mark_wake_activity(pool, app).await?;
             return Ok(());
         }
         let _permit = self
@@ -190,19 +200,28 @@ impl FleetManager {
         // a healthy port means awake. `wait_healthy` tries once before its
         // first sleep, so a zero timeout is a single probe, not a skip.
         if health::wait_healthy("127.0.0.1", app.port, Duration::ZERO).await {
+            self.mark_wake_activity(pool, app).await?;
             apps::set_asleep(pool, &app.id, None).await?;
             return Ok(());
         }
         let (spec, opts) = self.spec_for(app)?;
         let fleet = supervisor::start(&spec, &opts).await?;
-        self.inner
-            .fleets
-            .lock()
-            .await
-            .insert(app.slug.clone(), fleet);
+        self.inner.fleets.lock().await.insert(
+            app.slug.clone(),
+            LiveFleet {
+                fleet,
+                started: std::time::Instant::now(),
+            },
+        );
         if !health::wait_healthy("127.0.0.1", app.port, self.inner.wake_timeout).await {
             let mut fleets = self.inner.fleets.lock().await;
-            let mut fleet = fleets.remove(&app.slug).expect("fleet just inserted");
+            // The sleep sweep may have removed it first (its activity row can
+            // still look stale while no request has completed): stopping
+            // nothing is still a failed wake, never a panic.
+            let Some(live) = fleets.remove(&app.slug) else {
+                anyhow::bail!("fleet {} never became healthy", app.slug);
+            };
+            let mut fleet = live.fleet;
             drop(fleets);
             let tail = fleet.logs.lock().await.tail(20);
             let mut detail = tail
@@ -219,20 +238,27 @@ impl FleetManager {
                 app.slug
             );
         }
+        self.mark_wake_activity(pool, app).await?;
         apps::set_asleep(pool, &app.id, None).await?;
         Ok(())
+    }
+
+    /// A successful wake counts as activity: without this, the next sweep
+    /// would sleep a fleet whose first requests are still in flight.
+    async fn mark_wake_activity(&self, pool: &SqlitePool, app: &App) -> anyhow::Result<()> {
+        apps::touch_request(pool, &app.id, apps::now_ms()).await
     }
 
     /// Reload a live fleet without a restart; a no-op while asleep.
     pub async fn reload(&self, app: &App) -> anyhow::Result<()> {
         let mut fleets = self.inner.fleets.lock().await;
-        let Some(fleet) = fleets.get_mut(&app.slug) else {
+        let Some(live) = fleets.get_mut(&app.slug) else {
             return Ok(());
         };
-        if !fleet.is_alive() {
+        if !live.fleet.is_alive() {
             return Ok(());
         }
-        fleet.reload().await
+        live.fleet.reload().await
     }
 
     /// Stop every fleet whose app has been quieter than `sleep_after`, drop
@@ -250,7 +276,8 @@ impl FleetManager {
                 None => {
                     tracing::warn!(slug = %slug, "app row gone; stopping its orphan fleet");
                     let mut fleets = self.inner.fleets.lock().await;
-                    if let Some(mut fleet) = fleets.remove(&slug) {
+                    if let Some(live) = fleets.remove(&slug) {
+                        let mut fleet = live.fleet;
                         drop(fleets);
                         fleet.stop(StopGrace::NORMAL).await;
                     }
@@ -258,10 +285,10 @@ impl FleetManager {
                 }
             };
             let mut fleets = self.inner.fleets.lock().await;
-            let Some(fleet) = fleets.get_mut(&slug) else {
+            let Some(live) = fleets.get_mut(&slug) else {
                 continue;
             };
-            if !fleet.is_alive() {
+            if !live.fleet.is_alive() {
                 fleets.remove(&slug);
                 continue;
             }
@@ -269,9 +296,13 @@ impl FleetManager {
                 app.last_request_at,
                 app.created_at,
                 now,
+                live.started.elapsed(),
                 self.inner.sleep_after,
             ) {
-                let mut fleet = fleets.remove(&slug).expect("fleet just checked");
+                let Some(live) = fleets.remove(&slug) else {
+                    continue;
+                };
+                let mut fleet = live.fleet;
                 drop(fleets);
                 fleet.stop(StopGrace::NORMAL).await;
                 apps::set_asleep(pool, &app.id, Some(now)).await?;
@@ -304,7 +335,7 @@ impl FleetManager {
             .lock()
             .await
             .drain()
-            .map(|(_, fleet)| fleet)
+            .map(|(_, live)| live.fleet)
             .collect();
         futures::future::join_all(fleets.into_iter().map(|mut fleet| async move {
             fleet.stop(StopGrace::NORMAL).await;
@@ -319,19 +350,25 @@ impl FleetManager {
             .try_lock()
             .ok()?
             .get(slug)
-            .map(|fleet| fleet.logs.clone())
+            .map(|live| live.fleet.logs.clone())
     }
 }
 
 /// Whether the fleet should sleep: its newest activity
-/// (`max(last_request_at, created_at)`) is strictly older than `sleep_after`.
-/// The strict bound keeps a fleet awake through its whole grace period.
+/// (`max(last_request_at, created_at)`) is strictly older than `sleep_after`,
+/// and the fleet itself is at least that old. The uptime guard keeps a
+/// just-started fleet alive while its first requests are still in flight,
+/// when the activity row can still look stale.
 pub fn should_sleep(
     last_request_at: Option<i64>,
     created_at: i64,
     now_ms: i64,
+    uptime: Duration,
     sleep_after: Duration,
 ) -> bool {
+    if uptime < sleep_after {
+        return false;
+    }
     let activity = last_request_at.unwrap_or(created_at).max(created_at);
     now_ms.saturating_sub(activity) as i128 > sleep_after.as_millis() as i128
 }
@@ -343,18 +380,110 @@ mod tests {
     #[test]
     fn sleep_decision_at_its_boundaries() {
         let after = Duration::from_secs(300);
+        let old = Duration::from_secs(301);
         // Fresh activity stays awake.
-        assert!(!should_sleep(Some(1_000), 0, 1_000, after));
+        assert!(!should_sleep(Some(1_000), 0, 1_000, old, after));
         // Missing requests fall back to creation time.
-        assert!(!should_sleep(None, 1_000, 1_000, after));
-        assert!(should_sleep(None, 0, 301_000, after));
+        assert!(!should_sleep(None, 1_000, 1_000, old, after));
+        assert!(should_sleep(None, 0, 301_000, old, after));
         // Exactly at the bound is still awake: strictly older sleeps.
-        assert!(!should_sleep(Some(0), 0, 300_000, after));
-        assert!(should_sleep(Some(0), 0, 300_001, after));
+        assert!(!should_sleep(Some(0), 0, 300_000, old, after));
+        assert!(should_sleep(Some(0), 0, 300_001, old, after));
         // The newest of request and creation wins either way.
-        assert!(!should_sleep(Some(500_000), 0, 500_000, after));
-        assert!(!should_sleep(Some(0), 500_000, 500_000, after));
-        assert!(should_sleep(Some(0), 500_000, 800_001, after));
+        assert!(!should_sleep(Some(500_000), 0, 500_000, old, after));
+        assert!(!should_sleep(Some(0), 500_000, 500_000, old, after));
+        assert!(should_sleep(Some(0), 500_000, 800_001, old, after));
+        // A young fleet stays awake even with stale activity: its first
+        // requests may still be in flight.
+        assert!(!should_sleep(Some(0), 0, 300_001, Duration::ZERO, after));
+        assert!(!should_sleep(
+            Some(0),
+            0,
+            300_001,
+            Duration::from_secs(299),
+            after
+        ));
+        assert!(should_sleep(
+            Some(0),
+            0,
+            300_001,
+            Duration::from_secs(300),
+            after
+        ));
+    }
+
+    /// A wake counts as activity: `ensure_awake` against an already-healthy
+    /// port touches `last_request_at` without spawning celld. Uses a fake
+    /// health endpoint, no fleet involved.
+    #[tokio::test]
+    async fn wake_marks_activity_without_spawning() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'w@example.com', 0, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A listener that answers 200 to anything: the manager's zero-timeout
+        // probe treats it as an outlived healthy fleet and never spawns.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, visibility, last_activity_at, created_at)              VALUES ('app-w', 'wake', 'a1', 220001, 0, 0, 'unlisted', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Point the app at the fake healthy port.
+        sqlx::query("UPDATE app SET port = ?1, internal_port = ?2 WHERE id = 'app-w'")
+            .bind(port as i64)
+            .bind(port as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = apps::now_ms();
+        let manager = FleetManager::new(ManagerSettings {
+            data_dir: dir.path().to_path_buf(),
+            celld_bin: "/nonexistent/celld".to_string(),
+            storage: FleetStorage {
+                endpoint: "https://example.com".to_string(),
+                region: "auto".to_string(),
+                bucket: "outer-dev".to_string(),
+                access_key_id: "key".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+            },
+            cgroups: None,
+            memory_max_bytes: 0,
+            cpu_max: "50000 100000".to_string(),
+            sleep_after: Duration::from_secs(60),
+            wake_timeout: Duration::from_secs(2),
+            wake_concurrency: 4,
+        });
+        let app = apps::get_by_slug(&pool, "wake").await.unwrap().unwrap();
+        manager.ensure_awake(&pool, &app).await.unwrap();
+        let app = apps::get_by_slug(&pool, "wake").await.unwrap().unwrap();
+        assert!(
+            app.last_request_at.unwrap_or(0) >= before,
+            "a wake must touch last_request_at"
+        );
+        assert!(app.asleep_since.is_none());
     }
 
     /// Needs a real celld binary and an S3-compatible bucket (RustFS): starts
