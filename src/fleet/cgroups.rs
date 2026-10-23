@@ -190,21 +190,48 @@ fn is_drained(_cgroup: &Path) -> bool {
 }
 
 /// Remount `root` read-write, preserving its other flags: Docker mounts the
-/// container's cgroupfs read-only. Linux-only.
+/// container's cgroupfs read-only, and the multi compose override grants
+/// `CAP_SYS_ADMIN` exactly so outer can flip its own cgroup subtree
+/// writable. Without the grant this fails and setup degrades loudly.
+/// Linux-only.
 #[cfg(target_os = "linux")]
 fn remount_rw(root: &Path) -> anyhow::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
+    let options = mount_options(root).ok_or_else(|| {
+        anyhow::anyhow!(
+            "remount needs a cgroupfs mount: no /proc/self/mounts entry for {}",
+            root.display()
+        )
+    })?;
     let target = CString::new(root.as_os_str().as_bytes())
         .map_err(|e| anyhow::anyhow!("cgroup root is not a C string: {e}"))?;
+    let mut flags: libc::c_ulong = libc::MS_REMOUNT;
+    // A remount replaces the flag set, so every flag worth keeping is
+    // restated; only the read-only bit is dropped. Unknown options are the
+    // filesystem's own (seclabel, nsdelegate) and need no restating.
+    for option in options.split(',') {
+        flags |= match option {
+            "nosuid" => libc::MS_NOSUID,
+            "nodev" => libc::MS_NODEV,
+            "noexec" => libc::MS_NOEXEC,
+            "relatime" => libc::MS_RELATIME,
+            "strictatime" => libc::MS_STRICTATIME,
+            "noatime" => libc::MS_NOATIME,
+            "nodiratime" => libc::MS_NODIRATIME,
+            "sync" => libc::MS_SYNCHRONOUS,
+            "dirsync" => libc::MS_DIRSYNC,
+            _ => 0,
+        };
+    }
     // SAFETY: null source/type/data with MS_REMOUNT only flips the flags of
-    // this mount, touching nothing else.
+    // this mount (a bind inside the container), touching nothing else.
     let rc = unsafe {
         libc::mount(
             std::ptr::null(),
             target.as_ptr(),
             std::ptr::null(),
-            libc::MS_REMOUNT as libc::c_ulong,
+            flags,
             std::ptr::null(),
         )
     };
@@ -216,6 +243,31 @@ fn remount_rw(root: &Path) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// This mount's option list from `/proc/self/mounts` (`source target fstype
+/// options …`), so a remount can restate the flags it keeps. Octal escapes
+/// (`\040`) decode to their byte; the comparison target has none, but a
+/// container root under a spaced path must still match.
+#[cfg(target_os = "linux")]
+fn mount_options(root: &Path) -> Option<String> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    find_mount_options(&mounts, root)
+}
+
+/// The option list for `root` in one `/proc/self/mounts` dump (`source
+/// target fstype options …`). Pure so tests can pin the parsing.
+#[cfg(target_os = "linux")]
+fn find_mount_options(mounts: &str, root: &Path) -> Option<String> {
+    let want = root.to_string_lossy();
+    mounts.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next()?;
+        let target = fields.next()?.replace("\\040", " ");
+        fields.next()?;
+        let options = fields.next()?;
+        (target.as_str() == want.as_ref()).then(|| options.to_string())
+    })
 }
 
 /// The container's cgroupfs mount may be read-only: probe with a throwaway
@@ -339,17 +391,26 @@ pub fn self_check(anchor: &Path) -> anyhow::Result<()> {
 }
 
 /// Directory name for a fleet key (`slug`): keys are slug-shaped by
-/// construction, but a stray separator must never escape the anchor.
+/// construction, but a stray separator must never escape the anchor. `.`
+/// maps to `_`, so the result is never `.` or `..`; anything else outside
+/// `[0-9A-Za-z-_]` (including `/`) maps to `_` too, and an empty result
+/// becomes `"_"`.
 pub fn fleet_dir_name(key: &str) -> String {
-    key.chars()
+    let mapped: String = key
+        .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
             } else {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if mapped.is_empty() {
+        "_".to_string()
+    } else {
+        mapped
+    }
 }
 
 /// Create (or reuse) a fleet's cgroup leaf with its limits and return its
@@ -578,7 +639,59 @@ mod tests {
 
         // A stray separator never escapes the anchor.
         let evil = ensure_fleet_leaf(&anchor, "../evil", &limits).unwrap();
-        assert_eq!(evil, anchor.join(".._evil"));
+        assert_eq!(evil, anchor.join("___evil"));
+    }
+
+    #[test]
+    fn fleet_dir_name_never_escapes_the_anchor() {
+        assert_eq!(fleet_dir_name("grocery"), "grocery");
+        assert_eq!(fleet_dir_name("grocery-pro"), "grocery-pro");
+        assert_eq!(fleet_dir_name(".."), "__");
+        assert_eq!(fleet_dir_name("."), "_");
+        assert_eq!(fleet_dir_name(""), "_");
+        assert_eq!(fleet_dir_name("a/b"), "a_b");
+        assert_eq!(fleet_dir_name("../../etc"), "______etc");
+        // Whatever the input, the mapped name stays inside the anchor.
+        for name in ["..", ".", "", "a/b", "a..b", ".hidden", "a b"] {
+            let mapped = fleet_dir_name(name);
+            assert!(!mapped.is_empty(), "{name:?} must not map empty");
+            assert!(!mapped.contains('/'), "{name:?} must not keep a separator");
+            assert!(
+                mapped != "." && mapped != "..",
+                "{name:?} must not stay dotty"
+            );
+            let anchor = Path::new("/anchor");
+            assert_eq!(
+                anchor.join(&mapped).parent(),
+                Some(anchor),
+                "{mapped:?} escapes"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_options_picks_this_mount() {
+        let mounts = "cgroup2 /sys/fs/cgroup cgroup2 ro,nosuid,nodev,noexec,relatime,nsdelegate 0 0\ntmpfs /run tmpfs rw,nosuid,nodev 0 0\n";
+        assert_eq!(
+            find_mount_options(mounts, Path::new("/sys/fs/cgroup")),
+            Some("ro,nosuid,nodev,noexec,relatime,nsdelegate".to_string())
+        );
+        assert_eq!(
+            find_mount_options(mounts, Path::new("/run")),
+            Some("rw,nosuid,nodev".to_string())
+        );
+        assert_eq!(find_mount_options(mounts, Path::new("/missing")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_options_decodes_escaped_spaces() {
+        let mounts = "cgroup2 /mnt/my\\040cgroup cgroup2 rw,nosuid 0 0\n";
+        assert_eq!(
+            find_mount_options(mounts, Path::new("/mnt/my cgroup")),
+            Some("rw,nosuid".to_string())
+        );
     }
 
     #[test]

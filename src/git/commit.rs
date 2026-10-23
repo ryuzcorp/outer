@@ -110,6 +110,12 @@ pub enum CommitError {
     BadPath { path: String, reason: &'static str },
     #[error("{path} is both written and deleted")]
     BothWrittenAndDeleted { path: String },
+    #[error("{path} is written more than once in one commit")]
+    DuplicateWrite { path: String },
+    #[error("{path} is edited more than once in one commit")]
+    DuplicateEdit { path: String },
+    #[error("{path} is both written and edited in one commit")]
+    BothWrittenAndEdited { path: String },
     #[error("invalid move: {0}")]
     BadMove(String),
     #[error("invalid edit in {path}: {reason}")]
@@ -122,6 +128,11 @@ pub enum CommitError {
     UnknownBase { base: String, current: String },
     #[error("tip moved under this commit: main is {current_sha}")]
     Conflict { current_sha: String },
+    #[error("cannot roll back to {target}: {reason}")]
+    BadRollback {
+        target: String,
+        reason: &'static str,
+    },
     #[error("repo already has commit {current_sha}")]
     AlreadyInitialized { current_sha: String },
     #[error("bad slug {0:?}")]
@@ -189,8 +200,9 @@ pub async fn commit(
 }
 
 /// Make a new commit on main whose tree is `target`'s tree and whose parent is
-/// the current head, then publish it. History is never rewritten: the old
-/// head stays reachable as the new commit's parent.
+/// the current head, then publish it. `target` must be an earlier commit on
+/// main: the head itself and commits off main are refused. History is never
+/// rewritten: the old head stays reachable as the new commit's parent.
 pub async fn rollback(
     store: &crate::store::Store,
     cfg: &GitConfig,
@@ -218,7 +230,26 @@ pub async fn rollback(
             base: target.to_string(),
             current: head.clone(),
         })?;
+    if full == head {
+        return Err(CommitError::BadRollback {
+            target: full,
+            reason: "target is the current head",
+        });
+    }
     let git_dir = format!("--git-dir={}", bare.display());
+    let is_ancestor = manifest::run_git(
+        &[&git_dir, "merge-base", "--is-ancestor", &full, &head],
+        &[],
+        Duration::from_secs(15),
+    )
+    .await
+    .is_ok();
+    if !is_ancestor {
+        return Err(CommitError::BadRollback {
+            target: full,
+            reason: "target is not an ancestor of main",
+        });
+    }
     let tree = manifest::run_git(
         &[
             &git_dir,
@@ -370,8 +401,11 @@ fn validate_path(path: &str) -> Result<(), CommitError> {
 }
 
 /// Reject bad file moves before anything touches git: same path, duplicate
-/// ends, and a `from` that is also written, edited or deleted. The parent-tree
-/// checks (a `from` must be a blob, a `to` must be free) happen in
+/// ends, a `from` that is also written, edited or deleted, and a `to` that
+/// collides with a write, an edit or a delete. A `to` that is another
+/// move's `from` stays allowed: that is a chain (or swap), which
+/// [`build_commit`] resolves from the parent tree. The parent-tree checks
+/// (a `from` must be a blob, a `to` must be free) happen in
 /// [`build_commit`].
 fn validate_moves(
     moves: &[Move],
@@ -398,6 +432,15 @@ fn validate_moves(
         }
         if writes.iter().any(|f| f.path == m.from) || edits.iter().any(|e| e.path == m.from) {
             return Err(CommitError::BadMove(format!("{} is also written", m.from)));
+        }
+        if writes.iter().any(|f| f.path == m.to) {
+            return Err(CommitError::BadMove(format!("{} is also written", m.to)));
+        }
+        if edits.iter().any(|e| e.path == m.to) {
+            return Err(CommitError::BadMove(format!("{} is also edited", m.to)));
+        }
+        if deletes.contains(&m.to) {
+            return Err(CommitError::BadMove(format!("{} is also deleted", m.to)));
         }
     }
     Ok(())
@@ -430,8 +473,14 @@ fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), Commi
     validate_author(&req.author)?;
     let mut decoded = 0usize;
     let mut files = Vec::with_capacity(req.writes.len());
+    let mut seen_writes = HashSet::new();
     for f in &req.writes {
         validate_path(&f.path)?;
+        if !seen_writes.insert(f.path.as_str()) {
+            return Err(CommitError::DuplicateWrite {
+                path: f.path.clone(),
+            });
+        }
         let bytes = match &f.body {
             WriteBody::Text(text) => {
                 if text.len() > MAX_TEXT_BYTES {
@@ -477,8 +526,19 @@ fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), Commi
             return Err(CommitError::BothWrittenAndDeleted { path: path.clone() });
         }
     }
+    let mut seen_edits = HashSet::new();
     for e in &req.edits {
         validate_path(&e.path)?;
+        if !seen_edits.insert(e.path.as_str()) {
+            return Err(CommitError::DuplicateEdit {
+                path: e.path.clone(),
+            });
+        }
+        if seen_writes.contains(e.path.as_str()) {
+            return Err(CommitError::BothWrittenAndEdited {
+                path: e.path.clone(),
+            });
+        }
         if e.old.is_empty() {
             return Err(CommitError::InvalidEdit {
                 path: e.path.clone(),
@@ -492,6 +552,12 @@ fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), Commi
 
 /// Apply exact-match edits against the base commit's blobs. `old` must occur
 /// exactly once unless `replace_all` (then at least once).
+///
+/// Edits share the writes' caps: the base blob must fit in
+/// [`MAX_TEXT_BYTES`] (checked with `cat-file -s` before reading, so a huge
+/// blob never lands in memory), and each edit result must be UTF-8 without
+/// NUL, fit in [`MAX_TEXT_BYTES`], and count toward the same
+/// [`MAX_COMMIT_BYTES`] total as writes.
 async fn apply_edits(
     bare: &Path,
     parent: Option<&str>,
@@ -502,6 +568,7 @@ async fn apply_edits(
         return Ok(());
     }
     let git_dir = format!("--git-dir={}", bare.display());
+    let mut total: usize = files.iter().map(|f| f.bytes.len()).sum();
     for e in edits {
         let Some(parent) = parent else {
             return Err(CommitError::NotFound {
@@ -514,6 +581,22 @@ async fn apply_edits(
             .ok_or_else(|| CommitError::NotFound {
                 path: e.path.clone(),
             })?;
+        let size_out = manifest::run_git(
+            &[&git_dir, "cat-file", "-s", &entry.sha],
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .map_err(CommitError::Internal)?;
+        let size: usize = size_out
+            .trim()
+            .parse()
+            .map_err(|_| CommitError::Internal(anyhow::anyhow!("bad blob size for {0}", e.path)))?;
+        if size > MAX_TEXT_BYTES {
+            return Err(CommitError::TextTooLarge {
+                path: e.path.clone(),
+            });
+        }
         let bytes = manifest::run_git_raw(
             &[&git_dir, "cat-file", "-p", &entry.sha],
             &[],
@@ -537,6 +620,20 @@ async fn apply_edits(
         } else {
             content.replacen(&e.old, &e.new, 1)
         };
+        if replaced.len() > MAX_TEXT_BYTES {
+            return Err(CommitError::TextTooLarge {
+                path: e.path.clone(),
+            });
+        }
+        if replaced.as_bytes().contains(&0) {
+            return Err(CommitError::HasNul {
+                path: e.path.clone(),
+            });
+        }
+        total = total.saturating_add(replaced.len());
+        if total > MAX_COMMIT_BYTES {
+            return Err(CommitError::TotalTooLarge { bytes: total });
+        }
         files.push(RawFile {
             path: e.path.clone(),
             bytes: replaced.into_bytes(),
@@ -1367,5 +1464,269 @@ mod tests {
             Err(CommitError::AlreadyInitialized { current_sha }) => assert_eq!(current_sha, head),
             other => panic!("a second import must fail, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn edits_share_the_writes_size_caps() {
+        // An edit result just under MAX_TEXT_BYTES passes...
+        let (_dir, cfg, store, sync) = setup("edit-caps").await;
+        let mut seed = req("seed");
+        seed.writes.push(write("f.txt", "aaa"));
+        commit(&store, &cfg, &sync, "edit-caps", seed)
+            .await
+            .unwrap();
+        let mut ok = req("ok");
+        ok.edits.push(Edit {
+            path: "f.txt".to_string(),
+            old: "aaa".to_string(),
+            new: "a".repeat(MAX_TEXT_BYTES),
+            replace_all: false,
+        });
+        commit(&store, &cfg, &sync, "edit-caps", ok).await.unwrap();
+
+        // ...and one byte over fails, against the new base.
+        let mut over = req("over");
+        over.edits.push(Edit {
+            path: "f.txt".to_string(),
+            old: "a".repeat(MAX_TEXT_BYTES),
+            new: "a".repeat(MAX_TEXT_BYTES + 1),
+            replace_all: false,
+        });
+        match commit(&store, &cfg, &sync, "edit-caps", over).await {
+            Err(CommitError::TextTooLarge { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("an over-cap edit result must fail, got {other:?}"),
+        }
+
+        // A NUL byte in the edit result is refused like a NUL write.
+        let (_dir, cfg, store, sync) = setup("edit-nul").await;
+        let mut seed = req("seed");
+        seed.writes.push(write("f.txt", "aaa"));
+        commit(&store, &cfg, &sync, "edit-nul", seed).await.unwrap();
+        let mut nul = req("nul");
+        nul.edits.push(Edit {
+            path: "f.txt".to_string(),
+            old: "aaa".to_string(),
+            new: "a\0b".to_string(),
+            replace_all: false,
+        });
+        match commit(&store, &cfg, &sync, "edit-nul", nul).await {
+            Err(CommitError::HasNul { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("a NUL edit result must fail, got {other:?}"),
+        }
+
+        // A base file over MAX_TEXT_BYTES is refused before it is read.
+        // Seeded through Base64 (a Text write that large is refused up
+        // front), so the blob exists but is never editable.
+        use base64::Engine as _;
+        let (_dir, cfg, store, sync) = setup("edit-big-base").await;
+        let mut seed = req("seed");
+        seed.writes.push(FileWrite {
+            path: "big.txt".to_string(),
+            body: WriteBody::Base64(base64::engine::general_purpose::STANDARD.encode(vec![
+                b'a';
+                MAX_TEXT_BYTES
+                    + 1
+            ])),
+        });
+        commit(&store, &cfg, &sync, "edit-big-base", seed)
+            .await
+            .unwrap();
+        let mut big = req("big");
+        big.edits.push(Edit {
+            path: "big.txt".to_string(),
+            old: "a".to_string(),
+            new: "b".to_string(),
+            replace_all: true,
+        });
+        match commit(&store, &cfg, &sync, "edit-big-base", big).await {
+            Err(CommitError::TextTooLarge { path }) => assert_eq!(path, "big.txt"),
+            other => panic!("editing an over-cap base must fail, got {other:?}"),
+        }
+
+        // Edit results count toward the same MAX_COMMIT_BYTES total as
+        // writes: writes at exactly the cap plus any edit overflow it.
+        let (_dir, cfg, store, sync) = setup("edit-total").await;
+        let mut seed = req("seed");
+        seed.writes.push(write("e.txt", "aaa"));
+        commit(&store, &cfg, &sync, "edit-total", seed)
+            .await
+            .unwrap();
+        let enc = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![b'a'; n]);
+        let mut big = req("big");
+        big.writes.push(FileWrite {
+            path: "a.bin".to_string(),
+            body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+        });
+        big.writes.push(FileWrite {
+            path: "b.bin".to_string(),
+            body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+        });
+        big.writes.push(FileWrite {
+            path: "c.bin".to_string(),
+            body: WriteBody::Base64(enc(5 * 1024 * 1024)),
+        });
+        big.edits.push(Edit {
+            path: "e.txt".to_string(),
+            old: "aaa".to_string(),
+            new: "bbb".to_string(),
+            replace_all: false,
+        });
+        match commit(&store, &cfg, &sync, "edit-total", big).await {
+            Err(CommitError::TotalTooLarge { .. }) => {}
+            other => panic!("an edit overflowing the commit total must fail, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_head_and_foreign_commits() {
+        let (_dir, cfg, store, sync) = setup("rb-guard").await;
+        let mut v1 = req("v1");
+        v1.writes.push(write("app.ts", "v1"));
+        let h1 = commit(&store, &cfg, &sync, "rb-guard", v1).await.unwrap();
+        let mut v2 = req("v2");
+        v2.writes.push(write("app.ts", "v2"));
+        let h2 = commit(&store, &cfg, &sync, "rb-guard", v2).await.unwrap();
+
+        // The head itself: an empty no-op commit is refused.
+        match rollback(&store, &cfg, &sync, "rb-guard", &h2, &author()).await {
+            Err(CommitError::BadRollback { .. }) => {}
+            other => panic!("rollback to head must fail, got {other:?}"),
+        }
+
+        // A commit object off main (commit-tree without updating the ref)
+        // is not an ancestor of main and is refused.
+        let bare = manifest::mirror_path(&cfg, "rb-guard");
+        let git_dir = format!("--git-dir={}", bare.display());
+        let tree = tree_of(&bare, &h2).await;
+        let dangling = manifest::run_git(
+            &[&git_dir, "commit-tree", &tree, "-p", &h2, "-m", "dangling"],
+            &[
+                ("GIT_AUTHOR_NAME", "t"),
+                ("GIT_AUTHOR_EMAIL", "t@example.com"),
+                ("GIT_COMMITTER_NAME", "t"),
+                ("GIT_COMMITTER_EMAIL", "t@example.com"),
+            ],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        let dangling = dangling.trim().to_string();
+        match rollback(&store, &cfg, &sync, "rb-guard", &dangling, &author()).await {
+            Err(CommitError::BadRollback { .. }) => {}
+            other => panic!("rollback off main must fail, got {other:?}"),
+        }
+
+        // A real ancestor still succeeds.
+        rollback(&store, &cfg, &sync, "rb-guard", &h1, &author())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_paths_in_one_commit_are_rejected() {
+        let (_dir, cfg, store, sync) = setup("overlap").await;
+
+        // The same path written twice.
+        let mut dup = req("dup");
+        dup.writes.push(write("f.txt", "one"));
+        dup.writes.push(write("f.txt", "two"));
+        match commit(&store, &cfg, &sync, "overlap", dup).await {
+            Err(CommitError::DuplicateWrite { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("duplicate writes must fail, got {other:?}"),
+        }
+
+        // A write and an edit on one path.
+        let mut both = req("both");
+        both.writes.push(write("g.txt", "x"));
+        both.edits.push(Edit {
+            path: "g.txt".to_string(),
+            old: "x".to_string(),
+            new: "y".to_string(),
+            replace_all: false,
+        });
+        match commit(&store, &cfg, &sync, "overlap", both).await {
+            Err(CommitError::BothWrittenAndEdited { path }) => assert_eq!(path, "g.txt"),
+            other => panic!("a write and an edit on one path must fail, got {other:?}"),
+        }
+
+        // The same path edited twice.
+        let mut dedup = req("dedup");
+        dedup.edits.push(Edit {
+            path: "h.txt".to_string(),
+            old: "x".to_string(),
+            new: "y".to_string(),
+            replace_all: false,
+        });
+        dedup.edits.push(Edit {
+            path: "h.txt".to_string(),
+            old: "y".to_string(),
+            new: "z".to_string(),
+            replace_all: false,
+        });
+        match commit(&store, &cfg, &sync, "overlap", dedup).await {
+            Err(CommitError::DuplicateEdit { path }) => assert_eq!(path, "h.txt"),
+            other => panic!("duplicate edits must fail, got {other:?}"),
+        }
+
+        // A move whose target is written in the same commit.
+        let mut mv_write = req("mv-write");
+        mv_write.writes.push(write("w.txt", "x"));
+        mv_write.moves.push(Move {
+            from: "a.txt".to_string(),
+            to: "w.txt".to_string(),
+        });
+        match commit(&store, &cfg, &sync, "overlap", mv_write).await {
+            Err(CommitError::BadMove(msg)) => assert!(msg.contains("w.txt"), "wrong path: {msg}"),
+            other => panic!("a move onto a written path must fail, got {other:?}"),
+        }
+
+        // A move whose target is edited in the same commit.
+        let mut mv_edit = req("mv-edit");
+        mv_edit.edits.push(Edit {
+            path: "e.txt".to_string(),
+            old: "x".to_string(),
+            new: "y".to_string(),
+            replace_all: false,
+        });
+        mv_edit.moves.push(Move {
+            from: "a.txt".to_string(),
+            to: "e.txt".to_string(),
+        });
+        match commit(&store, &cfg, &sync, "overlap", mv_edit).await {
+            Err(CommitError::BadMove(msg)) => assert!(msg.contains("e.txt"), "wrong path: {msg}"),
+            other => panic!("a move onto an edited path must fail, got {other:?}"),
+        }
+
+        // A move whose target is deleted in the same commit.
+        let mut mv_delete = req("mv-delete");
+        mv_delete.deletes.push("d.txt".to_string());
+        mv_delete.moves.push(Move {
+            from: "a.txt".to_string(),
+            to: "d.txt".to_string(),
+        });
+        match commit(&store, &cfg, &sync, "overlap", mv_delete).await {
+            Err(CommitError::BadMove(msg)) => assert!(msg.contains("d.txt"), "wrong path: {msg}"),
+            other => panic!("a move onto a deleted path must fail, got {other:?}"),
+        }
+
+        // A move chain still succeeds: a `to` that is another move's `from`
+        // is how chains (and swaps) name their middle path.
+        let mut seed = req("seed");
+        seed.writes.push(write("x.txt", "X"));
+        seed.writes.push(write("y.txt", "Y"));
+        commit(&store, &cfg, &sync, "overlap", seed).await.unwrap();
+        let mut chain = req("chain");
+        chain.moves.push(Move {
+            from: "x.txt".to_string(),
+            to: "y.txt".to_string(),
+        });
+        chain.moves.push(Move {
+            from: "y.txt".to_string(),
+            to: "z.txt".to_string(),
+        });
+        let hc = commit(&store, &cfg, &sync, "overlap", chain).await.unwrap();
+        let bare = manifest::mirror_path(&cfg, "overlap");
+        assert_eq!(show(&bare, &hc, "y.txt").await, "X");
+        assert_eq!(show(&bare, &hc, "z.txt").await, "Y");
     }
 }

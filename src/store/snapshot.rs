@@ -334,10 +334,10 @@ async fn upload_text(store: &Store, key: &str, text: &str) -> anyhow::Result<()>
     store.put(key, text.as_bytes().to_vec()).await
 }
 
-/// Missing-key error shaped so [`is_not_found`] recognizes it: only a
-/// missing key counts as "no snapshot", never a transport failure.
+/// Missing-key error that [`is_not_found`] recognizes: only a missing key
+/// counts as "no snapshot", never a transport failure.
 fn not_found(key: &str) -> anyhow::Error {
-    anyhow::anyhow!("s3 download {key} failed: HTTP 404 NoSuchKey")
+    super::s3::not_found_error(key)
 }
 
 /// Boot path: if the local DB file does not exist, download the snapshot

@@ -62,7 +62,9 @@ pub fn is_reserved_env_name(name: &str) -> bool {
 /// Sandboxed step: uid/gid drop plus explicit env.
 /// `uid: None` runs as the current user.
 /// `cache_root` is the app's persistent cache dir; `cgroup_leaf` moves the
-/// child into that leaf right after spawn (best-effort, warned).
+/// child into that leaf right after spawn. A leaf means cgroups are active:
+/// a refused move fails the step (the group is killed) instead of running
+/// uncapped. `None` is dev (no cgroups), where no move is attempted.
 pub struct Sandbox<'a> {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
@@ -132,12 +134,23 @@ pub(crate) fn lchown_tree(path: &Path, uid: u32, gid: u32) -> bool {
 }
 
 /// Move `pid` into a cgroup leaf: the child's whole tree is contained from
-/// here, since containment is inherited across fork and exec. Best-effort:
-/// a missing leaf (dev, no cgroups) only warns.
-fn move_into_cgroup(leaf: &Path, pid: u32) {
-    if let Err(e) = std::fs::write(leaf.join("cgroup.procs"), pid.to_string()) {
-        tracing::warn!(leaf = %leaf.display(), pid, error = %e, "sandbox cgroup move failed; running uncapped");
-    }
+/// here, since containment is inherited across fork and exec. Returns the
+/// refusal so the caller fails the step instead of running uncapped.
+fn move_into_cgroup(leaf: &Path, pid: u32) -> anyhow::Result<()> {
+    std::fs::write(leaf.join("cgroup.procs"), pid.to_string())
+        .with_context(|| format!("move {pid} into {}", leaf.display()))?;
+    Ok(())
+}
+
+/// Whether `error` is the kernel reporting a gone process (ESRCH): a move
+/// target that exited mid-move. Only that case means nothing runs uncapped;
+/// every other refusal (EACCES, EPERM, read-only mount, no delegation) is a
+/// real containment miss.
+fn move_target_gone(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error() == Some(libc::ESRCH))
 }
 
 /// Truncate captured output at a UTF-8 boundary.
@@ -191,22 +204,42 @@ pub async fn run_sandboxed(
         cmd.env(key, value);
     }
     for (key, value) in sb.env {
+        if is_reserved_env_name(key) {
+            tracing::warn!(name = %key, "sandbox env reserved; skipping");
+            continue;
+        }
         cmd.env(key, value);
     }
+    // setgroups needs privilege; an unprivileged (dev) run keeps its own
+    // groups, which it cannot change anyway.
+    let privileged = unsafe { libc::geteuid() == 0 };
+    let drops_priv = privileged && (uid.is_some() || gid.is_some());
     {
         let std_cmd = cmd.as_std_mut();
-        if let Some(uid) = uid {
-            std_cmd.uid(uid);
-        }
-        if let Some(gid) = gid {
-            std_cmd.gid(gid);
-        }
         std_cmd.process_group(0);
         // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
-        // libc calls. setrlimit bounds fork bombs (NPROC) and runaway
-        // outputs (FSIZE 4 GiB).
+        // libc calls. The ids are set here (not via CommandExt::uid/gid,
+        // which would apply them before this hook, after which setgroups is
+        // EPERM): setgroups first so the child never keeps outer's
+        // supplementary groups, then setgid, then setuid. setrlimit bounds
+        // fork bombs (NPROC) and runaway outputs (FSIZE 4 GiB).
         unsafe {
             std_cmd.pre_exec(move || {
+                if drops_priv {
+                    if libc::setgroups(0, std::ptr::null()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(gid) = gid {
+                        if libc::setgid(gid) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(uid) = uid {
+                        if libc::setuid(uid) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                }
                 // RLIMIT_NPROC counts every process of the real uid, so it is
                 // only meaningful for a dedicated app uid; on outer's own uid
                 // (dev) it would cap outer and its fleets too.
@@ -226,10 +259,24 @@ pub async fn run_sandboxed(
             });
         }
     }
-    let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
     let pid = child.id();
     if let (Some(leaf), Some(pid)) = (sb.cgroup_leaf, pid) {
-        move_into_cgroup(leaf, pid);
+        if let Err(e) = move_into_cgroup(leaf, pid) {
+            if move_target_gone(&e) {
+                // Exited between spawn and the move: the wait below still
+                // reaps it, and nothing runs uncapped.
+                tracing::warn!(leaf = %leaf.display(), pid, "sandbox step exited before its cgroup move");
+            } else {
+                // Refused for a live pid: fail closed, like the fleet move.
+                // SAFETY: signals only the process group this call created.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                return Err(e);
+            }
+        }
     }
     let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
     // Whatever happened, nothing the step started may outlive it: a step
@@ -411,5 +458,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.trim(), "200000");
+    }
+    /// Reserved names in `sb.env` never reach the child: the platform owns
+    /// them, and the value is never logged.
+    #[tokio::test]
+    async fn sandboxed_env_drops_reserved_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let caller = vec![
+            ("GROCERY_LIST".to_string(), "milk".to_string()),
+            ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+            ("OUTER_SECRET".to_string(), "s3cr3t".to_string()),
+        ];
+        let sb = Sandbox {
+            uid: None,
+            gid: None,
+            env: &caller,
+            cache_root: &cache,
+            cgroup_leaf: None,
+        };
+        let out = run_sandboxed("env", &[], dir.path(), &sb, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let seen: std::collections::HashMap<&str, &str> = out
+            .lines()
+            .map(|line| line.split_once('=').unwrap())
+            .collect();
+        assert_eq!(seen["GROCERY_LIST"], "milk");
+        assert!(
+            !seen.contains_key("LD_PRELOAD"),
+            "reserved env leaked into sandbox env"
+        );
+        assert!(
+            !seen.contains_key("OUTER_SECRET"),
+            "reserved env leaked into sandbox env"
+        );
     }
 }

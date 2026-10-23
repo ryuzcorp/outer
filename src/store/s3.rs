@@ -20,27 +20,46 @@ const PRESIGN_SECS: u64 = 3600;
 const S3_MAX_ATTEMPTS: u32 = 3;
 
 /// True when an S3 error means "the object does not exist", as opposed
-/// to the store being unreachable. Native failures carry `HTTP 404` plus the
-/// store's `NoSuchKey` body. Callers that treat "missing" as "start fresh"
-/// must not do so on a transport error, or they overwrite good state.
+/// to the store being unreachable. Callers that treat "missing" as "start
+/// fresh" must not do so on a transport error, or they overwrite good state.
 ///
-/// The matchers are status-anchored on purpose: the target key rides inside
-/// the same message, so a bare `"404"` reads a transport failure on a
-/// numeric key as "missing". `(404)` is the legacy aws-CLI shape, kept so
-/// old snapshots still count as absent.
+/// Classification never scans free text: the target key rides inside every
+/// message, so a `"NoSuchKey"`/`"NotFound"` substring match reads a 5xx or a
+/// transport failure on a key named `NotFound...` as "missing", and the
+/// manifest reader would restart the seq and lose history. Instead the
+/// backend attaches an [`S3NotFound`] marker when it saw a 404 (or the
+/// store's `<Code>NoSuchKey</Code>` / `<Code>NoSuchBucket</Code>`), and this
+/// matches that marker by downcast. Callers that learn "missing" another way
+/// (a `Store::get` that returned `None`) build their error with
+/// [`not_found_error`], so there is exactly one signal.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
-    let text = format!("{err:#}");
-    text.contains("HTTP 404")
-        || text.contains("(404)")
-        || text.contains("NoSuchKey")
-        || text.contains("NoSuchBucket")
-        || text.contains("NotFound")
+    err.downcast_ref::<S3NotFound>().is_some()
 }
+
+/// A "key is absent" error that [`is_not_found`] recognizes.
+pub fn not_found_error(key: &str) -> anyhow::Error {
+    anyhow::Error::new(S3NotFound).context(format!("{key} not found"))
+}
+
+/// Marker for "the store answered 404 / NoSuchKey / NoSuchBucket": the key
+/// is absent, not the store unreachable. Attached at construction by
+/// [`s3_err_msg`], matched by [`is_not_found`] through the anyhow chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct S3NotFound;
+
+impl std::fmt::Display for S3NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "object not found")
+    }
+}
+
+impl std::error::Error for S3NotFound {}
 
 /// S3/R2 backend: rusty-s3 signs presigned URLs, one pooled reqwest client
 /// sends them. Region `auto` and [`UrlStyle::Path`] are what R2 expects;
-/// a session token (R2 temporary credentials) is attached to every signed
-/// request as `x-amz-security-token` via [`Credentials::new_with_token`].
+/// a session token (R2 temporary credentials) is signed into every
+/// presigned URL as the `X-Amz-Security-Token` query parameter by
+/// [`Credentials::new_with_token`].
 #[derive(Debug, Clone)]
 pub struct S3Backend {
     bucket: Bucket,
@@ -454,8 +473,9 @@ impl futures::Stream for FileChunks {
 }
 
 /// Rich S3 failure: HTTP status plus the store's XML error body.
-/// [`is_not_found`] matches on the status-anchored `HTTP 404`/`NoSuchKey`,
-/// so "missing" vs "unreachable" keeps working without knowing the transport.
+/// A 404 (or a body carrying the store's missing-key `<Code>`) also carries
+/// the [`S3NotFound`] marker, so [`is_not_found`] classifies without
+/// scanning the message the key rides in.
 async fn s3_err(
     op: &str,
     target: &str,
@@ -496,9 +516,22 @@ async fn bounded_text_or_empty(resp: reqwest::Response, timeout: Duration) -> St
 
 /// Same failure without the response: the retryable attempts classify before
 /// they would consume the body, so the message is built from parts.
+///
+/// A 404 status — or a body carrying the store's `<Code>NoSuchKey</Code>` /
+/// `<Code>NoSuchBucket</Code>` — attaches the [`S3NotFound`] marker. The
+/// code match runs on `body`, not on the composed message, so a key that
+/// merely contains those words can never count as missing.
 fn s3_err_msg(op: &str, target: &str, status: u16, body: &str) -> anyhow::Error {
     let snippet: String = body.trim().chars().take(300).collect();
-    anyhow::anyhow!("s3 {op} {target} failed: HTTP {status} {snippet}")
+    let err = anyhow::anyhow!("s3 {op} {target} failed: HTTP {status} {snippet}");
+    if status == 404
+        || body.contains("<Code>NoSuchKey</Code>")
+        || body.contains("<Code>NoSuchBucket</Code>")
+    {
+        err.context(S3NotFound)
+    } else {
+        err
+    }
 }
 
 /// Backoff between S3 attempts: 250 ms doubling per failure plus up to one
@@ -702,19 +735,36 @@ mod tests {
         ));
     }
 
-    /// A transport failure on a numeric key is unreachable, not missing: a
-    /// bare-`"404"` match would read `s3 download 404.html failed: HTTP 500`
-    /// as "start fresh" and let callers upload emptiness over good state.
+    /// Only the store's own 404 / missing-key codes count as missing — never
+    /// the key text. A 503 on a key named `NotFound...` is unreachable, and
+    /// reading it as "start fresh" would restart the seq over live history.
     #[test]
     fn not_found_ignores_key_names_and_transport_failures() {
-        let missing =
-            anyhow::anyhow!("s3 download tip.bundle failed: HTTP 404 <Code>NoSuchKey</Code>");
+        let missing = s3_err_msg("download", "tip.bundle", 404, "<Code>NoSuchKey</Code>");
         assert!(is_not_found(&missing));
-        let legacy =
-            anyhow::anyhow!("aws exit 1\nfatal error: An error occurred (404) when calling the HeadObject operation");
-        assert!(is_not_found(&legacy));
-        let numeric_key_on_500 =
-            anyhow::anyhow!("s3 download 404.html failed: HTTP 500 ServiceUnavailable");
+        let missing_bucket = s3_err_msg("download", "tip.bundle", 404, "<Code>NoSuchBucket</Code>");
+        assert!(is_not_found(&missing_bucket));
+        // A 404 with an empty body (HeadObject-style) still counts: the
+        // status alone marks it.
+        let bare_404 = s3_err_msg("download", "tip.bundle", 404, "");
+        assert!(is_not_found(&bare_404));
+        // A missing key learned another way (a `get` that returned `None`)
+        // counts only when built with `not_found_error`; free text never does.
+        assert!(is_not_found(&not_found_error("tip.bundle")));
+        let text_only = anyhow::anyhow!("s3 download tip.bundle failed: HTTP 404 NoSuchKey");
+        assert!(!is_not_found(&text_only));
+        // A 5xx on a key containing `NotFound` is unreachable, not missing.
+        let slow_on_notfound_key = s3_err_msg(
+            "download",
+            "backup-NotFound-2026.sqlite.zst",
+            503,
+            "ServiceUnavailable",
+        );
+        assert!(!is_not_found(&slow_on_notfound_key));
+        // Same for the other code words in key names on non-404 statuses.
+        let denied = s3_err_msg("download", "NoSuchKey-manifest.json", 403, "AccessDenied");
+        assert!(!is_not_found(&denied));
+        let numeric_key_on_500 = s3_err_msg("download", "404.html", 500, "InternalError");
         assert!(!is_not_found(&numeric_key_on_500));
         let down =
             anyhow::anyhow!("s3 download tip.bundle transport: error sending request for url");

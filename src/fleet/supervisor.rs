@@ -26,6 +26,11 @@ pub struct FleetSpec {
     pub secret_access_key: String,
     pub session_token: Option<String>,
     pub cgroup_leaf: PathBuf,
+    /// Whether `cgroups::setup()` succeeded: the caller sets this from its
+    /// return. Active means the leaf carries real limits, so a refused move
+    /// fails the start instead of running uncapped; inactive (dev machines)
+    /// only warns.
+    pub cgroups_active: bool,
     pub extra_env: Vec<(String, String)>,
 }
 
@@ -233,14 +238,77 @@ pub struct RunningFleet {
     child: tokio::process::Child,
 }
 
+/// Cap on one stored log line: a hostile fleet printing a newline-less flood
+/// must not grow memory without bound. The stored line keeps this many bytes
+/// (cut at a UTF-8 boundary) plus a truncation mark; the rest of the
+/// over-long line is discarded until the next newline.
+pub const MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// What `next_capped_line` appends once a line passes the cap.
+const TRUNC_MARK: &str = "…[truncated]";
+
+/// One line from a capture pipe, bounded: reads until the next newline (or
+/// EOF), keeps at most `MAX_LINE_BYTES`, and discards the rest of an
+/// over-long line. Returns `None` on EOF with nothing buffered.
+async fn next_capped_line<R>(reader: &mut R) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let (consumed, done) = {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                // EOF: a trailing partial line still counts.
+                if line.is_empty() && !truncated {
+                    return Ok(None);
+                }
+                (0, true)
+            } else {
+                let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
+                    Some(pos) => (pos, true),
+                    None => (chunk.len(), false),
+                };
+                if !truncated {
+                    let room = MAX_LINE_BYTES.saturating_sub(line.len());
+                    if take <= room {
+                        line.extend_from_slice(&chunk[..take]);
+                    } else {
+                        line.extend_from_slice(&chunk[..room]);
+                        truncated = true;
+                    }
+                }
+                (if done { take + 1 } else { take }, done)
+            }
+        };
+        reader.consume(consumed);
+        if done {
+            break;
+        }
+    }
+    // Strip a trailing CR (a `\r\n` line ending), then mark truncation.
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    if truncated {
+        while !line.is_empty() && std::str::from_utf8(&line).is_err() {
+            line.pop();
+        }
+        line.extend_from_slice(TRUNC_MARK.as_bytes());
+    }
+    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+}
+
 fn spawn_capture<R>(pipe: R, stream: LogStream, logs: SharedLogRing)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let mut lines = BufReader::new(pipe).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        use tokio::io::BufReader;
+        let mut reader = BufReader::new(pipe);
+        while let Ok(Some(line)) = next_capped_line(&mut reader).await {
             logs.lock().await.push(stream, line);
         }
     });
@@ -272,18 +340,43 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
     for (key, value) in &env {
         cmd.env(key, value);
     }
+    let uid = super::sandbox::resolve_drop_id(spec.uid);
+    let gid = super::sandbox::resolve_drop_id(gid);
+    // setgroups needs privilege; an unprivileged (dev) start keeps its own
+    // groups, which it cannot change anyway.
+    let privileged = unsafe { libc::geteuid() == 0 };
+    let drops_priv = privileged && (uid.is_some() || gid.is_some());
     {
         let std_cmd = cmd.as_std_mut();
-        if let Some(uid) = super::sandbox::resolve_drop_id(spec.uid) {
-            std_cmd.uid(uid);
-        }
-        if super::sandbox::resolve_drop_id(gid).is_some() {
-            std_cmd.gid(gid);
-        }
         // Its own process group: the stops below kill the whole tree, so an
         // orphaned worker can never keep the fleet's port into the next
-        // spawn. Uid drop above is untouched.
+        // spawn.
         std_cmd.process_group(0);
+        // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
+        // libc calls. The ids are set here (not via CommandExt::uid/gid,
+        // which would apply them before this hook, after which setgroups is
+        // EPERM): setgroups first so the child never keeps outer's
+        // supplementary groups, then setgid, then setuid.
+        unsafe {
+            std_cmd.pre_exec(move || {
+                if drops_priv {
+                    if libc::setgroups(0, std::ptr::null()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(gid) = gid {
+                        if libc::setgid(gid) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(uid) = uid {
+                        if libc::setuid(uid) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
     // Move the fleet into its leaf at once: between spawn and this write a
@@ -291,6 +384,24 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
     // negligible next to the fleet's lifetime, and documented, not hidden.
     if let Some(pid) = child.id() {
         if let Err(e) = std::fs::write(spec.cgroup_leaf.join("cgroup.procs"), pid.to_string()) {
+            if spec.cgroups_active {
+                // Fail closed when the leaf carries real limits: a refused
+                // move must never run uncapped. Kill the whole tree (the
+                // fleet leads its own group, so a worker it forked before
+                // the move dies with it instead of serving from the shared
+                // cgroup), reap, and fail the start.
+                // SAFETY: signals only the process group this start created
+                // (process_group(0) makes the group id the child's pid).
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                if e.raw_os_error() == Some(libc::ESRCH) {
+                    anyhow::bail!("fleet {} exited before its cgroup move", spec.slug);
+                }
+                return Err(e)
+                    .with_context(|| format!("fleet {} refused its cgroup move", spec.slug));
+            }
             tracing::warn!(fleet = %spec.slug, leaf = %spec.cgroup_leaf.display(), error = %e, "fleet cgroup move failed; running uncapped");
         }
     }
@@ -380,6 +491,8 @@ mod tests {
             secret_access_key: "secret".to_string(),
             session_token: Some("token".to_string()),
             cgroup_leaf: state.to_path_buf(),
+            // Dev-like default: no active cgroups, so a refused move warns.
+            cgroups_active: false,
             extra_env: vec![
                 ("GROCERY".to_string(), "milk".to_string()),
                 ("OUTER_SECRET".to_string(), "nope".to_string()),
@@ -492,5 +605,89 @@ mod tests {
             })
             .await;
         assert!(!fleet.is_alive());
+    }
+
+    fn fake_celld(dir: &tempfile::TempDir, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.path().join("celld");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    /// Fail closed: with active cgroups a refused move kills the tree and
+    /// fails the start instead of running uncapped.
+    #[tokio::test]
+    async fn refused_move_fails_the_start_when_cgroups_are_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut spec, mut opts) = test_spec(dir.path());
+        opts.celld_bin = fake_celld(&dir, "#!/bin/sh\nsleep 30\n");
+        // Nowhere to move into: the write is refused (ENOENT).
+        spec.cgroup_leaf = dir.path().join("no-such-leaf");
+        spec.cgroups_active = true;
+        let Err(err) = start(&spec, &opts).await else {
+            panic!("an active refused move must fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cgroup move"),
+            "fail-closed error names the move: {msg}"
+        );
+    }
+
+    /// Warn-only path: without active cgroups (dev) the fleet still starts.
+    #[tokio::test]
+    async fn refused_move_warns_only_when_cgroups_are_inactive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut spec, mut opts) = test_spec(dir.path());
+        opts.celld_bin = fake_celld(&dir, "#!/bin/sh\nsleep 30\n");
+        spec.cgroup_leaf = dir.path().join("no-such-leaf");
+        spec.cgroups_active = false;
+        let mut fleet = start(&spec, &opts).await.unwrap();
+        assert!(fleet.is_alive());
+        fleet
+            .stop(StopGrace {
+                term: Duration::from_secs(5),
+                kill: Duration::from_secs(5),
+            })
+            .await;
+        assert!(!fleet.is_alive());
+    }
+
+    /// A newline-less 1 MiB flood is stored capped and marked, and the line
+    /// after it arrives intact: unbounded `lines()` would keep the whole
+    /// megabyte in one ring entry.
+    #[tokio::test]
+    async fn capture_bounds_a_newline_less_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut spec, mut opts) = test_spec(dir.path());
+        opts.celld_bin = fake_celld(
+            &dir,
+            "#!/bin/sh\nhead -c 1048576 /dev/zero | tr '\\0' 'x'; echo; echo hello; sleep 30\n",
+        );
+        spec.cgroup_leaf = dir.path().to_path_buf();
+        let mut fleet = start(&spec, &opts).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let tail = loop {
+            let tail = fleet.logs.lock().await.tail(10);
+            if tail.len() >= 2 || std::time::Instant::now() >= deadline {
+                break tail;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(tail.len(), 2, "flood line plus the line after it");
+        assert!(
+            tail[0].line.len() <= MAX_LINE_BYTES + TRUNC_MARK.len(),
+            "flood stored capped, got {} bytes",
+            tail[0].line.len()
+        );
+        assert!(tail[0].line.ends_with(TRUNC_MARK), "flood marked truncated");
+        assert_eq!(tail[1].line, "hello");
+        fleet
+            .stop(StopGrace {
+                term: Duration::from_secs(5),
+                kill: Duration::from_secs(5),
+            })
+            .await;
     }
 }
