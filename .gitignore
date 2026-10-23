@@ -3,3 +3,6 @@
 *.sqlite
 *.sqlite-*
 .env
+/node_modules/
+/.blume/
+/dist/

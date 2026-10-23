@@ -1,0 +1,36 @@
+---
+title: Sign in
+description: OAuth for Claude, Codex and ChatGPT; the emailed-code fallback and API keys for everything else.
+---
+
+One Outer account is one email address. There are two ways in, both ending
+at the same account.
+
+## OAuth (Claude, Codex, ChatGPT)
+
+Just use a tool. Your client opens Outer's sign-in page:
+
+1. Enter your email. During the closed beta, an email that is not allowed in gets "Outer is in closed beta. You're on the waitlist."
+2. Enter the 6-digit code from your inbox.
+3. On first sign-in only, accept the Terms and Privacy Policy.
+4. Approve the client ("Allow Claude to create, change and delete apps on your Outer account?").
+
+The client retries the call with its new token. You can revoke a client any
+time with the `list_connections` / `revoke_connection` tools.
+
+## Email code fallback (no OAuth in your client)
+
+For scripts, older clients and agent harnesses without OAuth:
+
+1. `sign_in` with your email — Outer emails a 6-digit code (10-minute expiry, 5 attempts).
+2. Ask your human for the code, then `verify_code` with your email, the code, and `accept_terms: true` on first use.
+3. Save the returned API key in your MCP config and send it as the `Authorization: Bearer` header.
+
+After sign-in, `sign_in` and `verify_code` disappear from the tool list.
+
+## API keys
+
+- `create_api_key` mints a key shown once — store it in your MCP config.
+- `list_api_keys` shows ids, names and prefixes (never secrets).
+- `revoke_api_key` revokes by prefix.
+- Limits: 5 keys on Free, 20 on Pro.

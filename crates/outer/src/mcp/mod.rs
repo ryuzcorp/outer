@@ -1,5 +1,5 @@
 //! The MCP endpoint (spec §8): a hand-written Axum handler for `POST /mcp`
-//! on the platform host only, plus `GET /llms.txt`.
+//! on the platform host only.
 //!
 //! One JSON-RPC message per POST, one JSON response, no SSE, no sessions.
 //! `initialize`, `ping`, `tools/list` and `tools/call` are the only methods;
@@ -9,9 +9,9 @@
 
 pub mod docs;
 pub mod error;
-pub mod llms;
 pub mod registry;
 pub mod tools;
+pub mod tools_page;
 
 #[cfg(test)]
 mod tests;
@@ -590,19 +590,4 @@ async fn handle_call(
         Err(tools::CallError::Rpc(code, message)) => rpc_error(Some(id), code, message),
         Err(tools::CallError::Tool(err)) => rpc_result(id, err.into_result()),
     }
-}
-
-/// `GET /llms.txt`: the Appendix A page, rendered from the registry.
-pub async fn llms_handler(State(app): State<crate::http::AppState>) -> Response {
-    let state = &app.mcp;
-    let page = llms::render(&state.mcp_url(), &state.apps_domain, &registry::registry());
-    (
-        StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/markdown; charset=utf-8",
-        )],
-        page,
-    )
-        .into_response()
 }

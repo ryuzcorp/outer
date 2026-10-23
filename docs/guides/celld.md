@@ -1,0 +1,52 @@
+---
+title: celld guide
+description: How celld runs your app — the deploy pipeline, fleets, and runtime rules.
+---
+
+celld runs your built app: one fleet (isolated worker pool) per app, one
+uid per app, with its own memory, CPU and egress accounting.
+
+## The deploy pipeline
+
+Every `commit` runs these steps (each times out after 120 s):
+
+1. **Checkout** the commit into the app's persistent work directory.
+2. **`bun install`** — skipped when `package.json` and `bun.lock` hash
+   the same as the last successful install and `node_modules` exists.
+   With a lockfile present the install uses `--frozen-lockfile`.
+3. **`bun run build`** — skipped when `package.json` has no
+   `scripts.build`.
+4. **Validate `dist/wrangler.json`** (else `wrangler.jsonc` /
+   `wrangler.json` at the repo root): only keys celld accepts pass —
+   `name`, `main`, `compatibility_date`, `durable_objects`, `migrations`,
+   `assets`, `services`, `triggers`, `vars`, `d1_databases`,
+   `kv_namespaces`, `queues`, `workflows`, `r2_buckets` and a few build
+   keys. Anything else fails the deploy naming the key.
+5. **Review:** the pre-live gate (see the moderation guide).
+6. **Deploy** with celld, then poll the fleet's health. A deploy that
+   fails any step or the health check never takes over — the previous
+   version keeps serving. Nothing is uploaded before the gate passes.
+
+The template's `vite.config.ts` derives the deploy-root
+`dist/wrangler.json` from Void's own `dist/ssr/wrangler.json` — never
+hand-write it: set bindings in `void.config.ts` and rebuild.
+
+## Runtime rules
+
+- No module-scope state: every request must read fresh state.
+- `fetch` handlers only. No Workers AI, Vectorize or Cache bindings.
+- Outbound traffic from an app can never reach loopback, private ranges,
+  link-local or metadata addresses, and SMTP ports 25/465/587 are
+  blocked — send email through an HTTP API with a secret.
+- Responses an app fetches count against its own memory: stream large
+  downloads instead of buffering them.
+- A fleet stops after about 30 minutes without requests (the deployment's
+  idle setting) and wakes on the next request; a sleeping app adopts the
+  newest deploy when it wakes.
+
+## Sources
+
+- The template's build config (celld config derivation):
+  <https://github.com/ryuzcorp/noite-template-ilha/blob/636715ea44d8944701652abda734ab610e75c69d/vite.config.ts>
+- celld's runtime docs: <https://celld.dev/docs/>
+- Outer's deploy pipeline: `crates/outer/src/deploy/pipeline.rs`

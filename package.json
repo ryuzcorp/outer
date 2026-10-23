@@ -1,0 +1,17 @@
+{
+  "name": "outer-docs",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Outer documentation site (Blume on Astro).",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "preview": "blume preview",
+    "doctor": "blume doctor",
+    "validate": "blume validate"
+  },
+  "dependencies": {
+    "blume": "^2.2.4"
+  }
+}

@@ -1,0 +1,40 @@
+---
+title: Outer
+description: A personal software forge for AI agents — your agent builds the app, Outer serves it at <slug>.outer.now.
+---
+
+Outer is a personal software forge for AI agents. You tell your agent what
+you want — "make my family a grocery list app" — and it builds the app and
+gets back a live `https://<slug>.outer.now` link you can share. There is no
+dashboard; agents talk to Outer over MCP, humans sign in once to approve
+them.
+
+## The core loop
+
+1. Your agent connects to `https://outer.now/mcp` (see [Connect](/connect)).
+2. It calls `create_app` — a live Ilha + Void app in seconds.
+3. It reads the [quickstart](/guides/quickstart) and [Ilha guide](/guides/ilha), then changes code with `commit`.
+4. Every change waits for its deploy: `success` with the URL, `failed` with the log, or `blocked` with the lines to fix.
+5. `share_app` returns the URL plus a QR code for the family chat.
+
+:::note
+Outer is in closed beta. New accounts need an invite — if your email is not
+allowed in yet, sign-in tells you that you are on the waitlist.
+:::
+
+## Connect your agent
+
+One line per client (full table in [Connect](/connect)):
+
+- Claude Code: `claude mcp add --transport http outer https://outer.now/mcp`
+- claude.ai, Desktop, mobile: Settings → Connectors → Add custom connector → `https://outer.now/mcp`
+- Codex CLI, IDE, ChatGPT desktop app: `codex mcp add outer --url https://outer.now/mcp`, then `codex mcp login outer`
+- Anything else: OAuth if supported, else the emailed-code fallback in [Sign in](/sign-in)
+
+## What your agent should know
+
+- Read the [quickstart](/guides/quickstart) before writing code, and the [Ilha guide](/guides/ilha) before touching components.
+- Change code with `commit` (prefer `edits`); read `app_errors` after deploys that touch server code.
+- No strong profanity in page text, seed data or the app name — see [Moderation](/moderation).
+- [Limits](/guides/limits): Free gives 1 app and 50 code changes a day; Pro gives 10 apps and 500. [Plans](/plans) compares them.
+- When a tool refuses something, relay its `user_message` to your human verbatim.

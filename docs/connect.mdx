@@ -1,0 +1,34 @@
+---
+title: Connect
+description: Point your agent at Outer's MCP endpoint — one line per client, OAuth or emailed code.
+---
+
+Agents talk to Outer over MCP at `https://outer.now/mcp` (Streamable HTTP,
+OAuth 2.1). The first account tool call starts sign-in; after that the agent
+retries and keeps going.
+
+## Client setup
+
+| Client | Setup |
+| --- | --- |
+| Claude Code | `claude mcp add --transport http outer https://outer.now/mcp`. The first account tool call opens the browser |
+| claude.ai, Desktop, mobile | Settings → Connectors → Add custom connector → `https://outer.now/mcp` |
+| Codex CLI, IDE, ChatGPT desktop app | `codex mcp add outer --url https://outer.now/mcp`, then `codex mcp login outer` |
+| ChatGPT web | Coming in M2 — a custom plugin pointing at the MCP URL |
+| Anything else | OAuth if supported, else `sign_in` → `verify_code` → `Authorization` header (see [Sign in](/sign-in)) |
+
+:::note
+Codex may not start OAuth from a mid-session `401`; that is checked in the
+M1 client matrix. If sign-in does not start, sign in from a fresh session and
+retry the call.
+:::
+
+## How sign-in works
+
+Claude, Codex and ChatGPT use OAuth: your client opens Outer's sign-in page,
+you enter your email and the emailed code, accept the terms and approve the
+client. Clients without OAuth use two MCP tools instead — details in
+[Sign in](/sign-in).
+
+When a limit or refusal hits, the tool result carries a `user_message`
+written for you. Your agent relays it word for word.

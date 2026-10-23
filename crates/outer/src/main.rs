@@ -31,6 +31,7 @@ const USAGE: &str = "usage:
   outer app create SLUG --owner EMAIL [--name NAME]
   outer app deploy SLUG
   outer app list
+  outer docs tools
   outer version";
 
 #[tokio::main]
@@ -67,8 +68,12 @@ async fn main() -> ExitCode {
             run(move |config| app_deploy(config, slug)).await
         }
         ["app", "list"] => run(app_list).await,
-        ["version" | "--version" | "-V"] => {
-            println!("outer {}", env!("CARGO_PKG_VERSION"));
+        ["docs", "tools"] => {
+            // Generated site content: the registry rendered as Markdown.
+            print!(
+                "{}",
+                outer::mcp::tools_page::render(&outer::mcp::registry::registry())
+            );
             ExitCode::SUCCESS
         }
         ["help" | "--help" | "-h"] => {
@@ -555,6 +560,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             sync: sync.clone(),
             auth,
             mcp,
+            site: http::site::SiteDir::new(&config.site_dir),
         },
         http::proxy::ProxyState::new(
             pool.clone(),

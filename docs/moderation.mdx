@@ -1,0 +1,38 @@
+---
+title: Moderation
+description: What the pre-live gate checks, what blocks a deploy, and what happens to live apps.
+---
+
+Outer shares one domain between the platform and every app, so a bad app can
+hurt everyone. Moderation has two layers: a gate before anything goes live,
+and checks on what live apps render.
+
+## The pre-live gate
+
+Every deploy passes the gate before it can serve anything. It reads what
+visitors can read: JSX text, string literals and template parts in
+`ts`/`tsx`/`js`/`jsx`/`mjs` files (imports, URLs, CSS classes, comments and
+identifiers are skipped), `.html`/`.md`/`.txt` files, JSON strings under
+`public/`, SVG text, SQL string literals in migrations and seeds, the
+prerendered `dist/` HTML, and the slug plus app name.
+
+- Strong profanity, slurs, masked spellings and leetspeak, and the most severe content **block** the deploy. Mild words ("damn", "hell", "crap") pass.
+- A blocked deploy keeps the commit on `main` and the previous version keeps serving. `commit` returns `blocked` with the file, the line and an excerpt — fix those lines and commit again.
+- Only new text is checked; text cleared before is skipped.
+- Over the review caps (3000 files, 256 KiB each, 8 MiB total) the deploy is blocked as `too_large_to_review`.
+- When the classifier is unavailable, the deploy fails closed: nothing goes live and the previous version keeps serving.
+
+## After going live
+
+Rendered pages — including D1 rows and fetched text — are crawled after
+every deploy. Strong profanity on a rendered page **holds** the app (it
+serves a "being fixed" page until a clean deploy or a review); phishing and
+severe content **suspend** it. Run all visitor-written text through the
+template's `moderate()` helper before storing it. Uploaded files are not
+classified — that is why uploads are Pro-only.
+
+## Appeals
+
+There is no self-serve override during the closed beta: a human appeal goes
+to the platform owner for review. Relay any `user_message` verbatim instead
+of inventing a workaround. Full detail: [Moderation guide](/guides/moderation).

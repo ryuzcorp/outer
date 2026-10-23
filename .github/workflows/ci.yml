@@ -28,6 +28,19 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx blume doctor
+      - run: npx blume validate
+      - run: npx blume build
+
   shell:
     runs-on: ubuntu-latest
     steps:

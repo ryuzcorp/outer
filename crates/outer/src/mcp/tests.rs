@@ -107,6 +107,7 @@ fn app_state(state: &McpState) -> crate::http::AppState {
         sync: crate::store::snapshot::StateSync::new("test"),
         auth: state.auth.clone(),
         mcp: state.clone(),
+        site: crate::http::site::SiteDir::new(std::path::Path::new("/nonexistent")),
     }
 }
 
@@ -1069,34 +1070,15 @@ async fn app_logs_empty_ring_and_method_not_allowed() {
         0
     );
 
-    // GET on /mcp is 405; the platform router still serves llms.txt.
+    // GET on /mcp is 405. (Blume's own /llms.txt replaces the
+    // registry-rendered one; the site build checks it instead.)
     let app = crate::http::router(app_state(&state));
     use tower::ServiceExt as _;
     let get = app
-        .clone()
         .oneshot(Request::get("/mcp").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
-    let llms = app
-        .oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(llms.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(llms.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let page = String::from_utf8(bytes.to_vec()).unwrap();
-    for tool in registry() {
-        assert!(
-            page.contains(&format!("`{}`", tool.name)),
-            "llms.txt misses {}",
-            tool.name
-        );
-    }
-    assert!(page.contains("claude mcp add"));
-    assert!(page.contains("codex mcp add"));
-    assert!(page.contains("outer.localhost"));
 }
 
 #[tokio::test]

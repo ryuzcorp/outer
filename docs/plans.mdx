@@ -1,0 +1,40 @@
+---
+title: Plans
+description: Free and Pro compared — apps, code changes, storage, and what billing unlocks next.
+---
+
+Two plans. Every number is enforced in code; `whoami` shows your usage and
+when it resets.
+
+## Free
+
+- 1 app owned.
+- 50 code changes a day (UTC). `create_app`'s template commit and `rollback` never count.
+- 60 build minutes a day, 1 concurrent build.
+- 512 MiB fleet memory, 0.5 CPU, sleep after 30 min idle.
+- 250k requests a month, 500 MB app storage, 5 GB outbound traffic a month.
+- Bindings: D1, KV, Durable Objects. Cron intervals of at least 1 h.
+- 5 API keys. Logs and metrics kept 7 days.
+
+## Pro — $8/month
+
+- 10 apps owned.
+- 500 code changes a day, 600 build minutes a day, 2 concurrent builds.
+- 1 GiB fleet memory, 1 CPU, sleep after 24 h idle.
+- 5M requests a month, 25 GB app storage, 100 GB outbound traffic a month.
+- Bindings add R2 (file uploads), Queues and Workflows. Cron intervals down to 1 min.
+- Collaborators (up to 10 per app), code export, 20 API keys, 30-day retention.
+
+:::note
+Billing is coming — checkout, the customer portal and webhooks are not live
+yet, so every account is on Free during the closed beta. Collaborators, code
+export and custom domains arrive with billing in M2.
+:::
+
+## When a limit is hit
+
+Change, build, app and collaborator limits are hard refusals: the tool
+returns `quota_exceeded` with an upgrade link and a `user_message` your agent
+relays verbatim. Requests, storage and outbound traffic on Free pause the app
+at 100% until the month resets — data is kept. Full table:
+[Limits](/guides/limits).
