@@ -133,7 +133,23 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 || o[0] >= 240)
         }
         IpAddr::V6(v) => {
+            // IPv4-mapped (::ffff:a.b.c.d) is judged as the IPv4 it names.
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
             let s = v.segments();
+            // Transition and translation prefixes can tunnel to private
+            // IPv4 space: 6to4 2002::/16, Teredo 2001::/32, NAT64
+            // 64:ff9b::/96 (+ local-use 64:ff9b:1::/48), discard 100::/64,
+            // benchmarking 2001:2::/48.
+            if s[0] == 0x2002
+                || (s[0] == 0x2001 && s[1] == 0)
+                || (s[0] == 0x2001 && s[1] == 2 && s[2] == 0)
+                || (s[0] == 0x64 && s[1] == 0xff9b)
+                || (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+            {
+                return false;
+            }
             !(v.is_loopback()
                 || v.is_unspecified()
                 || v.is_multicast()
@@ -272,6 +288,9 @@ async fn fetch_cimd(
         .ok_or(ClientError::PrivateIp)?;
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
+        // A redirect would leave the vetted, pinned address (SSRF): CIMD
+        // documents are served directly or not at all.
+        .redirect(reqwest::redirect::Policy::none())
         .resolve(&host, SocketAddr::new(vetted, port))
         .build()
         .map_err(|err| ClientError::Fetch(format!("client failed: {err}")))?;
@@ -494,13 +513,26 @@ mod tests {
             "fc00::1",
             "ff02::1",
             "2001:db8::1",
+            // IPv4-mapped and transition prefixes that tunnel to private v4.
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "2002:a00:1::1",
+            "2001:0:4136:e378::1",
+            "64:ff9b::a00:1",
+            "100::1",
         ] {
             assert!(
                 !is_public_ip(ip.parse().unwrap()),
                 "{ip} must not count as public"
             );
         }
-        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(
                 is_public_ip(ip.parse().unwrap()),
                 "{ip} must count as public"

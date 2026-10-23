@@ -345,7 +345,7 @@ fn print_outcome(
 /// Build the auth module's state from config: issuer from scheme + domain +
 /// port, Cloudflare Email Service when the Cloudflare pair is set, log-only
 /// codes on localhost without it.
-fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> outer::auth::AuthState {
+fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> anyhow::Result<outer::auth::AuthState> {
     let issuer = format!(
         "{}://{}{}",
         scheme(config),
@@ -358,9 +358,14 @@ fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> outer::auth::AuthStat
             cf.api_token.clone(),
             outer::auth::EmailFrom::parse(&config.email_from),
         ),
-        None => outer::auth::EmailSender::Log,
+        // Codes in the log are a localhost convenience only: off localhost
+        // a missing sender must stop the boot, never leak live codes.
+        None if config.is_local() => outer::auth::EmailSender::Log,
+        None => anyhow::bail!(
+            "no email sender: set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN (Cloudflare Email Service)"
+        ),
     };
-    outer::auth::AuthState {
+    Ok(outer::auth::AuthState {
         pool: pool.clone(),
         config: outer::auth::AuthConfig {
             issuer: issuer.clone(),
@@ -375,7 +380,7 @@ fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> outer::auth::AuthStat
             allow_loopback_fetch: false,
             origin_locked: config.tls_enabled(),
         },
-    }
+    })
 }
 
 /// `:8080` unless the listener is on the scheme's default port.
@@ -490,7 +495,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         http::AppState {
             pool: pool.clone(),
             sync: sync.clone(),
-            auth: auth_state(&config, &pool),
+            auth: auth_state(&config, &pool)?,
         },
         http::proxy::ProxyState::new(
             pool.clone(),

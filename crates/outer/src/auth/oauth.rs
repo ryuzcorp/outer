@@ -81,6 +81,9 @@ fn html(status: StatusCode, page: maud::Markup, cookie: Option<String>) -> Respo
         [
             ("content-type", "text/html; charset=utf-8"),
             ("content-security-policy", pages::CSP),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            ("cache-control", "no-store"),
         ],
         pages::render(page),
     )
@@ -743,12 +746,18 @@ async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i6
     else {
         return bad("invalid_grant", "the authorization code is unknown");
     };
-    // Single use: the row goes before any other check.
-    sqlx::query("DELETE FROM oauth_request WHERE id = ?")
+    // Single use, atomically: only the redemption that actually deletes the
+    // row may continue; a concurrent duplicate sees zero rows affected.
+    let claimed = sqlx::query("DELETE FROM oauth_request WHERE id = ? AND code_hash = ?")
         .bind(&id)
+        .bind(&hash)
         .execute(&state.pool)
         .await
-        .ok();
+        .map(|done| done.rows_affected() == 1)
+        .unwrap_or(false);
+    if !claimed {
+        return bad("invalid_grant", "the authorization code was already used");
+    }
     if now > expires_at {
         return bad("invalid_grant", "the authorization code expired");
     }
@@ -775,6 +784,21 @@ async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i6
     let scope = scope.unwrap_or_else(|| "apps".to_string());
     let resource = stored_resource.unwrap_or_else(|| state.config.resource.clone());
     issue_grant(state, &client_id, &account_id, &scope, &resource, now).await
+}
+
+/// Refresh-token reuse: revoke the grant and drop all of its tokens.
+async fn revoke_grant_tokens(pool: &sqlx::SqlitePool, grant_id: &str, now: i64) {
+    sqlx::query("UPDATE oauth_grant SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+        .bind(now)
+        .bind(grant_id)
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM oauth_token WHERE grant_id = ?")
+        .bind(grant_id)
+        .execute(pool)
+        .await
+        .ok();
 }
 
 async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now: i64) -> Response {
@@ -807,17 +831,7 @@ async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now:
     };
     // Reusing a rotated refresh token revokes the whole grant.
     if rotated_at.is_some() {
-        sqlx::query("UPDATE oauth_grant SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
-            .bind(now)
-            .bind(&grant_id)
-            .execute(&state.pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM oauth_token WHERE grant_id = ?")
-            .bind(&grant_id)
-            .execute(&state.pool)
-            .await
-            .ok();
+        revoke_grant_tokens(&state.pool, &grant_id, now).await;
         return bad("invalid_grant", "the refresh token was already used");
     }
     if now > expires_at {
@@ -852,12 +866,21 @@ async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now:
     let (refresh, refresh_hash) = tokens::new_refresh_token();
     let access_ttl_ms = ttl_ms(state.config.access_ttl, 3_600_000);
     let refresh_ttl_ms = ttl_ms(state.config.refresh_ttl, 90 * 86_400_000);
-    sqlx::query("UPDATE oauth_token SET rotated_at = ? WHERE token_hash = ?")
-        .bind(now)
-        .bind(&hash)
-        .execute(&state.pool)
-        .await
-        .ok();
+    // Claim the rotation atomically: of two concurrent uses only one
+    // updates the row; the other is reuse and revokes the grant.
+    let claimed = sqlx::query(
+        "UPDATE oauth_token SET rotated_at = ? WHERE token_hash = ? AND rotated_at IS NULL",
+    )
+    .bind(now)
+    .bind(&hash)
+    .execute(&state.pool)
+    .await
+    .map(|done| done.rows_affected() == 1)
+    .unwrap_or(false);
+    if !claimed {
+        revoke_grant_tokens(&state.pool, &grant_id, now).await;
+        return bad("invalid_grant", "the refresh token was already used");
+    }
     sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'access', ?)")
         .bind(&access_hash)
         .bind(&grant_id)

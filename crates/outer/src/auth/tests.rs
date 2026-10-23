@@ -461,6 +461,71 @@ async fn full_authorize_flow_mints_a_working_token() {
     assert_eq!(params.get("iss").map(String::as_str), Some(ISSUER));
 }
 
+/// Concurrent redemption of one code mints at most one grant, and two
+/// concurrent uses of one refresh token never both succeed: the loser is
+/// reuse and revokes the grant (theft detection survives the race).
+#[tokio::test]
+async fn concurrent_code_and_refresh_reuse_cannot_double_spend() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_id = dcr_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let redeem = || {
+        send(
+            &flow.app,
+            post_form(
+                "/oauth/token",
+                &form(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", &params["code"]),
+                    ("redirect_uri", redirect_uri),
+                    ("code_verifier", VERIFIER),
+                ]),
+            ),
+        )
+    };
+    let (a, b) = tokio::join!(redeem(), redeem());
+    let ok: Vec<_> = [&a, &b]
+        .into_iter()
+        .filter(|r| r.0 == StatusCode::OK)
+        .collect();
+    assert_eq!(ok.len(), 1, "exactly one redemption wins: {a:?} {b:?}");
+    let tokens: serde_json::Value = ok[0].2.parse().unwrap();
+
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    let use_refresh = || {
+        send(
+            &flow.app,
+            post_form(
+                "/oauth/token",
+                &form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]),
+            ),
+        )
+    };
+    let (a, b) = tokio::join!(use_refresh(), use_refresh());
+    let wins = [&a, &b]
+        .into_iter()
+        .filter(|r| r.0 == StatusCode::OK)
+        .count();
+    assert!(wins <= 1, "a refresh token rotates once: {a:?} {b:?}");
+    if wins == 1 {
+        // The loser was reuse: the whole grant is gone, the winner's
+        // fresh access token included.
+        let winner = if a.0 == StatusCode::OK { &a } else { &b };
+        let rotated: serde_json::Value = winner.2.parse().unwrap();
+        let resolved = auth::resolve_bearer(
+            &flow.state.pool,
+            &flow.state.config,
+            rotated["access_token"].as_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(resolved.is_none(), "reuse revoked the grant");
+    }
+}
+
 #[tokio::test]
 async fn authorize_rejects_bad_params_without_redirecting() {
     let flow = flow().await;
@@ -689,6 +754,7 @@ async fn otp_attempts_expiry_and_limits() {
             "000000",
             false,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -705,6 +771,7 @@ async fn otp_attempts_expiry_and_limits() {
         "000000",
         false,
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -719,9 +786,17 @@ async fn otp_attempts_expiry_and_limits() {
         .execute(&pool)
         .await
         .unwrap();
-    let err = auth::otp_verify(&pool, &state.config, "ana@example.com", &code, true, None)
-        .await
-        .unwrap_err();
+    let err = auth::otp_verify(
+        &pool,
+        &state.config,
+        "ana@example.com",
+        &code,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code, "code_expired");
 
     // Five sends per hour per email.
@@ -828,6 +903,7 @@ async fn api_keys_create_list_revoke_and_resolve() {
         &code,
         true,
         Some("laptop"),
+        None,
     )
     .await
     .unwrap();

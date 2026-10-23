@@ -491,9 +491,10 @@ pub async fn otp_verify(
     code: &str,
     accept_terms: bool,
     key_name: Option<&str>,
+    client_ip: Option<&str>,
 ) -> Result<Verified, AuthError> {
     let email = normalize_email(email);
-    let (account_id, terms_ok) = verify_code_core(pool, cfg, &email, code, None).await?;
+    let (account_id, terms_ok) = verify_code_core(pool, cfg, &email, code, client_ip).await?;
     if !terms_ok && !accept_terms {
         return Err(AuthError {
             code: "terms_required",
@@ -588,11 +589,17 @@ pub async fn revoke_api_key(
     account_id: &str,
     prefix: &str,
 ) -> Result<bool, AuthError> {
+    // Exactly one live key per prefix, or nothing: a (vanishingly rare)
+    // prefix collision must never revoke a key the caller didn't mean.
     let result = sqlx::query(
         "UPDATE api_key SET revoked_at = ? \
-         WHERE account_id = ? AND prefix = ? AND revoked_at IS NULL",
+         WHERE account_id = ? AND prefix = ? AND revoked_at IS NULL \
+           AND (SELECT COUNT(*) FROM api_key \
+                WHERE account_id = ? AND prefix = ? AND revoked_at IS NULL) = 1",
     )
     .bind(now_ms())
+    .bind(account_id)
+    .bind(prefix)
     .bind(account_id)
     .bind(prefix)
     .execute(pool)
