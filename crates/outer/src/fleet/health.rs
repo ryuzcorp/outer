@@ -17,11 +17,25 @@ pub async fn wait_healthy(host: &str, port: u16, timeout: Duration) -> bool {
     });
     let url = format!("http://{host}:{port}/.well-known/celld/health");
     let deadline = tokio::time::Instant::now() + timeout;
+    let started = tokio::time::Instant::now();
     loop {
-        if let Ok(resp) = CLIENT.get(&url).send().await {
-            if resp.status().is_success() {
-                return true;
-            }
+        let attempt = tokio::time::Instant::now();
+        match CLIENT.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => return true,
+            Ok(resp) => tracing::debug!(
+                port,
+                status = resp.status().as_u16(),
+                attempt_ms = attempt.elapsed().as_millis() as u64,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "fleet not healthy yet"
+            ),
+            Err(err) => tracing::debug!(
+                port,
+                error = %err,
+                attempt_ms = attempt.elapsed().as_millis() as u64,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "fleet health probe failed"
+            ),
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
