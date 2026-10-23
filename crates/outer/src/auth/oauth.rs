@@ -97,11 +97,30 @@ fn oauth_error(status: StatusCode, code: &str, description: &str) -> Response {
 }
 
 fn html(status: StatusCode, page: maud::Markup, cookie: Option<String>) -> Response {
+    html_with_csp(status, page, cookie, pages::CSP)
+}
+
+/// The consent page: its Allow/Deny form answers with a redirect to the
+/// client, and browsers apply CSP `form-action` to the redirect target of a
+/// form submission too. With only `'self'` the browser silently drops the
+/// 302 to the app (the user stays on the consent page — found with
+/// Perplexity), so this page also allows the request's own redirect origin.
+fn consent(page: maud::Markup, redirect_uri: &str, cookie: Option<String>) -> Response {
+    let csp = pages::consent_csp(redirect_uri);
+    html_with_csp(StatusCode::OK, page, cookie, &csp)
+}
+
+fn html_with_csp(
+    status: StatusCode,
+    page: maud::Markup,
+    cookie: Option<String>,
+    csp: &str,
+) -> Response {
     let mut response = (
         status,
         [
             ("content-type", "text/html; charset=utf-8"),
-            ("content-security-policy", pages::CSP),
+            ("content-security-policy", csp),
             ("x-content-type-options", "nosniff"),
             ("referrer-policy", "no-referrer"),
             ("cache-control", "no-store"),
@@ -328,9 +347,9 @@ async fn authorize_get(
                     None,
                 );
             }
-            return html(
-                StatusCode::OK,
+            return consent(
                 pages::consent_page(&client, &scope, &id, &csrf),
+                redirect_uri,
                 None,
             );
         }
@@ -463,9 +482,9 @@ async fn authorize_post(
                             session,
                         );
                     }
-                    html(
-                        StatusCode::OK,
+                    consent(
                         pages::consent_page(&client, &pending.scope, &pending.id, &pending.csrf),
+                        &pending.redirect_uri,
                         session,
                     )
                 }
@@ -503,9 +522,9 @@ async fn authorize_post(
             {
                 return error("sign-in is unavailable right now");
             }
-            html(
-                StatusCode::OK,
+            consent(
                 pages::consent_page(&client, &pending.scope, &pending.id, &pending.csrf),
+                &pending.redirect_uri,
                 None,
             )
         }
