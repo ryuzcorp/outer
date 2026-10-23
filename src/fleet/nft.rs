@@ -51,7 +51,18 @@ fn counted_uids(cfg: &NftConfig) -> Vec<u32> {
 pub fn ruleset(cfg: &NftConfig) -> String {
     let id = range_match(cfg.uid_range);
     let mut rules = Vec::new();
-    // Replies first: these rules only restrict connections an app *opens*.
+    // Per-uid egress byte counters, read back for monthly usage. First and
+    // verdict-free: almost every byte an app sends belongs to an established
+    // connection, so counters below the `established` accept would only ever
+    // see each connection's opening packet. Loopback is excluded because
+    // that's the app answering outer's proxy, i.e. serving visitors, which
+    // the proxy meters as requests rather than as outbound traffic.
+    for uid in counted_uids(cfg) {
+        rules.push(format!(
+            "    meta skuid {uid} oifname != \"lo\" counter name \"app_{uid}\""
+        ));
+    }
+    // Replies next: these rules only restrict connections an app *opens*.
     // Without this, a fleet's answers to outer's proxy (over loopback) match
     // the rejects below, and no app is reachable at all.
     rules.push("    ct state established,related accept".to_string());
@@ -115,13 +126,6 @@ pub fn ruleset(cfg: &NftConfig) -> String {
         rules.push(format!(
             "    meta skuid {uid} ct state new limit rate over {}/second burst {} packets counter drop",
             cfg.pro_new_conns_per_sec, cfg.pro_new_conns_per_sec,
-        ));
-    }
-    // Per-uid egress byte counters, read back for monthly usage. Placed last
-    // so only traffic nothing above rejected is counted.
-    for uid in counted_uids(cfg) {
-        rules.push(format!(
-            "    meta skuid {uid} counter name \"app_{uid}\" accept"
         ));
     }
     let mut counters = String::new();
@@ -320,15 +324,18 @@ mod tests {
             );
             assert!(
                 rules.contains(&format!(
-                    "meta skuid {uid} counter name \"app_{uid}\" accept"
+                    "meta skuid {uid} oifname != \"lo\" counter name \"app_{uid}\""
                 )),
                 "counter rule for {uid}"
             );
         }
-        // Counters come after the rejects, so rejected traffic is not counted.
-        let last_reject = rules.rfind(" reject").expect("has rejects");
+        // Counters come before the established accept, or they would only see
+        // each connection's first packet.
         let first_counter = rules.find("counter name").expect("has counters");
-        assert!(last_reject < first_counter);
+        let replies = rules
+            .find("ct state established,related accept")
+            .expect("reply rule");
+        assert!(first_counter < replies);
     }
 
     #[test]
