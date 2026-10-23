@@ -67,9 +67,16 @@ pub fn is_reserved_env_name(name: &str) -> bool {
 /// uncapped. `None` is dev (no cgroups), where no move is attempted.
 /// Each step needs its own leaf: cleanup kills the whole leaf (`cgroup.kill`
 /// plus the process group), so a shared leaf would kill sibling steps.
+///
+/// Two env lists: `platform_env` is set by outer itself (PATH, the bucket
+/// credentials `celld deploy` needs) and reaches the child as given; `env`
+/// carries app-supplied values (secrets) and goes through
+/// [`is_reserved_env_name`], so an app can never set `LD_PRELOAD`, `AWS_*` or
+/// any platform name.
 pub struct Sandbox<'a> {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    pub platform_env: &'a [(String, String)],
     pub env: &'a [(String, String)],
     pub cache_root: &'a Path,
     pub cgroup_leaf: Option<&'a Path>,
@@ -235,6 +242,9 @@ pub async fn run_sandboxed(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     for (key, value) in base_env(&tmp.to_string_lossy(), sb.cache_root) {
+        cmd.env(key, value);
+    }
+    for (key, value) in sb.platform_env {
         cmd.env(key, value);
     }
     for (key, value) in sb.env {
@@ -409,6 +419,7 @@ mod tests {
         let sb = Sandbox {
             uid: None,
             gid: None,
+            platform_env: &[],
             env: &caller,
             cache_root: &cache,
             cgroup_leaf: None,
@@ -460,6 +471,7 @@ mod tests {
         let sb = Sandbox {
             uid: None,
             gid: None,
+            platform_env: &[],
             env: &[],
             cache_root: &cache,
             cgroup_leaf: None,
@@ -491,6 +503,7 @@ mod tests {
         let sb = Sandbox {
             uid: Some(200000),
             gid: Some(200000),
+            platform_env: &[],
             env: &[],
             cache_root: &cache,
             cgroup_leaf: None,
@@ -514,6 +527,7 @@ mod tests {
         let sb = Sandbox {
             uid: None,
             gid: None,
+            platform_env: &[],
             env: &caller,
             cache_root: &cache,
             cgroup_leaf: None,
@@ -617,6 +631,7 @@ mod tests {
         let sb = Sandbox {
             uid: Some(200_000),
             gid: Some(200_000),
+            platform_env: &[],
             env: &[],
             cache_root: &cache,
             cgroup_leaf: Some(&leaf),
@@ -662,6 +677,7 @@ mod tests {
         let sb = Sandbox {
             uid: None,
             gid: None,
+            platform_env: &[],
             env: &[],
             cache_root: &cache,
             cgroup_leaf: Some(&leaf),

@@ -1,5 +1,7 @@
-//! HTTP surface. M0 serves only the operator probes; MCP, OAuth and the app
-//! proxy mount here in later milestones.
+//! HTTP surface: the platform host (operator probes now; MCP and OAuth
+//! later) and every app host through [`proxy`].
+
+pub mod proxy;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -22,6 +24,35 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .with_state(state)
+}
+
+/// The whole HTTP surface: requests for the platform host (or with no
+/// `Host`) reach [`router`]; every other host is an app and goes to
+/// [`proxy::handle`], which answers 404 for hosts that aren't apps.
+pub fn app(platform: AppState, apps: proxy::ProxyState, platform_host: String) -> Router {
+    let platform = router(platform);
+    Router::new().fallback(move |req: axum::extract::Request| {
+        let platform = platform.clone();
+        let apps = apps.clone();
+        let platform_host = platform_host.clone();
+        async move {
+            let host = req
+                .headers()
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.split(':').next().unwrap_or(h).to_ascii_lowercase());
+            match host {
+                Some(host) if host != platform_host => proxy::handle(apps, req).await,
+                _ => {
+                    use tower::ServiceExt as _;
+                    match platform.oneshot(req).await {
+                        Ok(res) => res,
+                        Err(never) => match never {},
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Liveness: the process answers.
