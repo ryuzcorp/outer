@@ -1,6 +1,0 @@
-# Ambíguo: decidido pelo Jev; bloqueia enquanto o Jev não está disponível.
-vadia
-cadela
-pinto
-xota
-grelo

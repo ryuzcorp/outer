@@ -9,7 +9,6 @@ repository = "https://github.com/ryuzcorp/outer"
 publish = false
 
 [dependencies]
-aho-corasick = "1.1.5"
 anyhow = "1"
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
@@ -62,7 +61,6 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-unicode-normalization = "0.1.26"
 url = "2.5.8"
 uuid = { version = "1", features = ["serde", "v4"] }
 zstd = "0.14"

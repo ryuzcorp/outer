@@ -1,29 +1,55 @@
-//! The pre-live profanity gate (spec §15.1, step 6 of the pipeline).
+//! The pre-live gate (spec §15.1, step 6 of the pipeline).
 //!
 //! Source strings, content files, prerendered HTML and app metadata are
-//! extracted ([`extract`]), normalized ([`normalize`]), matched against
-//! embedded wordlists ([`wordlist`]), and decided ([`gate`]) while Jev is
-//! still unavailable: `strong` hits block, `ambiguous` hits block too
-//! (fail closed), other text passes. The decision function already takes
-//! an `Option<JevScores>` so a Jev client plugs in later without
-//! restructuring.
+//! extracted ([`extract`]) and classified by TypeSafe Jev through Cloudflare
+//! AI Gateway ([`jev`]); the per-chunk scores are decided ([`gate`]).
+//! There is no handwritten profanity machinery: no normalization, no
+//! wordlists, no masking. Jev is the only classifier, and when it is
+//! unreachable the deploy fails closed (`review_unavailable`).
 
 pub mod extract;
 pub mod gate;
-pub mod normalize;
-pub mod wordlist;
+pub mod jev;
 
 pub use extract::{Chunk, TooLarge, MAX_FILES, MAX_FILE_BYTES, MAX_TEXT_BYTES};
-pub use gate::{run_gate, BlockReason, Decision, Finding, GateOutcome, GateStats, JevScores};
-pub use normalize::{mask_excerpt, normalize, NormalizedText};
-pub use wordlist::{Tier, WordHit};
+pub use gate::{
+    cache_key, judge, run_gate, run_skipped, run_too_large, BlockReason, ChunkVerdict, Decision,
+    Finding, GateError, GateOutcome, GateStats,
+};
+pub use jev::{ChunkScores, JevClient, JevConfig, JevError, JEV_MODEL};
 
-/// The agent-facing line for a blocked deploy, per spec §15.1.
+/// The agent-facing line for a blocked deploy, per spec §15.1 for profanity
+/// and analogous for the other block categories.
 pub fn user_message(first: &Finding) -> String {
-    format!(
-        "Outer didn't publish this change because the page text has strong profanity ({}, line {}). Your app still shows the previous version.",
-        first.path, first.line
-    )
+    match first.category {
+        "sexual_minors" | "phishing" | "severity" => format!(
+            "Outer didn't publish this change because the page text was flagged as {} ({}, line {}). Your app still shows the previous version.",
+            category_label(first.category),
+            first.path,
+            first.line
+        ),
+        _ => format!(
+            "Outer didn't publish this change because the page text has strong profanity ({}, line {}). Your app still shows the previous version.",
+            first.path, first.line
+        ),
+    }
+}
+
+fn category_label(category: &str) -> &'static str {
+    match category {
+        "sexual_minors" => "sexual content involving minors",
+        "phishing" => "phishing or credential harvesting",
+        "severity" => "severely harmful content",
+        "hate" => "hate or harassment",
+        _ => "strong profanity",
+    }
+}
+
+/// The agent-facing line when Jev is unreachable: fail closed, keep serving
+/// the previous version, try again shortly.
+pub fn unavailable_message() -> String {
+    "Outer didn't publish this change because the content check is temporarily unavailable. Your app still shows the previous version — try again shortly."
+        .to_string()
 }
 
 /// The agent-facing line for an over-caps deploy.

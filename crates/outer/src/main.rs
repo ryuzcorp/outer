@@ -228,6 +228,19 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
     let store = build_store(config)?;
     let pool = db::open(&config.db_path()).await?;
     let rt = &config.runtime;
+    // The pre-live gate classifies through Jev on AI Gateway with the same
+    // Cloudflare pair that mints R2 credentials. Without the pair (localhost
+    // dev only) the gate logs a warning and passes unchecked.
+    let jev = match &config.cloudflare {
+        Some(cf) => Some(outer::moderation::JevClient::new(
+            outer::moderation::JevConfig::new(
+                cf.account_id.clone(),
+                cf.api_token.clone(),
+                config.ai_gateway.clone(),
+            ),
+        )?),
+        None => None,
+    };
     let deployer = Deployer::new(
         DeploySettings {
             data_dir: config.data_dir.clone(),
@@ -237,6 +250,7 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
             storage: fleet_storage(config)?,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
+            jev,
         },
         rt.build_concurrency,
     );
