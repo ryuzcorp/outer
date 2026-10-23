@@ -147,6 +147,10 @@ pub fn fleet_command(
             format!("{state_dir}/asset-cache"),
         ),
         ("CELLD_TRUST_FORWARDED_HEADERS".to_string(), "1".to_string()),
+        // Every app is a one-node fleet: there is no fleet capacity to wait
+        // for, and celld's default first-readiness gate (120 s cap) holds a
+        // cold wake for about a second locally and ~3 s on the VPS.
+        ("CELLD_READY_FLEET_GATE_MS".to_string(), "0".to_string()),
     ];
     if let Some(token) = &spec.session_token {
         env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
@@ -586,6 +590,10 @@ mod tests {
             (512u64 * 1024 * 1024).to_string()
         );
         assert_eq!(env["CELLD_TRUST_FORWARDED_HEADERS"], "1");
+        assert_eq!(
+            env["CELLD_READY_FLEET_GATE_MS"], "0",
+            "single-node fleets skip the fleet gate"
+        );
         assert_eq!(env["AWS_ACCESS_KEY_ID"], "key");
         assert_eq!(env["AWS_SECRET_ACCESS_KEY"], "secret");
         assert_eq!(env["AWS_SESSION_TOKEN"], "token");
