@@ -396,6 +396,21 @@ pub async fn set_last_deploy(pool: &SqlitePool, app_id: &str, sha: &str) -> anyh
     Ok(())
 }
 
+/// Change who may discover the app: `unlisted` (default, kept out of search
+/// engines) or `public`. Owner-only; the MCP layer enforces the role.
+pub async fn set_visibility(
+    pool: &SqlitePool,
+    app_id: &str,
+    visibility: Visibility,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE app SET visibility = ?1 WHERE id = ?2")
+        .bind(visibility.as_str())
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

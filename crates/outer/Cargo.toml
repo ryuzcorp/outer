@@ -44,6 +44,8 @@ rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",
 ] }
 rusty-s3 = "0.10.2"
+qrcode = "0.14"
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

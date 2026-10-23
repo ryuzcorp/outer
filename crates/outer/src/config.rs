@@ -84,6 +84,7 @@ impl std::fmt::Debug for Config {
             .field("admin_emails", &self.admin_emails)
             .field("oauth_access_ttl", &self.oauth_access_ttl)
             .field("oauth_refresh_ttl", &self.oauth_refresh_ttl)
+            .field("tool_wait", &self.tool_wait)
             .field("log_filter", &self.log_filter)
             .field("runtime", &self.runtime)
             .finish()
@@ -125,6 +126,8 @@ pub struct Config {
     pub oauth_access_ttl: Duration,
     /// `OUTER_OAUTH_REFRESH_TTL_D` (default 90).
     pub oauth_refresh_ttl: Duration,
+    /// `OUTER_TOOL_WAIT_S` (default 50): cap on one awaited tool call.
+    pub tool_wait: Duration,
     /// Log filter directives (`RUST_LOG`, default `info`).
     pub log_filter: String,
     /// Running apps: allocation ranges, binaries, limits, sleep.
@@ -304,6 +307,12 @@ impl Config {
                 &mut problems,
             ) * 86400,
         );
+        let tool_wait = Duration::from_secs(parse_num(
+            get("OUTER_TOOL_WAIT_S"),
+            "OUTER_TOOL_WAIT_S",
+            50u64,
+            &mut problems,
+        ));
         let log_filter = get("RUST_LOG").unwrap_or("info").to_string();
         if let Err(err) = tracing_subscriber::EnvFilter::try_new(&log_filter) {
             problems.push(format!(
@@ -383,6 +392,7 @@ impl Config {
             email_from,
             oauth_access_ttl,
             oauth_refresh_ttl,
+            tool_wait,
             log_filter,
             runtime,
         };
@@ -445,6 +455,9 @@ impl Config {
         }
         if self.oauth_refresh_ttl.is_zero() {
             problems.push("OUTER_OAUTH_REFRESH_TTL_D must be at least 1".to_string());
+        }
+        if self.tool_wait.is_zero() {
+            problems.push("OUTER_TOOL_WAIT_S must be at least 1".to_string());
         }
         let rt = &self.runtime;
         if !is_hostname(&rt.apps_domain) {

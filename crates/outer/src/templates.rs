@@ -236,6 +236,27 @@ pub async fn materialize(store: &Store, dest_dir: &Path) -> anyhow::Result<Templ
     Ok(template)
 }
 
+/// Point the store at an already-built bundle file (tests): uploads
+/// `bundle` under the template key for `sha` and stores the `current.json`
+/// pointer, so [`materialize`] works without a network `sync`.
+#[cfg(test)]
+pub(crate) async fn put_test_template(
+    store: &Store,
+    sha: &str,
+    bundle: &Path,
+) -> anyhow::Result<TemplateRef> {
+    let key = bundle_key(sha);
+    store.put_file(&key, bundle).await?;
+    let template = TemplateRef {
+        sha: sha.to_string(),
+        bundle_key: key,
+        source: "test".to_string(),
+    };
+    store
+        .put(CURRENT_KEY, serde_json::to_vec(&template)?)
+        .await?;
+    Ok(template)
+}
 /// `dest_dir` joined with `rel`, for tests.
 #[cfg(test)]
 fn dest_path(dest_dir: &Path, rel: &str) -> std::path::PathBuf {
