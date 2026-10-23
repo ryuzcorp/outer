@@ -5,11 +5,11 @@
   "type": "module",
   "description": "Outer documentation site (Blume on Astro).",
   "scripts": {
-    "dev": "blume dev",
-    "build": "blume build",
-    "preview": "blume preview",
-    "doctor": "blume doctor",
-    "validate": "blume validate"
+    "dev": "bun ./node_modules/blume/bin/blume.mjs dev",
+    "build": "bun ./node_modules/blume/bin/blume.mjs build",
+    "preview": "bun ./node_modules/blume/bin/blume.mjs preview",
+    "doctor": "bun ./node_modules/blume/bin/blume.mjs doctor",
+    "validate": "bun ./node_modules/blume/bin/blume.mjs validate"
   },
   "dependencies": {
     "blume": "^2.2.4"

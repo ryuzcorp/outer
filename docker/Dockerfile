@@ -15,13 +15,15 @@ FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
 # --- docs site (Blume) ----------------------------------------------------------
 # The platform host serves this static build for humans and agents; the MCP
-# `docs` tool serves the same Markdown from `docs/guides/`.
-FROM docker.io/library/node:24-slim AS site
+# `docs` tool serves the same Markdown from `docs/guides/`. Installed with
+# bun: npm's resolver stalls on Astro's dependency tree (250k+ placements,
+# no lockfile after hours), while `bun install` finishes in seconds.
+FROM docker.io/oven/bun:1.4-slim AS site
 WORKDIR /site
-COPY package.json package-lock.json blume.config.ts ./
+COPY package.json bun.lock blume.config.ts ./
 COPY docs ./docs
-RUN npm ci \
- && npx blume build
+RUN bun install --frozen-lockfile \
+ && bun ./node_modules/blume/bin/blume.mjs build
 
 # --- outer binary -------------------------------------------------------------
 FROM docker.io/library/rust:1-bookworm AS build
