@@ -265,12 +265,14 @@ fn close_event(current: &mut Vec<(i64, String)>, events: &mut Vec<ErrorEvent>) {
             first
         }
     };
+    // Store the error as the agent should read it: without the timestamp
+    // and log level/target prefix (fingerprints strip it anyway).
+    let message = strip_log_prefix(&message).to_string();
     let frame = current
         .iter()
         .skip(1)
-        .map(|(_, l)| l.as_str())
-        .find(|l| is_stack_frame(l))
-        .map(str::to_string);
+        .map(|(_, l)| l.trim().to_string())
+        .find(|l| is_stack_frame(l));
     events.push(ErrorEvent {
         message,
         frame,
@@ -865,7 +867,7 @@ mod tests {
         assert_eq!(events[0].message, "Error: boom");
         assert_eq!(
             events[0].frame.as_deref(),
-            Some("    at handler (file:///app/index.js:10:5)")
+            Some("at handler (file:///app/index.js:10:5)")
         );
     }
 
@@ -883,7 +885,7 @@ mod tests {
         assert_eq!(events[0].message, "ZeroDivisionError: division by zero");
         assert_eq!(
             events[0].frame.as_deref(),
-            Some("  File \"/app/entry.py\", line 10, in fetch")
+            Some("File \"/app/entry.py\", line 10, in fetch")
         );
     }
 
@@ -902,7 +904,7 @@ mod tests {
     fn fingerprint_survives_ids_ports_and_hashes() {
         let a = fingerprint(
             "TypeError: Cannot read properties of undefined (reading 'user-4821')",
-            Some("    at handler (file:///app/index.js:10:5)"),
+            Some("at handler (file:///app/index.js:10:5)"),
         );
         let b = fingerprint(
             "TypeError: Cannot read properties of undefined (reading 'user-9917')",
