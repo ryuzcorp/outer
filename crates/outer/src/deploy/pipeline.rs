@@ -392,11 +392,26 @@ impl Deployer {
         journal: &mut Journal,
     ) -> Result<(Option<String>, Vec<String>), StepEnd> {
         let Journal { steps, log } = journal;
-        // 1. Worktree.
+        // 1. Worktree. The handover (root-owned checkout to the app uid) is
+        // part of this step: it walks the whole tree (~0.3 s on the
+        // template), and hiding it made `deploy.duration_ms` miss it.
         let started = Instant::now();
         match self.materialize(git, app, sha).await {
             Ok(out) => {
-                push_step(steps, log, "worktree", started, false, &out);
+                // The worktree is outer-owned; the install, build and deploy
+                // steps run as the app uid, so hand it over before they write
+                // into it.
+                let handover_start = Instant::now();
+                hand_worktree_to_app(&app.slug, &self.work_dir(&app.slug), app.uid);
+                let handover_ms = handover_start.elapsed().as_millis();
+                push_step(
+                    steps,
+                    log,
+                    "worktree",
+                    started,
+                    false,
+                    &format!("{out}handover {handover_ms}ms\n"),
+                );
             }
             Err(e) => {
                 let ms = push_step(steps, log, "worktree", started, false, &format!("{e:#}"));
@@ -404,10 +419,6 @@ impl Deployer {
                 return Err(StepEnd::Failed(StepFailed::plain("worktree", &e)));
             }
         }
-
-        // The worktree is outer-owned; the install, build and deploy steps
-        // run as the app uid, so hand it over before they write into it.
-        hand_worktree_to_app(&app.slug, &self.work_dir(&app.slug), app.uid);
         // 2. Install.
         let started = Instant::now();
         match self.install(app, deploy_id).await {
