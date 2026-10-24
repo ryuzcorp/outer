@@ -194,6 +194,28 @@ pub async fn fail_interrupted(pool: &SqlitePool) -> anyhow::Result<u64> {
     Ok(closed)
 }
 
+/// Deploys kept per app (spec §13: the console shows the last 50).
+pub const KEEP_PER_APP: i64 = 50;
+
+/// Delete deploy rows older than the newest [`KEEP_PER_APP`] per app (the
+/// daily prune). Newest-first by `(created_at, rowid)`; ties keep the
+/// later insert. Returns the rows removed.
+pub async fn prune_old(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let removed = sqlx::query(
+        "DELETE FROM deploy WHERE rowid NOT IN ( \
+             SELECT d2.rowid FROM deploy d2 \
+             WHERE d2.app_id = deploy.app_id \
+             ORDER BY d2.created_at DESC, d2.rowid DESC \
+             LIMIT ?1 \
+         )",
+    )
+    .bind(KEEP_PER_APP)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(removed)
+}
+
 impl Deployer {
     pub fn new(settings: DeploySettings, build_concurrency: usize) -> Self {
         Self {
@@ -2518,5 +2540,63 @@ mod tests {
             ["success", "blocked", "failed", "failed", "failed", "failed"]
         );
         assert_eq!(fail_interrupted(&pool).await.unwrap(), 0, "idempotent");
+    }
+
+    #[tokio::test]
+    async fn prune_old_keeps_the_newest_fifty_per_app() {
+        let (_ddir, pool) = test_pool().await;
+        for (id, slug, uid, port, internal_port) in [
+            ("app1", "shop", 10101, 18101, 18102),
+            ("app2", "blog", 10102, 18103, 18104),
+        ] {
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) \
+                 VALUES (?, ?, 'owner1', ?, ?, ?, 0, 0)",
+            )
+            .bind(id)
+            .bind(slug)
+            .bind(uid)
+            .bind(port)
+            .bind(internal_port)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for i in 0..KEEP_PER_APP + 2 {
+            sqlx::query(
+                "INSERT INTO deploy (id, app_id, sha, status, created_at) VALUES (?, 'app1', 'abc', 'success', ?)",
+            )
+            .bind(format!("d{i}"))
+            .bind(i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, created_at) in [("e1", 7), ("e2", 7), ("e3", 8)] {
+            sqlx::query(
+                "INSERT INTO deploy (id, app_id, sha, status, created_at) VALUES (?, 'app2', 'abc', 'success', ?)",
+            )
+            .bind(id)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(prune_old(&pool).await.unwrap(), 2);
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM deploy WHERE app_id = 'app1' ORDER BY created_at")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kept.len(), KEEP_PER_APP as usize);
+        assert_eq!(kept[0], "d2", "the two oldest go, the rest stay");
+        assert_eq!(kept[kept.len() - 1], format!("d{}", KEEP_PER_APP + 1));
+        let other: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM deploy WHERE app_id = 'app2' ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(other, vec!["e1", "e2", "e3"], "small apps keep everything");
+        assert_eq!(prune_old(&pool).await.unwrap(), 0, "idempotent");
     }
 }

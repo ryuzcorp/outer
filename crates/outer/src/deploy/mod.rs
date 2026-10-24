@@ -6,4 +6,6 @@
 
 pub mod pipeline;
 
-pub use pipeline::{fail_interrupted, DeployOutcome, DeploySettings, Deployer, PurgeTasks, Step};
+pub use pipeline::{
+    fail_interrupted, prune_old, DeployOutcome, DeploySettings, Deployer, PurgeTasks, Step,
+};

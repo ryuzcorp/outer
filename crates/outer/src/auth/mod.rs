@@ -905,6 +905,24 @@ pub fn clear_session_cookie() -> String {
     format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
+/// Delete expired email codes and web sessions (the daily prune). Only rows
+/// no reader can still accept go (`expires_at < now`, matching the
+/// `now > expires_at` checks on the verify paths). Returns
+/// `(email_codes, sessions)` removed.
+pub async fn prune_expired(pool: &SqlitePool, now: i64) -> anyhow::Result<(u64, u64)> {
+    let codes = sqlx::query("DELETE FROM email_code WHERE expires_at < ?")
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let sessions = sqlx::query("DELETE FROM web_session WHERE expires_at < ?")
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok((codes, sessions))
+}
+
 #[cfg(test)]
 mod tests;
 

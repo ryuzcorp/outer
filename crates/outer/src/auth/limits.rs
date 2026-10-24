@@ -4,6 +4,12 @@
 
 use sqlx::SqlitePool;
 
+/// Longest window `check_and_record` is called with (account creation,
+/// 3/day per IP): rows older than `now - RETENTION_MS` are outside every
+/// window, so the daily sweep may delete them. Bump it when adding a wider
+/// window.
+pub const RETENTION_MS: i64 = 86_400_000;
+
 /// Count events for `subject` + `action` inside the window; when under the
 /// limit, record this attempt and return `Ok(None)`. When the limit is hit,
 /// return `Ok(Some(retry_after_s))`: the seconds until the oldest event in
@@ -16,6 +22,10 @@ pub async fn check_and_record(
     window_ms: i64,
     now: i64,
 ) -> anyhow::Result<Option<u64>> {
+    debug_assert!(
+        window_ms <= RETENTION_MS,
+        "window wider than the daily prune keeps: bump RETENTION_MS"
+    );
     let since = now - window_ms;
     let (count, oldest): (i64, Option<i64>) = sqlx::query_as(
         "SELECT COUNT(*), MIN(created_at) FROM rate_limit_events \
@@ -110,5 +120,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(limited, None);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_only_rows_older_than_the_cutoff() {
+        let pool = pool().await;
+        for created_at in [10, 99_999, 100_000] {
+            sqlx::query(
+                "INSERT INTO rate_limit_events (subject, action, created_at) VALUES ('ip:1', 'otp_send', ?)",
+            )
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let removed = prune(&pool, 100_000).await.unwrap();
+        assert_eq!(removed, 2);
+        let kept: Vec<i64> = sqlx::query_scalar("SELECT created_at FROM rate_limit_events")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, vec![100_000]);
     }
 }

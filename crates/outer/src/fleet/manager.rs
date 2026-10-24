@@ -521,9 +521,9 @@ impl FleetManager {
     }
 
     /// A tokio interval loop that sleeps idle fleets. Failures log and the
-    /// loop continues on the next tick. The agent action log is pruned to the
-    /// plan retention (spec §3: 7 d Free, 30 d Pro) at most once a day; the
-    /// timestamp lives in this task, not in global state.
+    /// loop continues on the next tick. Retention prunes run at most once a
+    /// day (spec §3 log retention, §13 deploys, §17 TTLs); the timestamp
+    /// lives in this task, not in global state.
     pub fn spawn_sleep_sweep(&self, pool: SqlitePool, every: Duration) {
         let this = self.clone();
         tokio::spawn(async move {
@@ -536,11 +536,8 @@ impl FleetManager {
                 }
                 let due = last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400));
                 if due {
+                    prune_retention(&pool).await;
                     last_prune = Some(std::time::Instant::now());
-                    if let Err(err) = crate::mcp::actions::prune(&pool, crate::auth::now_ms()).await
-                    {
-                        tracing::warn!(error = %format!("{err:#}"), "agent_action prune failed");
-                    }
                 }
             }
         });
@@ -570,6 +567,36 @@ impl FleetManager {
             .ok()?
             .get(slug)
             .map(|live| live.fleet.logs.clone())
+    }
+}
+
+/// Daily retention prunes: the agent action log per plan (spec §3), the
+/// rate-limit ledger, expired email codes and web sessions, expired OAuth
+/// leftovers and stale DCR clients, releasable slug quarantines (spec §17)
+/// and deploys past the last 50 per app (spec §13). Each prune logs its
+/// own failure and the rest still run, so one bad table never blocks the
+/// others.
+async fn prune_retention(pool: &SqlitePool) {
+    let now = crate::auth::now_ms();
+    if let Err(err) = crate::mcp::actions::prune(pool, now).await {
+        tracing::warn!(error = %format!("{err:#}"), "agent_action prune failed");
+    }
+    if let Err(err) =
+        crate::auth::limits::prune(pool, now - crate::auth::limits::RETENTION_MS).await
+    {
+        tracing::warn!(error = %format!("{err:#}"), "rate_limit_events prune failed");
+    }
+    if let Err(err) = crate::auth::prune_expired(pool, now).await {
+        tracing::warn!(error = %format!("{err:#}"), "email_code/web_session prune failed");
+    }
+    if let Err(err) = crate::auth::oauth::prune_expired(pool, now).await {
+        tracing::warn!(error = %format!("{err:#}"), "oauth prune failed");
+    }
+    if let Err(err) = crate::apps::prune_quarantine(pool, now).await {
+        tracing::warn!(error = %format!("{err:#}"), "slug_quarantine prune failed");
+    }
+    if let Err(err) = crate::deploy::prune_old(pool).await {
+        tracing::warn!(error = %format!("{err:#}"), "deploy prune failed");
     }
 }
 
