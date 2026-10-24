@@ -104,6 +104,16 @@ export interface ActionsPage {
   actions: ActionEntry[];
   next: string | null;
 }
+
+export interface SecretEntry {
+  name: string;
+  updated_at: number;
+}
+
+export interface SecretsSummary {
+  secrets: SecretEntry[];
+}
+
 export function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }

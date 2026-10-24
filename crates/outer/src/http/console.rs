@@ -20,6 +20,9 @@
 //!   in-memory log ring merged with persisted lines (same lines as MCP `app_logs`).
 //! - `GET /api/console/apps/:slug/errors?status=`: grouped runtime errors
 //!   plus the trailing-hour proxy 5xx (same rows as MCP `app_errors`).
+//! - `GET /api/console/apps/:slug/secrets`: the app's secret names plus
+//!   `updated_at` (same rows as MCP `list_secrets`; values never leave the
+//!   server — they are injected as Worker env vars at deploy time).
 //! - `POST /api/console/sign-out`: deletes the session, clears the cookie.
 //!
 //! Rules: session cookie only (an `Authorization` header is ignored, never
@@ -58,6 +61,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/apps/{slug}/metrics", get(api_metrics))
         .route("/api/console/apps/{slug}/logs", get(api_logs))
         .route("/api/console/apps/{slug}/errors", get(api_errors))
+        .route("/api/console/apps/{slug}/secrets", get(api_secrets))
         .route("/api/console/sign-out", post(api_sign_out))
         .with_state(state)
 }
@@ -439,6 +443,46 @@ async fn api_errors(
         "s5xx_last_hour": s5xx,
     }))
 }
+/// `GET /api/console/apps/:slug/secrets`: the app's secret names plus
+/// `updated_at`, ordered by name. Values never leave the server. The caller
+/// MUST own the app (see `owned_app`): anything else answers 404 exactly
+/// like a missing app.
+async fn api_secrets(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Response {
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    let app = match owned_app(mcp, &account, &slug).await {
+        Ok(Some(app)) => app,
+        Ok(None) => return not_found(),
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load secrets right now",
+            );
+        }
+    };
+    match crate::secrets::list(&mcp.pool, &app.id).await {
+        Ok(secrets) => ok_json(json!({
+            "secrets": secrets.iter().map(|s| json!({
+                "name": s.name,
+                "updated_at": s.updated_at,
+            })).collect::<Vec<_>>(),
+        })),
+        Err(_) => nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not load secrets right now",
+        ),
+    }
+}
+
 /// `GET /api/console/apps/:slug/actions`: the app's agent action log,
 /// newest first. `before` is the opaque `<created_at>:<id>` cursor of the
 /// last row on the previous page; `limit` defaults to 20 and clamps to
@@ -1720,6 +1764,87 @@ mod tests {
         assert_eq!(
             bad_body.parse::<serde_json::Value>().unwrap()["error"],
             "bad_status"
+        );
+    }
+    #[tokio::test]
+    async fn secrets_need_session_and_same_origin() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        // No cookie: 401, even same-origin.
+        let (status, _, _) = send(
+            &app,
+            same_origin(Request::get("/api/console/apps/groceries/secrets"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Valid session but cross-site: 403.
+        let session = login(&pool, "ana@example.com").await;
+        let (status, _, _) = send(
+            &app,
+            Request::get("/api/console/apps/groceries/secrets")
+                .header("cookie", session.clone())
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn secrets_are_owner_scoped_and_names_only() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "ben@example.com", "benblog", now).await;
+        let key = crate::secrets::SecretsKey::test_key();
+        for name in ["STRIPE_KEY", "API_TOKEN"] {
+            let enc = crate::secrets::encrypt(&key, "app-groceries", name, b"shh");
+            let capped = crate::secrets::set(&pool, "app-groceries", name, &enc, now)
+                .await
+                .unwrap();
+            assert!(!capped);
+        }
+        let session = login(&pool, "ana@example.com").await;
+        let (status, headers, body) = send(
+            &app,
+            authed("/api/console/apps/groceries/secrets", &session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        let body: serde_json::Value = body.parse().unwrap();
+        let names: Vec<&str> = body["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["API_TOKEN", "STRIPE_KEY"], "ordered by name");
+        for secret in body["secrets"].as_array().unwrap() {
+            assert_eq!(
+                secret.as_object().unwrap().len(),
+                2,
+                "name + updated_at only, never a value: {secret}"
+            );
+            assert_eq!(secret["updated_at"], now);
+        }
+        let raw = body.to_string();
+        assert!(!raw.contains("shh"), "no plaintext value in the response");
+        // A foreign slug answers exactly like a missing one.
+        let (foreign_status, _, foreign_body) =
+            send(&app, authed("/api/console/apps/benblog/secrets", &session)).await;
+        let (missing_status, _, missing) =
+            send(&app, authed("/api/console/apps/nope/secrets", &session)).await;
+        assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(foreign_body, missing);
+        assert_eq!(
+            foreign_body.parse::<serde_json::Value>().unwrap()["error"],
+            "not_found"
         );
     }
 }

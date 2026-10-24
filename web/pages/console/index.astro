@@ -1,5 +1,5 @@
 ---
-import { AppsList } from "./_islands/apps";
+import { Console } from "./_islands/console";
 import "./console.css";
 ---
 
@@ -9,18 +9,12 @@ import "./console.css";
     <meta charset="utf-8" />
     <link rel="icon" href="data:," />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="Your Outer apps: status, deploys and logs." />
+    <meta name="description" content="Your Outer apps: status, metrics and agent activity." />
     <title>Console · Outer</title>
   </head>
   <body>
-    <div class="mx-auto max-w-5xl px-4 py-8">
-      <header class="flex items-center justify-between pb-6">
-        <h1 class="text-xl font-bold">Outer console</h1>
-        <a class="link text-sm" href="/">Docs</a>
-      </header>
-      <main>
-        <AppsList client:load />
-      </main>
-    </div>
+    <main>
+      <Console client:load />
+    </main>
   </body>
 </html>
