@@ -2173,3 +2173,30 @@ async fn agent_action_pagination_prune_and_delete_cascade() {
         .unwrap();
     assert_eq!(left, 0);
 }
+
+/// `X-Robots-Tag` and `/robots.txt` change with visibility and the edge
+/// caches them: flipping visibility purges the app's host.
+#[tokio::test]
+async fn set_visibility_purges_the_app_host() {
+    let (mut state, _) = setup().await;
+    let fake = crate::cloudflare::fake::FakePurge::start().await;
+    state.delete_cfg.cache_purge = Some(
+        crate::cloudflare::CachePurge::new("zone-1".to_string(), "token-1".to_string())
+            .with_api_base(fake.base_url.clone()),
+    );
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    let before = fake.calls();
+    let (_, out) = call(
+        &state,
+        Some(&ana),
+        "set_visibility",
+        json!({"app": "groceries", "visibility": "public"}),
+    )
+    .await;
+    assert!(out.get("result").is_some(), "{out}");
+    assert_eq!(fake.calls(), before + 1);
+    let requests = fake.requests.lock().unwrap();
+    let host = format!("groceries.{}", state.delete_cfg.apps_domain);
+    assert_eq!(requests.last().unwrap().body["hosts"][0], host);
+}

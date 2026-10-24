@@ -207,6 +207,11 @@ pub async fn set_visibility(input: SetVisibilityInput, ctx: &Ctx<'_>) -> Result<
     apps::set_visibility(&ctx.state.pool, &app.id, visibility)
         .await
         .map_err(internal)?;
+    // Visibility changes `X-Robots-Tag` and `/robots.txt`, which the edge
+    // caches (robots.txt for hours): purge the host so the new answer is
+    // what crawlers see. Best-effort, like the deploy and delete purges.
+    let host = format!("{}.{}", app.slug, ctx.state.delete_cfg.apps_domain);
+    crate::cloudflare::purge_host_cache(ctx.state.delete_cfg.cache_purge.as_ref(), &host).await;
     Ok(ok(
         format!("{} is now {}.", app.slug, visibility.as_str()),
         json!({"visibility": visibility.as_str()}),
