@@ -521,15 +521,26 @@ impl FleetManager {
     }
 
     /// A tokio interval loop that sleeps idle fleets. Failures log and the
-    /// loop continues on the next tick.
+    /// loop continues on the next tick. The agent action log is pruned to the
+    /// plan retention (spec §3: 7 d Free, 30 d Pro) at most once a day; the
+    /// timestamp lives in this task, not in global state.
     pub fn spawn_sleep_sweep(&self, pool: SqlitePool, every: Duration) {
         let this = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(every);
+            let mut last_prune: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
                 if let Err(err) = this.sleep_idle(&pool).await {
                     tracing::warn!(error = %err, "sleep sweep failed");
+                }
+                let due = last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400));
+                if due {
+                    last_prune = Some(std::time::Instant::now());
+                    if let Err(err) = crate::mcp::actions::prune(&pool, crate::auth::now_ms()).await
+                    {
+                        tracing::warn!(error = %format!("{err:#}"), "agent_action prune failed");
+                    }
                 }
             }
         });
