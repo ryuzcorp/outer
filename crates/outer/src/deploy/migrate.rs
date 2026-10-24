@@ -2,14 +2,19 @@
 //!
 //! After the gate passes, the pipeline applies pending
 //! `NNNN_description.sql` files with `celld d1 migrations apply` under the
-//! app's scoped credentials, always BEFORE the `celld deploy` upload —
-//! first deploy or not. celld offers no staged upload (the upload publishes
-//! `deploy/current.json` and every fleet adopts it on its own poll), so
-//! ordering is the only gate: when the new pointer becomes visible the
-//! schema is already ready, and a migrate failure uploads nothing, so no
-//! fleet can ever serve new code against an unmigrated schema. celld reads
-//! the files relative to the deploy root, orders them by
-//! numeric prefix, and records applied
+//! app's scoped credentials. For an app with a live version the apply runs
+//! BEFORE the `celld deploy` upload: celld offers no staged upload (the
+//! upload publishes `deploy/current.json` and every fleet adopts it on its
+//! own poll), so ordering is the only gate — when the new pointer becomes
+//! visible the schema is already ready, and a migrate failure uploads
+//! nothing, so no fleet can ever serve new code against an unmigrated
+//! schema. For a first deploy the order reverses: the apply needs a running
+//! node (found through the bucket's node leases) and nothing is published
+//! yet, so the upload goes first, the fleet wakes, and the migrations apply
+//! after — and only a migrate success marks the app live. The proxy refuses
+//! to forward for an app with no successful deploy, so the uploaded-but-
+//! unmigrated code is never served. celld reads the files relative to the
+//! deploy root, orders them by numeric prefix, and records applied
 //! files by name in the app's own `d1_migrations` table (the same table and
 //! columns `wrangler d1 migrations` uses, so the two never re-apply each
 //! other's files). Outer additionally pins the sha256 it saw in
@@ -383,6 +388,50 @@ fn open_no_follow(path: &Path) -> anyhow::Result<std::fs::File> {
         .map_err(|e| anyhow::anyhow!("cannot open migration file {}: {e:#}", path.display()))
 }
 
+/// Outer stages as root under the sandbox's `077` umask, but `celld d1
+/// migrations apply` runs as the app uid and must read what was staged:
+/// set `mode` on the open fd (never through a path that could be swapped).
+/// Read-only for the app: it can't rewrite reviewed bytes after hashing.
+fn readable_by_app(file: &std::fs::File, path: &Path, mode: libc::mode_t) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: fchmod on a file descriptor we own; no memory is touched.
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+        anyhow::bail!(
+            "cannot make staged migration {} readable: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// Make every directory from `root` down to `target` that Outer itself
+/// created (owned by this process's euid) `0755`, so the app uid can reach
+/// the staged files. Directories the app owns are left alone: it can
+/// already traverse them. Each is opened `O_DIRECTORY | O_NOFOLLOW`, so a
+/// component swapped for a symlink fails instead of being followed.
+fn traversable_by_app(root: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let rel = target
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("{} is not under {}", target.display(), root.display()))?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let mut dir = root.to_path_buf();
+    for component in rel.components() {
+        dir.push(component);
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&dir)
+            .map_err(|e| anyhow::anyhow!("cannot open staged dir {}: {e:#}", dir.display()))?;
+        if handle.metadata()?.uid() == euid {
+            readable_by_app(&handle, &dir, 0o755)?;
+        }
+    }
+    Ok(())
+}
+
 /// Where an entry's files come from: the first conventional repo dir that
 /// holds `*.sql` — `<work>/<dir>`, then Void's `db/migrations` when
 /// `dir == "migrations"`. The winner is copied into `<root>/<dir>` because
@@ -432,7 +481,9 @@ pub fn stage_migrations(
             std::io::copy(&mut src, &mut dst).map_err(|e| {
                 anyhow::anyhow!("cannot stage migration file {}: {e:#}", dst_path.display())
             })?;
+            readable_by_app(&dst, &dst_path, 0o644)?;
         }
+        traversable_by_app(root, &target)?;
         // The target itself is re-checked after the copy: a swapped-in
         // symlink fails the step before celld ever reads through it.
         // (Component swaps above the target remain a residual TOCTOU; the
@@ -850,6 +901,45 @@ mod tests {
                 .join("9999_evil.sql")
                 .exists(),
             "planted SQL never reaches celld"
+        );
+    }
+
+    /// Outer stages as root under a `077` umask while celld applies as the
+    /// app uid: staged dirs Outer owns and the copied files end up readable
+    /// (and not writable) by others, or celld reports "no migrations
+    /// directory" — the live failure of 2026-10-24.
+    #[test]
+    fn staged_migrations_are_readable_by_the_app_uid() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let work = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let src = work.path().join("db").join("migrations");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("0001_init.sql"), "CREATE TABLE t (id INTEGER);").unwrap();
+        // What a 077 umask leaves behind: private dirs and a private file.
+        let target = root.path().join("db").join("migrations");
+        std::fs::create_dir_all(&target).unwrap();
+        for dir in [root.path().join("db"), target.clone()] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(target.join("0001_init.sql"), "").unwrap();
+        std::fs::set_permissions(
+            target.join("0001_init.sql"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        stage_migrations(root.path(), work.path(), "db/migrations")
+            .unwrap()
+            .expect("files exist");
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.path().join("db")), 0o755);
+        assert_eq!(mode(&target), 0o755);
+        assert_eq!(mode(&target.join("0001_init.sql")), 0o644);
+        assert_eq!(
+            std::fs::read_to_string(target.join("0001_init.sql")).unwrap(),
+            "CREATE TABLE t (id INTEGER);"
         );
     }
 

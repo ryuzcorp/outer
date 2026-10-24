@@ -3,6 +3,9 @@
 //! A sleeping fleet wakes on its first request; the request then forwards
 //! over HTTP/1 with a streaming body, WebSocket upgrades splice both halves,
 //! and activity is recorded (throttled) for the sleep sweep.
+//! Apps with no successful deploy get a 503 building page instead: a first
+//! deploy uploads before its migrations apply, so its code must never be
+//! forwarded until the migrate step succeeds.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -249,6 +252,19 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         }
     };
+    // No successful deploy yet: never forward. A first deploy uploads before
+    // its migrations apply, so a fleet can be awake on unmigrated code while
+    // the migrate step is still running — forwarding would serve it. The
+    // deploy marks `last_deploy_sha` only after the migrations succeed, so
+    // this gate makes the upload-then-migrate order safe, without waking a
+    // fleet for an app with nothing live.
+    if app.last_deploy_sha.is_none() {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "2")
+            .body(Body::from("this app is being built, try again"))
+            .unwrap();
+    }
     if header_bytes(req.headers()) > MAX_HEADER_BYTES {
         return text(
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
@@ -515,9 +531,12 @@ mod tests {
         port: u16,
         visibility: &str,
     ) {
+        // Fixture apps are live: `last_deploy_sha` set, so the not-live
+        // gate passes and requests forward. The new test below NULLs it to
+        // pin the building-page behavior.
         sqlx::query(
-            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, visibility, last_activity_at, created_at) \
-             VALUES (?, ?, 'a1', (SELECT COALESCE(MAX(uid), 200000) + 1 FROM app), ?, ?, ?, 0, 1000)",
+        "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, visibility, last_activity_at, created_at, last_deploy_sha) \
+         VALUES (?, ?, 'a1', (SELECT COALESCE(MAX(uid), 200000) + 1 FROM app), ?, ?, ?, 0, 1000, '0123456789abcdef0123456789abcdef01234567')",
         )
         .bind(id)
         .bind(slug)
@@ -624,6 +643,42 @@ mod tests {
             .unwrap();
         let (status, _, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn refuses_to_forward_before_first_success() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-new", "new", fleet.addr.port(), "public").await;
+        // No successful deploy yet: the app is still being built.
+        sqlx::query("UPDATE app SET last_deploy_sha = NULL WHERE id = 'app-new'")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        let req = Request::builder()
+            .uri("/items")
+            .header("host", "new.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers.get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        assert_eq!(body, "this app is being built, try again");
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            0,
+            "an unmigrated first deploy is never forwarded, so the wake never runs"
+        );
     }
 
     #[tokio::test]

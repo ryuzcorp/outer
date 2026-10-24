@@ -14,8 +14,9 @@
 //! are held, and to `deploying` before the migrate/upload steps run. The
 //! migrate step runs under the same `deploying` status, before the upload
 //! for an existing app and after it for a first deploy: a blocked deploy
-//! (gate) never touches app data, and a failed migration leaves the
-//! previous version serving.
+//! (gate) never touches app data, a failed migration on an existing app
+//! leaves the previous version serving, and a failed first-deploy migration
+//! leaves the app not-live.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -746,9 +747,11 @@ impl Deployer {
     /// Rows run in order; the first failure stops the pipeline. `Ok` carries
     /// the celld version and the validated cron schedules on success. The
     /// review runs before `deploy-root`, and before migrations, so a blocked
-    /// deploy never touches the app's data or uploads anything. Migrations
-    /// always run before the upload (first deploy or not), so no fleet can
-    /// ever serve new code against an unmigrated schema.
+    /// deploy never touches the app's data or uploads anything. For an app
+    /// with a live version migrations run before the upload, so no fleet can
+    /// ever serve new code against an unmigrated schema; for a first deploy
+    /// (no successful deploy yet) the upload runs first because `celld d1`
+    /// needs a running fleet and there is nothing to start one from yet.
     async fn run_steps(
         &self,
         pool: &SqlitePool,
@@ -857,31 +860,59 @@ impl Deployer {
             }
         };
 
-        // 6+7. D1 migrations, then the `celld deploy` upload — for every
-        // deploy, first or not. celld offers no staged or invisible upload:
-        // the upload publishes `deploy/current.json` and every fleet (awake
-        // or newly woken by traffic) adopts it on its own poll, so anything
-        // uploaded is servable within one poll interval. Migrating first is
-        // the only gate celld allows: when the new pointer becomes visible
+        // 6+7. D1 migrations and the `celld deploy` upload. For an app with
+        // a live version the migrate step runs before the upload: celld
+        // offers no staged or invisible upload (the upload publishes
+        // `deploy/current.json` and every fleet adopts it on its own poll),
+        // so ordering is the only gate: when the new pointer becomes visible
         // the schema is already ready, and a migrate failure uploads
-        // nothing, so a first deploy can never serve new code against an
-        // unmigrated schema. The old code keeps serving during the
-        // migration (expand-first for destructive changes).
+        // nothing, so the previous version keeps serving. The old code keeps
+        // serving during the migration (expand-first for destructive
+        // changes).
+        //
+        // A first deploy (`last_deploy_sha` is NULL: no successful deploy
+        // yet) reverses the order. `celld d1 migrations apply` finds its
+        // node through the bucket's node leases, and a first deploy has
+        // published nothing yet, so no fleet can start and the wake before
+        // the migrate step times out. The upload goes first, then the wake
+        // (now possible), then the migrations — and only a migrate success
+        // marks the deploy successful. Nothing is served before that: the
+        // proxy refuses to forward for an app with no successful deploy, so
+        // no fleet can serve the new code unmigrated.
+        //
+        // The live-version signal comes from the row, not the caller's
+        // snapshot: a previous deploy may have succeeded after the caller
+        // loaded the app (the per-app lock serializes deploys, so the row
+        // is current). `last_deploy_sha` NULL means no successful deploy yet.
+        let is_first_deploy = last_deploy_sha(pool, &app.id)
+            .await
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?
+            .is_none();
         set_status_blocking(pool, deploy_id)
             .await
             .map_err(StepEnd::Failed)?;
-        self.migrate_step(pool, app, deploy_id, &deploy_root, journal)
-            .await?;
-        let version = self
-            .deploy_step(pool, app, deploy_id, &deploy_root, journal)
-            .await?;
-        Ok((version, crons))
+        if is_first_deploy {
+            let version = self
+                .deploy_step(pool, app, deploy_id, &deploy_root, journal)
+                .await?;
+            self.migrate_step(pool, app, deploy_id, &deploy_root, is_first_deploy, journal)
+                .await?;
+            Ok((version, crons))
+        } else {
+            self.migrate_step(pool, app, deploy_id, &deploy_root, is_first_deploy, journal)
+                .await?;
+            let version = self
+                .deploy_step(pool, app, deploy_id, &deploy_root, journal)
+                .await?;
+            Ok((version, crons))
+        }
     }
 
     /// The `celld deploy <root> ... --json` upload step; returns the version.
     /// The upload publishes `deploy/current.json`, which every fleet adopts
-    /// on its own poll — so it always runs AFTER the migrate step, and a
-    /// migrate failure uploads nothing at all.
+    /// on its own poll — so for an existing app it runs after the migrate
+    /// step (a migrate failure uploads nothing at all), while for a first
+    /// deploy it runs first (nothing to start a fleet from otherwise).
     async fn deploy_step(
         &self,
         pool: &SqlitePool,
@@ -919,8 +950,10 @@ impl Deployer {
     }
 
     /// The D1 migrations step: pending `NNNN_*.sql` files for the built
-    /// config's `d1_databases`, applied with the app's scoped credentials
-    /// before the upload makes them visible to any fleet. No files (or no
+    /// config's `d1_databases`, applied with the app's scoped credentials.
+    /// For an existing app this runs before the upload makes the new code
+    /// visible to any fleet; for a first deploy it runs after the upload
+    /// (which is what lets the woken fleet exist at all). No files (or no
     /// D1) skips the step without waking a sleeping fleet.
     async fn migrate_step(
         &self,
@@ -928,11 +961,15 @@ impl Deployer {
         app: &App,
         deploy_id: &str,
         deploy_root: &DeployRoot,
+        is_first_deploy: bool,
         journal: &mut Journal,
     ) -> Result<(), StepEnd> {
         let Journal { steps, log } = journal;
         let started = Instant::now();
-        match self.migrate(pool, app, deploy_id, deploy_root).await {
+        match self
+            .migrate(pool, app, deploy_id, deploy_root, is_first_deploy)
+            .await
+        {
             Ok((skipped, out)) => {
                 push_step(steps, log, "migrate", started, skipped, &out);
                 Ok(())
@@ -1286,14 +1323,18 @@ impl Deployer {
     /// credentials, and every file present is recorded in `d1_migration` so
     /// a later edit of an applied file fails the deploy instead of drifting.
     /// A failure names the migration file when celld's output identifies it
-    /// and carries an agent-facing line; the fleet is never reloaded, so the
-    /// previous version keeps serving.
+    /// and carries an agent-facing line; the fleet is never reloaded, so an
+    /// existing app keeps serving its previous version while a first deploy
+    /// leaves the app not-live (the proxy forwards only after a success).
+    /// `is_first_deploy` selects that wording and the operator-CLI hint
+    /// below; the caller derives it from `last_deploy_sha` being NULL.
     async fn migrate(
         &self,
         pool: &SqlitePool,
         app: &App,
         deploy_id: &str,
         deploy_root: &DeployRoot,
+        is_first_deploy: bool,
     ) -> Result<(bool, String), StepFailed> {
         let root = &deploy_root.root;
         let work = self.work_dir(&app.slug);
@@ -1343,6 +1384,13 @@ impl Deployer {
         // Files with no recorded hash are pending; when every file is
         // already recorded there is nothing for celld to do, and no reason
         // to wake a sleeping fleet.
+        // A first deploy that never went live has no previous version: say
+        // the app isn't live yet instead of naming one that keeps serving.
+        let live_line = if is_first_deploy {
+            "Your app isn't live yet."
+        } else {
+            "Your app still shows the previous version."
+        };
         let mut any_pending = false;
         for (db, files) in &staged {
             for file in files {
@@ -1354,14 +1402,13 @@ impl Deployer {
                     Some(sha) if sha != file.sha256 => {
                         let error = format!(
                             "migration {} for database {} was edited after it was applied; \
-                             write a new migration instead",
+                              write a new migration instead",
                             file.name, db.database_name
                         );
                         let user_message = format!(
                             "Outer couldn't publish this change because migration {} was edited \
-                             after it was already applied to database {}. Your app still shows \
-                             the previous version. Write a new migration file instead of editing \
-                             an applied one.",
+                              after it was already applied to database {}. {live_line} Write a \
+                              new migration file instead of editing an applied one.",
                             file.name, db.database_name
                         );
                         return Err(StepFailed::migration(error, user_message));
@@ -1393,6 +1440,27 @@ impl Deployer {
                 .await
                 .map_err(|e| {
                     let text = format!("{e:#}");
+                    // The operator CLI runs no fleet manager (`wake: None`):
+                    // a first deploy can never have a fleet for `celld d1`
+                    // to reach, so the lease error it returns means the
+                    // deploy must go through the server instead. Say so
+                    // instead of surfacing celld's lease internals. (With a
+                    // fleet manager the wake above runs first, so a lease
+                    // error there is a real failure, not this hint.)
+                    if is_first_deploy && self.settings.wake.is_none() && text.contains("no node leases") {
+                        return StepFailed::migration(
+                            format!(
+                                "first deploy with D1 migrations needs the server; deploy through MCP \
+                                 (celld d1 needs a running fleet and none serves {} yet): {}",
+                                app.slug,
+                                first_output_line(&text)
+                            ),
+                            "Outer couldn't publish this app because its first deploy needs \
+                             database migrations and those only run on the server. Deploy through \
+                             MCP instead of the operator CLI. Your app isn't live yet."
+                                .to_string(),
+                        );
+                    }
                     let failed = migrate::failing_file(&text);
                     let error = match &failed {
                         Some(name) => format!(
@@ -1409,13 +1477,13 @@ impl Deployer {
                     let user_message = match &failed {
                         Some(name) => format!(
                             "Outer couldn't publish this change because migration {name} failed \
-                             to apply to database {}: {}. Your app still shows the previous version.",
+                             to apply to database {}: {}. {live_line}",
                             db.database_name,
                             error_detail(&text, Some(name))
                         ),
                         None => format!(
                             "Outer couldn't publish this change because the database migrations \
-                             failed to apply: {}. Your app still shows the previous version.",
+                             failed to apply: {}. {live_line}",
                             first_output_line(&text)
                         ),
                     };
@@ -1735,8 +1803,9 @@ impl StepFailed {
     }
 
     /// For a failed migration: names the file when identifiable, with an
-    /// agent-facing line. The fleet is never reloaded, so the previous
-    /// version keeps serving either way.
+    /// agent-facing line. The fleet is never reloaded, so an existing app
+    /// keeps serving its previous version while a first deploy stays
+    /// not-live.
     fn migration(error: String, user_message: String) -> Self {
         Self {
             step: "migrate",
@@ -2565,6 +2634,18 @@ async fn set_deploy_status(pool: &SqlitePool, deploy_id: &str, status: &str) -> 
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// The app's latest successful deploy sha, if any. Read fresh from the row
+/// (never from the caller's snapshot) to decide first-deploy routing: a
+/// previous deploy in this process may have succeeded after the caller
+/// loaded the app.
+async fn last_deploy_sha(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<String>> {
+    let (sha,): (Option<String>,) = sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+        .bind(app_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(sha)
 }
 
 async fn finish_success(
@@ -3705,6 +3786,9 @@ exit 0
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        // A first deploy (`last_deploy_sha` NULL) uploads before it
+        // migrates: `celld d1` needs a running fleet and nothing is
+        // published yet.
         let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -3714,8 +3798,8 @@ exit 0
                 "build",
                 "gate",
                 "deploy-root",
-                "migrate",
-                "deploy"
+                "deploy",
+                "migrate"
             ]
         );
         assert!(
@@ -3745,10 +3829,10 @@ exit 0
         assert_ne!(rows[0].1, rows[1].1, "distinct content hashes");
 
         // The apply ran once, against this app's database and prefix grant.
-        // Even a first deploy migrates before the upload makes the pointer
-        // visible, so no fleet can serve the new code unmigrated.
+        // The upload runs first so the fleet can exist for the apply; the
+        // proxy still serves nothing until this success lands.
         assert_eq!(apply_calls(state.path()), 1);
-        assert_eq!(call_kinds(state.path()), ["apply", "deploy"]);
+        assert_eq!(call_kinds(state.path()), ["deploy", "apply"]);
         let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
         assert!(
             calls.contains("d1 migrations apply app-db"),
@@ -4154,7 +4238,21 @@ exit 0
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
         assert_eq!(first.status, "success", "error: {:?}", first.error);
-
+        // The first deploy has no live version yet, so it uploads before it
+        // migrates.
+        let first_names: Vec<&str> = first.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            first_names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "deploy",
+                "migrate"
+            ]
+        );
         // A second tree with one pending migration: the app has a live
         // version now, so the migrate step must run before the upload — an
         // awake fleet must never serve new code against the old schema.
@@ -4196,8 +4294,8 @@ exit 0
         let kinds = call_kinds(state.path());
         assert_eq!(
             kinds,
-            ["apply", "deploy", "apply", "deploy"],
-            "every deploy migrates before its upload"
+            ["deploy", "apply", "apply", "deploy"],
+            "the first deploy uploads before it migrates; the existing-app deploy migrates before its upload"
         );
         let (last_sha,): (Option<String>,) =
             sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
@@ -4436,7 +4534,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn migrate_failure_fails_the_deploy_without_switching() {
+    async fn first_deploy_migrate_failure_uploads_then_fails_not_live() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
@@ -4477,15 +4575,15 @@ exit 0
         );
         let message = outcome.user_message.as_deref().unwrap_or("");
         assert!(
-            message.contains("0002_bad.sql") && message.contains("previous version"),
-            "the agent learns which file failed and that the old version serves: {message}"
+            message.contains("0002_bad.sql") && message.contains("isn't live yet"),
+            "the agent learns which file failed and that nothing is live: {message}"
         );
         assert!(
             outcome.log_tail.contains("0002_bad.sql"),
             "the migration error is in the log tail"
         );
-
-        // Nothing recorded, the previous version keeps serving.
+        // Nothing recorded and the app stays not-live: there is no previous
+        // version, and the proxy still refuses to forward.
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM d1_migration")
             .fetch_one(&pool)
             .await
@@ -4497,11 +4595,14 @@ exit 0
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(last_sha, None, "a failed migrate never switches the fleet");
+        assert_eq!(last_sha, None, "a failed first deploy never goes live");
+        // The upload ran first (the fleet must exist before `celld d1` can
+        // reach it); the failure is in the migrate step that followed it.
+        assert_eq!(upload_calls(state.path()), 1);
         assert_eq!(
             call_kinds(state.path()),
-            ["apply"],
-            "a failed migrate uploads nothing, first deploy or not"
+            ["deploy", "apply"],
+            "a first deploy uploads before it migrates, even when the migration fails"
         );
         let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -4512,9 +4613,99 @@ exit 0
                 "build",
                 "gate",
                 "deploy-root",
+                "deploy",
                 "migrate"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_first_deploy_retries_on_first_deploy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![
+                write(
+                    "db/migrations/0001_init.sql",
+                    "CREATE TABLE item (id INTEGER);",
+                ),
+                write("db/migrations/0002_bad.sql", "CREATE TABLE oops (;"),
+                write("dist/.fake-fail", "0002_bad.sql"),
+            ],
+        )
+        .await;
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10112);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let failed = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.failed_step.as_deref(), Some("migrate"));
+        // Still no successful deploy, so the retry is a first deploy too:
+        // it uploads before it migrates again — and this time succeeds.
+        // (celld skips already-applied files on its own; the failed apply
+        // recorded nothing, so both files apply fresh here.)
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "fix migration".to_string(),
+                base: Some(sha_a.clone()),
+                writes: vec![],
+                edits: vec![crate::git::commit::Edit {
+                    path: "db/migrations/0002_bad.sql".to_string(),
+                    old: "CREATE TABLE oops (;".to_string(),
+                    new: "CREATE TABLE oops (id INTEGER);".to_string(),
+                    replace_all: false,
+                }],
+                deletes: vec!["dist/.fake-fail".to_string()],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "deploy",
+                "migrate"
+            ]
+        );
+        assert_eq!(
+            call_kinds(state.path()),
+            ["deploy", "apply", "deploy", "apply"],
+            "the retry is still a first deploy: upload before migrate"
+        );
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha_b.as_str()));
     }
 
     #[tokio::test]
