@@ -1459,6 +1459,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();
@@ -1811,6 +1812,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();
@@ -1887,6 +1889,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();
@@ -2010,6 +2013,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();
@@ -2156,6 +2160,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();
@@ -2293,6 +2298,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();

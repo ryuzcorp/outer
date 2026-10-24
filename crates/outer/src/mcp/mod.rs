@@ -397,6 +397,7 @@ impl McpState {
             store: Store::memory(),
             git: GitConfig {
                 repos_dir: data_dir.join("git"),
+                oxfmt_bin: None,
             },
             sync: GitSync::default(),
             deploys: Deploys::fake(FakeOutcome::success()),

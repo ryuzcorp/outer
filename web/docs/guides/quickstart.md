@@ -12,7 +12,9 @@ tools, Outer builds and deploys, and you get a live link to share.
 3. `list_files` / `read_file` — look at the code.
 4. `commit {app, message, edits}` — change code with exact-match `edits`.
    Every code tool waits for the deploy and returns `success` + URL,
-   `failed` + log, or `blocked` + the lines to fix.
+   `failed` + log, or `blocked` + the lines to fix. Written/edited code is
+   formatted with oxfmt before the commit lands: `commit.formatted` lists
+   the files it changed, so target that text with your next edits.
 5. `share_app {app}` — URL, share text and QR code for the family chat.
 
 Rules: no strong profanity in page text, seed data or the app name — the

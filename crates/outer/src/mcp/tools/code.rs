@@ -363,7 +363,7 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     // moved head) gives the change back; a created commit counts even when
     // its deploy fails or is blocked.
     let claim = claim_change(&ctx.state.pool, &caller.account_id).await?;
-    let sha = match git::commit::commit(
+    let outcome = match git::commit::commit_with_outcome(
         &ctx.state.store,
         &ctx.state.git,
         &ctx.state.sync,
@@ -372,7 +372,7 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     )
     .await
     {
-        Ok(sha) => sha,
+        Ok(outcome) => outcome,
         Err(e) => {
             if let Err(refund) = refund_change(&ctx.state.pool, &caller.account_id).await {
                 tracing::warn!("commit refund failed: {refund:#}");
@@ -380,15 +380,27 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
             return Err(ToolError::from_commit(e));
         }
     };
+    let sha = outcome.sha;
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
     let quota =
         json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
-    let summary = format!(
+    let mut summary = format!(
         "Committed {} ({}).",
         &sha[..12.min(sha.len())],
         deploy["status"].as_str().unwrap_or("")
     );
-    let structured = json!({"commit": {"sha": sha}, "deploy": deploy, "quota": quota});
+    if !outcome.formatted.is_empty() {
+        summary.push_str(&format!(" Formatted {} file(s).", outcome.formatted.len()));
+    }
+    let mut commit = json!({"sha": sha, "formatted": outcome.formatted});
+    if !outcome.format_skipped.is_empty() {
+        commit["format_skipped"] = json!(outcome
+            .format_skipped
+            .iter()
+            .map(|s| json!({"path": s.path, "reason": s.reason}))
+            .collect::<Vec<_>>());
+    }
+    let structured = json!({"commit": commit, "deploy": deploy, "quota": quota});
     Ok(ok_deploy(
         summary,
         &structured["deploy"].clone(),

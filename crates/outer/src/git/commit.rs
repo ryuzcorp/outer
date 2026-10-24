@@ -141,10 +141,23 @@ pub enum CommitError {
     Internal(#[from] anyhow::Error),
 }
 
-/// One decoded file, ready for the scratch index.
-struct RawFile {
-    path: String,
-    bytes: Vec<u8>,
+/// One decoded file, ready for the scratch index. `is_text` marks full-file
+/// text writes and edit results: the only candidates oxfmt ever sees.
+/// Uploads (base64), moves and deletes are never formatted.
+pub(crate) struct RawFile {
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) is_text: bool,
+}
+
+/// What [`commit_with_outcome`] did: the new commit sha, the repo-relative
+/// paths whose content oxfmt changed, and the files committed unformatted
+/// with why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    pub sha: String,
+    pub formatted: Vec<String>,
+    pub format_skipped: Vec<super::format::FormatSkip>,
 }
 
 /// Commit `req` onto `slug`'s main without a worktree and publish it through
@@ -160,6 +173,26 @@ pub async fn commit(
     slug: &str,
     req: CommitRequest,
 ) -> Result<String, CommitError> {
+    commit_with_outcome(store, cfg, sync, slug, req)
+        .await
+        .map(|outcome| outcome.sha)
+}
+
+/// Like [`commit`], but also formats written/edited text files through the
+/// platform oxfmt and reports what changed. `rollback` and `import_dir`
+/// build their commits directly and never format.
+///
+/// Formatting runs after exact-match edits apply (so it sees the final
+/// content) and before the commit is built. Files oxfmt cannot parse, that
+/// time out, or whose output is oversized commit UNFORMATTED with a reason
+/// in `format_skipped` — the commit never fails for formatting.
+pub async fn commit_with_outcome(
+    store: &crate::store::Store,
+    cfg: &GitConfig,
+    sync: &GitSync,
+    slug: &str,
+    req: CommitRequest,
+) -> Result<CommitOutcome, CommitError> {
     if manifest::validate_slug(slug).is_err() {
         return Err(CommitError::BadSlug(slug.to_string()));
     }
@@ -184,6 +217,13 @@ pub async fn commit(
         }
     }
     apply_edits(&bare, head.as_deref(), &req.edits, &mut files).await?;
+    let outcome = super::format::format_committed_files(
+        cfg.oxfmt_bin.as_deref(),
+        &bare,
+        head.as_deref(),
+        &mut files,
+    )
+    .await;
     require_existing(&bare, head.as_deref(), &req.deletes, &req.moves).await?;
     let sha = build_commit(
         &bare,
@@ -196,7 +236,12 @@ pub async fn commit(
     )
     .await
     .map_err(CommitError::Internal)?;
-    publish_mapped(store, cfg, sync, slug, &bare, head.as_deref(), &sha).await
+    publish_mapped(store, cfg, sync, slug, &bare, head.as_deref(), &sha).await?;
+    Ok(CommitOutcome {
+        sha,
+        formatted: outcome.formatted,
+        format_skipped: outcome.skipped,
+    })
 }
 
 /// Make a new commit on main whose tree is `target`'s tree and whose parent is
@@ -481,7 +526,7 @@ fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), Commi
                 path: f.path.clone(),
             });
         }
-        let bytes = match &f.body {
+        let (bytes, is_text) = match &f.body {
             WriteBody::Text(text) => {
                 if text.len() > MAX_TEXT_BYTES {
                     return Err(CommitError::TextTooLarge {
@@ -493,7 +538,7 @@ fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), Commi
                         path: f.path.clone(),
                     });
                 }
-                text.as_bytes().to_vec()
+                (text.as_bytes().to_vec(), true)
             }
             WriteBody::Base64(s) => {
                 use base64::Engine as _;
@@ -508,13 +553,14 @@ fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), Commi
                         path: f.path.clone(),
                     });
                 }
-                bytes
+                (bytes, false)
             }
         };
         decoded += bytes.len();
         files.push(RawFile {
             path: f.path.clone(),
             bytes,
+            is_text,
         });
     }
     if decoded > MAX_COMMIT_BYTES {
@@ -637,6 +683,7 @@ async fn apply_edits(
         files.push(RawFile {
             path: e.path.clone(),
             bytes: replaced.into_bytes(),
+            is_text: true,
         });
     }
     Ok(())
@@ -925,6 +972,8 @@ fn collect_dir(dir: &Path) -> anyhow::Result<Vec<RawFile>> {
                 out.push(RawFile {
                     path: rel_str,
                     bytes,
+                    // Seeding never formats; the flag is unused here.
+                    is_text: false,
                 });
             }
         }
@@ -945,6 +994,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();
@@ -1065,6 +1115,7 @@ mod tests {
         let fresh_dir = tempfile::tempdir().unwrap();
         let fresh_cfg = GitConfig {
             repos_dir: fresh_dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let fresh_sync = GitSync::default();
         let got = manifest::rehydrate(&store, &fresh_cfg, &fresh_sync, "rehyd")
@@ -1728,5 +1779,329 @@ mod tests {
         let bare = manifest::mirror_path(&cfg, "overlap");
         assert_eq!(show(&bare, &hc, "y.txt").await, "X");
         assert_eq!(show(&bare, &hc, "z.txt").await, "Y");
+    }
+
+    /// A fake oxfmt: an executable shell script. The runner clears the
+    /// environment, so absolute paths are baked into the script text.
+    fn fake_oxfmt(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn setup_with_bin(
+        slug: &str,
+        bin: Option<std::path::PathBuf>,
+    ) -> (tempfile::TempDir, GitConfig, Store, GitSync) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig {
+            repos_dir: dir.path().join("git"),
+            oxfmt_bin: bin,
+        };
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, slug)
+            .await
+            .unwrap();
+        (dir, cfg, store, sync)
+    }
+
+    /// Uppercase-everything fake that logs each formatted path (`$2` is the
+    /// `--stdin-filepath` value) and the `-c` config it was given (`$4`).
+    /// `.oxfmtrc.json` passes through unchanged so later commits in the same
+    /// repo still read a valid tree config from head.
+    fn logging_uppercaser(
+        dir: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let files_log = dir.path().join("files.log");
+        let cfg_log = dir.path().join("cfg.log");
+        let bin = fake_oxfmt(
+            dir,
+            "upper.sh",
+            &format!(
+                "echo \"$2\" >> {}\ncat \"$4\" >> {}\necho >> {}\ncase \"$2\" in *.oxfmtrc.json) cat;; *) tr 'a-z' 'A-Z';; esac",
+                files_log.display(),
+                cfg_log.display(),
+                cfg_log.display(),
+            ),
+        );
+        (bin, files_log, cfg_log)
+    }
+
+    fn logged_paths(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn format_touches_only_formattable_text_and_lists_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, files_log, _cfg_log) = logging_uppercaser(&dir);
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-only", Some(bin)).await;
+        let mut r = req("format");
+        r.writes.push(write("app/a.ts", "const x = 1;\n"));
+        r.writes.push(write("app/clean.ts", "ABC\n"));
+        r.writes.push(write("app/note.txt", "hello\n"));
+        r.writes.push(FileWrite {
+            path: "app/upload.ts".to_string(),
+            body: WriteBody::Base64("Y29uc3QgeSA9IDI7Cg==".to_string()),
+        });
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-only", r)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-only");
+        assert_eq!(
+            show(&bare, &outcome.sha, "app/a.ts").await,
+            "CONST X = 1;\n"
+        );
+        assert_eq!(show(&bare, &outcome.sha, "app/clean.ts").await, "ABC\n");
+        assert_eq!(show(&bare, &outcome.sha, "app/note.txt").await, "hello\n");
+        assert_eq!(
+            show(&bare, &outcome.sha, "app/upload.ts").await,
+            "const y = 2;\n",
+            "base64 uploads are bytes, never formatted"
+        );
+        assert_eq!(outcome.formatted, vec!["app/a.ts".to_string()]);
+        assert!(outcome.format_skipped.is_empty());
+        // Only the two formattable text files reached the formatter (log
+        // order is nondeterministic: files format concurrently); txt and
+        // base64 never did.
+        let mut logged = logged_paths(&files_log);
+        logged.sort();
+        assert_eq!(logged, vec!["app/a.ts", "app/clean.ts"]);
+    }
+
+    #[tokio::test]
+    async fn format_covers_edits_but_not_moves_or_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, files_log, _cfg_log) = logging_uppercaser(&dir);
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-mv", Some(bin)).await;
+        let mut seed = req("seed");
+        seed.writes.push(write("edit.ts", "HELLO WORLD\n"));
+        seed.writes.push(write("move.ts", "HELLO\n"));
+        seed.writes.push(write("del.ts", "HELLO\n"));
+        commit_with_outcome(&store, &cfg, &sync, "fmt-mv", seed)
+            .await
+            .unwrap();
+        let logged_after_seed = logged_paths(&files_log).len();
+        assert_eq!(logged_after_seed, 3);
+        let mut change = req("change");
+        change.edits.push(Edit {
+            path: "edit.ts".to_string(),
+            old: "WORLD".to_string(),
+            new: "world".to_string(),
+            replace_all: false,
+        });
+        change.moves.push(Move {
+            from: "move.ts".to_string(),
+            to: "moved.ts".to_string(),
+        });
+        change.deletes.push("del.ts".to_string());
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-mv", change)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-mv");
+        assert_eq!(
+            show(&bare, &outcome.sha, "edit.ts").await,
+            "HELLO WORLD\n",
+            "edit result passes through the formatter"
+        );
+        assert_eq!(show(&bare, &outcome.sha, "moved.ts").await, "HELLO\n");
+        assert_eq!(outcome.formatted, vec!["edit.ts".to_string()]);
+        assert!(outcome.format_skipped.is_empty());
+        // Only the edited file reached the formatter; the move (a blob
+        // re-point, content untouched) and the delete did not.
+        assert_eq!(logged_paths(&files_log).len(), logged_after_seed + 1);
+        assert_eq!(&logged_paths(&files_log)[logged_after_seed..], ["edit.ts"]);
+    }
+
+    #[tokio::test]
+    async fn format_failure_commits_unformatted_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_oxfmt(
+            &dir,
+            "fail.sh",
+            "case \"$2\" in *bad.ts*) echo '  × Unexpected token' >&2; exit 2;; *) tr 'a-z' 'A-Z';; esac",
+        );
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-fail", Some(bin)).await;
+        let mut r = req("format");
+        r.writes.push(write("good.ts", "const x = 1;\n"));
+        r.writes
+            .push(write("bad.ts", "const = SYNTAX-BROKEN ;;;\n"));
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-fail", r)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-fail");
+        assert_eq!(show(&bare, &outcome.sha, "good.ts").await, "CONST X = 1;\n");
+        assert_eq!(
+            show(&bare, &outcome.sha, "bad.ts").await,
+            "const = SYNTAX-BROKEN ;;;\n"
+        );
+        assert_eq!(outcome.formatted, vec!["good.ts".to_string()]);
+        assert_eq!(outcome.format_skipped.len(), 1);
+        assert_eq!(outcome.format_skipped[0].path, "bad.ts");
+        assert!(
+            outcome.format_skipped[0]
+                .reason
+                .contains("Unexpected token"),
+            "reason carries the actionable line: {}",
+            outcome.format_skipped[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn format_timeout_commits_unformatted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_oxfmt(&dir, "slow.sh", "sleep 30");
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-slow", Some(bin)).await;
+        let mut r = req("format");
+        r.writes.push(write("slow.ts", "const x = 1;\n"));
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-slow", r)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-slow");
+        assert_eq!(show(&bare, &outcome.sha, "slow.ts").await, "const x = 1;\n");
+        assert!(outcome.formatted.is_empty());
+        assert_eq!(outcome.format_skipped.len(), 1);
+        assert_eq!(outcome.format_skipped[0].path, "slow.ts");
+        assert_eq!(outcome.format_skipped[0].reason, "timeout");
+    }
+
+    #[tokio::test]
+    async fn format_without_binary_commits_unchanged() {
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-none", None).await;
+        let mut r = req("format");
+        r.writes.push(write("app/a.ts", "const x = 1;\n"));
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-none", r)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-none");
+        assert_eq!(
+            show(&bare, &outcome.sha, "app/a.ts").await,
+            "const x = 1;\n"
+        );
+        assert!(outcome.formatted.is_empty());
+        assert!(outcome.format_skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn format_honors_tree_config_and_ignore_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, files_log, cfg_log) = logging_uppercaser(&dir);
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-ignore", Some(bin)).await;
+        let mut first = req("first");
+        first.writes.push(write(
+            ".oxfmtrc.json",
+            "{\"ignorePatterns\": [\"gen/**\"]}\n",
+        ));
+        first.writes.push(write(".prettierignore", "skip/\n"));
+        first.writes.push(write("gen/a.ts", "const x = 1;\n"));
+        first.writes.push(write("skip/b.ts", "const x = 1;\n"));
+        first.writes.push(write("src/a.ts", "const x = 1;\n"));
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-ignore", first)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-ignore");
+        assert_eq!(
+            show(&bare, &outcome.sha, "gen/a.ts").await,
+            "const x = 1;\n",
+            "oxfmtrc ignorePatterns skips the whole subtree"
+        );
+        assert_eq!(
+            show(&bare, &outcome.sha, "skip/b.ts").await,
+            "const x = 1;\n",
+            ".prettierignore skips the directory"
+        );
+        assert_eq!(
+            show(&bare, &outcome.sha, "src/a.ts").await,
+            "CONST X = 1;\n"
+        );
+        assert!(outcome.format_skipped.is_empty());
+        let logged = logged_paths(&files_log);
+        assert!(logged.contains(&"src/a.ts".to_string()), "{logged:?}");
+        assert!(!logged.contains(&"gen/a.ts".to_string()), "{logged:?}");
+        assert!(!logged.contains(&"skip/b.ts".to_string()), "{logged:?}");
+        // The `-c` config the formatter saw came from the commit's own tree
+        // state, not from disk.
+        let cfgs = std::fs::read_to_string(&cfg_log).unwrap();
+        assert!(cfgs.contains("gen/**"), "unexpected -c content: {cfgs:?}");
+
+        // A later commit reads the config from head: the ignore still holds
+        // without rewriting `.oxfmtrc.json`.
+        let mut second = req("second");
+        second.writes.push(write("src/b.ts", "const y = 2;\n"));
+        second.writes.push(write("gen/b.ts", "const y = 2;\n"));
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-ignore", second)
+            .await
+            .unwrap();
+        assert_eq!(
+            show(&bare, &outcome.sha, "src/b.ts").await,
+            "CONST Y = 2;\n"
+        );
+        assert_eq!(
+            show(&bare, &outcome.sha, "gen/b.ts").await,
+            "const y = 2;\n"
+        );
+        assert_eq!(outcome.formatted, vec!["src/b.ts".to_string()]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the real oxfmt binary: OUTER_TEST_OXFMT_BIN=/path/to/oxfmt"]
+    async fn format_real_oxfmt_end_to_end() {
+        let bin = match std::env::var("OUTER_TEST_OXFMT_BIN") {
+            Ok(bin) => bin,
+            Err(_) => {
+                eprintln!("skipping: set OUTER_TEST_OXFMT_BIN to run");
+                return;
+            }
+        };
+        let (_dir, cfg, store, sync) =
+            setup_with_bin("fmt-real", Some(std::path::PathBuf::from(bin))).await;
+        let mut r = req("format");
+        r.writes
+            .push(write(".oxfmtrc.json", "{\"singleQuote\": true}\n"));
+        r.writes.push(write("app/a.js", "const s = \"hi\"\n"));
+        r.writes.push(write("app/b.json", "{\"b\":1,\"a\":2}\n"));
+        r.writes.push(write("app/c.css", "a{color:red}\n"));
+        r.writes.push(write("app/d.md", "# hi\n"));
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-real", r)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-real");
+        // The tree's `-c` config applied (single quotes), proving stdin mode
+        // plus pinned-config plumbing with no on-disk discovery.
+        assert_eq!(
+            show(&bare, &outcome.sha, "app/a.js").await,
+            "const s = 'hi';\n"
+        );
+        assert_eq!(
+            show(&bare, &outcome.sha, "app/b.json").await,
+            "{ \"b\": 1, \"a\": 2 }\n"
+        );
+        assert_eq!(
+            show(&bare, &outcome.sha, "app/c.css").await,
+            "a {\n  color: red;\n}\n"
+        );
+        assert_eq!(show(&bare, &outcome.sha, "app/d.md").await, "# hi\n");
+        // The config formats itself (JSON spacing) without changing meaning.
+        assert_eq!(
+            show(&bare, &outcome.sha, ".oxfmtrc.json").await,
+            "{ \"singleQuote\": true }\n"
+        );
+        assert_eq!(
+            outcome.formatted,
+            vec![
+                ".oxfmtrc.json".to_string(),
+                "app/a.js".to_string(),
+                "app/b.json".to_string(),
+                "app/c.css".to_string(),
+            ]
+        );
+        assert!(outcome.format_skipped.is_empty());
     }
 }

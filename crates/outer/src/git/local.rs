@@ -565,6 +565,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = super::super::manifest::GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();

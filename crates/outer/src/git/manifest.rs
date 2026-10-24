@@ -25,6 +25,9 @@ pub const MAIN_REF: &str = "refs/heads/main";
 pub struct GitConfig {
     /// Local bare mirrors live here: `{repos_dir}/{slug}.git`.
     pub repos_dir: PathBuf,
+    /// Platform-owned oxfmt binary that formats commits. `None` disables
+    /// formatting (commit still works); tests use `None` or a fake script.
+    pub oxfmt_bin: Option<PathBuf>,
 }
 
 /// Key of a slug's manifest in the bucket.
@@ -634,6 +637,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig {
             repos_dir: dir.path().join("git"),
+            oxfmt_bin: None,
         };
         let store = Store::memory();
         let sync = GitSync::default();

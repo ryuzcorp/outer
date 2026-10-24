@@ -501,6 +501,10 @@ async fn create_commit_read_history_roundtrip() {
         .unwrap()
         .contains("groceries"));
     assert_eq!(commit["quota"]["used"], 1);
+    // No formatter in tests: `formatted` is present but empty, and
+    // `format_skipped` is omitted when nothing was skipped.
+    assert_eq!(commit["commit"]["formatted"].as_array().unwrap().len(), 0);
+    assert!(commit["commit"].get("format_skipped").is_none());
     let sha2 = commit["commit"]["sha"].as_str().unwrap().to_string();
 
     let (_, search) = call(
