@@ -110,6 +110,25 @@ struct WakeReport {
     reused_credentials: bool,
 }
 
+/// Persist a fleet's ring tail before the ring dies with the fleet (sleep
+/// and credential-refresh stops). The sweep flushes every tick, so this is
+/// normally a handful of lines. A flush failure only warns: the fleet
+/// still stops. Both callers hold the slug's wake lock (the sweep takes it
+/// across evaluate-and-stop; `ensure_awake` holds it from its first
+/// liveness check to its activity write), so a wake-spawned ring cannot be
+/// orphaned while this snapshot flushes.
+async fn flush_ring_before_stop(
+    pool: &SqlitePool,
+    app_id: &str,
+    slug: &str,
+    logs: &crate::fleet::supervisor::SharedLogRing,
+) {
+    let tail = crate::observe::logs::ring_snapshot(logs).await;
+    if let Err(err) = crate::observe::logs::flush_fleet(pool, app_id, &tail).await {
+        tracing::warn!(slug = %slug, error = %format!("{err:#}"), "pre-stop flush failed; tail lines lost");
+    }
+}
+
 /// Running fleets, started on demand and slept when idle. Cheap to clone.
 #[derive(Clone)]
 pub struct FleetManager {
@@ -479,14 +498,7 @@ impl FleetManager {
                 };
                 let mut fleet = live.fleet;
                 drop(fleets);
-                // Persist the tail before the ring dies with the fleet: the
-                // sweep flushes every tick, so this is normally a handful
-                // of lines. A flush failure still sleeps the fleet; the
-                // warn carries the slug.
-                let tail = crate::observe::logs::ring_snapshot(&fleet.logs).await;
-                if let Err(err) = crate::observe::logs::flush_fleet(pool, &app.id, &tail).await {
-                    tracing::warn!(slug = %slug, error = %format!("{err:#}"), "sleep flush failed; tail lines lost");
-                }
+                flush_ring_before_stop(pool, &app.id, &slug, &fleet.logs).await;
                 fleet.stop(StopGrace::NORMAL).await;
                 apps::set_asleep(pool, &app.id, Some(now)).await?;
                 slept.push(slug);
@@ -516,8 +528,13 @@ impl FleetManager {
             let Some(live) = fleets.remove(&slug) else {
                 continue;
             };
+            // Persist the tail before the ring dies with the fleet (mirrors
+            // the sleep path above): the sweep flushes every tick, so this
+            // is normally a handful of lines. A flush failure still
+            // restarts the fleet; the warn carries the slug.
             let mut fleet = live.fleet;
             drop(fleets);
+            flush_ring_before_stop(pool, &app.id, &slug, &fleet.logs).await;
             fleet.stop(StopGrace::NORMAL).await;
             // The restart forces a fresh mint: restarting on the cached grant
             // would restart on the same near-expiry credentials.
@@ -825,6 +842,46 @@ mod tests {
         apps::delete_row(&pool, &stale.id).await.unwrap();
         let err = manager.ensure_awake(&pool, &stale).await.unwrap_err();
         assert!(err.to_string().contains("no longer exists"), "{err}");
+    }
+
+    /// The sleep and credential-refresh stops share one helper that flushes
+    /// the ring before the fleet (and its ring) dies: unflushed lines —
+    /// including a grouped error — persist instead of being lost.
+    #[tokio::test]
+    async fn pre_stop_flush_persists_unflushed_lines() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        let ring: crate::fleet::supervisor::SharedLogRing =
+            std::sync::Arc::new(tokio::sync::Mutex::new(LogRing::new(64)));
+        {
+            let mut guard = ring.lock().await;
+            guard.push(LogStream::Stdout, "serving on :8080".to_string());
+            guard.push(
+                LogStream::Stderr,
+                "Error: refresh must not lose me".to_string(),
+            );
+        }
+        flush_ring_before_stop(&pool, "app1", "slug1", &ring).await;
+        let lines: Vec<String> =
+            sqlx::query_scalar("SELECT line FROM app_log WHERE app_id = ?1 ORDER BY seq")
+                .bind("app1")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lines.len(), 2, "both unflushed lines persist");
+        let issues = crate::observe::logs::issues(&pool, "app1", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            issues.len(),
+            1,
+            "the error line groups an issue: {issues:?}"
+        );
+        assert!(issues[0].message.contains("must not lose me"));
+        pool.close().await;
     }
 
     /// Needs a real celld binary and an S3-compatible bucket (RustFS, with

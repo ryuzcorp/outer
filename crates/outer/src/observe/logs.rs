@@ -17,7 +17,10 @@
 //! on one `since` cursor. A ring that overflowed before its first flush
 //! leaves a seq gap; the cursor skips gaps without duplicating lines.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
+
 use sqlx::SqlitePool;
 
 use crate::fleet::manager::FleetManager;
@@ -29,6 +32,16 @@ pub const MAX_PERSISTED_LINES: i64 = 2000;
 pub const ERROR_RETENTION_MS: i64 = 30 * 86_400_000;
 /// Most issues one `app_errors` answer carries.
 pub const MAX_ISSUES: usize = 50;
+/// Most grouped issues kept per app (spec §13 flood bound): once an app
+/// reaches this many, existing fingerprints keep updating but new ones
+/// route into the single [`OVERFLOW_FINGERPRINT`] issue, so one noisy app
+/// can't bloat the shared SQLite and slow `flush_all` for every app.
+pub const MAX_ERROR_ISSUES: usize = 500;
+/// Fingerprint of the per-app overflow issue (never collides: real
+/// fingerprints are sha256 hex).
+pub const OVERFLOW_FINGERPRINT: &str = "overflow";
+/// Message of the per-app overflow issue.
+pub const OVERFLOW_MESSAGE: &str = "More distinct errors than Outer keeps; showing the first 500";
 /// Most stack lines kept in one grouped event (flood bound).
 const MAX_EVENT_LINES: usize = 40;
 /// Traceback header opening a Python exception block.
@@ -62,11 +75,11 @@ pub struct Issue {
     pub status: String,
 }
 
-/// Strip a leading `2026-10-24T09:41:44.123Z`-style timestamp plus the
-/// tracing level/target prefix (`ERROR celld::console: `), so fingerprints
-/// don't move with the clock. Returns the rest of the line unchanged when
-/// no such prefix is present.
-fn strip_log_prefix(line: &str) -> &str {
+/// Split a leading `2026-10-24T09:41:44.123Z`-style timestamp plus the
+/// tracing level/target prefix (`ERROR celld::console: `) off `line`.
+/// Returns the tracing level (`TRACE`..`ERROR`) when one is present, plus
+/// the rest of the line. The rest is unchanged when no such prefix exists.
+fn split_log_prefix(line: &str) -> (Option<&'static str>, &str) {
     let mut rest = line.trim_start();
     // Date: exactly `NNNN-NN-NNTNN:NN:NN`, then anything to whitespace.
     let bytes = rest.as_bytes();
@@ -95,23 +108,30 @@ fn strip_log_prefix(line: &str) -> &str {
                         rest = msg[2..].trim_start();
                     }
                 }
-                break;
+                return (Some(level), rest);
             }
         }
     }
-    rest
+    (None, rest)
+}
+
+/// Strip a leading `2026-10-24T09:41:44.123Z`-style timestamp plus the
+/// tracing level/target prefix (`ERROR celld::console: `), so fingerprints
+/// don't move with the clock. Returns the rest of the line unchanged when
+/// no such prefix is present.
+fn strip_log_prefix(line: &str) -> &str {
+    split_log_prefix(line).1
 }
 
 fn is_error_start(line: &str) -> bool {
-    // Level markers survive prefix stripping, so check the raw line first:
-    // a tracing `ERROR ...` line is an error even after the level is gone.
-    if line
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|w| w == "ERROR")
-    {
+    let (level, text) = split_log_prefix(line);
+    // A tracing `ERROR` line is an error even when the stripped body
+    // carries no marker. Any other level leaves the decision to the
+    // markers below, so an INFO line mentioning ERROR in passing (or
+    // visitor text echoed into the logs) never mints an issue.
+    if level == Some("ERROR") {
         return true;
     }
-    let text = strip_log_prefix(line);
     if text.contains("console.error") || text.contains("severity_text\":\"ERROR\"") {
         return true;
     }
@@ -357,10 +377,55 @@ pub async fn max_seq(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<i
     Ok(max)
 }
 
+/// One grouped event to record in `error_issue`.
+struct NewIssue<'a> {
+    fingerprint: &'a str,
+    message: &'a str,
+    frame: Option<&'a str>,
+    count: i64,
+    first_seen_ms: i64,
+    last_seen_ms: i64,
+}
+
+/// Record one grouped event: insert a new `open` issue, or — on a known
+/// fingerprint — bump `count` and refresh `last_seen`/`message`/`frame`
+/// while keeping `first_seen` and `status`. A resolved issue that recurs
+/// keeps its status: resolving is the owner's explicit choice, and a
+/// recount must not silently reopen it.
+async fn upsert_issue(
+    tx: &mut sqlx::SqliteConnection,
+    app_id: &str,
+    issue: &NewIssue<'_>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open') \
+         ON CONFLICT (app_id, fingerprint) DO UPDATE SET \
+           count = error_issue.count + excluded.count, \
+           last_seen = excluded.last_seen, \
+           message = excluded.message, \
+           frame = excluded.frame",
+    )
+    .bind(app_id)
+    .bind(issue.fingerprint)
+    .bind(issue.message)
+    .bind(issue.frame)
+    .bind(issue.count)
+    .bind(issue.first_seen_ms)
+    .bind(issue.last_seen_ms)
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
 /// Flush one fleet's ring entries for `app_id`: persist every line past the
 /// persisted watermark (idempotent: re-flushes insert nothing), group the
 /// new lines into `error_issue` rows, and prune to the last
 /// [`MAX_PERSISTED_LINES`] lines. Returns the lines persisted.
+///
+/// Grouped issues are capped at [`MAX_ERROR_ISSUES`] per app: existing
+/// fingerprints keep updating, but fingerprints past the cap route into
+/// the single [`OVERFLOW_FINGERPRINT`] issue instead of new rows.
 pub async fn flush_fleet(
     pool: &SqlitePool,
     app_id: &str,
@@ -392,29 +457,105 @@ pub async fn flush_fleet(
         .await?;
     }
     let events = scan_errors(fresh.iter().map(|e| (e.ts, e.line.as_str())));
-    for event in &events {
-        let fp = fingerprint(&event.message, event.frame.as_deref());
-        // `first_seen` keeps the earliest sighting; `message`/`frame` track
-        // the latest wording under the same fingerprint. A resolved issue
-        // that recurs keeps its status: resolving is the owner's explicit
-        // choice, and a recount must not silently reopen it.
-        sqlx::query(
-            "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status) \
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 'open') \
-             ON CONFLICT (app_id, fingerprint) DO UPDATE SET \
-               count = error_issue.count + 1, \
-               last_seen = excluded.last_seen, \
-               message = excluded.message, \
-               frame = excluded.frame",
-        )
-        .bind(app_id)
-        .bind(&fp)
-        .bind(&event.message)
-        .bind(event.frame.as_deref())
-        .bind(event.first_ts * 1000)
-        .bind(event.last_ts * 1000)
-        .execute(&mut *tx)
-        .await?;
+    // Fingerprint once; distinct fingerprints in first-seen order decide
+    // the cap: one COUNT per flush in the common case, plus one bounded
+    // fingerprint SELECT only when this flush could push past the cap.
+    let keyed: Vec<(String, &ErrorEvent)> = events
+        .iter()
+        .map(|event| (fingerprint(&event.message, event.frame.as_deref()), event))
+        .collect();
+    let mut distinct: Vec<&str> = Vec::new();
+    {
+        let mut seen = HashSet::new();
+        for (fp, _) in &keyed {
+            if seen.insert(fp.as_str()) {
+                distinct.push(fp.as_str());
+            }
+        }
+    }
+    let issue_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM error_issue WHERE app_id = ?1 AND fingerprint != ?2",
+    )
+    .bind(app_id)
+    .bind(OVERFLOW_FINGERPRINT)
+    .fetch_one(&mut *tx)
+    .await?;
+    if issue_count as usize + distinct.len() <= MAX_ERROR_ISSUES {
+        for (fp, event) in &keyed {
+            upsert_issue(
+                &mut tx,
+                app_id,
+                &NewIssue {
+                    fingerprint: fp,
+                    message: &event.message,
+                    frame: event.frame.as_deref(),
+                    count: 1,
+                    first_seen_ms: event.first_ts * 1000,
+                    last_seen_ms: event.last_ts * 1000,
+                },
+            )
+            .await?;
+        }
+    } else {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT fingerprint FROM error_issue WHERE app_id = ?1")
+                .bind(app_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut known: HashSet<String> = rows.into_iter().map(|(fp,)| fp).collect();
+        // The overflow row itself must never consume the new-issue budget.
+        known.remove(OVERFLOW_FINGERPRINT);
+        let mut budget = (MAX_ERROR_ISSUES as i64 - issue_count).max(0) as usize;
+        let mut overflow_count: i64 = 0;
+        let mut overflow_first: i64 = 0;
+        let mut overflow_last: i64 = 0;
+        for (fp, event) in &keyed {
+            if !known.contains(fp.as_str()) {
+                if budget == 0 {
+                    let first = event.first_ts * 1000;
+                    let last = event.last_ts * 1000;
+                    if overflow_count == 0 {
+                        overflow_first = first;
+                        overflow_last = last;
+                    } else {
+                        overflow_first = overflow_first.min(first);
+                        overflow_last = overflow_last.max(last);
+                    }
+                    overflow_count += 1;
+                    continue;
+                }
+                budget -= 1;
+                known.insert((*fp).to_string());
+            }
+            upsert_issue(
+                &mut tx,
+                app_id,
+                &NewIssue {
+                    fingerprint: fp,
+                    message: &event.message,
+                    frame: event.frame.as_deref(),
+                    count: 1,
+                    first_seen_ms: event.first_ts * 1000,
+                    last_seen_ms: event.last_ts * 1000,
+                },
+            )
+            .await?;
+        }
+        if overflow_count > 0 {
+            upsert_issue(
+                &mut tx,
+                app_id,
+                &NewIssue {
+                    fingerprint: OVERFLOW_FINGERPRINT,
+                    message: OVERFLOW_MESSAGE,
+                    frame: None,
+                    count: overflow_count,
+                    first_seen_ms: overflow_first,
+                    last_seen_ms: overflow_last,
+                },
+            )
+            .await?;
+        }
     }
     sqlx::query(
         "DELETE FROM app_log WHERE app_id = ?1 AND seq NOT IN \
@@ -634,6 +775,9 @@ mod tests {
         assert!(is_error_start(
             "2026-10-24T09:41:44.123Z  ERROR cell_console: console.error nope"
         ));
+        assert!(is_error_start(
+            "2026-10-24T09:41:44.123Z  ERROR celld::console: boom"
+        ));
         assert!(is_error_start("error: script error"));
         assert!(is_error_start("Traceback (most recent call last):"));
         // Ordinary lines are not errors.
@@ -642,6 +786,20 @@ mod tests {
         assert!(!is_error_start("INFO cell_console: serving"));
         assert!(!is_error_start("error rate 1.2% over 5m"));
         assert!(!is_error_start("0 errors this hour"));
+        // An ERROR token in the message body is not error-ness: only the
+        // tracing level field (or an explicit marker) decides.
+        assert!(!is_error_start(
+            "2026-10-24T09:41:44.123Z  INFO celld::console: my ERROR handling broke nothing"
+        ));
+        assert!(!is_error_start(
+            "INFO celld::console: visitor said ERROR loudly"
+        ));
+        assert!(!is_error_start("WARN celld::console: error counts are up"));
+        // Explicit markers still fire under a non-error level.
+        assert!(is_error_start("INFO celld::console: console.error boom"));
+        assert!(is_error_start(
+            "2026-10-24T09:41:44.123Z  INFO celld::console: TypeError: bad shape"
+        ));
     }
 
     #[test]
@@ -820,6 +978,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(min, 100, "the newest 2,000 survive");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn flush_caps_issues_per_app_with_overflow() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        let app_id = "app1";
+        // Fill the app to the cap with distinct errors (letters alone do
+        // not normalize away, so each line is its own fingerprint).
+        let mut ring = LogRing::new(10_000);
+        for i in 0..MAX_ERROR_ISSUES {
+            let ch = (b'a' + (i % 26) as u8) as char;
+            ring.push(
+                LogStream::Stderr,
+                format!("Error: failure {ch} {}", "x".repeat(i / 26)),
+            );
+        }
+        let entries: Vec<LogEntry> = ring.tail(10_000);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM error_issue WHERE app_id = ?1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, MAX_ERROR_ISSUES as i64);
+        // A repeat of a capped fingerprint still updates its row.
+        let mut ring2 = LogRing::new_with_next(10, entries.len() as u64);
+        ring2.push(LogStream::Stderr, "Error: failure a ".to_string());
+        let entries2: Vec<LogEntry> = ring2.tail(10);
+        flush_fleet(&pool, app_id, &entries2).await.unwrap();
+        // New fingerprints past the cap land in the one overflow issue.
+        let mut ring3 = LogRing::new_with_next(10, (entries.len() + entries2.len()) as u64);
+        for word in ["zzznewone", "zzznewtwo"] {
+            ring3.push(LogStream::Stderr, format!("Error: {word} happened"));
+        }
+        let entries3: Vec<LogEntry> = ring3.tail(10);
+        flush_fleet(&pool, app_id, &entries3).await.unwrap();
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT fingerprint, count FROM error_issue WHERE app_id = ?1")
+                .bind(app_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), MAX_ERROR_ISSUES + 1, "cap rows plus overflow");
+        let overflow = rows
+            .iter()
+            .find(|(fp, _)| fp == OVERFLOW_FINGERPRINT)
+            .expect("overflow issue exists");
+        assert_eq!(overflow.1, 2, "both new fingerprints counted once each");
+        let msg: String = sqlx::query_scalar(
+            "SELECT message FROM error_issue WHERE app_id = ?1 AND fingerprint = ?2",
+        )
+        .bind(app_id)
+        .bind(OVERFLOW_FINGERPRINT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(msg, OVERFLOW_MESSAGE);
         pool.close().await;
     }
 
