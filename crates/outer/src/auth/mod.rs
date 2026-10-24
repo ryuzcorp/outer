@@ -493,7 +493,10 @@ pub async fn verify_code_core(
                     });
                 }
             }
-            if !is_admin(cfg, &email) {
+            // Only people who joined with an invite get codes to pass on
+            // (owner, 2026-10-24): not admins, not allowlisted emails, and
+            // not app collaborators, who are admitted through the allowlist.
+            if carried_invite.is_some() && !is_admin(cfg, &email) {
                 invites::mint_grants(&mut tx, &id, now)
                     .await
                     .map_err(|err| AuthError::new("db", format!("{err}")))?;

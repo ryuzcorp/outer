@@ -1424,9 +1424,11 @@ async fn closed_beta_waitlists_by_default() {
         .unwrap();
 }
 
-/// A fresh account mints exactly 3 grant codes; an admin account mints none.
+/// Codes go only to people who joined with an invite: an account admitted
+/// any other way (open sign-up, the allowlist — how app collaborators get
+/// in) and an admin mint none. The invite round trip below pins the 3.
 #[tokio::test]
-async fn fresh_account_gets_three_grants_admin_gets_none() {
+async fn only_invite_joiners_get_grants() {
     let pool = test_pool().await;
     let (config, codes) = test_config();
 
@@ -1448,7 +1450,7 @@ async fn fresh_account_gets_three_grants_admin_gets_none() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(ana_grants, 3);
+    assert_eq!(ana_grants, 0, "no invite, no codes to pass on");
     let (owner_grants,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM invite_code WHERE createdBy = \
          (SELECT id FROM user WHERE email = 'owner@example.com')",
