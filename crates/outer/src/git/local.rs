@@ -563,10 +563,7 @@ mod tests {
         GitSync,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = super::super::manifest::GitConfig {
-            repos_dir: dir.path().join("git"),
-            oxfmt_bin: None,
-        };
+        let cfg = super::super::manifest::GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, "grocery")

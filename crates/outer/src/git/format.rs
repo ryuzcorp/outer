@@ -9,22 +9,34 @@
 //! Security: the app's code is never executed. oxfmt runs with stdin/stdout
 //! pipes, `cwd` an empty temp dir, and a fully cleared environment, so it
 //! discovers no config or code on disk: the only config it sees is the `-c`
-//! file Outer writes from bytes read as data out of the commit's tree.
+//! file Outer writes from bytes read as data out of the commit's tree,
+//! minus the `sortTailwindcss` key (top level and inside every
+//! `overrides[]` entry). oxfmt 0.74's `config`/`stylesheet` sub-options
+//! take host paths and its tailwind auto-find walks up from the config
+//! file, which would `jiti.import()` JS as the Outer uid; app files are
+//! never on disk, so these options can never legitimately resolve. The
+//! schema has no other filesystem/module key (there are no plugin keys;
+//! globs and import-sort prefixes match in memory only), so removing the
+//! whole key closes it entirely.
 //! Ignore rules honored: the tree's `.oxfmtrc.json` `ignorePatterns` and the
 //! tree's `.prettierignore`. `.gitignore` is NOT honored. Pattern syntax:
 //! `*` (any run within a segment), `**` (any run across segments), `?` (one
 //! character), a leading `/` or `./` is stripped, a trailing `/` matches the
 //! whole directory, a pattern without `/` matches at any depth, and (in
 //! `.prettierignore` only) a leading `!` negates with last-match-wins. No
-//! character classes, no `\` escapes.
+//! character classes, no `\` escapes. Budgets below bound adversarial
+//! configs; over-budget patterns are ignored (fail-open: those files
+//! format).
 //!
 //! Failure policy: a file oxfmt cannot parse, a timeout, or an oversized
 //! output commits that file UNFORMATTED — never block the agent's commit.
 //! The build reports syntax errors, not the commit path.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
@@ -41,8 +53,10 @@ pub const FORMATTABLE_EXTENSIONS: &[&str] = &[
     "js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts", "json", "jsonc", "css", "md",
 ];
 
-/// Total formatting budget per commit. Every file run is killed at this
-/// deadline, so a hung formatter delays the commit by at most this long.
+/// Total formatting budget per commit. A file's whole run — the wait for a
+/// per-commit and a process-wide permit, the spawn, the stdin write, and
+/// the formatter wait — is abandoned at this deadline and its process group
+/// killed, so a hung formatter delays the commit by at most this long.
 pub const FORMAT_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Most concurrent oxfmt processes per commit.
@@ -55,6 +69,19 @@ pub const FORMAT_OUTPUT_CAP: usize = 1024 * 1024;
 /// Cap on a config/ignore blob read from the tree. Real configs are tiny;
 /// anything larger is treated as absent.
 const TREE_CONFIG_CAP: usize = 1024 * 1024;
+
+/// Largest single formatter stderr kept in memory; only the first line ever
+/// reaches the agent, the rest is diagnostic at best.
+pub const FORMAT_STDERR_CAP: usize = 64 * 1024;
+
+/// Ignore-pattern budgets: adversarial configs (up to 256 KB of patterns)
+/// times long paths times 100 files must not wedge a tokio worker. At most
+/// this many patterns are honored; longer ones are skipped and parsing
+/// stops once the byte budget is spent. Fail-open: those files format.
+pub const MAX_IGNORE_PATTERNS: usize = 256;
+pub const MAX_IGNORE_PATTERN_CHARS: usize = 256;
+pub const MAX_IGNORE_SEGMENT_CHARS: usize = 128;
+pub const MAX_IGNORE_PATTERN_BYTES: usize = 16 * 1024;
 
 /// One file committed unformatted, with the reason the agent sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,14 +133,19 @@ struct Pattern {
 impl IgnoreRules {
     pub(crate) fn parse(oxfmt_config: Option<&[u8]>, prettierignore: Option<&[u8]>) -> Self {
         let mut rules = IgnoreRules::default();
+        let mut budget = PatternBudget::default();
         if let Some(bytes) = oxfmt_config {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
                 if let Some(patterns) = value.get("ignorePatterns").and_then(|v| v.as_array()) {
                     for raw in patterns.iter().filter_map(|v| v.as_str()) {
                         // oxfmtrc patterns don't negate: a `!` there is literal.
-                        if let Some(pattern) = compile_pattern(raw) {
-                            rules.patterns.push(pattern);
+                        let Some(pattern) = compile_pattern(raw) else {
+                            continue;
+                        };
+                        if !budget.admit(&pattern) {
+                            return rules;
                         }
+                        rules.patterns.push(pattern);
                     }
                 }
             }
@@ -129,10 +161,14 @@ impl IgnoreRules {
                         Some(rest) => (true, rest),
                         None => (false, line),
                     };
-                    if let Some(mut pattern) = compile_pattern(line) {
-                        pattern.negated = negated;
-                        rules.patterns.push(pattern);
+                    let Some(mut pattern) = compile_pattern(line) else {
+                        continue;
+                    };
+                    pattern.negated = negated;
+                    if !budget.admit(&pattern) {
+                        return rules;
                     }
+                    rules.patterns.push(pattern);
                 }
             }
         }
@@ -151,7 +187,32 @@ impl IgnoreRules {
     }
 }
 
+/// Running count/size of honored patterns: parsing stops (fail-open) once
+/// an adversarial config would push matching work past the budgets.
+#[derive(Default)]
+struct PatternBudget {
+    patterns: usize,
+    bytes: usize,
+}
+
+impl PatternBudget {
+    /// False when `pattern` would exceed the count or byte budget: the
+    /// caller stops parsing and keeps what it has.
+    fn admit(&mut self, pattern: &Pattern) -> bool {
+        let bytes: usize = pattern.segments.iter().map(|s| s.len()).sum();
+        if self.patterns >= MAX_IGNORE_PATTERNS || self.bytes + bytes > MAX_IGNORE_PATTERN_BYTES {
+            return false;
+        }
+        self.patterns += 1;
+        self.bytes += bytes;
+        true
+    }
+}
+
 fn compile_pattern(raw: &str) -> Option<Pattern> {
+    if raw.len() > MAX_IGNORE_PATTERN_CHARS {
+        return None;
+    }
     let mut text = raw.trim();
     if text.is_empty() {
         return None;
@@ -176,6 +237,9 @@ fn compile_pattern(raw: &str) -> Option<Pattern> {
     // adversarial patterns from blowing up the matcher.
     let mut segments = Vec::new();
     for segment in full.split('/') {
+        if segment.len() > MAX_IGNORE_SEGMENT_CHARS {
+            return None;
+        }
         if segment == "**" && segments.last().is_some_and(|s| s == "**") {
             continue;
         }
@@ -185,6 +249,25 @@ fn compile_pattern(raw: &str) -> Option<Pattern> {
         segments,
         negated: false,
     })
+}
+
+/// The `-c` config Outer hands the formatter: this commit's `.oxfmtrc.json`
+/// with every filesystem-touching option removed (see the module docs).
+/// Unparseable or non-object configs become oxfmt defaults.
+pub(crate) fn sanitize_oxfmt_config(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return b"{}".to_vec();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return b"{}".to_vec();
+    };
+    obj.remove("sortTailwindcss");
+    if let Some(overrides) = obj.get_mut("overrides").and_then(|v| v.as_array_mut()) {
+        for entry in overrides.iter_mut().filter_map(|v| v.as_object_mut()) {
+            entry.remove("sortTailwindcss");
+        }
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec())
 }
 
 impl Pattern {
@@ -251,9 +334,11 @@ fn segment_match(pattern: &str, text: &str) -> bool {
 /// Format every eligible file in place, returning what changed and what was
 /// committed unformatted. `bin` `None`, or a binary missing at runtime,
 /// skips formatting entirely (empty outcome) with one warn: the commit still
-/// works, which is the localhost/dev case.
+/// works, which is the localhost/dev case. `slots` is the process-wide
+/// formatter semaphore (shared by cloning `GitConfig`, never a global).
 pub(crate) async fn format_committed_files(
     bin: Option<&Path>,
+    slots: &Arc<tokio::sync::Semaphore>,
     bare: &Path,
     head: Option<&str>,
     files: &mut [RawFile],
@@ -261,7 +346,6 @@ pub(crate) async fn format_committed_files(
     let oxfmt_config = tree_file_content(bare, head, files, OXFMT_CONFIG_PATH).await;
     let prettierignore = tree_file_content(bare, head, files, PRETTIER_IGNORE_PATH).await;
     let rules = IgnoreRules::parse(oxfmt_config.as_deref(), prettierignore.as_deref());
-
     let mut candidates = Vec::new();
     for (index, file) in files.iter().enumerate() {
         if file.is_text && is_formattable(&file.path) && !rules.matches(&file.path) {
@@ -294,12 +378,13 @@ pub(crate) async fn format_committed_files(
             };
         }
     };
-    // The `-c` config: this commit's `.oxfmtrc.json` when it parses, else
+    // The `-c` config: this commit's `.oxfmtrc.json` with
+    // filesystem-touching options removed (`sanitize_oxfmt_config`), else
     // oxfmt defaults from an empty config. Either way oxfmt discovers
     // nothing on disk: the scratch dir holds only this file.
     let config_bytes = match &oxfmt_config {
-        Some(bytes) if serde_json::from_slice::<serde_json::Value>(bytes).is_ok() => bytes.clone(),
-        _ => b"{}".to_vec(),
+        Some(bytes) => sanitize_oxfmt_config(bytes),
+        None => b"{}".to_vec(),
     };
     let config_path = scratch.path().join("oxfmt.json");
     if std::fs::write(&config_path, &config_bytes).is_err() {
@@ -316,34 +401,61 @@ pub(crate) async fn format_committed_files(
     }
 
     let deadline = Instant::now() + FORMAT_TOTAL_TIMEOUT;
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(FORMAT_CONCURRENCY));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(FORMAT_CONCURRENCY));
     let mut set = tokio::task::JoinSet::new();
-    for index in candidates {
+    for &index in &candidates {
         let semaphore = semaphore.clone();
+        let slots = Arc::clone(slots);
         let bin = bin.to_path_buf();
         let path = files[index].path.clone();
         let content = files[index].bytes.clone();
         let config_path = config_path.clone();
         let workdir = scratch.path().to_path_buf();
         set.spawn(async move {
-            let permit = semaphore.acquire_owned().await;
-            let Ok(_permit) = permit else {
-                return (
-                    index,
-                    FileResult::Skipped("formatter unavailable".to_string()),
-                );
-            };
-            let result = run_one(&bin, &path, &content, &config_path, &workdir, deadline).await;
+            // The whole per-file body — both permit waits, the spawn, the
+            // stdin write, the formatter wait — shares the commit deadline:
+            // a formatter that never drains stdin blocks its writer, so
+            // leaving any of this outside the timeout hangs the commit.
+            // `acquire_owned` is cancel-safe: a timed-out wait holds no
+            // permit.
+            let finished = tokio::time::timeout_at(deadline.into(), async {
+                let Ok(_process) = slots.acquire_owned().await else {
+                    return FileResult::Skipped("formatter unavailable".to_string());
+                };
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return FileResult::Skipped("formatter unavailable".to_string());
+                };
+                run_one(&bin, &path, &content, &config_path, &workdir, deadline).await
+            })
+            .await;
+            let result = finished.unwrap_or(FileResult::Skipped("timeout".to_string()));
             (index, result)
         });
     }
     // Tasks never panic (every failure maps to `FileResult`), so a join
-    // error can only mean cancellation, which never happens here.
+    // error only costs an index: its file keeps its bytes and is reported
+    // as a timeout below. The join itself is bounded by the deadline —
+    // anything still running is aborted (its drop kills its process group
+    // via `kill_on_drop` plus the explicit `kill_group` in `run_one`).
+    let mut unfinished: HashSet<usize> = candidates.iter().copied().collect();
     let mut results = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok(result) = joined {
-            results.push(result);
+    while !unfinished.is_empty() {
+        let next = tokio::time::timeout_at(deadline.into(), set.join_next()).await;
+        let Ok(Some(joined)) = next else {
+            break;
+        };
+        if let Ok((index, result)) = joined {
+            unfinished.remove(&index);
+            results.push((index, result));
         }
+        // A join error (panic/cancel, which never happens: every failure
+        // maps to `FileResult`) only costs an index: its file keeps its
+        // bytes and lands in the timeout leftovers below.
+    }
+    set.abort_all();
+    while set.join_next().await.is_some() {}
+    for index in unfinished {
+        results.push((index, FileResult::Skipped("timeout".to_string())));
     }
     results.sort_by_key(|(index, _)| *index);
     let mut outcome = FormatOutcome::default();
@@ -406,40 +518,81 @@ async fn run_one(
         Ok(child) => child,
         Err(_) => return FileResult::Skipped("formatter unavailable".to_string()),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        // A formatter may exit before reading stdin (an immediate
-        // failure): ignore a broken pipe and report its exit below
-        // instead of masking it as unavailable.
-        let _ = stdin.write_all(content).await;
-        // Close stdin so the formatter sees EOF instead of hanging.
-        drop(stdin);
-    }
     let pid = child.id();
-    // `wait_with_output` consumes the child; on timeout the future is
-    // dropped and `kill_on_drop` kills the process itself.
-    let output = match tokio::time::timeout_at(deadline.into(), child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) => return FileResult::Skipped("formatter unavailable".to_string()),
+    // Stdin, stdout, stderr and the exit wait share this one deadline: a
+    // formatter that never drains stdin blocks `write_all` past the pipe
+    // buffer (>64 KB inputs), so the write must die with the child, not
+    // hang the commit on a held permit. On timeout the future is dropped
+    // (`kill_on_drop` kills the process itself) and the group is killed
+    // explicitly below.
+    let finished = tokio::time::timeout_at(deadline.into(), async {
+        if let Some(mut stdin) = child.stdin.take() {
+            // A formatter may exit before reading stdin (an immediate
+            // failure): ignore a broken pipe and report its exit below
+            // instead of masking it as unavailable.
+            let _ = stdin.write_all(content).await;
+            // Close stdin so the formatter sees EOF instead of hanging.
+            drop(stdin);
+        }
+        // Drain stdout/stderr concurrently — a formatter spewing on one
+        // pipe must not wedge the other — each with a hard cap, mirroring
+        // `MAX_GIT_OUTPUT_BYTES` in `local.rs`. Past the stdout cap the
+        // group dies and the file commits unformatted.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        {
+            use tokio::io::AsyncReadExt as _;
+            let out = async {
+                if let Some(pipe) = child.stdout.take() {
+                    let mut capped = pipe.take((FORMAT_OUTPUT_CAP + 1) as u64);
+                    let _ = capped.read_to_end(&mut stdout).await;
+                }
+            };
+            let err = async {
+                if let Some(pipe) = child.stderr.take() {
+                    let mut capped = pipe.take((FORMAT_STDERR_CAP + 1) as u64);
+                    let _ = capped.read_to_end(&mut stderr).await;
+                }
+            };
+            tokio::join!(out, err);
+        }
+        if stdout.len() > FORMAT_OUTPUT_CAP {
+            if let Some(pid) = pid {
+                kill_group(pid);
+            }
+            // Reap the kill; the drop's SIGKILL backs this up.
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            return Err(FileResult::Skipped("output too large".to_string()));
+        }
+        if stderr.len() > FORMAT_STDERR_CAP {
+            stderr.truncate(FORMAT_STDERR_CAP);
+        }
+        match child.wait().await {
+            Ok(status) => Ok((status, stdout, stderr)),
+            Err(_) => Err(FileResult::Skipped("formatter unavailable".to_string())),
+        }
+    })
+    .await;
+    let (status, stdout, stderr) = match finished {
         Err(_) => {
             if let Some(pid) = pid {
                 kill_group(pid);
             }
             return FileResult::Skipped("timeout".to_string());
         }
+        Ok(Err(skip)) => return skip,
+        Ok(Ok(done)) => done,
     };
-    if !output.status.success() {
-        let reason = first_stderr_line(&output.stderr)
+    if !status.success() {
+        let reason = first_stderr_line(&stderr)
             .map(|line| format!("oxfmt: {line}"))
-            .unwrap_or_else(|| format!("oxfmt failed ({})", output.status));
+            .unwrap_or_else(|| format!("oxfmt failed ({status})"));
         return FileResult::Skipped(reason);
     }
-    if output.stdout.len() > FORMAT_OUTPUT_CAP {
-        return FileResult::Skipped("output too large".to_string());
-    }
-    if output.stdout == content {
+    if stdout == content {
         FileResult::Unchanged
     } else {
-        FileResult::Changed(output.stdout)
+        FileResult::Changed(stdout)
     }
 }
 
@@ -589,5 +742,109 @@ mod tests {
         assert!(!rules.matches("src/app.ts"));
         let rules = IgnoreRules::parse(Some(br#"{"ignorePatterns": [42]}"#), None);
         assert!(!rules.matches("src/app.ts"));
+    }
+
+    #[test]
+    fn sanitize_removes_sort_tailwindcss_everywhere_but_keeps_the_rest() {
+        let raw = br#"{
+            "singleQuote": true,
+            "ignorePatterns": ["gen/**"],
+            "sortTailwindcss": {"config": "/tmp/evil/tailwind.config.js", "stylesheet": "/tmp/evil/t.css"},
+            "overrides": [
+                {"files": ["*.ts"], "sortTailwindcss": true},
+                {"files": ["*.css"], "singleQuote": false}
+            ]
+        }"#;
+        let cleaned = sanitize_oxfmt_config(raw);
+        let value: serde_json::Value = serde_json::from_slice(&cleaned).unwrap();
+        assert!(value.get("sortTailwindcss").is_none(), "{value}");
+        for entry in value.get("overrides").unwrap().as_array().unwrap() {
+            assert!(entry.get("sortTailwindcss").is_none(), "{entry}");
+        }
+        assert_eq!(
+            value.get("singleQuote"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(value.get("ignorePatterns").is_some(), "{value}");
+        assert_eq!(value.get("overrides").unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sanitize_unparseable_or_non_object_config_becomes_empty() {
+        assert_eq!(sanitize_oxfmt_config(b"{not json"), b"{}");
+        assert_eq!(sanitize_oxfmt_config(br#"[1, 2]"#), b"{}");
+        assert_eq!(
+            sanitize_oxfmt_config(br#"{"singleQuote": true}"#),
+            br#"{"singleQuote":true}"#
+        );
+    }
+
+    #[test]
+    fn ignore_budgets_cap_count_and_fail_open() {
+        // 300 distinct patterns: only the first 256 are honored.
+        let mut patterns = Vec::new();
+        for i in 0..300 {
+            patterns.push(format!("\"dir{i}/**\""));
+        }
+        let config = format!("{{\"ignorePatterns\": [{}]}}", patterns.join(","));
+        let rules = IgnoreRules::parse(Some(config.as_bytes()), None);
+        assert_eq!(rules.patterns.len(), MAX_IGNORE_PATTERNS);
+        assert!(rules.matches("dir0/a.ts"));
+        assert!(rules.matches("dir255/a.ts"));
+        assert!(!rules.matches("dir299/a.ts"), "over budget: formats");
+    }
+
+    #[test]
+    fn ignore_budgets_skip_oversize_patterns_and_continue() {
+        // One 300-char pattern is skipped; parsing continues after it.
+        let long = "a".repeat(300);
+        let rules = IgnoreRules::parse(
+            Some(format!("{{\"ignorePatterns\": [\"{long}\", \"gen/**\"]}}").as_bytes()),
+            None,
+        );
+        assert!(!rules.matches("src/app.ts"));
+        assert!(rules.matches("gen/a.ts"));
+    }
+
+    #[test]
+    fn ignore_budgets_stop_at_byte_budget_before_count_cap() {
+        // 300 patterns of ~90 bytes each: the 16 KB cumulative budget stops
+        // parsing (~180 in) before the 256-pattern count cap matters.
+        let pad = "x".repeat(80);
+        let mut patterns = vec!["gen/**".to_string()];
+        for i in 0..300 {
+            patterns.push(format!("seg-{i:03}-{pad}/**"));
+        }
+        let quoted: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+        let config = format!("{{\"ignorePatterns\": [{}]}}", quoted.join(","));
+        let rules = IgnoreRules::parse(Some(config.as_bytes()), None);
+        assert!(rules.matches("gen/a.ts"));
+        assert!(
+            rules.patterns.len() < MAX_IGNORE_PATTERNS,
+            "byte budget binds first: {}",
+            rules.patterns.len()
+        );
+        assert!(
+            !rules.matches(&format!("seg-299-{pad}/a.ts")),
+            "fail-open: over-budget patterns format"
+        );
+    }
+
+    #[test]
+    fn ignore_budgets_skip_oversize_segments_and_prettierignore_lines() {
+        let long_segment = "b".repeat(200);
+        let rules = IgnoreRules::parse(
+            None,
+            Some(format!("{long_segment}/**\nkeep/**\n").as_bytes()),
+        );
+        assert!(rules.matches("keep/a.ts"));
+        assert!(
+            !rules.matches(&format!("{long_segment}/a.ts")),
+            "fail-open: formats"
+        );
+        // Oversize prettierignore lines are skipped, the rest still applies.
+        let long_line = "c".repeat(300);
+        let rules = IgnoreRules::parse(None, Some(format!("{long_line}\nskip/**\n").as_bytes()));
+        assert!(rules.matches("skip/a.ts"));
     }
 }

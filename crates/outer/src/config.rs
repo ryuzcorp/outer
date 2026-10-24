@@ -140,6 +140,10 @@ pub struct Config {
     /// oxfmt binary that formats agent commits. Missing at runtime skips
     /// formatting (commit still works); localhost dev has none.
     pub oxfmt_bin: PathBuf,
+    /// True when `OUTER_OXFMT_BIN` was set explicitly: a missing binary is
+    /// a prod misconfiguration (`error!`), not the localhost default
+    /// (`warn!`).
+    pub oxfmt_bin_explicit: bool,
     /// Log filter directives (`RUST_LOG`, default `info`).
     pub log_filter: String,
     /// Running apps: allocation ranges, binaries, limits, sleep.
@@ -412,6 +416,7 @@ impl Config {
                 get("OUTER_OXFMT_BIN").unwrap_or("/usr/local/bin/oxfmt"),
                 vars.get("PATH").map(String::as_str).unwrap_or(""),
             )),
+            oxfmt_bin_explicit: get("OUTER_OXFMT_BIN").is_some(),
             log_filter,
             runtime,
         };
@@ -1078,6 +1083,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.oxfmt_bin, PathBuf::from("/usr/local/bin/oxfmt"));
+        assert!(!cfg.oxfmt_bin_explicit, "default path: localhost case");
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "apps.localhost"),
             ("OUTER_STORE", "memory"),
@@ -1085,5 +1091,9 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.oxfmt_bin, PathBuf::from("/opt/oxfmt/oxfmt"));
+        assert!(
+            cfg.oxfmt_bin_explicit,
+            "explicit path: missing means misconfig"
+        );
     }
 }

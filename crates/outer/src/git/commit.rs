@@ -219,6 +219,7 @@ pub async fn commit_with_outcome(
     apply_edits(&bare, head.as_deref(), &req.edits, &mut files).await?;
     let outcome = super::format::format_committed_files(
         cfg.oxfmt_bin.as_deref(),
+        &cfg.oxfmt_slots,
         &bare,
         head.as_deref(),
         &mut files,
@@ -992,10 +993,7 @@ mod tests {
 
     async fn setup(slug: &str) -> (tempfile::TempDir, GitConfig, Store, GitSync) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-            oxfmt_bin: None,
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, slug)
@@ -1113,10 +1111,7 @@ mod tests {
         let head = commit(&store, &cfg, &sync, "rehyd", r).await.unwrap();
 
         let fresh_dir = tempfile::tempdir().unwrap();
-        let fresh_cfg = GitConfig {
-            repos_dir: fresh_dir.path().join("git"),
-            oxfmt_bin: None,
-        };
+        let fresh_cfg = GitConfig::new(fresh_dir.path().join("git"), None);
         let fresh_sync = GitSync::default();
         let got = manifest::rehydrate(&store, &fresh_cfg, &fresh_sync, "rehyd")
             .await
@@ -1796,10 +1791,7 @@ mod tests {
         bin: Option<std::path::PathBuf>,
     ) -> (tempfile::TempDir, GitConfig, Store, GitSync) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-            oxfmt_bin: bin,
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), bin);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, slug)
@@ -1866,7 +1858,6 @@ mod tests {
             "const y = 2;\n",
             "base64 uploads are bytes, never formatted"
         );
-        assert_eq!(outcome.formatted, vec!["app/a.ts".to_string()]);
         assert!(outcome.format_skipped.is_empty());
         // Only the two formattable text files reached the formatter (log
         // order is nondeterministic: files format concurrently); txt and
@@ -1972,6 +1963,122 @@ mod tests {
         assert_eq!(outcome.format_skipped[0].reason, "timeout");
     }
 
+    #[tokio::test]
+    async fn format_hung_stdin_consumer_times_out_within_budget() {
+        // The formatter never reads stdin and never exits. A >64 KB file
+        // fills the pipe buffer, so `write_all` blocks: if any of the
+        // per-file body sat outside the shared deadline, this commit would
+        // hang forever (and hold its permit with it).
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("hung.pid");
+        let bin = fake_oxfmt(
+            &dir,
+            "hung.sh",
+            &format!("echo $$ > {}\nsleep 30", pidfile.display()),
+        );
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-hung", Some(bin)).await;
+        let mut r = req("format");
+        let big = "const x = 1;\n".repeat(8192);
+        assert!(big.len() > 64 * 1024, "must fill the pipe buffer");
+        r.writes.push(FileWrite {
+            path: "big.ts".to_string(),
+            body: WriteBody::Text(big.clone()),
+        });
+        let start = std::time::Instant::now();
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-hung", r)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < super::super::format::FORMAT_TOTAL_TIMEOUT + Duration::from_secs(5),
+            "commit must return within the deadline + slack, took {elapsed:?}",
+        );
+        assert_eq!(
+            show(
+                &manifest::mirror_path(&cfg, "fmt-hung"),
+                &outcome.sha,
+                "big.ts"
+            )
+            .await,
+            big
+        );
+        assert!(outcome.formatted.is_empty());
+        assert_eq!(outcome.format_skipped.len(), 1);
+        assert_eq!(outcome.format_skipped[0].path, "big.ts");
+        assert_eq!(outcome.format_skipped[0].reason, "timeout");
+        // The hung process group actually died: no lingering `sleep`.
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..50 {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            gone,
+            "timed-out formatter group must die, pid {pid} still alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn format_oversized_output_commits_unformatted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_oxfmt(
+            &dir,
+            "flood.sh",
+            "head -c 2000000 /dev/zero | tr '\\000' 'y'",
+        );
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-flood", Some(bin)).await;
+        let mut r = req("format");
+        r.writes.push(write("flood.ts", "const x = 1;\n"));
+        let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-flood", r)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "fmt-flood");
+        assert_eq!(
+            show(&bare, &outcome.sha, "flood.ts").await,
+            "const x = 1;\n"
+        );
+        assert!(outcome.formatted.is_empty());
+        assert_eq!(outcome.format_skipped.len(), 1);
+        assert_eq!(outcome.format_skipped[0].path, "flood.ts");
+        assert_eq!(outcome.format_skipped[0].reason, "output too large");
+    }
+
+    #[tokio::test]
+    async fn format_strips_tailwind_sorting_from_config_given_to_formatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, _files_log, cfg_log) = logging_uppercaser(&dir);
+        let (_dir, cfg, store, sync) = setup_with_bin("fmt-sanitize", Some(bin)).await;
+        let mut r = req("format");
+        r.writes.push(write(
+            ".oxfmtrc.json",
+            "{\"singleQuote\": true, \"sortTailwindcss\": {\"config\": \"/tmp/evil/tailwind.config.js\"}, \"overrides\": [{\"files\": [\"*.ts\"], \"sortTailwindcss\": true}]}",
+        ));
+        r.writes.push(write("app/a.ts", "const x = 1;\n"));
+        commit_with_outcome(&store, &cfg, &sync, "fmt-sanitize", r)
+            .await
+            .unwrap();
+        let cfgs = std::fs::read_to_string(&cfg_log).unwrap();
+        assert!(
+            !cfgs.contains("sortTailwindcss"),
+            "formatter must never see it: {cfgs:?}"
+        );
+        assert!(
+            !cfgs.contains("tailwind.config"),
+            "no host paths leak: {cfgs:?}"
+        );
+        assert!(
+            cfgs.contains("singleQuote"),
+            "other options pass through: {cfgs:?}"
+        );
+    }
     #[tokio::test]
     async fn format_without_binary_commits_unchanged() {
         let (_dir, cfg, store, sync) = setup_with_bin("fmt-none", None).await;

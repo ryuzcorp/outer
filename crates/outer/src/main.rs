@@ -226,10 +226,7 @@ fn cgroups() -> Option<std::path::PathBuf> {
 }
 
 fn git_config(config: &Config) -> GitConfig {
-    GitConfig {
-        repos_dir: config.data_dir.join("git"),
-        oxfmt_bin: Some(config.oxfmt_bin.clone()),
-    }
+    GitConfig::new(config.data_dir.join("git"), Some(config.oxfmt_bin.clone()))
 }
 
 /// The app-operation context for CLI commands: the same DB and bucket
@@ -497,10 +494,19 @@ async fn app_list(config: Config) -> anyhow::Result<()> {
 async fn serve(config: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     if !config.oxfmt_available() {
-        tracing::warn!(
-            "oxfmt binary {} missing or not executable: commits skip formatting (localhost/dev case)",
-            config.oxfmt_bin.display(),
-        );
+        // An explicitly configured binary that isn't executable is a prod
+        // misconfiguration; the default path missing is the localhost case.
+        if config.oxfmt_bin_explicit {
+            tracing::error!(
+                "oxfmt binary {} explicitly set via OUTER_OXFMT_BIN but not executable: commits skip formatting",
+                config.oxfmt_bin.display(),
+            );
+        } else {
+            tracing::warn!(
+                "oxfmt binary {} missing or not executable: commits skip formatting (localhost/dev case)",
+                config.oxfmt_bin.display(),
+            );
+        }
     }
     let store = build_store(&config)?;
 
