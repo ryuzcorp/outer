@@ -71,6 +71,12 @@ fn truncate(s: &str, n: usize) -> String {
     out
 }
 
+/// The first `n` chars: caller-supplied values may be any UTF-8, so never
+/// slice them by byte offset.
+fn prefix_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)?.as_str()
 }
@@ -172,7 +178,7 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
                 s.push_str(&format!(" prefix={prefix}"));
             }
             if let Some(sha) = arg_str(args, "sha") {
-                s.push_str(&format!(" sha={}", &sha[..12.min(sha.len())]));
+                s.push_str(&format!(" sha={}", prefix_chars(sha, 12)));
             }
             s
         }
@@ -205,7 +211,7 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
         "deploy_status" | "deploy_log" => {
             let mut s = tool.to_string();
             if let Some(id) = arg_str(args, "deploy_id") {
-                s.push_str(&format!(" deploy {}", &id[..8.min(id.len())]));
+                s.push_str(&format!(" deploy {}", prefix_chars(id, 8)));
             }
             s
         }

@@ -1847,6 +1847,25 @@ async fn agent_action_foreign_app_writes_nothing_and_failures_log_error() {
         "{}",
         rows[0].summary.len()
     );
+
+    // Multi-byte input where the summary keeps a short prefix (sha, deploy
+    // id) must not panic the call: the caller still gets its result.
+    let (_, odd) = call(
+        &state,
+        Some(&ana),
+        "list_files",
+        json!({"app": "groceries", "sha": "aéééééééé"}),
+    )
+    .await;
+    assert!(odd.get("result").is_some(), "{odd}");
+    let (_, odd) = call(
+        &state,
+        Some(&ana),
+        "deploy_log",
+        json!({"app": "groceries", "deploy_id": "dééééé"}),
+    )
+    .await;
+    assert!(odd.get("result").is_some(), "{odd}");
 }
 
 #[tokio::test]
