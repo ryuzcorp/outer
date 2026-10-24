@@ -81,38 +81,48 @@ pub async fn deploy_log(input: DeployLogInput, ctx: &Ctx<'_>) -> Result<Value, T
     ))
 }
 
+/// Lines from a fleet's in-memory log ring: the newest `limit` tail, or —
+/// when `since` is set — the OLDEST `limit` after that sequence number, so
+/// the next poll from the last returned seq continues without a gap.
+/// Shared by the MCP `app_logs` tool and the console logs endpoint.
+pub async fn log_lines(
+    fleets: &crate::fleet::manager::FleetManager,
+    slug: &str,
+    since: Option<u64>,
+    limit: usize,
+) -> Vec<Value> {
+    let Some(ring) = fleets.logs(slug) else {
+        return Vec::new();
+    };
+    let ring = ring.lock().await;
+    let entries = match since {
+        Some(seq) => ring.since(seq),
+        None => ring.tail(limit),
+    };
+    // tail() returns the newest N in order; since() is unbounded and feeds
+    // a cursor: keep the OLDEST `limit` after `since`.
+    let entries = if since.is_some() {
+        cursor_page(entries, limit)
+    } else {
+        entries
+    };
+    entries
+        .iter()
+        .map(|e| {
+            json!({
+                "seq": e.seq,
+                "ts": e.ts,
+                "stream": format!("{:?}", e.stream).to_ascii_lowercase(),
+                "line": e.line,
+            })
+        })
+        .collect()
+}
+
 pub async fn app_logs(input: AppLogsInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
     let limit = input.limit.unwrap_or(100).clamp(1, 500) as usize;
-    let lines: Vec<Value> = match ctx.state.fleets.logs(&app.slug) {
-        None => Vec::new(),
-        Some(ring) => {
-            let ring = ring.lock().await;
-            let entries = match input.since {
-                Some(seq) => ring.since(seq),
-                None => ring.tail(limit),
-            };
-            // tail() returns the newest N in order; since() is unbounded and
-            // feeds a cursor: keep the OLDEST `limit` after `since`, so the
-            // next poll from `next_since` picks up where this one stopped.
-            let entries = if input.since.is_some() {
-                cursor_page(entries, limit)
-            } else {
-                entries
-            };
-            entries
-                .iter()
-                .map(|e| {
-                    json!({
-                        "seq": e.seq,
-                        "ts": e.ts,
-                        "stream": format!("{:?}", e.stream).to_ascii_lowercase(),
-                        "line": e.line,
-                    })
-                })
-                .collect()
-        }
-    };
+    let lines: Vec<Value> = log_lines(&ctx.state.fleets, &app.slug, input.since, limit).await;
     let next_since = lines.last().and_then(|l| l["seq"].as_u64());
     let data = lines
         .iter()

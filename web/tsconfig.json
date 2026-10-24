@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemagrid.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    // Ilha's automatic JSX runtime, as in Outer apps (outer-template):
+    // islands compile without importing anything.
+    "jsx": "react-jsx",
+    "jsxImportSource": "ilha",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["pages", "blume.config.ts"]
+}

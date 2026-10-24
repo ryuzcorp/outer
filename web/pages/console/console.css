@@ -1,0 +1,85 @@
+/* Console-only stylesheet, linked from the standalone console shells.
+   Tailwind v4 (via Blume's Vite) plus daisyUI. Self-contained on purpose:
+   the shells link no Blume stylesheet, so Blume's tokens don't exist here
+   and the palette below carries Blume's own light/dark values instead (read
+   off the built docs CSS). Nothing in this file reaches the docs.
+   `@source "."` pins Tailwind's content scan to this directory: Blume's
+   Vite does not see the island `.tsx` otherwise (verified: classes only
+   appear with the explicit source). The light theme is the default; the
+   dark one follows the OS preference. */
+@import "tailwindcss";
+
+@source ".";
+
+@plugin "daisyui" {
+  themes: false;
+  exclude: scrollbar;
+}
+
+@plugin "daisyui/theme" {
+  name: "light";
+  default: true;
+  color-scheme: light;
+  --color-base-100: oklch(100% 0 0);
+  --color-base-200: oklch(98% 0 0);
+  --color-base-300: oklch(92% 0 0);
+  --color-base-content: oklch(14.5% 0 0);
+  --color-primary: oklch(55% 0.16 250);
+  --color-primary-content: oklch(100% 0 0);
+  --color-secondary: oklch(65% 0.241 354.308);
+  --color-secondary-content: oklch(94% 0.028 342.258);
+  --color-accent: oklch(55% 0.16 250);
+  --color-accent-content: oklch(100% 0 0);
+  --color-neutral: oklch(14% 0.005 285.823);
+  --color-neutral-content: oklch(92% 0.004 286.32);
+  --color-info: oklch(74% 0.16 232.661);
+  --color-info-content: oklch(29% 0.066 243.157);
+  --color-success: oklch(76% 0.177 163.223);
+  --color-success-content: oklch(37% 0.077 168.94);
+  --color-warning: oklch(82% 0.189 84.429);
+  --color-warning-content: oklch(41% 0.112 45.904);
+  --color-error: oklch(71% 0.194 13.428);
+  --color-error-content: oklch(27% 0.105 12.094);
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 1;
+  --noise: 0;
+}
+
+@plugin "daisyui/theme" {
+  name: "dark";
+  prefersdark: true;
+  color-scheme: dark;
+  --color-base-100: oklch(8.5% 0 0);
+  --color-base-200: oklch(16% 0 0);
+  --color-base-300: oklch(24% 0 0);
+  --color-base-content: oklch(96% 0 0);
+  --color-primary: oklch(62% 0.16 250);
+  --color-primary-content: oklch(8.5% 0 0);
+  --color-secondary: oklch(65% 0.241 354.308);
+  --color-secondary-content: oklch(94% 0.028 342.258);
+  --color-accent: oklch(62% 0.16 250);
+  --color-accent-content: oklch(8.5% 0 0);
+  --color-neutral: oklch(14% 0.005 285.823);
+  --color-neutral-content: oklch(92% 0.004 286.32);
+  --color-info: oklch(74% 0.16 232.661);
+  --color-info-content: oklch(29% 0.066 243.157);
+  --color-success: oklch(76% 0.177 163.223);
+  --color-success-content: oklch(37% 0.077 168.94);
+  --color-warning: oklch(82% 0.189 84.429);
+  --color-warning-content: oklch(41% 0.112 45.904);
+  --color-error: oklch(71% 0.194 13.428);
+  --color-error-content: oklch(27% 0.105 12.094);
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 1;
+  --noise: 0;
+}

@@ -1,0 +1,26 @@
+---
+import { AppView } from "./_islands/app";
+import "./console.css";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="One Outer app: deploys and recent logs." />
+    <title>App · Outer console</title>
+  </head>
+  <body>
+    <div class="mx-auto max-w-5xl px-4 py-8">
+      <header class="flex items-center justify-between pb-6">
+        <h1 class="text-xl font-bold">Outer console</h1>
+        <a class="link text-sm" href="/">Docs</a>
+      </header>
+      <main>
+        <AppView client:load />
+      </main>
+    </div>
+  </body>
+</html>
