@@ -735,13 +735,11 @@ async fn free_plan_caps_changes_per_day() {
     let account_id = crate::apps::ensure_account(&state.pool, "ana@example.com")
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO usage_day (account_id, day, code_changes) VALUES (?1, date('now'), 49)",
-    )
-    .bind(&account_id)
-    .execute(&state.pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO usage_day (userId, day, code_changes) VALUES (?1, date('now'), 49)")
+        .bind(&account_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
 
     let (_, fiftieth) = call(
         &state,
@@ -1254,19 +1252,17 @@ async fn commit_quota_claim_is_atomic_and_refunded() {
         .await
         .unwrap();
     async fn used(state: &McpState, account_id: &str) -> i64 {
-        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE account_id = ?1")
+        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
             .bind(account_id)
             .fetch_one(&state.pool)
             .await
             .unwrap()
     }
-    sqlx::query(
-        "INSERT INTO usage_day (account_id, day, code_changes) VALUES (?1, date('now'), 10)",
-    )
-    .bind(&account_id)
-    .execute(&state.pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO usage_day (userId, day, code_changes) VALUES (?1, date('now'), 10)")
+        .bind(&account_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
     // A malformed base never claims: validation runs before the UPSERT.
     let (_, bad_shape) = call(
         &state,
@@ -1290,7 +1286,7 @@ async fn commit_quota_claim_is_atomic_and_refunded() {
     assert_eq!(is_error(&unknown)["error"], "conflict");
     assert_eq!(used(&state, &account_id).await, 10);
     // Racing at the boundary: exactly one claim fits under 50.
-    sqlx::query("UPDATE usage_day SET code_changes = 49 WHERE account_id = ?1")
+    sqlx::query("UPDATE usage_day SET code_changes = 49 WHERE userId = ?1")
         .bind(&account_id)
         .execute(&state.pool)
         .await
@@ -1914,14 +1910,14 @@ async fn agent_action_commit_logged_with_redacted_summary() {
         rows[0].client_label
     );
     let key_ids: Vec<Option<String>> =
-        sqlx::query_scalar("SELECT api_key_id FROM agent_action ORDER BY created_at")
+        sqlx::query_scalar("SELECT apikey_id FROM agent_action ORDER BY created_at")
             .fetch_all(&state.pool)
             .await
             .unwrap();
     assert_eq!(key_ids.len(), 2);
     assert!(key_ids.iter().all(|id| id.is_some()), "{key_ids:?}");
     let grants: Vec<Option<String>> =
-        sqlx::query_scalar("SELECT grant_id FROM agent_action ORDER BY created_at")
+        sqlx::query_scalar("SELECT consent_id FROM agent_action ORDER BY created_at")
             .fetch_all(&state.pool)
             .await
             .unwrap();
@@ -2006,7 +2002,7 @@ async fn agent_action_oauth_caller_resolves_client_label() {
     let token = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &token, "groceries").await;
     let account_id: String =
-        sqlx::query_scalar("SELECT id FROM account WHERE email = 'ana@example.com'")
+        sqlx::query_scalar("SELECT id FROM user WHERE email = 'ana@example.com'")
             .fetch_one(&state.pool)
             .await
             .unwrap();
@@ -2014,16 +2010,16 @@ async fn agent_action_oauth_caller_resolves_client_label() {
     let (access, hash) = crate::auth::tokens::new_access_token();
     let now = crate::auth::now_ms();
     sqlx::query(
-        "INSERT INTO oauth_client (client_id, kind, name, host, redirect_uris, created_at) \
-         VALUES ('cid-claude', 'dcr', 'Claude', 'claude.ai', '[\"https://claude.ai/cb\"]', ?1)",
+        "INSERT INTO oauthClient (id, clientId, kind, name, host, redirectUris, verified, createdAt, updatedAt) \
+         VALUES ('ocid-1', 'cid-claude', 'dcr', 'Claude', 'claude.ai', '[\"https://claude.ai/cb\"]', 0, ?1, ?1)",
     )
     .bind(now)
     .execute(&state.pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO oauth_grant (id, account_id, client_id, scope, resource, client_name, created_at) \
-         VALUES ('gid-1', ?1, 'cid-claude', 'apps', 'http://outer.localhost/mcp', 'Claude', ?2)",
+        "INSERT INTO oauthConsent (id, clientId, userId, scopes, resources, clientName, createdAt, updatedAt) \
+         VALUES ('gid-1', 'cid-claude', ?1, 'apps', 'http://outer.localhost/mcp', 'Claude', ?2, ?2)",
     )
     .bind(&account_id)
     .bind(now)
@@ -2031,11 +2027,13 @@ async fn agent_action_oauth_caller_resolves_client_label() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) \
-         VALUES (?1, 'gid-1', 'access', ?2)",
+        "INSERT INTO oauthAccessToken (id, token, clientId, userId, referenceId, scopes, expiresAt, createdAt) \
+         VALUES ('oat-1', ?1, 'cid-claude', ?2, 'gid-1', 'apps', ?3, ?4)",
     )
     .bind(&hash)
+    .bind(&account_id)
     .bind(now + 3_600_000)
+    .bind(now)
     .execute(&state.pool)
     .await
     .unwrap();
@@ -2054,7 +2052,7 @@ async fn agent_action_oauth_caller_resolves_client_label() {
     assert_eq!(rows[0].tool, "get_app");
     assert_eq!(rows[0].client_label, "Claude (claude.ai)");
     let grant_id: Option<String> =
-        sqlx::query_scalar("SELECT grant_id FROM agent_action WHERE tool = 'get_app'")
+        sqlx::query_scalar("SELECT consent_id FROM agent_action WHERE tool = 'get_app'")
             .fetch_one(&state.pool)
             .await
             .unwrap();
@@ -2068,7 +2066,7 @@ async fn agent_action_pagination_prune_and_delete_cascade() {
     create_app(&state, &token, "groceries").await;
     let id = app_id(&state, "groceries").await;
     let account_id: String =
-        sqlx::query_scalar("SELECT id FROM account WHERE email = 'ana@example.com'")
+        sqlx::query_scalar("SELECT id FROM user WHERE email = 'ana@example.com'")
             .fetch_one(&state.pool)
             .await
             .unwrap();
@@ -2082,7 +2080,7 @@ async fn agent_action_pagination_prune_and_delete_cascade() {
         ("c", "commit", 300),
     ] {
         sqlx::query(
-            "INSERT INTO agent_action (id, app_id, account_id, tool, summary, outcome, duration_ms, created_at) \
+            "INSERT INTO agent_action (id, app_id, user_id, tool, summary, outcome, duration_ms, created_at) \
              VALUES (?1, ?2, ?3, ?4, 's', 'ok', 1, ?5)",
         )
         .bind(row_id)
@@ -2135,7 +2133,7 @@ async fn agent_action_pagination_prune_and_delete_cascade() {
     assert_eq!(kept, vec!["b".to_string(), "c".to_string()]);
 
     // Pro accounts keep 30 days: an 8-day-old row survives, a 31-day one goes.
-    sqlx::query("UPDATE account SET plan = 'pro' WHERE id = ?1")
+    sqlx::query("UPDATE user SET plan = 'pro' WHERE id = ?1")
         .bind(&account_id)
         .execute(&state.pool)
         .await

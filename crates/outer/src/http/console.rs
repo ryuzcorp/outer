@@ -655,7 +655,7 @@ async fn api_sign_out(State(state): State<super::AppState>, headers: HeaderMap) 
         );
     }
     let hash = crate::auth::session_hash(&session);
-    sqlx::query("DELETE FROM web_session WHERE id_hash = ?")
+    sqlx::query("DELETE FROM session WHERE token = ?")
         .bind(&hash)
         .execute(&mcp.pool)
         .await
@@ -1133,10 +1133,11 @@ mod tests {
     /// Seed one account plus one app with one finished deploy.
     async fn seed_app(pool: &SqlitePool, owner: &str, slug: &str, now: i64) {
         sqlx::query(
-            "INSERT INTO account (id, email, last_active_at, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(format!("acct-{owner}"))
         .bind(owner)
+        .bind(now)
         .bind(now)
         .bind(now)
         .execute(pool)
@@ -1416,7 +1417,7 @@ mod tests {
         created_at: i64,
     ) {
         sqlx::query(
-            "INSERT INTO agent_action (id, app_id, account_id, grant_id, api_key_id, \
+            "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
              tool, summary, outcome, error_code, duration_ms, created_at) \
              VALUES (?1, ?2, 'acct-ana@example.com', NULL, NULL, ?3, 'did a thing', ?4, NULL, 120, ?5)",
         )

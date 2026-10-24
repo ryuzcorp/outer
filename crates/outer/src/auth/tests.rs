@@ -792,7 +792,7 @@ async fn otp_attempts_expiry_and_limits() {
         .await
         .unwrap();
     let code = captured(&codes, "ana@example.com");
-    sqlx::query("UPDATE email_code SET expires_at = 0 WHERE email = 'ana@example.com'")
+    sqlx::query("UPDATE verification SET expiresAt = 0 WHERE identifier = 'email-verification:ana@example.com'")
         .execute(&pool)
         .await
         .unwrap();
@@ -920,12 +920,11 @@ async fn api_keys_create_list_revoke_and_resolve() {
     assert!(verified.api_key.starts_with("outer_"));
 
     // Terms are stored on first verify.
-    let (terms,): (Option<String>,) =
-        sqlx::query_as("SELECT terms_version FROM account WHERE id = ?")
-            .bind(&verified.account_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (terms,): (Option<String>,) = sqlx::query_as("SELECT termsVersion FROM user WHERE id = ?")
+        .bind(&verified.account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(terms.as_deref(), Some("2026-10-23"));
 
     let principal = auth::resolve_bearer(&pool, &state.config, &verified.api_key)
@@ -1433,7 +1432,7 @@ fn consent_page_never_warns_and_notes_only_self_registered_apps() {
 async fn prune_expired_keeps_live_and_boundary_rows() {
     let pool = test_pool().await;
     sqlx::query(
-        "INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'a@example.com', 0, 0)",
+        "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)",
     )
     .execute(&pool)
     .await
@@ -1444,9 +1443,10 @@ async fn prune_expired_keeps_live_and_boundary_rows() {
         ("edge@example.com", 100),
     ] {
         sqlx::query(
-            "INSERT INTO email_code (email, code_hash, expires_at, created_at) VALUES (?, 'h', ?, 0)",
+            "INSERT INTO verification (id, identifier, value, expiresAt, createdAt, updatedAt) VALUES (?, ?, 'h', ?, 0, 0)",
         )
         .bind(email)
+        .bind(format!("email-verification:{email}"))
         .bind(expires_at)
         .execute(&pool)
         .await
@@ -1454,8 +1454,9 @@ async fn prune_expired_keeps_live_and_boundary_rows() {
     }
     for (hash, expires_at) in [("dead", 99), ("live", 200), ("edge", 100)] {
         sqlx::query(
-            "INSERT INTO web_session (id_hash, account_id, expires_at) VALUES (?, 'a1', ?)",
+            "INSERT INTO session (id, token, userId, expiresAt, createdAt, updatedAt) VALUES (?, ?, 'a1', ?, 0, 0)",
         )
+        .bind(hash)
         .bind(hash)
         .bind(expires_at)
         .execute(&pool)
@@ -1464,16 +1465,22 @@ async fn prune_expired_keeps_live_and_boundary_rows() {
     }
     let (codes, sessions) = auth::prune_expired(&pool, 100).await.unwrap();
     assert_eq!((codes, sessions), (1, 1));
-    let kept_codes: Vec<String> = sqlx::query_scalar("SELECT email FROM email_code ORDER BY email")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert_eq!(kept_codes, vec!["edge@example.com", "live@example.com"]);
-    let kept_sessions: Vec<String> =
-        sqlx::query_scalar("SELECT id_hash FROM web_session ORDER BY id_hash")
+    let kept_codes: Vec<String> =
+        sqlx::query_scalar("SELECT identifier FROM verification ORDER BY identifier")
             .fetch_all(&pool)
             .await
             .unwrap();
+    assert_eq!(
+        kept_codes,
+        vec![
+            "email-verification:edge@example.com",
+            "email-verification:live@example.com"
+        ]
+    );
+    let kept_sessions: Vec<String> = sqlx::query_scalar("SELECT token FROM session ORDER BY token")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
     assert_eq!(kept_sessions, vec!["edge", "live"]);
 }
 
@@ -1487,7 +1494,7 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
     // would make every client "fresh".
     let now: i64 = 3_000_000_000;
     sqlx::query(
-        "INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'a@example.com', 0, 0)",
+        "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)",
     )
     .execute(&pool)
     .await
@@ -1507,9 +1514,27 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
         .await
         .unwrap();
     }
+    for (client_id, kind, created_at) in [
+        ("c", "cimd", 100),
+        ("dcr-old", "dcr", 100),
+        ("dcr-fresh", "dcr", now - 1_000),
+        ("cimd-old", "cimd", 100),
+    ] {
+        sqlx::query(
+            "INSERT INTO oauthClient (id, clientId, kind, redirectUris, verified, createdAt, updatedAt) VALUES (?, ?, ?, '[]', 0, ?, ?)",
+        )
+        .bind(format!("oc-{client_id}"))
+        .bind(client_id)
+        .bind(kind)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
     sqlx::query(
-        "INSERT INTO oauth_grant (id, account_id, client_id, scope, resource, created_at) \
-         VALUES ('g1', 'a1', 'c', 'apps', 'r', 0)",
+        "INSERT INTO oauthConsent (id, clientId, userId, scopes, resources, createdAt, updatedAt) \
+         VALUES ('g1', 'c', 'a1', 'apps', 'r', 0, 0)",
     )
     .execute(&pool)
     .await
@@ -1520,25 +1545,11 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
         ("t-edge", now),
     ] {
         sqlx::query(
-            "INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, 'g1', 'access', ?)",
+            "INSERT INTO oauthAccessToken (id, token, clientId, userId, referenceId, scopes, expiresAt, createdAt) VALUES (?, ?, 'c', 'a1', 'g1', 'apps', ?, 0)",
         )
         .bind(hash)
+        .bind(hash)
         .bind(expires_at)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    for (client_id, kind, created_at) in [
-        ("dcr-old", "dcr", 100),
-        ("dcr-fresh", "dcr", now - 1_000),
-        ("cimd-old", "cimd", 100),
-    ] {
-        sqlx::query(
-            "INSERT INTO oauth_client (client_id, kind, redirect_uris, created_at) VALUES (?, ?, '[]', ?)",
-        )
-        .bind(client_id)
-        .bind(kind)
-        .bind(created_at)
         .execute(&pool)
         .await
         .unwrap();
@@ -1551,15 +1562,15 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
         .unwrap();
     assert_eq!(kept_requests, vec!["r-edge", "r-live"]);
     let kept_tokens: Vec<String> =
-        sqlx::query_scalar("SELECT token_hash FROM oauth_token ORDER BY token_hash")
+        sqlx::query_scalar("SELECT token FROM oauthAccessToken ORDER BY token")
             .fetch_all(&pool)
             .await
             .unwrap();
     assert_eq!(kept_tokens, vec!["t-edge", "t-live"]);
     let kept_clients: Vec<String> =
-        sqlx::query_scalar("SELECT client_id FROM oauth_client ORDER BY client_id")
+        sqlx::query_scalar("SELECT clientId FROM oauthClient ORDER BY clientId")
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(kept_clients, vec!["cimd-old", "dcr-fresh"]);
+    assert_eq!(kept_clients, vec!["c", "cimd-old", "dcr-fresh"]);
 }

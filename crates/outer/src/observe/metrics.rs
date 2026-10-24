@@ -724,7 +724,7 @@ pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64, 
     for (cutoff, plan) in [(free_cutoff, "free"), (pro_cutoff, "pro")] {
         minutes += sqlx::query(
             "DELETE FROM metric_minute WHERE minute < ?1 AND app_id IN \
-             (SELECT a.id FROM app a JOIN account c ON c.id = a.owner_id WHERE c.plan = ?2)",
+             (SELECT a.id FROM app a JOIN user c ON c.id = a.owner_id WHERE c.plan = ?2)",
         )
         .bind(cutoff)
         .bind(plan)
@@ -736,7 +736,7 @@ pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64, 
     for (cutoff, plan) in [(free_cutoff, "free"), (pro_cutoff, "pro")] {
         paths += sqlx::query(
             "DELETE FROM path_hour WHERE hour < ?1 AND app_id IN \
-             (SELECT a.id FROM app a JOIN account c ON c.id = a.owner_id WHERE c.plan = ?2)",
+             (SELECT a.id FROM app a JOIN user c ON c.id = a.owner_id WHERE c.plan = ?2)",
         )
         .bind(cutoff)
         .bind(plan)
@@ -748,7 +748,7 @@ pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64, 
     for (cutoff, plan) in [(day_of(free_cutoff), "free"), (day_of(pro_cutoff), "pro")] {
         days += sqlx::query(
             "DELETE FROM visitor_day WHERE day < ?1 AND app_id IN \
-             (SELECT a.id FROM app a JOIN account c ON c.id = a.owner_id WHERE c.plan = ?2)",
+             (SELECT a.id FROM app a JOIN user c ON c.id = a.owner_id WHERE c.plan = ?2)",
         )
         .bind(cutoff)
         .bind(plan)
@@ -940,7 +940,7 @@ mod tests {
     }
 
     async fn app(pool: &SqlitePool, id: &str, plan: &str) {
-        sqlx::query("INSERT INTO account (id, email, plan, last_active_at, created_at) VALUES (?1, ?2, ?3, 0, 0)")
+        sqlx::query("INSERT INTO user (id, email, plan, lastActiveAt, createdAt, updatedAt) VALUES (?1, ?2, ?3, 0, 0, 0)")
             .bind(format!("acct-{id}"))
             .bind(format!("{id}@example.com"))
             .bind(plan)

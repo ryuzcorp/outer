@@ -1,8 +1,9 @@
 //! Accounts, sign-in (OAuth 2.1 + email OTP) and API keys.
 //!
-//! This module owns `account`, `beta_allowlist`, `waitlist`, `email_code`,
-//! `api_key`, `oauth_*` and `web_session`. The MCP handler only calls the
-//! functions below; names and shapes are binding.
+//! This module owns the Better Auth-shaped `user`, `session`, `account`,
+//! `verification`, `apikey` and `oauth*` tables plus Outer's `oauthRequest`,
+//! `beta_allowlist` and `waitlist`. Secret columns hold ONLY sha256 hashes.
+//! The MCP handler only calls the functions below; names and shapes are binding.
 
 pub mod cimd;
 pub mod email;
@@ -169,7 +170,7 @@ pub struct AccountRow {
     pub id: String,
     pub email: String,
     pub terms_version: Option<String>,
-    pub banned_at: Option<i64>,
+    pub banned: bool,
 }
 
 impl AccountRow {
@@ -180,17 +181,23 @@ impl AccountRow {
 }
 
 async fn account_by_email(pool: &SqlitePool, email: &str) -> anyhow::Result<Option<AccountRow>> {
-    let row: Option<(String, String, Option<String>, Option<i64>)> =
-        sqlx::query_as("SELECT id, email, terms_version, banned_at FROM account WHERE email = ?")
+    let row: Option<(String, String, Option<String>, i64)> =
+        sqlx::query_as("SELECT id, email, termsVersion, banned FROM user WHERE email = ?")
             .bind(email)
             .fetch_optional(pool)
             .await?;
-    Ok(row.map(|(id, email, terms_version, banned_at)| AccountRow {
+    Ok(row.map(|(id, email, terms_version, banned)| AccountRow {
         id,
         email,
         terms_version,
-        banned_at,
+        banned: banned != 0,
     }))
+}
+
+/// Better Auth email-OTP identifier for an address: the `verification`
+/// table is shared, so the kind namespaces the row.
+fn otp_identifier(email: &str) -> String {
+    format!("email-verification:{email}")
 }
 
 /// Closed-beta gate: open signup, admin emails and allowlisted emails pass;
@@ -253,7 +260,7 @@ pub async fn send_code(
         .await
         .map_err(|err| AuthError::new("db", format!("account lookup failed: {err}")))?
     {
-        if account.banned_at.is_some() {
+        if account.banned {
             return Err(AuthError::new(
                 "forbidden",
                 "this account is banned".to_string(),
@@ -285,14 +292,16 @@ pub async fn send_code(
     }
     let code = tokens::new_otp_code();
     sqlx::query(
-        "INSERT INTO email_code (email, code_hash, expires_at, attempts, created_at) \
-         VALUES (?, ?, ?, 0, ?) \
-         ON CONFLICT(email) DO UPDATE SET code_hash = excluded.code_hash, \
-           expires_at = excluded.expires_at, attempts = 0, created_at = excluded.created_at",
+        "INSERT INTO verification (id, identifier, value, expiresAt, createdAt, updatedAt) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(identifier) DO UPDATE SET value = excluded.value, \
+           expiresAt = excluded.expiresAt, attempts = 0, updatedAt = excluded.updatedAt",
     )
-    .bind(&email)
+    .bind(tokens::new_id())
+    .bind(otp_identifier(&email))
     .bind(tokens::sha256_hex(&code))
     .bind(now + (EXPIRES_IN_S as i64) * 1000)
+    .bind(now)
     .bind(now)
     .execute(pool)
     .await
@@ -333,9 +342,10 @@ pub async fn verify_code_core(
     let db = |err: sqlx::Error| AuthError::new("db", format!("{err}"));
     let now = now_ms();
     let email = normalize_email(email);
+    let identifier = otp_identifier(&email);
     let row: Option<(String, i64, i64)> =
-        sqlx::query_as("SELECT code_hash, expires_at, attempts FROM email_code WHERE email = ?")
-            .bind(&email)
+        sqlx::query_as("SELECT value, expiresAt, attempts FROM verification WHERE identifier = ?")
+            .bind(&identifier)
             .fetch_optional(pool)
             .await
             .map_err(db)?;
@@ -346,8 +356,8 @@ pub async fn verify_code_core(
         ));
     };
     if now > expires_at {
-        sqlx::query("DELETE FROM email_code WHERE email = ?")
-            .bind(&email)
+        sqlx::query("DELETE FROM verification WHERE identifier = ?")
+            .bind(&identifier)
             .execute(pool)
             .await
             .map_err(db)?;
@@ -357,8 +367,8 @@ pub async fn verify_code_core(
         ));
     }
     if attempts >= 5 {
-        sqlx::query("DELETE FROM email_code WHERE email = ?")
-            .bind(&email)
+        sqlx::query("DELETE FROM verification WHERE identifier = ?")
+            .bind(&identifier)
             .execute(pool)
             .await
             .map_err(db)?;
@@ -370,8 +380,8 @@ pub async fn verify_code_core(
     if !tokens::ct_eq(&tokens::sha256_hex(code.trim()), &code_hash) {
         let attempts = attempts + 1;
         if attempts >= 5 {
-            sqlx::query("DELETE FROM email_code WHERE email = ?")
-                .bind(&email)
+            sqlx::query("DELETE FROM verification WHERE identifier = ?")
+                .bind(&identifier)
                 .execute(pool)
                 .await
                 .map_err(db)?;
@@ -380,9 +390,10 @@ pub async fn verify_code_core(
                 "too many wrong codes, ask for a new one".to_string(),
             ));
         }
-        sqlx::query("UPDATE email_code SET attempts = ? WHERE email = ?")
+        sqlx::query("UPDATE verification SET attempts = ?, updatedAt = ? WHERE identifier = ?")
             .bind(attempts)
-            .bind(&email)
+            .bind(now)
+            .bind(&identifier)
             .execute(pool)
             .await
             .map_err(db)?;
@@ -391,8 +402,8 @@ pub async fn verify_code_core(
             "that code doesn't match".to_string(),
         ));
     }
-    sqlx::query("DELETE FROM email_code WHERE email = ?")
-        .bind(&email)
+    sqlx::query("DELETE FROM verification WHERE identifier = ?")
+        .bind(&identifier)
         .execute(pool)
         .await
         .map_err(db)?;
@@ -419,10 +430,12 @@ pub async fn verify_code_core(
             }
             let id = tokens::new_id();
             sqlx::query(
-                "INSERT INTO account (id, email, last_active_at, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO user (id, email, emailVerified, lastActiveAt, createdAt, updatedAt) \
+                 VALUES (?, ?, 1, ?, ?, ?)",
             )
             .bind(&id)
             .bind(&email)
+            .bind(now)
             .bind(now)
             .bind(now)
             .execute(pool)
@@ -432,17 +445,18 @@ pub async fn verify_code_core(
                 id,
                 email: email.clone(),
                 terms_version: None,
-                banned_at: None,
+                banned: false,
             }
         }
     };
-    if account.banned_at.is_some() {
+    if account.banned {
         return Err(AuthError::new(
             "forbidden",
             "this account is banned".to_string(),
         ));
     }
-    sqlx::query("UPDATE account SET last_active_at = ? WHERE id = ?")
+    sqlx::query("UPDATE user SET lastActiveAt = ?, updatedAt = ? WHERE id = ?")
+        .bind(now)
         .bind(now)
         .bind(&account.id)
         .execute(pool)
@@ -459,14 +473,19 @@ pub async fn record_terms_acceptance(
     cfg: &AuthConfig,
     account_id: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query("UPDATE account SET terms_version = ?, terms_accepted_at = ? WHERE id = ?")
-        .bind(&cfg.terms_version)
-        .bind(now_ms())
-        .bind(account_id)
-        .execute(pool)
-        .await?;
-    sqlx::query("UPDATE account SET last_active_at = ? WHERE id = ?")
-        .bind(now_ms())
+    let now = now_ms();
+    sqlx::query(
+        "UPDATE user SET termsVersion = ?, termsAcceptedAt = ?, updatedAt = ? WHERE id = ?",
+    )
+    .bind(&cfg.terms_version)
+    .bind(now)
+    .bind(now)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    sqlx::query("UPDATE user SET lastActiveAt = ?, updatedAt = ? WHERE id = ?")
+        .bind(now)
+        .bind(now)
         .bind(account_id)
         .execute(pool)
         .await?;
@@ -538,14 +557,15 @@ pub async fn create_api_key(
     let (key, prefix, key_hash) = tokens::new_api_key();
     let id = tokens::new_id();
     sqlx::query(
-        "INSERT INTO api_key (id, account_id, name, prefix, key_hash, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO apikey (id, name, prefix, key, referenceId, createdAt, updatedAt) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(account_id)
     .bind(&name)
     .bind(&prefix)
     .bind(&key_hash)
+    .bind(account_id)
+    .bind(now)
     .bind(now)
     .execute(pool)
     .await
@@ -553,7 +573,7 @@ pub async fn create_api_key(
     Ok(NewApiKey { id, prefix, key })
 }
 
-/// One API key row: id, name, prefix, created_at, last_used_at, client name/version.
+/// One API key row: id, name, prefix, createdAt, lastRequest, clientName/clientVersion.
 type ApiKeyRow = (
     String,
     Option<String>,
@@ -566,8 +586,8 @@ type ApiKeyRow = (
 
 pub async fn list_api_keys(pool: &SqlitePool, account_id: &str) -> anyhow::Result<Vec<ApiKeyInfo>> {
     let rows: Vec<ApiKeyRow> = sqlx::query_as(
-        "SELECT id, name, prefix, created_at, last_used_at, client_name, client_version \
-             FROM api_key WHERE account_id = ? AND revoked_at IS NULL ORDER BY created_at",
+        "SELECT id, name, prefix, createdAt, lastRequest, clientName, clientVersion \
+             FROM apikey WHERE referenceId = ? AND enabled != 0 ORDER BY createdAt",
     )
     .bind(account_id)
     .fetch_all(pool)
@@ -598,10 +618,10 @@ pub async fn revoke_api_key(
     // Exactly one live key per prefix, or nothing: a (vanishingly rare)
     // prefix collision must never revoke a key the caller didn't mean.
     let result = sqlx::query(
-        "UPDATE api_key SET revoked_at = ? \
-         WHERE account_id = ? AND prefix = ? AND revoked_at IS NULL \
-           AND (SELECT COUNT(*) FROM api_key \
-                WHERE account_id = ? AND prefix = ? AND revoked_at IS NULL) = 1",
+        "UPDATE apikey SET enabled = 0, updatedAt = ? \
+         WHERE referenceId = ? AND prefix = ? AND enabled != 0 \
+           AND (SELECT COUNT(*) FROM apikey \
+                WHERE referenceId = ? AND prefix = ? AND enabled != 0) = 1",
     )
     .bind(now_ms())
     .bind(account_id)
@@ -614,7 +634,7 @@ pub async fn revoke_api_key(
     Ok(result.rows_affected() > 0)
 }
 
-/// One grant row with the client label: grant id, client_id, grant/client names, host, scope, created, last used.
+/// One consent row with the client label: consent id, clientId, consent/client names, host, scopes, created, last used.
 type ConnectionRow = (
     String,
     String,
@@ -632,9 +652,9 @@ pub async fn list_connections(
 ) -> anyhow::Result<Vec<ConnectionInfo>> {
     let rows: Vec<ConnectionRow> =
         sqlx::query_as(
-            "SELECT g.id, g.client_id, g.client_name, c.name, c.host, g.scope, g.created_at, g.last_used_at \
-             FROM oauth_grant g LEFT JOIN oauth_client c ON c.client_id = g.client_id \
-             WHERE g.account_id = ? AND g.revoked_at IS NULL ORDER BY g.created_at",
+            "SELECT c.id, c.clientId, c.clientName, o.name, o.host, c.scopes, c.createdAt, c.lastUsedAt \
+             FROM oauthConsent c LEFT JOIN oauthClient o ON o.clientId = c.clientId \
+             WHERE c.userId = ? AND c.revokedAt IS NULL ORDER BY c.createdAt",
         )
         .bind(account_id)
         .fetch_all(pool)
@@ -674,8 +694,9 @@ pub async fn revoke_connection(
     let db = |err: sqlx::Error| AuthError::new("db", format!("{err}"));
     let now = now_ms();
     let result = sqlx::query(
-        "UPDATE oauth_grant SET revoked_at = ? WHERE id = ? AND account_id = ? AND revoked_at IS NULL",
+        "UPDATE oauthConsent SET revokedAt = ?, updatedAt = ? WHERE id = ? AND userId = ? AND revokedAt IS NULL",
     )
+    .bind(now)
     .bind(now)
     .bind(grant_id)
     .bind(account_id)
@@ -685,7 +706,12 @@ pub async fn revoke_connection(
     if result.rows_affected() == 0 {
         return Ok(false);
     }
-    sqlx::query("DELETE FROM oauth_token WHERE grant_id = ?")
+    sqlx::query("DELETE FROM oauthAccessToken WHERE referenceId = ?")
+        .bind(grant_id)
+        .execute(pool)
+        .await
+        .map_err(db)?;
+    sqlx::query("DELETE FROM oauthRefreshToken WHERE referenceId = ?")
         .bind(grant_id)
         .execute(pool)
         .await
@@ -704,17 +730,21 @@ pub async fn record_client_info(
     let version = version.trim().chars().take(100).collect::<String>();
     match credential {
         Credential::ApiKey { key_id } => {
-            sqlx::query("UPDATE api_key SET client_name = ?, client_version = ? WHERE id = ?")
-                .bind(&name)
-                .bind(&version)
-                .bind(key_id)
-                .execute(pool)
-                .await?;
+            sqlx::query(
+                "UPDATE apikey SET clientName = ?, clientVersion = ?, updatedAt = ? WHERE id = ?",
+            )
+            .bind(&name)
+            .bind(&version)
+            .bind(now_ms())
+            .bind(key_id)
+            .execute(pool)
+            .await?;
         }
         Credential::OAuth { grant_id } => {
-            sqlx::query("UPDATE oauth_grant SET client_name = ?, client_version = ? WHERE id = ?")
+            sqlx::query("UPDATE oauthConsent SET clientName = ?, clientVersion = ?, updatedAt = ? WHERE id = ?")
                 .bind(&name)
                 .bind(&version)
+                .bind(now_ms())
                 .bind(grant_id)
                 .execute(pool)
                 .await?;
@@ -747,11 +777,11 @@ pub async fn resolve_bearer(
         }
         let hash = tokens::sha256_hex(token);
         let row: Option<(String, String, String, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT g.id, g.account_id, a.email, g.created_at, g.last_used_at \
-             FROM oauth_token t JOIN oauth_grant g ON g.id = t.grant_id \
-             JOIN account a ON a.id = g.account_id \
-             WHERE t.token_hash = ? AND t.kind = 'access' AND t.expires_at > ? \
-               AND g.revoked_at IS NULL AND a.banned_at IS NULL",
+            "SELECT c.id, c.userId, u.email, c.createdAt, c.lastUsedAt \
+             FROM oauthAccessToken t JOIN oauthConsent c ON c.id = t.referenceId \
+             JOIN user u ON u.id = c.userId \
+             WHERE t.token = ? AND t.expiresAt > ? \
+               AND c.revokedAt IS NULL AND u.banned = 0",
         )
         .bind(&hash)
         .bind(now)
@@ -779,9 +809,9 @@ pub async fn resolve_bearer(
     }
     let hash = tokens::sha256_hex(token);
     let row: Option<(String, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT k.id, k.account_id, a.email, k.last_used_at \
-         FROM api_key k JOIN account a ON a.id = k.account_id \
-         WHERE k.key_hash = ? AND k.revoked_at IS NULL AND a.banned_at IS NULL",
+        "SELECT k.id, k.referenceId, u.email, k.lastRequest \
+         FROM apikey k JOIN user u ON u.id = k.referenceId \
+         WHERE k.key = ? AND k.enabled != 0 AND u.banned = 0",
     )
     .bind(&hash)
     .fetch_optional(pool)
@@ -790,7 +820,8 @@ pub async fn resolve_bearer(
         return Ok(None);
     };
     if last_used_at.is_none_or(|last| now - last >= 60_000) {
-        sqlx::query("UPDATE api_key SET last_used_at = ? WHERE id = ?")
+        sqlx::query("UPDATE apikey SET lastRequest = ?, updatedAt = ? WHERE id = ?")
+            .bind(now)
             .bind(now)
             .bind(&key_id)
             .execute(pool)
@@ -811,7 +842,8 @@ async fn touch_grant(
     now: i64,
 ) -> anyhow::Result<()> {
     if last_used_at.is_none_or(|last| now - last >= 60_000) {
-        sqlx::query("UPDATE oauth_grant SET last_used_at = ? WHERE id = ?")
+        sqlx::query("UPDATE oauthConsent SET lastUsedAt = ?, updatedAt = ? WHERE id = ?")
+            .bind(now)
             .bind(now)
             .bind(grant_id)
             .execute(pool)
@@ -841,12 +873,18 @@ pub const SESSION_TTL_MS: i64 = 30 * 86_400_000;
 pub async fn create_session(pool: &SqlitePool, account_id: &str) -> anyhow::Result<String> {
     let now = now_ms();
     let (id, hash) = tokens::new_session_id();
-    sqlx::query("INSERT INTO web_session (id_hash, account_id, expires_at) VALUES (?, ?, ?)")
-        .bind(&hash)
-        .bind(account_id)
-        .bind(now + SESSION_TTL_MS)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO session (id, token, userId, expiresAt, createdAt, updatedAt) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(tokens::new_id())
+    .bind(&hash)
+    .bind(account_id)
+    .bind(now + SESSION_TTL_MS)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
     Ok(id)
 }
 
@@ -856,20 +894,20 @@ pub async fn account_from_session(
 ) -> anyhow::Result<Option<AccountRow>> {
     let now = now_ms();
     let hash = tokens::sha256_hex(session_id.trim());
-    let row: Option<(String, String, Option<String>, Option<i64>)> = sqlx::query_as(
-        "SELECT a.id, a.email, a.terms_version, a.banned_at FROM web_session s \
-         JOIN account a ON a.id = s.account_id \
-         WHERE s.id_hash = ? AND s.expires_at > ? AND a.banned_at IS NULL",
+    let row: Option<(String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT u.id, u.email, u.termsVersion, u.banned FROM session s \
+         JOIN user u ON u.id = s.userId \
+         WHERE s.token = ? AND s.expiresAt > ? AND u.banned = 0",
     )
     .bind(&hash)
     .bind(now)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, email, terms_version, banned_at)| AccountRow {
+    Ok(row.map(|(id, email, terms_version, banned)| AccountRow {
         id,
         email,
         terms_version,
-        banned_at,
+        banned: banned != 0,
     }))
 }
 
@@ -893,8 +931,10 @@ pub fn session_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     })
 }
 
-/// The `web_session.id_hash` for a presented session id (sign-out deletes
-/// by hash; the raw id never reaches storage).
+/// The `session.token` hash for a presented session id (sign-out deletes
+/// by hash; the raw id never reaches storage). The column holds ONLY the
+/// sha256 hex digest, never the raw session id (a deliberate departure
+/// from Better Auth, which stores the raw session token).
 pub fn session_hash(session_id: &str) -> String {
     tokens::sha256_hex(session_id.trim())
 }
@@ -905,17 +945,13 @@ pub fn clear_session_cookie() -> String {
     format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
-/// Delete expired email codes and web sessions (the daily prune). Only rows
-/// no reader can still accept go (`expires_at < now`, matching the
-/// `now > expires_at` checks on the verify paths). Returns
-/// `(email_codes, sessions)` removed.
 pub async fn prune_expired(pool: &SqlitePool, now: i64) -> anyhow::Result<(u64, u64)> {
-    let codes = sqlx::query("DELETE FROM email_code WHERE expires_at < ?")
+    let codes = sqlx::query("DELETE FROM verification WHERE expiresAt < ?")
         .bind(now)
         .execute(pool)
         .await?
         .rows_affected();
-    let sessions = sqlx::query("DELETE FROM web_session WHERE expires_at < ?")
+    let sessions = sqlx::query("DELETE FROM session WHERE expiresAt < ?")
         .bind(now)
         .execute(pool)
         .await?

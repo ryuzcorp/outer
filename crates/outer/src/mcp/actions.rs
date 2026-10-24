@@ -318,7 +318,7 @@ pub async fn record(
         Credential::ApiKey { key_id } => (None, Some(key_id.as_str())),
     };
     if let Err(err) = sqlx::query(
-        "INSERT INTO agent_action (id, app_id, account_id, grant_id, api_key_id, \
+        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
          tool, summary, outcome, error_code, duration_ms, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )
@@ -348,16 +348,16 @@ pub async fn prune(pool: &SqlitePool, now: i64) -> anyhow::Result<u64> {
     // Set-based, on the `created_at` index: Pro apps keep 30 d, the rest 7 d.
     let pro = sqlx::query(
         "DELETE FROM agent_action WHERE created_at < ?1 AND app_id IN \
-           (SELECT app.id FROM app JOIN account ON account.id = app.owner_id \
-            WHERE account.plan = 'pro')",
+           (SELECT app.id FROM app JOIN user ON user.id = app.owner_id \
+            WHERE user.plan = 'pro')",
     )
     .bind(pro_cutoff)
     .execute(pool)
     .await?;
     let rest = sqlx::query(
         "DELETE FROM agent_action WHERE created_at < ?1 AND app_id NOT IN \
-           (SELECT app.id FROM app JOIN account ON account.id = app.owner_id \
-            WHERE account.plan = 'pro')",
+           (SELECT app.id FROM app JOIN user ON user.id = app.owner_id \
+            WHERE user.plan = 'pro')",
     )
     .bind(free_cutoff)
     .execute(pool)
@@ -431,11 +431,11 @@ pub async fn list(
     let rows: Vec<Row> = match before {
         Some((before_ts, before_id)) => sqlx::query_as(
             "SELECT a.id, a.tool, a.summary, a.outcome, a.error_code, a.duration_ms, a.created_at, \
-             g.client_name, c.name, c.host, k.name, k.prefix \
+             g.clientName, c.name, c.host, k.name, k.prefix \
              FROM agent_action AS a \
-             LEFT JOIN oauth_grant AS g ON g.id = a.grant_id \
-             LEFT JOIN oauth_client AS c ON c.client_id = g.client_id \
-             LEFT JOIN api_key AS k ON k.id = a.api_key_id \
+             LEFT JOIN oauthConsent AS g ON g.id = a.consent_id \
+             LEFT JOIN oauthClient AS c ON c.clientId = g.clientId \
+             LEFT JOIN apikey AS k ON k.id = a.apikey_id \
              WHERE a.app_id = ?1 AND (a.created_at, a.id) < (?2, ?3) \
              ORDER BY a.created_at DESC, a.id DESC LIMIT ?4",
         )
@@ -447,11 +447,11 @@ pub async fn list(
         .await?,
         None => sqlx::query_as(
             "SELECT a.id, a.tool, a.summary, a.outcome, a.error_code, a.duration_ms, a.created_at, \
-             g.client_name, c.name, c.host, k.name, k.prefix \
+             g.clientName, c.name, c.host, k.name, k.prefix \
              FROM agent_action AS a \
-             LEFT JOIN oauth_grant AS g ON g.id = a.grant_id \
-             LEFT JOIN oauth_client AS c ON c.client_id = g.client_id \
-             LEFT JOIN api_key AS k ON k.id = a.api_key_id \
+             LEFT JOIN oauthConsent AS g ON g.id = a.consent_id \
+             LEFT JOIN oauthClient AS c ON c.clientId = g.clientId \
+             LEFT JOIN apikey AS k ON k.id = a.apikey_id \
              WHERE a.app_id = ?1 \
              ORDER BY a.created_at DESC, a.id DESC LIMIT ?2",
         )

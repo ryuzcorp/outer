@@ -2,7 +2,7 @@
 //!
 //! The `client_id` is either an HTTPS URL (a client-instance metadata
 //! document, fetched with HTTPS only to public IPs only, 3 s timeout,
-//! ≤ 16 KiB, cached in `oauth_client`) or a `dcr_…` id from `POST
+//! ≤ 16 KiB, cached in `oauthClient`) or a `dcr_…` id from `POST
 //! /oauth/register`. Known clients only get a friendlier label; their
 //! redirects always come from their own document.
 
@@ -12,7 +12,7 @@ use std::time::Duration;
 use sqlx::SqlitePool;
 use url::Url;
 
-use super::{now_ms, AuthConfig};
+use super::{now_ms, tokens, AuthConfig};
 
 /// ≤ 16 KiB per spec.
 ///
@@ -213,8 +213,8 @@ fn check_redirect(mut doc: ClientDoc, redirect_uri: &str) -> Result<ClientDoc, C
 
 async fn dcr_client(pool: &SqlitePool, client_id: &str) -> anyhow::Result<Option<ClientDoc>> {
     let row: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT client_id, name, host, redirect_uris FROM oauth_client \
-         WHERE client_id = ? AND kind = 'dcr'",
+        "SELECT clientId, name, host, redirectUris FROM oauthClient \
+         WHERE clientId = ? AND kind = 'dcr'",
     )
     .bind(client_id)
     .fetch_optional(pool)
@@ -331,16 +331,19 @@ async fn fetch_cimd(
     // Backdate so `fetched_at + 24 h` is the exact expiry.
     let fetched_at = now - (DOC_TTL_MS - ttl_ms);
     sqlx::query(
-        "INSERT INTO oauth_client (client_id, kind, name, host, redirect_uris, verified, fetched_at, created_at) \
-         VALUES (?, 'cimd', ?, ?, ?, 0, ?, ?) \
-         ON CONFLICT(client_id) DO UPDATE SET name = excluded.name, host = excluded.host, \
-           redirect_uris = excluded.redirect_uris, fetched_at = excluded.fetched_at",
+        "INSERT INTO oauthClient (id, clientId, kind, name, host, redirectUris, verified, fetchedAt, createdAt, updatedAt) \
+         VALUES (?, ?, 'cimd', ?, ?, ?, 0, ?, ?, ?) \
+         ON CONFLICT(clientId) DO UPDATE SET name = excluded.name, host = excluded.host, \
+           redirectUris = excluded.redirectUris, fetchedAt = excluded.fetchedAt, \
+           updatedAt = excluded.updatedAt",
     )
+    .bind(tokens::new_id())
     .bind(client_id)
     .bind(&name)
     .bind(&host)
     .bind(serde_json::to_string(&redirect_uris).unwrap_or_default())
     .bind(fetched_at)
+    .bind(now)
     .bind(now)
     .execute(pool)
     .await
@@ -361,8 +364,8 @@ async fn cached_doc(
     now: i64,
 ) -> anyhow::Result<Option<ClientDoc>> {
     let row: Option<CachedDoc> = sqlx::query_as(
-        "SELECT name, host, redirect_uris, fetched_at FROM oauth_client \
-         WHERE client_id = ? AND kind = 'cimd'",
+        "SELECT name, host, redirectUris, fetchedAt FROM oauthClient \
+         WHERE clientId = ? AND kind = 'cimd'",
     )
     .bind(client_id)
     .fetch_optional(pool)

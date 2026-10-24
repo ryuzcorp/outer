@@ -34,14 +34,14 @@ mod tests {
         let path = dir.path().join("outer.sqlite");
 
         let pool = open(&path).await.unwrap();
-        sqlx::query("INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'ana@example.com', 0, 0)")
+        sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'ana@example.com', 0, 0, 0)")
             .execute(&pool)
             .await
             .unwrap();
         pool.close().await;
 
         let pool = open(&path).await.unwrap();
-        let (emails,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM account")
+        let (emails,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -55,6 +55,15 @@ mod tests {
         )
         .execute(&pool)
         .await;
-        assert!(orphan.is_err(), "an app must reference an existing account");
+        assert!(orphan.is_err(), "an app must reference an existing user");
+
+        let violations: Vec<(i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(
+            violations.is_empty(),
+            "a fresh database has no foreign-key violations: {violations:?}"
+        );
     }
 }
