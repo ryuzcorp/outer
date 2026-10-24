@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::store::Store;
 
 /// Where the template lives upstream.
-pub const ILHA_VOID_URL: &str = "https://github.com/ryuzcorp/noite-template-ilha";
+pub const ILHA_VOID_URL: &str = "https://github.com/ryuzcorp/outer-template";
 /// The pinned commit `outer templates sync` vendors.
-pub const ILHA_VOID_SHA: &str = "636715ea44d8944701652abda734ab610e75c69d";
+pub const ILHA_VOID_SHA: &str = "9571514d8d604be68f74d1ce5bc1cd1705572cae";
 
 /// Pointer to the vendored bundle in the store.
 const CURRENT_KEY: &str = "outer/templates/ilha-void/current.json";

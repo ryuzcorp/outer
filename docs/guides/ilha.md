@@ -35,9 +35,9 @@ export default function Counter({ start = 0 }: { start?: number }) {
 
 - `atom(value)` takes a value, an Effect atom, an Effect, or a Stream.
   It never takes a plain function — use `atom.lazy(() => …)` for one-time
-  init or a stored function value.
-- Derive with `atom(Atom.map(source.atom, …))` or `atom(Atom.transform(…))`
-  from `effect/reactivity/Atom`. Pass `handle.atom` to Effect APIs.
+  init or a stored function value. Pass `handle.atom` to Effect APIs.
+- Derive with `atom(Atom.map(source.atom, …))` from
+  `effect/reactivity/Atom`.
 - Give every component returned from `.map()` a stable `key`.
 - Use `yield* when(…)` only inside a generator component.
 - Use lowercase DOM names on native elements: `onclick`, `class`, `for`.
@@ -46,9 +46,9 @@ export default function Counter({ start = 0 }: { start?: number }) {
 
 ## Test and debug
 
-- `bun run typecheck` runs `tsc --noEmit`; `bun run lint` runs Oxlint
-  with the Ilha plugin (`--fix` applies autofixes); `bun run check`
-  runs typecheck, lint and `bun test`.
+- `bun run typecheck` builds then runs `tsc --noEmit`; `bun run lint`
+  runs Oxlint; `bun run fmt` formats with oxfmt; `bun run check` runs
+  typecheck, lint, the format check and `bun test`.
 - `renderHtml(Component)` from `ilha/test` returns the server HTML;
   assert on it in `pages/*.test.tsx`.
 - Every Ilha error carries a code such as `ILHA002`, a `Fix:` line and a
@@ -65,6 +65,6 @@ export default function Counter({ start = 0 }: { start?: number }) {
 ## Sources
 
 - Template `AGENTS.md` (the counter, commands, error codes):
-  <https://github.com/ryuzcorp/noite-template-ilha/blob/636715ea44d8944701652abda734ab610e75c69d/AGENTS.md>
+  <https://github.com/ryuzcorp/outer-template/blob/9571514d8d604be68f74d1ce5bc1cd1705572cae/AGENTS.md>
 - Ilha docs for agents and the Void integration:
   <https://ilha.build/llms.txt>, <https://ilha.build/guide/void>
