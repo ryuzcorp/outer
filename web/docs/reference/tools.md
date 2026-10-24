@@ -28,13 +28,14 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `sign_in`
 
 - **Access:** anyone (no token needed)
-- **Description:** Start email sign-in (clients without OAuth): emails a 6-digit code. Then call verify_code. Disappears after sign-in.
+- **Description:** Start email sign-in (clients without OAuth): emails a 6-digit code. Then call verify_code. During the closed beta a new email also needs invite_code (OUTER-XXXX-XXXX). Disappears after sign-in.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `email` | string | yes | The email address to sign in as. |
+| `invite_code` | string | no | Optional invite code for the closed beta (`OUTER-XXXX-XXXX`; dashes and the prefix are optional). Only needed when the email is new and not allowlisted: existing, allowlisted and admin emails ignore it. |
 
 ## `verify_code`
 

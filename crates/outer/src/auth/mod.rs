@@ -7,6 +7,7 @@
 
 pub mod cimd;
 pub mod email;
+pub mod invites;
 pub mod limits;
 pub mod oauth;
 pub mod pages;
@@ -201,16 +202,22 @@ fn otp_identifier(email: &str) -> String {
 }
 
 /// Closed-beta gate: open signup, admin emails and allowlisted emails pass;
-/// anyone else lands on the waitlist (counted) with the exact closed-beta
-/// user message. Idempotent: repeat sends bump the waitlist count.
+/// anyone else needs a valid invite code (§6.5.1) or lands on the waitlist
+/// (counted) with the exact closed-beta user message. Idempotent: repeat
+/// sends bump the waitlist count.
+///
+/// Returns the canonical invite code to carry with the pending verification
+/// when the code is what admits the email; `None` admits without consuming
+/// anything (existing/allowlisted/admin emails ignore the code, §6.5.1).
 async fn check_beta(
     pool: &SqlitePool,
     cfg: &AuthConfig,
     email: &str,
+    invite_code: Option<&str>,
     now: i64,
-) -> Result<(), AuthError> {
+) -> Result<Option<String>, AuthError> {
     if cfg.signup_open || is_admin(cfg, email) {
-        return Ok(());
+        return Ok(None);
     }
     let allowed: Option<(String,)> =
         sqlx::query_as("SELECT email FROM beta_allowlist WHERE email = ?")
@@ -219,7 +226,17 @@ async fn check_beta(
             .await
             .map_err(|err| AuthError::new("db", format!("allowlist lookup failed: {err}")))?;
     if allowed.is_some() {
-        return Ok(());
+        return Ok(None);
+    }
+    if let Some(raw) = invite_code {
+        if let Some(canonical) = invites::normalize_invite_code(raw) {
+            let valid = invites::is_valid(pool, &canonical)
+                .await
+                .map_err(|err| AuthError::new("db", format!("invite lookup failed: {err}")))?;
+            if valid {
+                return Ok(Some(canonical));
+            }
+        }
     }
     sqlx::query(
         "INSERT INTO waitlist (email, first_seen, attempts) VALUES (?, ?, 1) \
@@ -233,17 +250,23 @@ async fn check_beta(
     Err(AuthError {
         code: "closed_beta",
         message: format!("{email} is not on the beta allowlist"),
-        user_message: Some("Outer is in closed beta. You're on the waitlist.".to_string()),
+        user_message: Some(
+            "Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist."
+                .to_string(),
+        ),
         retry_after_s: None,
     })
 }
 
 /// Shared send path for `otp_sign_in` and the OAuth email step: same codes,
-/// same 10-minute expiry, same 5/h-per-email and 20/h-per-IP limits.
+/// same 10-minute expiry, same 5/h-per-email and 20/h-per-IP limits. The
+/// optional invite code (§6.5.1) only matters for a new email during the
+/// closed beta: existing accounts, allowlisted emails and admins ignore it.
 pub async fn send_code(
     pool: &SqlitePool,
     cfg: &AuthConfig,
     email: &str,
+    invite_code: Option<&str>,
     client_ip: Option<&str>,
 ) -> Result<u64, AuthError> {
     const EXPIRES_IN_S: u64 = 600;
@@ -255,11 +278,10 @@ pub async fn send_code(
             format!("{email:?} is not an email address"),
         ));
     }
-    check_beta(pool, cfg, &email, now).await?;
-    if let Some(account) = account_by_email(pool, &email)
+    let existing = account_by_email(pool, &email)
         .await
-        .map_err(|err| AuthError::new("db", format!("account lookup failed: {err}")))?
-    {
+        .map_err(|err| AuthError::new("db", format!("account lookup failed: {err}")))?;
+    if let Some(account) = &existing {
         if account.banned {
             return Err(AuthError::new(
                 "forbidden",
@@ -267,6 +289,12 @@ pub async fn send_code(
             ));
         }
     }
+    // Returning users sign straight back in: the beta gate only admits new
+    // emails (invite joiners are never allowlisted, §6.5.1).
+    let carried = match &existing {
+        Some(_) => None,
+        None => check_beta(pool, cfg, &email, invite_code, now).await?,
+    };
     match limits::check_and_record(
         pool,
         &format!("email:{email}"),
@@ -292,10 +320,11 @@ pub async fn send_code(
     }
     let code = tokens::new_otp_code();
     sqlx::query(
-        "INSERT INTO verification (id, identifier, value, expiresAt, createdAt, updatedAt) \
-         VALUES (?, ?, ?, ?, ?, ?) \
+        "INSERT INTO verification (id, identifier, value, expiresAt, createdAt, updatedAt, inviteCode) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(identifier) DO UPDATE SET value = excluded.value, \
-           expiresAt = excluded.expiresAt, attempts = 0, updatedAt = excluded.updatedAt",
+           expiresAt = excluded.expiresAt, attempts = 0, updatedAt = excluded.updatedAt, \
+           inviteCode = excluded.inviteCode",
     )
     .bind(tokens::new_id())
     .bind(otp_identifier(&email))
@@ -303,6 +332,7 @@ pub async fn send_code(
     .bind(now + (EXPIRES_IN_S as i64) * 1000)
     .bind(now)
     .bind(now)
+    .bind(carried)
     .execute(pool)
     .await
     .map_err(|err| AuthError::new("db", format!("code store failed: {err}")))?;
@@ -343,13 +373,14 @@ pub async fn verify_code_core(
     let now = now_ms();
     let email = normalize_email(email);
     let identifier = otp_identifier(&email);
-    let row: Option<(String, i64, i64)> =
-        sqlx::query_as("SELECT value, expiresAt, attempts FROM verification WHERE identifier = ?")
-            .bind(&identifier)
-            .fetch_optional(pool)
-            .await
-            .map_err(db)?;
-    let Some((code_hash, expires_at, attempts)) = row else {
+    let row: Option<(String, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT value, expiresAt, attempts, inviteCode FROM verification WHERE identifier = ?",
+    )
+    .bind(&identifier)
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    let Some((code_hash, expires_at, attempts, carried_invite)) = row else {
         return Err(AuthError::new(
             "invalid_code",
             "no pending code for this email".to_string(),
@@ -411,6 +442,8 @@ pub async fn verify_code_core(
         .await
         .map_err(|err| AuthError::new("db", format!("{err}")))?
     {
+        // Existing accounts ignore the code: it admitted nobody, so it
+        // burns nothing (§6.5.1).
         Some(account) => account,
         None => {
             if let Some(ip) = client_ip {
@@ -428,6 +461,11 @@ pub async fn verify_code_core(
                     return Err(AuthError::rate_limited(retry_after_s));
                 }
             }
+            // One transaction: insert the account, consume the carried
+            // invite, mint the 3 grant codes (admins get none). The consume
+            // is conditional, so a code spent between `sign_in` and verify
+            // refuses here and creates nothing.
+            let mut tx = pool.begin().await.map_err(db)?;
             let id = tokens::new_id();
             sqlx::query(
                 "INSERT INTO user (id, email, emailVerified, lastActiveAt, createdAt, updatedAt) \
@@ -438,9 +476,29 @@ pub async fn verify_code_core(
             .bind(now)
             .bind(now)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(db)?;
+            if let Some(code) = carried_invite.as_deref() {
+                let won = invites::consume(&mut tx, code, &id, now)
+                    .await
+                    .map_err(|err| AuthError::new("db", format!("{err}")))?;
+                if !won {
+                    tx.rollback().await.map_err(db)?;
+                    return Err(AuthError {
+                        code: "invite_used",
+                        message: format!("invite code {code} was just used"),
+                        user_message: Some("That invite code was just used.".to_string()),
+                        retry_after_s: None,
+                    });
+                }
+            }
+            if !is_admin(cfg, &email) {
+                invites::mint_grants(&mut tx, &id, now)
+                    .await
+                    .map_err(|err| AuthError::new("db", format!("{err}")))?;
+            }
+            tx.commit().await.map_err(db)?;
             AccountRow {
                 id,
                 email: email.clone(),
@@ -492,17 +550,18 @@ pub async fn record_terms_acceptance(
     Ok(())
 }
 
-/// `sign_in` tool (§6.2): normalize, beta allowlist/waitlist (§6.5), limits
-/// (5/h per email, 20/h per IP, §14.3), store sha256(code) 10 min / 5
-/// attempts, send.
+/// `sign_in` tool (§6.2): normalize, beta allowlist/waitlist or invite code
+/// (§6.5.1), limits (5/h per email, 20/h per IP, §14.3), store sha256(code)
+/// 10 min / 5 attempts, send.
 pub async fn otp_sign_in(
     pool: &SqlitePool,
     cfg: &AuthConfig,
     email: &str,
+    invite_code: Option<&str>,
     client_ip: Option<&str>,
 ) -> Result<SignInSent, AuthError> {
     Ok(SignInSent {
-        expires_in_s: send_code(pool, cfg, email, client_ip).await?,
+        expires_in_s: send_code(pool, cfg, email, invite_code, client_ip).await?,
     })
 }
 

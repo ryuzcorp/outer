@@ -53,7 +53,18 @@ fn hidden(request_id: &str, csrf: &str, step: &str) -> Markup {
     }
 }
 
-pub fn email_page(client: &ClientDoc, request_id: &str, csrf: &str, error: Option<&str>) -> Markup {
+/// The email-first sign-in step. The invite field stays collapsed behind
+/// "Have an invite code?" (a no-JS `<details>`), opening automatically when
+/// the server refuses with the closed-beta message. `invite_value` preserves
+/// what the user typed across that refusal.
+pub fn email_page(
+    client: &ClientDoc,
+    request_id: &str,
+    csrf: &str,
+    error: Option<&str>,
+    invite_open: bool,
+    invite_value: &str,
+) -> Markup {
     layout(
         "Sign in",
         html! {
@@ -67,7 +78,18 @@ pub fn email_page(client: &ClientDoc, request_id: &str, csrf: &str, error: Optio
                 br;
                 input type="email" name="email" id="email" required autocomplete="email"
                     style="width:100%;font-size:1rem;padding:.5rem;" {}
-                br; br;
+                br;
+                details open[invite_open] {
+                    summary { "Have an invite code?" }
+                    p style="font-size:.9rem;" { "Outer is in closed beta. New here without an allowlisted email? Paste the code someone on Outer shared with you." }
+                    label for="invite_code" { "Invite code (optional)" }
+                    br;
+                    input type="text" name="invite_code" id="invite_code" value=(invite_value)
+                        autocomplete="off" spellcheck="false"
+                        placeholder="OUTER-XXXX-XXXX"
+                        style="width:100%;font-size:1rem;padding:.5rem;" {}
+                }
+                br;
                 button type="submit" style="font-size:1rem;padding:.5rem 1rem;" { "Send code" }
             }
         },
@@ -191,11 +213,12 @@ pub fn error_page(title: &str, message: &str) -> Markup {
 /// the email page; anything else becomes a 400 error page.
 pub fn friendly_error(code: &str) -> &str {
     match code {
-        "closed_beta" => "Outer is in closed beta. You're on the waitlist.",
+        "closed_beta" => "Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist.",
         "rate_limited" => "Too many attempts. Try again shortly.",
         "invalid_email" => "That doesn't look like an email address.",
         "email_retry" => "Outer couldn't send the code. Try again shortly.",
         "email_failed" => "Outer couldn't send the code to that address.",
+        "invite_used" => "That invite code was just used.",
         _ => "Something went wrong signing in. Start over from the app.",
     }
 }

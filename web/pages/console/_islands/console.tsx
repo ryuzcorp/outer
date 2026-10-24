@@ -10,13 +10,17 @@ import { watch } from "ilha";
 
 import {
   api,
+  apiPost,
   type ActionsPage,
+  type AdminInvitesPage,
   type AppDetail,
   type ConsoleApp,
   type ErrorsSummary,
+  type InvitesSummary,
   type LogLine,
   type MetricsSummary,
   type SecretsSummary,
+  type WaitlistSummary,
 } from "./api.ts";
 import {
   ActionsIcon,
@@ -34,12 +38,16 @@ import {
   PlusIcon,
   SecretsIcon,
   SettingsIcon,
+  ShieldIcon,
   SignOutIcon,
+  TicketIcon,
 } from "./icons.tsx";
 import {
   ActionsView,
+  AdminView,
   DeploysView,
   ErrorsView,
+  InvitesView,
   LogsView,
   MetricsView,
   OverviewView,
@@ -48,6 +56,7 @@ import {
 } from "./views.tsx";
 
 import {
+  ACCOUNT_VIEWS,
   CopyButton,
   RANGES,
   VIEWS,
@@ -143,12 +152,18 @@ const VIEW_TITLES: Record<ViewId, string> = {
   errors: "Errors",
   secrets: "Secrets",
   settings: "Settings",
+  invites: "Invite codes",
+  admin: "Admin",
 };
 
 export function Console() {
   const route = atom<Route>(readRoute());
   const apps = atom<Panel<ConsoleApp[]>>({ kind: "loading" });
   const email = atom("");
+  const isAdmin = atom(false);
+  const invites = atom<Panel<InvitesSummary>>({ kind: "loading" });
+  const adminInvites = atom<Panel<AdminInvitesPage>>({ kind: "loading" });
+  const waitlist = atom<Panel<WaitlistSummary>>({ kind: "loading" });
   const detail = atom<Panel<AppDetail>>({ kind: "loading" });
   const metrics = atom<Panel<{ hours: number; summary: MetricsSummary }>>({
     kind: "loading",
@@ -173,7 +188,9 @@ export function Console() {
     document.title =
       app && r.app
         ? `${r.app} · ${VIEW_TITLES[r.view]} · Outer console`
-        : "Console · Outer";
+        : isAccountView(r.view)
+          ? `${VIEW_TITLES[r.view]} · Outer console`
+          : "Console · Outer";
   }
 
   function loadersFor(view: ViewId): Array<"metrics" | "actions" | "errors" | "logs" | "secrets"> {
@@ -193,6 +210,8 @@ export function Console() {
       case "secrets":
         return ["secrets"];
       case "settings":
+      case "invites":
+      case "admin":
         return [];
     }
   }
@@ -312,8 +331,98 @@ export function Console() {
     await Promise.all(jobs);
   }
 
+  function isAccountView(view: ViewId): boolean {
+    return view === "invites" || view === "admin";
+  }
+
+  async function loadAccountView(view: ViewId, myEpoch: number): Promise<void> {
+    const fresh = () => epoch === myEpoch;
+    if (view === "invites") {
+      invites.set({ kind: "loading" });
+      try {
+        const summary = await api<InvitesSummary>("/api/console/invites");
+        if (fresh()) {
+          invites.set({ kind: "ready", value: summary });
+          setTitle(route(), null);
+        }
+      } catch (err: unknown) {
+        if (fresh()) {
+          invites.set({ kind: "error", message: String(err) });
+        }
+      }
+      return;
+    }
+    if (view === "admin") {
+      adminInvites.set({ kind: "loading" });
+      waitlist.set({ kind: "loading" });
+      try {
+        const [page, list] = await Promise.all([
+          api<AdminInvitesPage>("/api/console/admin/invites?limit=50"),
+          api<WaitlistSummary>("/api/console/admin/waitlist?limit=100"),
+        ]);
+        if (fresh()) {
+          adminInvites.set({ kind: "ready", value: page });
+          waitlist.set({ kind: "ready", value: list });
+          setTitle(route(), null);
+        }
+      } catch (err: unknown) {
+        if (fresh()) {
+          const message = String(err);
+          adminInvites.set({ kind: "error", message });
+          waitlist.set({ kind: "error", message });
+        }
+      }
+    }
+  }
+
+  async function generateCodes(count: number, note: string): Promise<void> {
+    await apiPost<{ codes: string[] }>("/api/console/admin/invites", {
+      count,
+      note: note || undefined,
+    });
+    await loadAccountView("admin", epoch);
+  }
+
+  async function revokeCode(code: string): Promise<void> {
+    await apiPost<{ revoked: boolean }>(
+      `/api/console/admin/invites/${encodeURIComponent(code)}/revoke`,
+      {},
+    );
+    await loadAccountView("admin", epoch);
+  }
+
+  async function loadMoreAdminCodes(): Promise<void> {
+    const current = adminInvites();
+    if (current.kind !== "ready" || !current.value.next) {
+      return;
+    }
+    const before = current.value.next;
+    try {
+      const page = await api<AdminInvitesPage>(
+        `/api/console/admin/invites?limit=50&before=${encodeURIComponent(before)}`,
+      );
+      const latest = adminInvites();
+      if (latest.kind !== "ready") {
+        return;
+      }
+      adminInvites.set({
+        kind: "ready",
+        value: { codes: [...latest.value.codes, ...page.codes], next: page.next },
+      });
+    } catch {
+      // The table keeps what it has; retry via the view's Retry button.
+    }
+  }
+
   async function enter(r: Route, myEpoch: number): Promise<void> {
-    if (!r.app) {
+    if (isAccountView(r.view)) {
+      setTitle(r, null);
+      await loadAccountView(r.view, myEpoch);
+      if (!r.app) {
+        return;
+      }
+      // Fall through: keep the app detail (and the sidebar) live too.
+    } else if (!r.app) {
       return;
     }
     const fresh = () => epoch === myEpoch;
@@ -357,6 +466,11 @@ export function Console() {
     epoch += 1;
     if (r.app !== prev.app) {
       void enter(r, epoch);
+      return;
+    }
+    if (isAccountView(r.view)) {
+      setTitle(r, null);
+      void loadAccountView(r.view, epoch);
       return;
     }
     if (r.app) {
@@ -419,12 +533,21 @@ export function Console() {
       .then(async (data) => {
         apps.set({ kind: "ready", value: data.apps });
         try {
-          const me = await api<{ email: string }>("/api/console/me");
+          const me = await api<{ email: string; is_admin?: boolean }>("/api/console/me");
           email.set(me.email);
+          isAdmin.set(me.is_admin ?? false);
         } catch {
           email.set("");
+          isAdmin.set(false);
         }
         const r = route();
+        if (isAccountView(r.view)) {
+          // Account views never depend on the app: a missing or foreign
+          // `?app=` still shows them instead of hanging on skeletons.
+          epoch += 1;
+          await enter(r, epoch);
+          return;
+        }
         if (!r.app) {
           if (data.apps.length > 0) {
             const first = data.apps[0].slug;
@@ -461,6 +584,12 @@ export function Console() {
     window.addEventListener("popstate", () => {
       const r = readRoute();
       route.set(r);
+      if (isAccountView(r.view)) {
+        // Like boot: the account view stands alone, whatever `?app=` says.
+        epoch += 1;
+        void enter(r, epoch);
+        return;
+      }
       if (!r.app) {
         return;
       }
@@ -473,9 +602,10 @@ export function Console() {
       void enter(r, epoch);
     });
     // Noite's live feed, polling edition: refresh the visible view only.
+    // Account views never poll: invites change through this shell alone.
     window.setInterval(() => {
       const r = route();
-      if (!r.app || document.hidden) {
+      if (!r.app || isAccountView(r.view) || document.hidden) {
         return;
       }
       void loadViewData(r.app, r.view, r.range, epoch, true);
@@ -505,7 +635,8 @@ export function Console() {
     );
   }
   const list = appsPanel.value;
-  if (list.length === 0) {
+  const accountView = isAccountView(r.view);
+  if (list.length === 0 && !accountView) {
     return (
       <div class="console-empty" role="status">
         <OuterMark size={28} />
@@ -518,6 +649,31 @@ export function Console() {
       </div>
     );
   }
+  const accountPanel = accountView ? (
+    r.view === "invites" ? (
+      <InvitesView
+        panel={invites()}
+        isAdmin={isAdmin()}
+        onRetry={() => {
+          epoch += 1;
+          void loadAccountView("invites", epoch);
+        }}
+      />
+    ) : (
+      <AdminView
+        codes={adminInvites()}
+        waitlist={waitlist()}
+        isAdmin={isAdmin()}
+        onGenerate={(count, note) => generateCodes(count, note)}
+        onRevoke={(code) => revokeCode(code)}
+        onMore={() => void loadMoreAdminCodes()}
+        onRetry={() => {
+          epoch += 1;
+          void loadAccountView("admin", epoch);
+        }}
+      />
+    )
+  ) : null;
   const active =
     list.find((a) => a.slug === r.app) ??
     (detailPanel.kind === "ready" ? detailPanel.value : null);
@@ -542,7 +698,9 @@ export function Console() {
           aria-label="Outer console"
           onclick={(e: Event) => {
             e.preventDefault();
-            navigate({ app: list[0].slug, view: "overview" });
+            if (list.length > 0) {
+              navigate({ app: list[0].slug, view: "overview" });
+            }
           }}
         >
           <OuterMark />
@@ -654,6 +812,32 @@ export function Console() {
                   <button
                     type="button"
                     onclick={() => {
+                      patchUi({ accountOpen: false });
+                      navigate({ view: "invites" });
+                    }}
+                  >
+                    <TicketIcon size={16} />
+                    Invite codes
+                  </button>
+                </li>
+                {isAdmin() && (
+                  <li>
+                    <button
+                      type="button"
+                      onclick={() => {
+                        patchUi({ accountOpen: false });
+                        navigate({ view: "admin" });
+                      }}
+                    >
+                      <ShieldIcon size={16} />
+                      Admin
+                    </button>
+                  </li>
+                )}
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => {
                       void fetch("/api/console/sign-out", {
                         method: "POST",
                       }).finally(() => {
@@ -736,14 +920,15 @@ export function Console() {
                 ))}
               </div>
               <div class="main-body">
-                {detailPanel.kind === "loading" && (
+                {accountView && accountPanel}
+                {!accountView && detailPanel.kind === "loading" && (
                   <div class="flex min-w-0 flex-col gap-3" role="status" aria-label="Loading app">
                     <div class="skeleton rounded-box h-30 w-full" />
                     <div class="skeleton rounded-box h-70 w-full" />
                     <div class="skeleton rounded-box h-30 w-full" />
                   </div>
                 )}
-                {detailPanel.kind === "error" && (
+                {!accountView && detailPanel.kind === "error" && (
                   <div class="alert alert-error alert-soft" role="alert">
                     <span class="min-w-0">Couldn't load this app (unknown or not yours).</span>
                     <button
@@ -757,7 +942,7 @@ export function Console() {
                     </button>
                   </div>
                 )}
-                {detailPanel.kind === "ready" && (
+                {!accountView && detailPanel.kind === "ready" && (
                   <ViewBody
                     route={r}
                     app={detailPanel.value}
@@ -853,6 +1038,20 @@ export function Console() {
                     </span>
                   </li>
                 ))}
+                <li class="menu-title">Account</li>
+                {ACCOUNT_VIEWS.filter((v) => v.id !== "admin" || isAdmin()).map((v) => (
+                  <li key={v.id} class="min-w-0">
+                    <button
+                      type="button"
+                      class={r.view === v.id ? "menu-active min-w-0" : "min-w-0"}
+                      aria-current={r.view === v.id ? "page" : undefined}
+                      onclick={() => navigate({ view: v.id })}
+                    >
+                      <ViewIcon id={v.id} />
+                      <span class="min-w-0 flex-1 truncate">{v.label}</span>
+                    </button>
+                  </li>
+                ))}
               </ul>
               <div class="side-foot">
                 <div class="divider my-2" aria-hidden="true" />
@@ -867,6 +1066,18 @@ export function Console() {
                 </div>
               </div>
             </aside>
+          </div>
+        </div>
+      )}
+      {!active && accountView && (
+        <div class="drawer min-w-0">
+          <div class="drawer-content min-w-0">
+            <main class="main" id="console-main" tabindex={-1}>
+              <div class="main-head">
+                <h1 class="main-title">{VIEW_TITLES[r.view]}</h1>
+              </div>
+              <div class="main-body">{accountPanel}</div>
+            </main>
           </div>
         </div>
       )}
@@ -892,6 +1103,10 @@ function ViewIcon({ id }: { id: ViewId }) {
       return <SecretsIcon />;
     case "settings":
       return <SettingsIcon />;
+    case "invites":
+      return <TicketIcon />;
+    case "admin":
+      return <ShieldIcon />;
   }
 }
 

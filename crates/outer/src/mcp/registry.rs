@@ -159,7 +159,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<account::SignInInput>(
             "sign_in",
-            "Start email sign-in (clients without OAuth): emails a 6-digit code. Then call verify_code. Disappears after sign-in.",
+            "Start email sign-in (clients without OAuth): emails a 6-digit code. Then call verify_code. During the closed beta a new email also needs invite_code (OUTER-XXXX-XXXX). Disappears after sign-in.",
             Public, false,
         ),
         tool::<account::VerifyCodeInput>(

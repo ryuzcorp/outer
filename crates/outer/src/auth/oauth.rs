@@ -367,7 +367,7 @@ async fn authorize_get(
     }
     html(
         StatusCode::OK,
-        pages::email_page(&client, &id, &csrf, None),
+        pages::email_page(&client, &id, &csrf, None, false, ""),
         None,
     )
 }
@@ -434,7 +434,17 @@ async fn authorize_post(
     match step.as_str() {
         "email" => {
             let email = form.get("email").cloned().unwrap_or_default();
-            match super::send_code(&state.pool, &state.config, &email, ip.as_deref()).await {
+            let invite_code = form.get("invite_code").cloned().unwrap_or_default();
+            let invite_value = invite_code.trim().to_string();
+            match super::send_code(
+                &state.pool,
+                &state.config,
+                &email,
+                (!invite_value.is_empty()).then_some(invite_value.as_str()),
+                ip.as_deref(),
+            )
+            .await
+            {
                 Ok(_) => html(
                     StatusCode::OK,
                     pages::code_page(
@@ -451,6 +461,9 @@ async fn authorize_post(
                     } else {
                         StatusCode::BAD_REQUEST
                     };
+                    // A closed-beta refusal opens the invite field so the
+                    // user can retry with a code in one step.
+                    let invite_open = err.code == "closed_beta";
                     html(
                         status,
                         pages::email_page(
@@ -458,6 +471,8 @@ async fn authorize_post(
                             &pending.id,
                             &pending.csrf,
                             Some(pages::friendly_error(err.code)),
+                            invite_open,
+                            &invite_value,
                         ),
                         None,
                     )

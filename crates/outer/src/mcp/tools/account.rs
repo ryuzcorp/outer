@@ -22,6 +22,10 @@ pub struct DocsInput {
 pub struct SignInInput {
     /// The email address to sign in as.
     pub email: String,
+    /// Optional invite code for the closed beta (`OUTER-XXXX-XXXX`; dashes
+    /// and the prefix are optional). Only needed when the email is new and
+    /// not allowlisted: existing, allowlisted and admin emails ignore it.
+    pub invite_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -91,6 +95,7 @@ pub async fn sign_in(input: SignInInput, ctx: &Ctx<'_>) -> Result<Value, ToolErr
         &ctx.state.pool,
         &ctx.state.auth.config,
         &input.email,
+        input.invite_code.as_deref(),
         ctx.client_ip.as_deref(),
     )
     .await
