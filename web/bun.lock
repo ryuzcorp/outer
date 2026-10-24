@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "outer-docs",
+      "name": "outer-web",
       "dependencies": {
         "blume": "^2.2.4",
       },

@@ -1,9 +1,9 @@
 {
-  "name": "outer-docs",
+  "name": "outer-web",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Outer documentation site (Blume on Astro).",
+  "description": "Outer's web surface: docs and console (Blume on Astro).",
   "scripts": {
     "dev": "bun ./node_modules/blume/bin/blume.mjs dev",
     "build": "bun ./node_modules/blume/bin/blume.mjs build",
