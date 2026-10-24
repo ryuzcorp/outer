@@ -108,19 +108,16 @@ fn raw_set_session(headers: &HeaderMap) -> String {
         .expect("session cookie set")
 }
 
-fn location_query(headers: &HeaderMap) -> (StatusCode, HashMap<String, String>) {
-    let location = headers
-        .get("location")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let params = url::Url::parse(&format!("http://redirect.invalid{location}"))
+/// The client URL the Allow/Deny page navigates to (its `<meta refresh>`).
+fn return_query(body: &str) -> HashMap<String, String> {
+    let start = body.find("0;url=").expect("refresh target") + "0;url=".len();
+    let end = start + body[start..].find('"').expect("closing quote");
+    let target = body[start..end].replace("&amp;", "&");
+    url::Url::parse(&target)
         .unwrap()
         .query_pairs()
         .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
-    (StatusCode::FOUND, params)
+        .collect()
 }
 
 fn app_with(state: &AuthState) -> Router {
@@ -316,9 +313,9 @@ async fn allow(
         ]),
     );
     req.headers_mut().insert("cookie", session.parse().unwrap());
-    let (status, headers, _) = send(&flow.app, req).await;
-    assert_eq!(status, StatusCode::FOUND);
-    let (_, params) = location_query(&headers);
+    let (status, _, body) = send(&flow.app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let params = return_query(&body);
     assert_eq!(params.get("state").map(String::as_str), Some("xyz-state"));
     assert_eq!(params.get("iss").map(String::as_str), Some(ISSUER));
     assert!(params.contains_key("code"));
@@ -450,9 +447,9 @@ async fn full_authorize_flow_mints_a_working_token() {
         ]),
     );
     req.headers_mut().insert("cookie", session.parse().unwrap());
-    let (status, headers, _) = send(&flow.app, req).await;
-    assert_eq!(status, StatusCode::FOUND);
-    let (_, params) = location_query(&headers);
+    let (status, _, body) = send(&flow.app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let params = return_query(&body);
     assert_eq!(
         params.get("error").map(String::as_str),
         Some("access_denied")

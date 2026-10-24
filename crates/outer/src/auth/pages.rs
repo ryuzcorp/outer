@@ -150,6 +150,33 @@ pub fn consent_page(client: &ClientDoc, scope: &str, request_id: &str, csrf: &st
     )
 }
 
+/// After Allow/Deny: hand the browser back to the client with a page that
+/// navigates by itself (`<meta refresh>`) instead of a 302 answer to the form
+/// POST. Browsers apply CSP `form-action` to every hop of a form
+/// submission's redirect chain, and some clients bounce through more than one
+/// origin before landing (Gemini: oauth-redirect.googleusercontent.com, then
+/// Google's own pages), so a 302 gets the user stuck on the consent page. A
+/// refresh is a fresh navigation that `form-action` doesn't govern. The link
+/// is the fallback when refresh is disabled.
+pub fn return_page(url: &str, host: &str) -> Markup {
+    html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                meta http-equiv="refresh" content=(format!("0;url={url}"));
+                title { "Returning · Outer" }
+            }
+            body style="font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem;line-height:1.5;" {
+                h1 style="font-size:1.25rem;" { "Outer" }
+                p { "Returning to " strong { (host) } "…" }
+                p { a href=(url) { "Continue to " (host) } }
+            }
+        }
+    }
+}
+
 pub fn error_page(title: &str, message: &str) -> Markup {
     layout(
         title,
