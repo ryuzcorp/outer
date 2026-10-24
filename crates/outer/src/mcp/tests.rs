@@ -1828,6 +1828,25 @@ async fn agent_action_foreign_app_writes_nothing_and_failures_log_error() {
     let (_, shape) = call(&state, Some(&ana), "commit", json!({})).await;
     assert_eq!(shape["error"]["code"], -32602);
     assert_eq!(action_rows(&state, "groceries").await.len(), 2);
+
+    // A refused call's arguments were never length-checked: the stored
+    // summary is still bounded.
+    let huge = "p".repeat(100_000);
+    let (_, long) = call(
+        &state,
+        Some(&ana),
+        "read_file",
+        json!({"app": "groceries", "path": huge}),
+    )
+    .await;
+    assert_eq!(is_error(&long)["error"], "invalid_argument");
+    let rows = action_rows(&state, "groceries").await;
+    assert_eq!(rows[0].tool, "read_file");
+    assert!(
+        rows[0].summary.chars().count() <= 2003,
+        "{}",
+        rows[0].summary.len()
+    );
 }
 
 #[tokio::test]

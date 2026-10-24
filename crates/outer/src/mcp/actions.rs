@@ -59,6 +59,9 @@ const LOGGED_TOOLS: &[&str] = &[
 ];
 
 /// Truncate to `n` chars on a char boundary, marking the cut.
+/// Ceiling on one stored summary, in chars.
+const MAX_SUMMARY_CHARS: usize = 2000;
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
@@ -279,7 +282,10 @@ pub async fn record(
         return;
     }
     // Recompute: `summary_for` returned Some above, so this is Some too.
-    let Some(summary) = summary_for(tool, args) else {
+    // Field values are bounded by the tools on success, but a refused call
+    // is logged too and its arguments were never length-checked: one final
+    // cap keeps a single row small whatever the caller sent.
+    let Some(summary) = summary_for(tool, args).map(|s| truncate(&s, MAX_SUMMARY_CHARS)) else {
         return;
     };
     let (outcome, error_code) = outcome_of(result);
@@ -315,18 +321,24 @@ pub async fn record(
 pub async fn prune(pool: &SqlitePool, now: i64) -> anyhow::Result<u64> {
     let free_cutoff = now - FREE_RETENTION_MS;
     let pro_cutoff = now - PRO_RETENTION_MS;
-    let result = sqlx::query(
-        "DELETE FROM agent_action WHERE created_at < ( \
-           SELECT CASE WHEN COALESCE( \
-             (SELECT plan FROM account WHERE id = \
-               (SELECT owner_id FROM app WHERE id = agent_action.app_id)), 'free') = 'pro' \
-           THEN ?1 ELSE ?2 END)",
+    // Set-based, on the `created_at` index: Pro apps keep 30 d, the rest 7 d.
+    let pro = sqlx::query(
+        "DELETE FROM agent_action WHERE created_at < ?1 AND app_id IN \
+           (SELECT app.id FROM app JOIN account ON account.id = app.owner_id \
+            WHERE account.plan = 'pro')",
     )
     .bind(pro_cutoff)
+    .execute(pool)
+    .await?;
+    let rest = sqlx::query(
+        "DELETE FROM agent_action WHERE created_at < ?1 AND app_id NOT IN \
+           (SELECT app.id FROM app JOIN account ON account.id = app.owner_id \
+            WHERE account.plan = 'pro')",
+    )
     .bind(free_cutoff)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    Ok(pro.rows_affected() + rest.rows_affected())
 }
 
 /// One console action-log row, newest first, with the caller label resolved:
@@ -366,7 +378,9 @@ fn client_label(
     }
 }
 
-/// The app's action log, newest first. `before` is the `(created_at, id)`
+/// The app's action log, newest first. The caller must have checked that the
+/// signed-in account may see `app_id` (e.g. the console's `owned_app`): this
+/// filters by app only. `before` is the `(created_at, id)`
 /// cursor of the last row on the previous page; `limit` is clamped to
 /// 1–100.
 pub async fn list(
