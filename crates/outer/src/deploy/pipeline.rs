@@ -305,6 +305,19 @@ fn atomic_replace_no_follow(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Res
                 path.display(),
                 std::io::Error::last_os_error()
             )));
+        } // Keep the original's owner: `celld deploy` runs as the app uid and
+          // must still read the file, while Outer (root in production) created
+          // the temp. `fchown` on the fd, never through the path.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            use std::os::unix::fs::MetadataExt;
+            let rc = unsafe { libc::fchown(tmp_file.as_raw_fd(), meta.uid(), meta.gid()) };
+            if rc != 0 {
+                return Err(failed(anyhow::anyhow!(
+                    "cannot set owner on replacement for {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
         }
     }
     // `rename` swaps atomically and never follows the final component:
@@ -3959,6 +3972,24 @@ exit 0
     }
 
     #[cfg(unix)]
+    /// `celld deploy` runs as the app uid: the replaced config must keep the
+    /// original's owner, or the upload can't read it (found live: EACCES on
+    /// a root-owned 0600 `dist/wrangler.json`). Needs root to chown.
+    #[test]
+    #[ignore = "privileged: needs root to own a file as another uid"]
+    fn atomic_replace_keeps_the_original_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrangler.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::chown(c.as_ptr(), 12345, 12345) }, 0);
+        atomic_replace_no_follow(&path, br#"{"vars":{}}"#, 0o600).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (12345, 12345));
+        assert_eq!(meta.mode() & 0o777, 0o600);
+    }
+
     #[tokio::test]
     async fn inject_refuses_symlinked_config_and_leaves_target_untouched() {
         let (_data, deployer, pool, app, config, _original) =
