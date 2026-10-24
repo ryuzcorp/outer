@@ -3,14 +3,19 @@
 //! `Deployer::deploy` materializes `sha` from the bare mirror into
 //! `{data}/work/{slug}`, runs `bun install` (skipped when the lockfile hash
 //! is unchanged) and `bun run build`, validates the wrangler config at the
-//! deploy root, and runs `celld deploy`. Steps 2, 3 and 5 run sandboxed as the
-//! app's uid through `run_sandboxed`; the worktree and deploy-root steps run
-//! as outer (they only touch git metadata and read files).
+//! deploy root, applies pending D1 migrations and uploads with
+//! `celld deploy`, and reloads the fleet. Install, build, deploy and
+//! migrate run sandboxed as the app's uid through `run_sandboxed`; the
+//! worktree and deploy-root steps run as outer (they only touch git
+//! metadata and read files).
 //!
 //! Concurrency: a global semaphore bounds simultaneous builds and a per-app
 //! mutex serializes deploys of the same app. The `deploy` row is inserted as
-//! `queued` before either is waited on, then moved to `building` once both
-//! are held, and to `deploying` before `celld deploy` runs.
+//! are held, and to `deploying` before the migrate/upload steps run. The
+//! migrate step runs under the same `deploying` status, before the upload
+//! for an existing app and after it for a first deploy: a blocked deploy
+//! (gate) never touches app data, and a failed migration leaves the
+//! previous version serving.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +29,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 use crate::apps::{self, App};
 use crate::cron;
+use crate::deploy::migrate;
 use crate::fleet::cgroups;
 use crate::fleet::manager::FleetStorage;
 use crate::fleet::sandbox::{self, Sandbox};
@@ -32,7 +38,7 @@ use crate::moderation::gate;
 use crate::moderation::jev::JevClient;
 
 /// What the pipeline needs: dirs, tool paths, storage creds, timeouts.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeploySettings {
     /// Worktrees at `{data}/work/{slug}`, caches at `{data}/cache/{slug}`.
     pub data_dir: PathBuf,
@@ -57,6 +63,12 @@ pub struct DeploySettings {
     /// Off localhost the config refuses to boot without the pair, so the
     /// gate always classifies there.
     pub jev: Option<JevClient>,
+    /// Wakes a sleeping fleet before the migrate step applies D1 migrations:
+    /// `celld d1` reaches the database through a running node. `Some` in
+    /// `serve` (the fleet manager lives there); `None` in the operator CLI
+    /// and in tests with a fake `celld`, where no fleet can be woken and the
+    /// apply fails loudly when no fleet serves the app.
+    pub wake: Option<crate::fleet::manager::FleetManager>,
 }
 
 /// One pipeline step's timing for the `deploy` row's `steps` JSON.
@@ -94,7 +106,16 @@ pub struct DeployOutcome {
     pub reloaded: bool,
 }
 
-/// Builds apps: the global semaphore plus per-app locks live here.
+/// What the deploy-root step selected: the directory celld deploys and
+/// reads migrations from, plus the exact wrangler file that won discovery
+/// (`dist/wrangler.json`, else `wrangler.jsonc`, else `wrangler.json`).
+/// The migrate step takes this instead of re-deciding, so upload and D1
+/// detection always read the same config.
+#[derive(Debug)]
+pub struct DeployRoot {
+    pub root: PathBuf,
+    pub config: PathBuf,
+}
 pub struct Deployer {
     settings: DeploySettings,
     semaphore: Arc<Semaphore>,
@@ -382,7 +403,9 @@ impl Deployer {
     /// Rows run in order; the first failure stops the pipeline. `Ok` carries
     /// the celld version and the validated cron schedules on success. The
     /// review runs before `deploy-root`, and before migrations, so a blocked
-    /// deploy never touches the app's data or uploads anything.
+    /// deploy never touches the app's data or uploads anything. Migrations
+    /// always run before the upload (first deploy or not), so no fleet can
+    /// ever serve new code against an unmigrated schema.
     async fn run_steps(
         &self,
         pool: &SqlitePool,
@@ -480,10 +503,10 @@ impl Deployer {
 
         // 5. Deploy root.
         let started = Instant::now();
-        let (root, crons) = match self.deploy_root(app) {
-            Ok((root, crons, out)) => {
+        let (deploy_root, crons) = match self.deploy_root(app) {
+            Ok((deploy_root, crons, out)) => {
                 push_step(steps, log, "deploy-root", started, false, &out);
-                (root, crons)
+                (deploy_root, crons)
             }
             Err(e) => {
                 push_step(steps, log, "deploy-root", started, false, &format!("{e:#}"));
@@ -491,19 +514,74 @@ impl Deployer {
             }
         };
 
-        // 6. `celld deploy`.
+        // 6+7. D1 migrations, then the `celld deploy` upload — for every
+        // deploy, first or not. celld offers no staged or invisible upload:
+        // the upload publishes `deploy/current.json` and every fleet (awake
+        // or newly woken by traffic) adopts it on its own poll, so anything
+        // uploaded is servable within one poll interval. Migrating first is
+        // the only gate celld allows: when the new pointer becomes visible
+        // the schema is already ready, and a migrate failure uploads
+        // nothing, so a first deploy can never serve new code against an
+        // unmigrated schema. The old code keeps serving during the
+        // migration (expand-first for destructive changes).
         set_status_blocking(pool, deploy_id)
             .await
             .map_err(StepEnd::Failed)?;
+        self.migrate_step(pool, app, deploy_id, &deploy_root, journal)
+            .await?;
+        let version = self
+            .deploy_step(app, deploy_id, &deploy_root.root, journal)
+            .await?;
+        Ok((version, crons))
+    }
+
+    /// The `celld deploy <root> ... --json` upload step; returns the version.
+    /// The upload publishes `deploy/current.json`, which every fleet adopts
+    /// on its own poll — so it always runs AFTER the migrate step, and a
+    /// migrate failure uploads nothing at all.
+    async fn deploy_step(
+        &self,
+        app: &App,
+        deploy_id: &str,
+        root: &Path,
+        journal: &mut Journal,
+    ) -> Result<Option<String>, StepEnd> {
+        let Journal { steps, log } = journal;
         let started = Instant::now();
-        match self.celld_deploy(app, deploy_id, &root).await {
+        match self.celld_deploy(app, deploy_id, root).await {
             Ok((out, version)) => {
                 push_step(steps, log, "deploy", started, false, &out);
-                Ok((version, crons))
+                Ok(version)
             }
             Err(e) => {
                 push_step(steps, log, "deploy", started, false, &format!("{e:#}"));
                 Err(StepEnd::Failed(StepFailed::sandboxed("deploy", &e)))
+            }
+        }
+    }
+
+    /// The D1 migrations step: pending `NNNN_*.sql` files for the built
+    /// config's `d1_databases`, applied with the app's scoped credentials
+    /// before the upload makes them visible to any fleet. No files (or no
+    /// D1) skips the step without waking a sleeping fleet.
+    async fn migrate_step(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        deploy_id: &str,
+        deploy_root: &DeployRoot,
+        journal: &mut Journal,
+    ) -> Result<(), StepEnd> {
+        let Journal { steps, log } = journal;
+        let started = Instant::now();
+        match self.migrate(pool, app, deploy_id, deploy_root).await {
+            Ok((skipped, out)) => {
+                push_step(steps, log, "migrate", started, skipped, &out);
+                Ok(())
+            }
+            Err(e) => {
+                push_step(steps, log, "migrate", started, false, &e.error);
+                Err(StepEnd::Failed(e))
             }
         }
     }
@@ -665,10 +743,12 @@ impl Deployer {
     }
 
     /// Step 4: find and validate the wrangler config. Returns the deploy
-    /// root and the validated `triggers.crons` schedules. An invalid cron
-    /// expression fails the step, naming the expression, before anything
-    /// goes live.
-    fn deploy_root(&self, app: &App) -> anyhow::Result<(PathBuf, Vec<String>, String)> {
+    /// root, the exact config file selected, and the validated
+    /// `triggers.crons` schedules. An invalid cron expression fails the
+    /// step, naming the expression, before anything goes live. The migrate
+    /// step reads this same file (never re-decides), so D1 detection and
+    /// the upload can never disagree about which config won.
+    fn deploy_root(&self, app: &App) -> anyhow::Result<(DeployRoot, Vec<String>, String)> {
         let work = self.work_dir(&app.slug);
         let config = find_deploy_config(&work).ok_or_else(|| {
             anyhow::anyhow!(
@@ -676,26 +756,18 @@ impl Deployer {
                 work.display()
             )
         })?;
-        let raw = std::fs::read_to_string(&config)?;
-        let parsed: serde_json::Value = if config.extension().is_some_and(|e| e == "jsonc") {
-            serde_json::from_str(&strip_jsonc_comments(&raw))?
-        } else {
-            serde_json::from_str(&raw)?
-        };
+        let parsed = read_config_file(&config)?;
         validate_config_keys(&parsed)?;
         let crons = cron::crons_from_config(&parsed)?;
         let root = config
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| work.clone());
-        Ok((
-            root.clone(),
-            crons,
-            format!("deploy root {}\n", root.display()),
-        ))
+        let out = format!("deploy root {}\n", root.display());
+        Ok((DeployRoot { root, config }, crons, out))
     }
 
-    /// Step 5: `celld deploy <root> ... --json`; returns (output, version).
+    /// The `celld deploy <root> ... --json` upload; returns (output, version).
     /// Bucket credentials come from the per-prefix cache when fresh (minted
     /// on a miss), so the step env never carries the parent keys.
     async fn celld_deploy(
@@ -761,6 +833,237 @@ impl Deployer {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         Ok((out, version))
+    }
+    /// Apply pending D1 migrations, then record what was applied.
+    /// Returns `(skipped, journal)`: skipped when the built config declares
+    /// no D1 databases or the repo holds no migration files, in which case a
+    /// sleeping fleet is never woken. Otherwise the fleet is woken first
+    /// (`celld d1` reaches the database through a running node), pending
+    /// files apply in numeric-prefix order under the app's scoped
+    /// credentials, and every file present is recorded in `d1_migration` so
+    /// a later edit of an applied file fails the deploy instead of drifting.
+    /// A failure names the migration file when celld's output identifies it
+    /// and carries an agent-facing line; the fleet is never reloaded, so the
+    /// previous version keeps serving.
+    async fn migrate(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        deploy_id: &str,
+        deploy_root: &DeployRoot,
+    ) -> Result<(bool, String), StepFailed> {
+        let root = &deploy_root.root;
+        let work = self.work_dir(&app.slug);
+        // The exact file deploy-root selected: never re-decide, so D1
+        // detection and the upload read the same config.
+        let parsed =
+            read_config_file(&deploy_root.config).map_err(|e| StepFailed::plain("migrate", &e))?;
+        let databases =
+            migrate::d1_databases(&parsed).map_err(|e| StepFailed::plain("migrate", &e))?;
+        if databases.is_empty() {
+            return Ok((
+                true,
+                "migrate: no d1_databases declared; skipping migrations".to_string(),
+            ));
+        }
+        // Stage each distinct migrations dir once; several databases may
+        // share one directory, and each of them gets the staged files.
+        let mut by_dir: Vec<(String, Vec<migrate::MigrationFile>)> = Vec::new();
+        for db in &databases {
+            let dir = migrate::migrations_dir_name(db).to_string();
+            if !by_dir.iter().any(|(seen, _)| *seen == dir) {
+                let files = migrate::stage_migrations(root, &work, &dir)
+                    .map_err(|e| StepFailed::plain("migrate", &e))?
+                    .unwrap_or_default();
+                by_dir.push((dir, files));
+            }
+        }
+        let mut staged: Vec<(migrate::D1Database, Vec<migrate::MigrationFile>)> = Vec::new();
+        for db in databases {
+            let dir = migrate::migrations_dir_name(&db);
+            let files = by_dir
+                .iter()
+                .find(|(seen, _)| seen == dir)
+                .map(|(_, files)| files.clone())
+                .unwrap_or_default();
+            staged.push((db, files));
+        }
+        if staged.iter().all(|(_, files)| files.is_empty()) {
+            return Ok((
+                true,
+                "migrate: no migration files; skipping migrations".to_string(),
+            ));
+        }
+        // An applied file edited afterwards is a new migration pretending to
+        // be an old one: fail naming it instead of letting celld silently
+        // skip it (celld tracks names only) and drifting from the database.
+        // Files with no recorded hash are pending; when every file is
+        // already recorded there is nothing for celld to do, and no reason
+        // to wake a sleeping fleet.
+        let mut any_pending = false;
+        for (db, files) in &staged {
+            for file in files {
+                let recorded =
+                    migrate::applied_sha(pool, &app.id, db.effective_identity(), &file.name)
+                        .await
+                        .map_err(|e| StepFailed::plain("migrate", &e))?;
+                match recorded {
+                    Some(sha) if sha != file.sha256 => {
+                        let error = format!(
+                            "migration {} for database {} was edited after it was applied; \
+                             write a new migration instead",
+                            file.name, db.database_name
+                        );
+                        let user_message = format!(
+                            "Outer couldn't publish this change because migration {} was edited \
+                             after it was already applied to database {}. Your app still shows \
+                             the previous version. Write a new migration file instead of editing \
+                             an applied one.",
+                            file.name, db.database_name
+                        );
+                        return Err(StepFailed::migration(error, user_message));
+                    }
+                    Some(_) => {}
+                    None => any_pending = true,
+                }
+            }
+        }
+        if !any_pending {
+            let total: usize = staged.iter().map(|(_, files)| files.len()).sum();
+            return Ok((
+                true,
+                format!("migrate: {total} migration files, all already applied"),
+            ));
+        }
+        if let Some(wake) = &self.settings.wake {
+            wake.ensure_awake(pool, app)
+                .await
+                .map_err(|e| StepFailed::plain("migrate", &e))?;
+        }
+        let mut journal = String::new();
+        for (db, files) in &staged {
+            if files.is_empty() {
+                continue;
+            }
+            let out = self
+                .celld_migrate(app, deploy_id, root, &db.database_name)
+                .await
+                .map_err(|e| {
+                    let text = format!("{e:#}");
+                    let failed = migrate::failing_file(&text);
+                    let error = match &failed {
+                        Some(name) => format!(
+                            "migration {name} for database {} failed: {}",
+                            db.database_name,
+                            error_detail(&text, Some(name))
+                        ),
+                        None => format!(
+                            "migrations for database {} failed: {}",
+                            db.database_name,
+                            first_output_line(&text)
+                        ),
+                    };
+                    let user_message = match &failed {
+                        Some(name) => format!(
+                            "Outer couldn't publish this change because migration {name} failed \
+                             to apply to database {}: {}. Your app still shows the previous version.",
+                            db.database_name,
+                            error_detail(&text, Some(name))
+                        ),
+                        None => format!(
+                            "Outer couldn't publish this change because the database migrations \
+                             failed to apply: {}. Your app still shows the previous version.",
+                            first_output_line(&text)
+                        ),
+                    };
+                    StepFailed::migration(error, user_message)
+                })?;
+            journal.push_str(&out);
+            if !out.ends_with('\n') {
+                journal.push('\n');
+            }
+            migrate::record_applied(
+                pool,
+                &app.id,
+                &db.database_name,
+                db.effective_identity(),
+                files,
+                apps::now_ms(),
+            )
+            .await
+            .map_err(|e| StepFailed::plain("migrate", &e))?;
+        }
+        Ok((
+            false,
+            format!("migrate: applied pending migrations\n{journal}"),
+        ))
+    }
+
+    /// One `celld d1 migrations apply` under the app's scoped storage
+    /// credentials (the same grant shape `celld deploy` uses: celld reads
+    /// the fleet's shared secret from the bucket, so it needs the prefix
+    /// grant, never the parent keys).
+    /// No `--` before the positionals on purpose: celld 0.6.2's leaf parsers
+    /// honor neither `--help` nor `--` (`migrations list -- foo` still
+    /// reports "needs a database name"), so a `--` would break the call
+    /// instead of protecting it. Option injection is closed one layer up:
+    /// `migrate::d1_databases` only accepts names that cannot parse as flags
+    /// (and argv never passes through a shell).
+    async fn celld_migrate(
+        &self,
+        app: &App,
+        deploy_id: &str,
+        root: &Path,
+        database_name: &str,
+    ) -> anyhow::Result<String> {
+        let prefix = FleetStorage::fleet_prefix(&app.slug);
+        let creds = self
+            .settings
+            .storage
+            .credentials
+            .for_prefix(&prefix)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "minting scoped R2 credentials for migrations of {}: {err:#}",
+                    app.slug
+                )
+            })?;
+        let bucket = self.settings.storage.bucket_url(&app.slug);
+        let endpoint = self.settings.storage.endpoint.clone();
+        let region = self.settings.storage.region.clone();
+        let mut env = vec![
+            ("AWS_ACCESS_KEY_ID".to_string(), creds.access_key_id),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), creds.secret_access_key),
+            ("AWS_REGION".to_string(), region.clone()),
+            ("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string()),
+            ("S3_ENDPOINT".to_string(), endpoint.clone()),
+        ];
+        if let Some(token) = &creds.session_token {
+            env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
+        }
+        let args = vec![
+            "d1".to_string(),
+            "migrations".to_string(),
+            "apply".to_string(),
+            database_name.to_string(),
+            root.to_string_lossy().into_owned(),
+            "--bucket".to_string(),
+            bucket,
+            "--endpoint".to_string(),
+            endpoint,
+            "--region".to_string(),
+            region,
+        ];
+        self.run_sandboxed_step(
+            app,
+            deploy_id,
+            "migrate",
+            &self.settings.celld_bin,
+            &args,
+            env,
+        )
+        .await
     }
 
     /// Run one sandboxed step: the binaries come resolved from the config
@@ -937,7 +1240,8 @@ struct BlockedInfo {
 }
 
 /// A step that failed: its name, the first meaningful output line, and an
-/// optional agent-facing line (only the gate sets one, for `review_unavailable`).
+/// optional agent-facing line (the gate sets one for `review_unavailable`,
+/// migrate for file-specific failures).
 struct StepFailed {
     step: &'static str,
     error: String,
@@ -983,6 +1287,17 @@ impl StepFailed {
         Self {
             step,
             error: "review_unavailable".to_string(),
+            user_message: Some(user_message),
+        }
+    }
+
+    /// For a failed migration: names the file when identifiable, with an
+    /// agent-facing line. The fleet is never reloaded, so the previous
+    /// version keeps serving either way.
+    fn migration(error: String, user_message: String) -> Self {
+        Self {
+            step: "migrate",
+            error: cap_error(&error),
             user_message: Some(user_message),
         }
     }
@@ -1065,6 +1380,44 @@ fn find_deploy_config(work: &Path) -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|candidate| candidate.is_file())
+}
+/// Parse one wrangler file (JSON, or JSONC with comments stripped).
+fn read_config_file(config: &Path) -> anyhow::Result<serde_json::Value> {
+    let raw = std::fs::read_to_string(config)?;
+    Ok(if config.extension().is_some_and(|e| e == "jsonc") {
+        serde_json::from_str(&strip_jsonc_comments(&raw))?
+    } else {
+        serde_json::from_str(&raw)?
+    })
+}
+
+/// The first meaningful output line: the sandboxed runner prepends a
+/// `prog [args] exit ..` header, which names no migration file.
+fn first_output_line(text: &str) -> &str {
+    text.lines()
+        .skip(1)
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_else(|| {
+            text.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+        })
+}
+
+/// The output line naming the failed migration, when one does; otherwise the
+/// first meaningful line. celld prints progress lines for applied files
+/// before the error, so the first line would name the wrong file.
+fn error_detail<'a>(text: &'a str, failed: Option<&str>) -> &'a str {
+    let Some(name) = failed else {
+        return first_output_line(text);
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find(|l| l.contains(name))
+        .unwrap_or_else(|| first_output_line(text))
 }
 
 /// Step timings and the combined output, filled in as the pipeline runs.
@@ -1708,7 +2061,7 @@ fn remove_renamed_tmp(
     anyhow::bail!("removing {}", cache_root.join("tmp").display())
 }
 
-/// Mark the deploy `deploying` before `celld deploy` runs. A separate
+/// Mark the deploy `deploying` before the migrate/upload steps run. A separate
 /// function so the `?` maps to a bookkeeping error, not a step failure.
 async fn set_status_blocking(pool: &SqlitePool, deploy_id: &str) -> Result<(), StepFailed> {
     set_deploy_status(pool, deploy_id, "deploying")
@@ -2017,6 +2370,7 @@ mod tests {
             apps_domain: "outer.localhost".to_string(),
             cache_purge: None,
             jev: None,
+            wake: None,
         }
     }
 
@@ -2608,6 +2962,1046 @@ mod tests {
         assert_eq!(checks, 0, "nothing is recorded");
     }
 
+    /// A fake `celld` for migrate tests: answers `deploy` with JSON and
+    /// simulates `d1 migrations apply` by walking `<root>/migrations`
+    /// in order. A `<root>/.fake-fail` file names the migration that must
+    /// fail, like a syntax error would. Bucket-shaped state never leaves the
+    /// test: the fake treats `--bucket s3://<dir>/fleets/<slug>` as a state
+    /// dir (`<dir>` is a tempdir), recording calls and env there, so counts
+    /// survive the worktree wipe between deploys.
+    fn install_fake_celld(state: &Path) -> PathBuf {
+        let script = state.join("fake-celld");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state_of_bucket() {
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--bucket" ]; then printf '%s' "$a"; return 0; fi
+    prev="$a"
+  done
+}
+if [ "$1" = "deploy" ]; then
+  bucket=$(state_of_bucket "$@")
+  statedir=$(printf '%s' "$bucket" | sed -e 's|^s3://||' -e 's|/fleets/.*||')
+  mkdir -p "$statedir"
+  printf '%s\n' "$*" >> "$statedir/calls.log"
+  printf '{"version":"fake-v1"}\n'
+  exit 0
+fi
+bucket=$(state_of_bucket "$@")
+statedir=$(printf '%s' "$bucket" | sed -e 's|^s3://||' -e 's|/fleets/.*||')
+mkdir -p "$statedir"
+printf '%s\n' "$*" >> "$statedir/calls.log"
+env | grep '^AWS_' | sort >> "$statedir/env.log"
+root="$5"
+failpat=""
+if [ -f "$root/.fake-fail" ]; then failpat=$(cat "$root/.fake-fail"); fi
+for f in "$root"/migrations/*.sql; do
+  [ -e "$f" ] || continue
+  name=$(basename "$f")
+  if [ -n "$failpat" ] && [ "$name" = "$failpat" ]; then
+    echo "error applying $name: near \"oops\": syntax error" >&2
+    exit 1
+  fi
+  echo "applied $name"
+done
+exit 0
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+
+    fn migrate_settings(data: &tempfile::TempDir, state: &Path, script: &Path) -> DeploySettings {
+        let mut settings = test_settings(data.path().to_path_buf());
+        settings.celld_bin = script.to_string_lossy().into_owned();
+        settings.bun_bin = "/bin/true".to_string();
+        // The fake reads its state dir back out of the bucket URL.
+        settings.storage.bucket = state.to_string_lossy().into_owned();
+        settings
+    }
+
+    fn apply_calls(state: &Path) -> usize {
+        let log = state.join("calls.log");
+        if !log.is_file() {
+            return 0;
+        }
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("d1 migrations apply"))
+            .count()
+    }
+
+    /// How many `celld deploy` uploads the fake saw.
+    fn upload_calls(state: &Path) -> usize {
+        let log = state.join("calls.log");
+        if !log.is_file() {
+            return 0;
+        }
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("deploy "))
+            .count()
+    }
+
+    /// The fake-celld subcommand sequence: `deploy` for an upload,
+    /// `apply` for a `d1 migrations apply`. The fake logs one line per
+    /// invocation in order, so this pins migrate-vs-upload ordering.
+    fn call_kinds(state: &Path) -> Vec<&'static str> {
+        let log = state.join("calls.log");
+        if !log.is_file() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.starts_with("deploy ") {
+                    "deploy"
+                } else if l.contains("d1 migrations apply") {
+                    "apply"
+                } else {
+                    "other"
+                }
+            })
+            .collect()
+    }
+
+    async fn insert_test_app(pool: &SqlitePool, app: &App) {
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A commit carrying a valid deploy root, a clean page, and the given
+    /// extra files (migration files, sentinels). An extra file at a default
+    /// path replaces the default, so tests can commit a profane page.
+    async fn commit_tree(
+        cfg: &GitConfig,
+        store: &Store,
+        sync: &GitSync,
+        slug: &str,
+        extra: Vec<FileWrite>,
+    ) -> String {
+        let paths: Vec<&str> = extra.iter().map(|w| w.path.as_str()).collect();
+        let mut writes: Vec<FileWrite> = [
+            (
+                "dist/wrangler.json",
+                r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","d1_databases":[{"binding":"DB","database_name":"app-db"}]}"#,
+            ),
+            (
+                "pages/index.tsx",
+                "export default () => <h1>grocery list</h1>;",
+            ),
+        ]
+        .into_iter()
+        .filter(|(path, _)| !paths.contains(path))
+        .map(|(path, content)| write(path, content))
+        .collect();
+        writes.extend(extra);
+        commit::commit(
+            store,
+            cfg,
+            sync,
+            slug,
+            CommitRequest {
+                message: "migrate test".to_string(),
+                base: None,
+                writes,
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migrate_applies_pending_in_order_and_records_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![
+                write(
+                    "db/migrations/0001_init.sql",
+                    "CREATE TABLE item (id INTEGER);",
+                ),
+                write(
+                    "db/migrations/0002_add_owner.sql",
+                    "ALTER TABLE item ADD COLUMN owner TEXT;",
+                ),
+            ],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10101);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "migrate",
+                "deploy"
+            ]
+        );
+        assert!(
+            !outcome.steps.last().unwrap().skipped,
+            "pending files run the step"
+        );
+        assert!(
+            outcome.log_tail.contains("applied 0001_init.sql")
+                && outcome.log_tail.contains("applied 0002_add_owner.sql"),
+            "the celld output is journaled: {}",
+            outcome.log_tail
+        );
+
+        // Staged into the deploy root, in order, and recorded per file.
+        let root = deployer.work_dir(&app.slug).join("dist");
+        assert!(root.join("migrations").join("0001_init.sql").is_file());
+        assert!(root.join("migrations").join("0002_add_owner.sql").is_file());
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, sha256 FROM d1_migration WHERE app_id = ?1 ORDER BY name")
+                .bind(&app.id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "0001_init.sql");
+        assert_eq!(rows[1].0, "0002_add_owner.sql");
+        assert_ne!(rows[0].1, rows[1].1, "distinct content hashes");
+
+        // The apply ran once, against this app's database and prefix grant.
+        // Even a first deploy migrates before the upload makes the pointer
+        // visible, so no fleet can serve the new code unmigrated.
+        assert_eq!(apply_calls(state.path()), 1);
+        assert_eq!(call_kinds(state.path()), ["apply", "deploy"]);
+        let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
+        assert!(
+            calls.contains("d1 migrations apply app-db"),
+            "the database name travels: {calls}"
+        );
+        assert!(
+            calls.contains(&format!("fleets/{}", app.slug)),
+            "the scoped prefix grant travels: {calls}"
+        );
+        let env = std::fs::read_to_string(state.path().join("env.log")).unwrap();
+        assert!(
+            env.contains("AWS_ACCESS_KEY_ID=outeraccess"),
+            "the scoped key travels, never the parent: {env}"
+        );
+
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha.as_str()));
+    }
+
+    #[tokio::test]
+    async fn migrate_runs_before_upload_for_existing_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![write(
+                "db/migrations/0001_init.sql",
+                "CREATE TABLE item (id INTEGER);",
+            )],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10110);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+
+        // A second tree with one pending migration: the app has a live
+        // version now, so the migrate step must run before the upload — an
+        // awake fleet must never serve new code against the old schema.
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "second migration".to_string(),
+                base: Some(sha_a.clone()),
+                writes: vec![write(
+                    "db/migrations/0002_add_owner.sql",
+                    "ALTER TABLE item ADD COLUMN owner TEXT;",
+                )],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "migrate",
+                "deploy"
+            ]
+        );
+        let kinds = call_kinds(state.path());
+        assert_eq!(
+            kinds,
+            ["apply", "deploy", "apply", "deploy"],
+            "every deploy migrates before its upload"
+        );
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha_b.as_str()));
+    }
+
+    #[tokio::test]
+    async fn migrate_failure_skips_upload_for_existing_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![write(
+                "db/migrations/0001_init.sql",
+                "CREATE TABLE item (id INTEGER);",
+            )],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10111);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+        assert_eq!(upload_calls(state.path()), 1);
+
+        // A pending migration that fails: the live deploy must fail before
+        // any upload, so the previous version keeps serving with certainty.
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "bad migration".to_string(),
+                base: Some(sha_a.clone()),
+                writes: vec![
+                    write("db/migrations/0002_bad.sql", "CREATE TABLE oops (;"),
+                    write("dist/.fake-fail", "0002_bad.sql"),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("migrate"));
+        assert_eq!(
+            upload_calls(state.path()),
+            1,
+            "the failed migrate uploads nothing"
+        );
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "migrate"
+            ],
+            "the deploy step is never reached"
+        );
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            last_sha.as_deref(),
+            Some(sha_a.as_str()),
+            "a failed migrate never touches last_deploy_sha"
+        );
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM d1_migration")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "a failed apply records nothing new");
+    }
+
+    #[tokio::test]
+    async fn migrate_skips_when_everything_is_already_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![write(
+                "db/migrations/0001_init.sql",
+                "CREATE TABLE item (id INTEGER);",
+            )],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10102);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+        assert_eq!(apply_calls(state.path()), 1);
+
+        // Same tree again: nothing pending, no second apply, no wake.
+        let second = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(second.status, "success", "error: {:?}", second.error);
+        let migrate = second
+            .steps
+            .iter()
+            .find(|s| s.name == "migrate")
+            .expect("the migrate step is journaled");
+        assert!(migrate.skipped, "all files recorded: {migrate:?}");
+        assert_eq!(
+            apply_calls(state.path()),
+            1,
+            "no celld call when nothing is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_skips_without_d1_or_files() {
+        // No `d1_databases` declared: the step skips without touching celld.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "no d1".to_string(),
+                base: None,
+                writes: vec![
+                    write(
+                        "dist/wrangler.json",
+                        r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                    ),
+                    write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10103);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let migrate = outcome
+            .steps
+            .iter()
+            .find(|s| s.name == "migrate")
+            .expect("the migrate step is journaled");
+        assert!(migrate.skipped);
+        assert!(
+            outcome.log_tail.contains("no d1_databases"),
+            "the journal says why: {}",
+            outcome.log_tail
+        );
+        assert_eq!(apply_calls(state.path()), 0, "celld never runs");
+    }
+
+    #[tokio::test]
+    async fn migrate_skips_with_d1_but_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit_tree(&cfg, &store, &sync, "grocery", vec![]).await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10104);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let migrate = outcome
+            .steps
+            .iter()
+            .find(|s| s.name == "migrate")
+            .expect("the migrate step is journaled");
+        assert!(migrate.skipped);
+        assert_eq!(apply_calls(state.path()), 0, "celld never runs");
+    }
+
+    #[tokio::test]
+    async fn migrate_failure_fails_the_deploy_without_switching() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![
+                write(
+                    "db/migrations/0001_init.sql",
+                    "CREATE TABLE item (id INTEGER);",
+                ),
+                write("db/migrations/0002_bad.sql", "CREATE TABLE oops (;"),
+                write("dist/.fake-fail", "0002_bad.sql"),
+            ],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10105);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("migrate"));
+        let error = outcome.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("0002_bad.sql"),
+            "the error names the failing file: {error}"
+        );
+        let message = outcome.user_message.as_deref().unwrap_or("");
+        assert!(
+            message.contains("0002_bad.sql") && message.contains("previous version"),
+            "the agent learns which file failed and that the old version serves: {message}"
+        );
+        assert!(
+            outcome.log_tail.contains("0002_bad.sql"),
+            "the migration error is in the log tail"
+        );
+
+        // Nothing recorded, the previous version keeps serving.
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM d1_migration")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a failed apply records nothing");
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha, None, "a failed migrate never switches the fleet");
+        assert_eq!(
+            call_kinds(state.path()),
+            ["apply"],
+            "a failed migrate uploads nothing, first deploy or not"
+        );
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "migrate"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_failure_on_edited_applied_file_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![write(
+                "db/migrations/0001_init.sql",
+                "CREATE TABLE item (id INTEGER);",
+            )],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10106);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+        assert_eq!(apply_calls(state.path()), 1);
+
+        // Same name, new content: the deploy fails before celld runs again.
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "edit applied migration".to_string(),
+                base: Some(sha_a.clone()),
+                writes: vec![],
+                edits: vec![crate::git::commit::Edit {
+                    path: "db/migrations/0001_init.sql".to_string(),
+                    old: "CREATE TABLE item (id INTEGER);".to_string(),
+                    new: "CREATE TABLE item (id TEXT);".to_string(),
+                    replace_all: false,
+                }],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("migrate"));
+        let error = outcome.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("0001_init.sql") && error.contains("edited"),
+            "the error names the edited file: {error}"
+        );
+        let message = outcome.user_message.as_deref().unwrap_or("");
+        assert!(
+            message.contains("0001_init.sql") && message.contains("new migration"),
+            "the agent learns to write a new file: {message}"
+        );
+        assert_eq!(
+            apply_calls(state.path()),
+            1,
+            "an edited file never reaches celld again"
+        );
+        assert_eq!(
+            upload_calls(state.path()),
+            1,
+            "the edit refusal happens before any second upload"
+        );
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha_a.as_str()));
+    }
+
+    #[tokio::test]
+    async fn blocked_gate_never_migrates() {
+        // A profane page with a valid deploy root and migration files: the
+        // gate blocks, and celld (deploy and migrate alike) never runs.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![
+                write(
+                    "pages/index.tsx",
+                    "export default () => <h1>this list is fuck awesome</h1>;",
+                ),
+                write(
+                    "db/migrations/0001_init.sql",
+                    "CREATE TABLE item (id INTEGER);",
+                ),
+            ],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10107);
+        insert_test_app(&pool, &app).await;
+        let fake = FakeJev::start(block_responder()).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = migrate_settings(&data, state.path(), &script);
+        settings.bun_bin = "/bin/true".to_string();
+        settings.jev = Some(jev_client(&fake.base_url));
+        let deployer = Deployer::new(settings, 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "blocked");
+        assert_eq!(
+            apply_calls(state.path()),
+            0,
+            "the gate runs before migrations"
+        );
+        assert!(
+            !state.path().join("calls.log").is_file(),
+            "celld never runs at all: the deploy step is never reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_applies_each_database_sharing_one_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "two databases".to_string(),
+                base: None,
+                writes: vec![
+                    write(
+                        "dist/wrangler.json",
+                        r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","d1_databases":[{"binding":"DB","database_name":"app-db"},{"binding":"AUX","database_name":"aux-db"}]}"#,
+                    ),
+                    write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
+                    write("db/migrations/0001_init.sql", "CREATE TABLE item (id INTEGER);"),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10108);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        assert_eq!(apply_calls(state.path()), 2, "one apply per database");
+        let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
+        assert!(calls.contains("d1 migrations apply app-db"), "{calls}");
+        assert!(calls.contains("d1 migrations apply aux-db"), "{calls}");
+        for db in ["app-db", "aux-db"] {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM d1_migration WHERE app_id = ?1 AND database_identity = ?2",
+            )
+            .bind(&app.id)
+            .bind(db)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "recorded under the effective identity for {db}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_database_id_reapplies_to_the_new_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let wrangler = |id: &str| {
+            write(
+                "dist/wrangler.json",
+                &format!(
+                    "{{\"name\":\"t\",\"main\":\"index.js\",\"compatibility_date\":\"2026-01-01\",\
+                      \"d1_databases\":[{{\"binding\":\"DB\",\"database_name\":\"app-db\",\
+                      \"database_id\":\"{id}\"}}]}}"
+                ),
+            )
+        };
+        let sha_a = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "first id".to_string(),
+                base: None,
+                writes: vec![
+                    wrangler("db-id-1"),
+                    write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
+                    write(
+                        "db/migrations/0001_init.sql",
+                        "CREATE TABLE item (id INTEGER);",
+                    ),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10109);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+        assert_eq!(apply_calls(state.path()), 1);
+
+        // Same name, new id: celld sees a new (empty) database, so the same
+        // files are pending again and apply a second time.
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "second id".to_string(),
+                base: Some(sha_a.clone()),
+                writes: vec![wrangler("db-id-2")],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        assert_eq!(apply_calls(state.path()), 2, "the new identity re-applies");
+        let mut identities: Vec<(String,)> =
+            sqlx::query_as("SELECT database_identity FROM d1_migration WHERE app_id = ?1")
+                .bind(&app.id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        identities.sort();
+        assert_eq!(
+            identities,
+            [("db-id-1".to_string(),), ("db-id-2".to_string(),)],
+            "each identity pins its own hash"
+        );
+    }
+
+    /// The real `celld d1 migrations` contract the pipeline depends on:
+    /// `apply` is idempotent (a second run is a no-op success) and `list`
+    /// shows the applied file. Needs a live fleet, so it runs only when the
+    /// integrator sets it up at merge time:
+    /// `OUTER_LIVE_D1_BUCKET` (e.g. `s3://outer/fleets/pwa-check`),
+    /// `OUTER_LIVE_D1_PROJECT` (a dir with the app's wrangler config and a
+    /// `migrations/` dir holding `0001_outer_smoke.sql`), `OUTER_LIVE_D1_DB`
+    /// (the `database_name`), plus the bucket credentials in the env and a
+    /// fleet serving that app. Uses the real `celld` on PATH, unsandboxed:
+    /// it pins the CLI surface, not the pipeline (the fake covers that).
+    #[tokio::test]
+    #[ignore = "needs a live fleet: OUTER_LIVE_D1_BUCKET, OUTER_LIVE_D1_PROJECT, OUTER_LIVE_D1_DB"]
+    async fn live_celld_migrations_apply_is_idempotent() {
+        let bucket = std::env::var("OUTER_LIVE_D1_BUCKET")
+            .expect("OUTER_LIVE_D1_BUCKET must be set (e.g. s3://outer/fleets/pwa-check)");
+        let project = std::env::var("OUTER_LIVE_D1_PROJECT")
+            .expect("OUTER_LIVE_D1_PROJECT must be set (dir with wrangler config + migrations/)");
+        let db = std::env::var("OUTER_LIVE_D1_DB")
+            .expect("OUTER_LIVE_D1_DB must be set (the d1_databases database_name)");
+        let mut extra = Vec::new();
+        if let Ok(endpoint) = std::env::var("OUTER_LIVE_D1_ENDPOINT") {
+            extra.push("--endpoint".to_string());
+            extra.push(endpoint);
+        }
+        if let Ok(region) = std::env::var("OUTER_LIVE_D1_REGION") {
+            extra.push("--region".to_string());
+            extra.push(region);
+        }
+        let run = |args: &[String]| {
+            let args = args.to_vec();
+            let extra = extra.clone();
+            let bucket = bucket.clone();
+            async move {
+                let mut cmd = tokio::process::Command::new("celld");
+                cmd.args(["d1", "migrations"]);
+                cmd.args(&args);
+                cmd.args(["--bucket", bucket.as_str()]);
+                cmd.args(&extra);
+                cmd.output().await.expect("celld must be on PATH")
+            }
+        };
+        let project_arg = project.clone();
+        let db_arg = db.clone();
+        let first = run(&["apply".to_string(), db_arg.clone(), project_arg.clone()]).await;
+        assert!(
+            first.status.success(),
+            "apply must succeed: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let second = run(&["apply".to_string(), db_arg.clone(), project_arg.clone()]).await;
+        assert!(
+            second.status.success(),
+            "a second apply is a no-op success: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        let mut list = tokio::process::Command::new("celld");
+        list.args([
+            "d1",
+            "migrations",
+            "list",
+            db_arg.as_str(),
+            project_arg.as_str(),
+            "--bucket",
+            bucket.as_str(),
+        ]);
+        list.args(&extra);
+        let list = list.output().await.expect("celld must be on PATH");
+        assert!(
+            list.status.success(),
+            "list must succeed: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&list.stdout);
+        assert!(
+            stdout.contains("0001_outer_smoke"),
+            "list shows the applied file: {stdout}"
+        );
+    }
+
     #[test]
     fn deploy_root_returns_validated_crons() {
         let data = tempfile::tempdir().unwrap();
@@ -2620,8 +4014,9 @@ mod tests {
             r#"{"name":"grocery","main":"index.js","triggers":{"crons":["*/15 * * * *","0 9 * * MON"]}}"#,
         )
         .unwrap();
-        let (root, crons, _) = deployer.deploy_root(&app).unwrap();
-        assert_eq!(root, work);
+        let (deploy_root, crons, _) = deployer.deploy_root(&app).unwrap();
+        assert_eq!(deploy_root.root, work);
+        assert_eq!(deploy_root.config, work.join("wrangler.json"));
         assert_eq!(crons, ["*/15 * * * *", "0 9 * * MON"]);
     }
 
@@ -2834,6 +4229,7 @@ mod tests {
             apps_domain: "outer.now".to_string(),
             cache_purge: None,
             jev: None,
+            wake: None,
         };
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();

@@ -277,6 +277,11 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(config),
             jev,
+            // The operator CLI runs no fleet manager: a migrate step that
+            // finds pending files fails loudly when no fleet serves the app —
+            // before any upload for an existing app, after the upload for a
+            // first deploy (which uploads first).
+            wake: None,
         },
         rt.build_concurrency,
     );
@@ -596,6 +601,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(&config),
             jev: jev_client(&config)?,
+            // The migrate step wakes a sleeping fleet before applying D1
+            // migrations (`celld d1` reaches the database through a node).
+            wake: Some(fleets.clone()),
         },
         rt.build_concurrency,
     );
