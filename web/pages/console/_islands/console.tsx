@@ -73,7 +73,7 @@ function tintIndex(slug: string): number {
 
 function monogram(slug: string): string {
   const clean = slug.replace(/[^a-z0-9]/gi, "");
-  return (clean.slice(0, 2) || "?").toUpperCase();
+  return (clean.slice(0, 1) || "?").toUpperCase();
 }
 
 async function loadActionsPage(
@@ -670,6 +670,17 @@ export function Console() {
               </li>
             ))}
           </ul>
+          <div class="side-foot">
+            <p class="side-foot-url mono trim" title={active.url}>
+              {active.url}
+            </p>
+            <div class="side-foot-row">
+              <CopyButton value={active.url} label="Copy app URL" />
+              <a class="link" href={active.url}>
+                Open app
+              </a>
+            </div>
+          </div>
         </aside>
       )}
       {ui().drawer && active && (

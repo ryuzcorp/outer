@@ -175,8 +175,9 @@ body {
 
 .rail-mono {
   font-weight: 700;
-  font-size: 15px;
+  font-size: 21px;
   letter-spacing: 0.02em;
+  line-height: 1;
 }
 
 .status-dot {
@@ -309,10 +310,13 @@ body {
 .side {
   position: sticky;
   top: 12px;
+  display: flex;
+  flex-direction: column;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 16px 12px;
+  padding: 16px 12px 12px;
+  min-height: calc(100dvh - 24px);
   max-height: calc(100dvh - 24px);
   overflow-y: auto;
   box-shadow: var(--shadow);
@@ -428,6 +432,24 @@ button.side-item:hover {
   color: var(--ink-muted);
   font-size: 11px;
   font-weight: 600;
+}
+
+.side-foot {
+  margin-top: auto;
+  padding: 12px 4px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.side-foot-url {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.side-foot-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .scrim {
@@ -745,6 +767,10 @@ button.main-menu {
   margin-top: 8px;
   font-size: 12px;
   color: var(--ink-muted);
+}
+
+.card-head .legend {
+  margin-top: 0;
 }
 
 .legend-item {

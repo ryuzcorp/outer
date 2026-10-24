@@ -136,6 +136,42 @@ function halfChange(buckets: MetricsBucket[]): string | null {
   return `${pct >= 0 ? "+" : ""}${pct}%`;
 }
 
+// Error rate: exact 0% only when there are no 5xx; sub-1% rates keep two
+// decimals so e.g. 6 / 28,845 reads 0.02% instead of 0.0%.
+function fmtRate(s5xx: number, requests: number): string {
+  if (requests <= 0) {
+    return "—";
+  }
+  if (s5xx <= 0) {
+    return "0%";
+  }
+  const pct = (100 * s5xx) / requests;
+  if (pct >= 1) {
+    return `${pct.toFixed(1)}%`;
+  }
+  if (pct >= 0.005) {
+    return `${pct.toFixed(2)}%`;
+  }
+  return "<0.01%";
+}
+
+// Y-axis ticks with a round ceiling (0, 10, 20, … like the reference).
+function niceTicks(max: number, count = 5): number[] {
+  if (max <= 0) {
+    return [0];
+  }
+  const raw = max / (count - 1);
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const norm = raw / mag;
+  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+  const top = Math.ceil(max / step) * step;
+  const ticks: number[] = [];
+  for (let v = 0; v <= top + step / 2; v += step) {
+    ticks.push(Math.round((v / step)) * step);
+  }
+  return ticks;
+}
+
 // --- Stat cards --------------------------------------------------------------
 
 function StatCard({
@@ -188,17 +224,19 @@ function RequestsLine({
   const plotW = width - padL - 8;
   const plotH = height - padT - padB;
   const max = Math.max(1, ...buckets.map((b) => b.requests));
+  const yTicks = niceTicks(max);
+  const top = Math.max(1, yTicks[yTicks.length - 1]);
   const n = buckets.length;
   const x = (i: number) =>
     n === 1 ? padL + plotW / 2 : padL + (i * plotW) / (n - 1);
-  const y = (v: number) => padT + plotH * (1 - v / max);
+  const y = (v: number) => padT + plotH * (1 - v / top);
   const line = (pick: (b: MetricsBucket) => number) =>
     buckets.map((b, i) => `${x(i).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(" ");
   const area =
     `${padL},${(padT + plotH).toFixed(1)} ` +
     line((b) => b.requests) +
     ` ${x(n - 1).toFixed(1)},${(padT + plotH).toFixed(1)}`;
-  const ticks = [0, 1, 2, 3, 4, 5];
+  const guides = [0, 1, 2, 3, 4, 5];
   const first = buckets[0];
   const last = buckets[n - 1];
   return (
@@ -209,7 +247,31 @@ function RequestsLine({
         role="img"
         aria-label="Requests over time with errors for comparison"
       >
-        {ticks.map((t) => {
+        {yTicks.map((t) => (
+          <g key={t}>
+            <line
+              x1={padL}
+              y1={y(t)}
+              x2={padL + plotW}
+              y2={y(t)}
+              stroke="currentColor"
+              stroke-width="1"
+              stroke-dasharray="3 4"
+              opacity="0.25"
+            />
+            <text
+              x={padL - 6}
+              y={y(t) + 4}
+              font-size="11"
+              fill="currentColor"
+              opacity="0.55"
+              text-anchor="end"
+            >
+              {compact(t)}
+            </text>
+          </g>
+        ))}
+        {guides.map((t) => {
           const gx = padL + (t * plotW) / 5;
           return (
             <line
@@ -225,19 +287,6 @@ function RequestsLine({
             />
           );
         })}
-        {[0, 0.5, 1].map((f) => (
-          <text
-            key={f}
-            x={padL - 6}
-            y={y(max * f) + 4}
-            font-size="11"
-            fill="currentColor"
-            opacity="0.55"
-            text-anchor="end"
-          >
-            {compact(Math.round(max * f))}
-          </text>
-        ))}
         <polygon points={area} fill="currentColor" opacity="0.05" />
         <polyline
           points={line((b) => b.s4xx + b.s5xx)}
@@ -263,16 +312,6 @@ function RequestsLine({
           </g>
         )}
       </svg>
-      <figcaption class="legend">
-        <span class="legend-item">
-          <span class="swatch swatch-dark" aria-hidden="true" />
-          Requests
-        </span>
-        <span class="legend-item">
-          <span class="swatch swatch-light" aria-hidden="true" />
-          Errors (4xx + 5xx)
-        </span>
-      </figcaption>
     </figure>
   );
 }
@@ -284,64 +323,104 @@ function Bars({
   buckets: MetricsBucket[];
   hours: number;
 }) {
-  const width = Math.max(buckets.length * 10, 10);
-  const height = 120;
-  const plot = 96;
-  const max = Math.max(1, ...buckets.map((b) => b.requests));
-  const step = width / buckets.length;
-  // Sparse ranges (24 h) get slim bars with real gaps; dense ranges merge
-  // toward an area, like Noite's chart.
-  const bar = Math.max(0.6, Math.min(step - 1, step * 0.55));
-  const barX = (i: number) => i * step + (step - bar) / 2;
-  const first = buckets[0];
-  const last = buckets[buckets.length - 1];
+  // 30 d of hourly buckets would render sub-pixel: roll up to days so
+  // bars stay readable. Fewer than ~200 buckets keep hourly bars.
+  let bars = buckets;
+  let grouped = false;
+  if (buckets.length > 200) {
+    const days: MetricsBucket[] = [];
+    for (let i = 0; i < buckets.length; i += 24) {
+      const slice = buckets.slice(i, i + 24);
+      days.push({
+        hour: slice[0].hour,
+        requests: slice.reduce((a, b) => a + b.requests, 0),
+        s4xx: slice.reduce((a, b) => a + b.s4xx, 0),
+        s5xx: slice.reduce((a, b) => a + b.s5xx, 0),
+      });
+    }
+    bars = days;
+    grouped = true;
+  }
+  const width = 720;
+  const height = 200;
+  const padL = 44;
+  const padB = 26;
+  const padT = 14;
+  const plotW = width - padL - 8;
+  const plotH = height - padT - padB;
+  const max = Math.max(1, ...bars.map((b) => b.requests));
+  const yTicks = niceTicks(max);
+  const top = Math.max(1, yTicks[yTicks.length - 1]);
+  const y = (v: number) => padT + plotH * (1 - v / top);
+  const step = plotW / Math.max(1, bars.length);
+  // Thin near-black bars like the reference (2–3 px at card width).
+  const bar = Math.min(3, Math.max(2, step * 0.55));
+  const barX = (i: number) => padL + i * step + (step - bar) / 2;
+  const titleFor = (b: MetricsBucket): string =>
+    grouped
+      ? `${axisLabel(b.hour, 168)}: ${b.requests} requests, ${b.s4xx} 4xx, ${b.s5xx} 5xx`
+      : bucketTitle(b, hours);
+  const first = bars[0];
+  const last = bars[bars.length - 1];
   return (
     <figure class="chart-block">
       <svg
         viewBox={`0 0 ${width} ${height}`}
         width="100%"
         role="img"
-        aria-label="Hourly requests as bars"
-        {...{ preserveAspectRatio: "none" }}
+        aria-label={grouped ? "Daily requests as bars" : "Hourly requests as bars"}
       >
-        <line
-          x1="0"
-          y1={plot - 0.5}
-          x2={width}
-          y2={plot - 0.5}
-          stroke="currentColor"
-          stroke-width="1"
-          opacity="0.25"
-          {...{ "vector-effect": "non-scaling-stroke" }}
-        />
-        {buckets.map((b, i) => {
-          const h = Math.max(1.5, (b.requests / max) * (plot - 2));
+        {yTicks.map((t) => (
+          <g key={t}>
+            <line
+              x1={padL}
+              y1={y(t)}
+              x2={padL + plotW}
+              y2={y(t)}
+              stroke="currentColor"
+              stroke-width="1"
+              stroke-dasharray="3 4"
+              opacity="0.25"
+            />
+            <text
+              x={padL - 6}
+              y={y(t) + 4}
+              font-size="11"
+              fill="currentColor"
+              opacity="0.55"
+              text-anchor="end"
+            >
+              {compact(t)}
+            </text>
+          </g>
+        ))}
+        {bars.map((b, i) => {
+          const h = Math.max(1.5, (b.requests / top) * (plotH - 2));
           return (
             <g key={b.hour}>
               <rect
                 x={barX(i)}
-                y={plot - h}
+                y={padT + plotH - h}
                 width={bar}
                 height={h}
-                {...{ rx: "1.5" }}
                 fill="currentColor"
               />
               <rect
-                x={i * step}
-                y="0"
+                x={padL + i * step}
+                y={padT}
                 width={step}
-                height={plot}
+                height={plotH}
                 fill="transparent"
               >
-                <title>{bucketTitle(b, hours)}</title>
+                <title>{titleFor(b)}</title>
               </rect>
             </g>
           );
         })}
       </svg>
       <figcaption class="axis-ends" aria-hidden="true">
-        <span>{first ? axisLabel(first.hour, hours) : ""}</span>
-        <span>{last ? axisLabel(last.hour, hours) : ""}</span>
+        <span>{first ? axisLabel(first.hour, grouped ? 168 : hours) : ""}</span>
+        <span>{last ? axisLabel(last.hour, grouped ? 168 : hours) : ""}</span>
       </figcaption>
     </figure>
   );
@@ -483,10 +562,7 @@ function OverviewReady({
   hours: number;
   onRange: (hours: number) => void;
 }) {
-  const errorRate =
-    summary.requests > 0
-      ? `${((100 * summary.s5xx) / summary.requests).toFixed(1)}%`
-      : "—";
+  const errorRate = fmtRate(summary.s5xx, summary.requests);
   return (
     <div class="stack">
       <div class="stat-grid">
@@ -521,6 +597,16 @@ function OverviewReady({
       <section class="card" aria-label="Requests chart">
         <div class="card-head">
           <h2>Requests</h2>
+          <div class="legend">
+            <span class="legend-item">
+              <span class="swatch swatch-dark" aria-hidden="true" />
+              This period
+            </span>
+            <span class="legend-item">
+              <span class="swatch swatch-light" aria-hidden="true" />
+              Errors (4xx + 5xx)
+            </span>
+          </div>
         </div>
         {summary.buckets.length === 0 ? (
           <p class="muted" role="status">
@@ -550,10 +636,7 @@ export function MetricsView({
     return <Err message={metrics.message} />;
   }
   const { summary, hours } = metrics.value;
-  const errorRate =
-    summary.requests > 0
-      ? `${((100 * summary.s5xx) / summary.requests).toFixed(1)}%`
-      : "—";
+  const errorRate = fmtRate(summary.s5xx, summary.requests);
   return (
     <div class="stack">
       <div class="stat-grid">
