@@ -1244,21 +1244,21 @@ export function InvitesView({
         <section class="card card-border bg-base-100 min-w-0" aria-label="Your invite codes">
           <div class="card-body min-w-0">
             <div class="min-w-0 overflow-x-auto">
-              <table class="table table-fixed w-full">
+              <table class="table table-fixed w-full max-sm:[&_td]:px-2 max-sm:[&_th]:px-2">
                 <colgroup>
-                  <col class="w-48" />
-                  <col class="w-20" />
+                  <col class="sm:w-48" />
+                  <col class="w-20 max-sm:hidden" />
                   <col class="w-28" />
-                  <col />
-                  <col class="w-28" />
+                  <col class="max-sm:hidden" />
+                  <col class="w-28 max-sm:hidden" />
                 </colgroup>
                 <thead>
                   <tr>
                     <th scope="col">Code</th>
-                    <th scope="col">Kind</th>
+                    <th scope="col" class="max-sm:hidden">Kind</th>
                     <th scope="col">Status</th>
-                    <th scope="col">Joined by</th>
-                    <th scope="col">Created</th>
+                    <th scope="col" class="max-sm:hidden">Joined by</th>
+                    <th scope="col" class="max-sm:hidden">Created</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1268,13 +1268,13 @@ export function InvitesView({
                       <tr key={entry.code}>
                         <td class="min-w-0">
                           <span class="flex min-w-0 items-center gap-2">
-                            <span class="min-w-0 flex-1 truncate font-mono" title={entry.code}>
+                            <span class="min-w-0 flex-1 truncate font-mono max-sm:text-xs" title={entry.code}>
                               {entry.code}
                             </span>
                             <CopyButton value={entry.code} label={`Copy ${entry.code}`} />
                           </span>
                         </td>
-                        <td class="truncate" title={entry.kind}>
+                        <td class="truncate max-sm:hidden" title={entry.kind}>
                           {entry.kind}
                         </td>
                         <td class="min-w-0">
@@ -1283,12 +1283,12 @@ export function InvitesView({
                           </span>
                         </td>
                         <td
-                          class="min-w-0 truncate"
+                          class="min-w-0 truncate max-sm:hidden"
                           title={entry.redeemedByEmail ?? entry.note ?? ""}
                         >
                           {entry.redeemedByEmail ?? entry.note ?? "—"}
                         </td>
-                        <td class="whitespace-nowrap" title={when(entry.createdAt)}>
+                        <td class="whitespace-nowrap max-sm:hidden" title={when(entry.createdAt)}>
                           {timeAgo(entry.createdAt)}
                         </td>
                       </tr>
@@ -1477,22 +1477,22 @@ function AdminCodesCard({
           <Empty>No codes yet — generate some above.</Empty>
         ) : (
           <div class="min-w-0 overflow-x-auto">
-            <table class="table table-fixed w-full">
+            <table class="table table-fixed w-full max-sm:[&_td]:px-2 max-sm:[&_th]:px-2">
               <colgroup>
-                <col class="w-48" />
-                <col class="w-20" />
-                <col />
-                <col />
-                <col class="w-28" />
-                <col class="w-28" />
+                <col class="sm:w-48" />
+                <col class="w-20 max-md:hidden" />
+                <col class="max-md:hidden" />
+                <col class="max-sm:hidden" />
+                <col class="w-28 max-md:hidden" />
+                <col class="w-20 sm:w-28" />
               </colgroup>
               <thead>
                 <tr>
                   <th scope="col">Code</th>
-                  <th scope="col">Kind</th>
-                  <th scope="col">Creator</th>
-                  <th scope="col">Note / joined by</th>
-                  <th scope="col">Created</th>
+                  <th scope="col" class="max-md:hidden">Kind</th>
+                  <th scope="col" class="max-md:hidden">Creator</th>
+                  <th scope="col" class="max-sm:hidden">Note / joined by</th>
+                  <th scope="col" class="max-md:hidden">Created</th>
                   <th scope="col">
                     <span class="sr-only">Actions</span>
                   </th>
@@ -1506,25 +1506,25 @@ function AdminCodesCard({
                     <tr key={entry.code}>
                       <td class="min-w-0">
                         <span class="flex min-w-0 items-center gap-2">
-                          <span class="min-w-0 flex-1 truncate font-mono" title={entry.code}>
+                          <span class="min-w-0 flex-1 truncate font-mono max-sm:text-xs" title={entry.code}>
                             {entry.code}
                           </span>
                           <CopyButton value={entry.code} label={`Copy ${entry.code}`} />
                         </span>
                       </td>
-                      <td class="truncate" title={entry.kind}>
+                      <td class="truncate max-md:hidden" title={entry.kind}>
                         {entry.kind}
                       </td>
-                      <td class="min-w-0 truncate" title={entry.createdByEmail ?? ""}>
+                      <td class="min-w-0 truncate max-md:hidden" title={entry.createdByEmail ?? ""}>
                         {entry.createdByEmail ?? "—"}
                       </td>
                       <td
-                        class="min-w-0 truncate"
+                        class="min-w-0 truncate max-sm:hidden"
                         title={entry.redeemedByEmail ?? entry.note ?? status.label}
                       >
                         {entry.redeemedByEmail ?? entry.note ?? status.label}
                       </td>
-                      <td class="whitespace-nowrap" title={when(entry.createdAt)}>
+                      <td class="whitespace-nowrap max-md:hidden" title={when(entry.createdAt)}>
                         {timeAgo(entry.createdAt)}
                       </td>
                       <td class="min-w-0">
