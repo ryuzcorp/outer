@@ -8,5 +8,6 @@ pub mod migrate;
 pub mod pipeline;
 
 pub use pipeline::{
-    fail_interrupted, prune_old, DeployOutcome, DeploySettings, Deployer, PurgeTasks, Step,
+    fail_interrupted, prune_old, scrub_interrupted_injections, DeployOutcome, DeploySettings,
+    Deployer, PurgeTasks, Step,
 };

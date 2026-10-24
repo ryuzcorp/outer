@@ -69,6 +69,10 @@ pub struct DeploySettings {
     /// and in tests with a fake `celld`, where no fleet can be woken and the
     /// apply fails loudly when no fleet serves the app.
     pub wake: Option<crate::fleet::manager::FleetManager>,
+    /// AES-256-GCM key for app secrets, derived from `OUTER_SECRET` at boot.
+    /// Secrets are decrypted only for the `celld deploy` step and injected
+    /// into the deploy-root config `vars`; builds never see them.
+    pub secrets_key: crate::secrets::SecretsKey,
 }
 
 /// One pipeline step's timing for the `deploy` row's `steps` JSON.
@@ -115,6 +119,203 @@ pub struct DeployOutcome {
 pub struct DeployRoot {
     pub root: PathBuf,
     pub config: PathBuf,
+}
+/// The patched deploy-root config while its `vars` hold plaintext: the
+/// original bytes plus their mode, for a byte-identical restore once the
+/// upload has the file. Plaintext lives only between `inject_secrets` and
+/// the guard's drop, plus the uploaded copy under `fleets/<slug>/`, where
+/// celld needs it to serve `env.*`.
+///
+/// RAII: [`Drop`] restores best-effort (warn, never panic), so a panic or
+/// an early return in the upload window still scrubs the worktree. A
+/// crash between processes is covered by [`scrub_interrupted_injections`],
+/// which replays the sidecar stashed before the inject.
+struct InjectedSecrets {
+    path: PathBuf,
+    original: Vec<u8>,
+    mode: u32,
+    injected: usize,
+    overwritten: Vec<String>,
+    /// The crash-recovery sidecar (`<slug>.orig` + `<slug>.target` under
+    /// `{data}/secret-sidecars/`), removed once the config is restored.
+    sidecar_orig: Option<PathBuf>,
+    sidecar_target: Option<PathBuf>,
+}
+impl InjectedSecrets {
+    /// One journal line: counts and overwritten names only, never values.
+    fn journal_line(&self) -> String {
+        if self.overwritten.is_empty() {
+            format!("secrets: injected {} vars\n", self.injected)
+        } else {
+            format!(
+                "secrets: injected {} vars (overwrote code-defined {})\n",
+                self.injected,
+                self.overwritten.join(", ")
+            )
+        }
+    }
+    /// Byte-identical restore, pass or fail. Best-effort: a restore
+    /// failure warns but must not fail a deploy whose upload succeeded.
+    /// Never panics, so [`Drop`] can call it on the unwind path.
+    fn restore(&self) {
+        if let Err(e) = atomic_replace_no_follow(&self.path, &self.original, self.mode) {
+            tracing::warn!(path = %self.path.display(), error = %format!("{e:#}"), "restoring deploy config after secrets injection");
+            return;
+        }
+        for sidecar in [&self.sidecar_orig, &self.sidecar_target]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(e) = std::fs::remove_file(sidecar) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %sidecar.display(), error = %format!("{e:#}"), "removing secrets sidecar after restore");
+                }
+            }
+        }
+    }
+}
+impl Drop for InjectedSecrets {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+/// Refuse when any existing component of `path` is a symlink: the build
+/// runs as the app uid and can plant links anywhere under the worktree, so
+/// a deploy step running as outer/root must never resolve through one.
+/// Missing trailing components are fine (a not-yet-created file has no
+/// link to follow); any other stat failure fails closed.
+fn refuse_symlink_components(path: &Path) -> anyhow::Result<()> {
+    let mut cursor = PathBuf::new();
+    for component in path.components() {
+        cursor.push(component.as_os_str());
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing {}: {} is a symlink",
+                    path.display(),
+                    cursor.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                anyhow::bail!("cannot stat {}: {e:#}", cursor.display(),);
+            }
+        }
+    }
+    Ok(())
+}
+/// Read a file without following a trailing symlink (fails when the final
+/// component is a link), returning its bytes and mode. Component symlinks
+/// are refused first, so a planted `dist -> elsewhere` fails closed too.
+fn read_no_follow(path: &Path) -> anyhow::Result<(Vec<u8>, u32)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    refuse_symlink_components(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("cannot open {}: {e:#}", path.display()))?;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        file.metadata()
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o644)
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    file.read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e:#}", path.display()))?;
+    Ok((bytes, mode))
+}
+/// Replace `path` atomically without following a trailing symlink: the new
+/// bytes land in a fresh `O_CREAT|O_EXCL|O_NOFOLLOW` temp file (mode 0600
+/// from the start, then `fchmod`ed to `mode` on its fd — never a
+/// write-then-chmod of the target) and `rename` swaps it over the
+/// original, which never resolves the final component through a link.
+fn atomic_replace_no_follow(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    refuse_symlink_components(path)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cannot replace {}: no parent dir", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("cannot replace {}: no file name", path.display()))?;
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut tmp: Option<(PathBuf, std::fs::File)> = None;
+    for _ in 0..8 {
+        let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dir.join(format!(
+            ".{}.outer-{}-{}-{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            n,
+            crate::apps::now_ms()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                tmp = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                anyhow::bail!("cannot stage replacement for {}: {e:#}", path.display());
+            }
+        }
+    }
+    let (tmp_path, tmp_file) = tmp.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot stage replacement for {}: temp names busy",
+            path.display()
+        )
+    })?;
+    let failed = |e: anyhow::Error| {
+        let _ = std::fs::remove_file(&tmp_path);
+        e
+    };
+    use std::io::Write as _;
+    if let Err(e) = (&tmp_file)
+        .write_all(bytes)
+        .and_then(|()| tmp_file.sync_all())
+    {
+        return Err(failed(anyhow::anyhow!(
+            "cannot write replacement for {}: {e:#}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // `fchmod` on the open fd: the target path is never chmod-ed
+        // through a possibly swapped link, and umask never interferes.
+        let rc = unsafe { libc::fchmod(tmp_file.as_raw_fd(), mode & 0o7777) };
+        if rc != 0 {
+            return Err(failed(anyhow::anyhow!(
+                "cannot set mode on replacement for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    // `rename` swaps atomically and never follows the final component:
+    // a link re-planted at `path` is replaced, not written through.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        return Err(failed(anyhow::anyhow!(
+            "cannot replace {}: {e:#}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 pub struct Deployer {
     settings: DeploySettings,
@@ -214,6 +415,135 @@ pub async fn fail_interrupted(pool: &SqlitePool) -> anyhow::Result<u64> {
     .await?
     .rows_affected();
     Ok(closed)
+}
+
+/// Outer-private dir holding one crash-recovery sidecar per app whose
+/// deploy config currently carries injected plaintext (`<slug>.orig` with
+/// the pre-inject bytes, `<slug>.target` with `"<mode:o>\n<config path>"`).
+/// Both files are 0600; the dir is 0700 and never inside an app-writable
+/// worktree, so the app uid can neither read the bytes nor swap the names.
+fn secret_sidecar_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("secret-sidecars")
+}
+
+/// Stash the pre-inject config bytes before the worktree file is touched:
+/// a crash in the upload window leaves this behind for
+/// [`scrub_interrupted_injections`] to replay at boot. Returns the two
+/// sidecar paths for the guard to remove after it restores.
+fn stash_secret_sidecar(
+    data_dir: &Path,
+    slug: &str,
+    config: &Path,
+    mode: u32,
+    original: &[u8],
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = secret_sidecar_dir(data_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("cannot create secrets sidecar dir: {e:#}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow::anyhow!("cannot lock down secrets sidecar dir: {e:#}"))?;
+    }
+    let orig_path = dir.join(format!("{slug}.orig"));
+    let target_path = dir.join(format!("{slug}.target"));
+    let write_sidecar = |path: &Path, bytes: &[u8]| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| {
+                anyhow::anyhow!("cannot stash secrets sidecar {}: {e:#}", path.display())
+            })?;
+        use std::io::Write as _;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| {
+                anyhow::anyhow!("cannot stash secrets sidecar {}: {e:#}", path.display())
+            })?;
+        Ok(())
+    };
+    write_sidecar(&orig_path, original)?;
+    let target_meta = format!("{:o}\n{}", mode & 0o7777, config.display());
+    if let Err(e) = write_sidecar(&target_path, target_meta.as_bytes()) {
+        let _ = std::fs::remove_file(&orig_path);
+        return Err(e);
+    }
+    Ok((orig_path, target_path))
+}
+
+/// Boot scrub for a deploy interrupted mid-upload: for every leftover
+/// sidecar, put the pre-inject bytes back over the worktree config (the
+/// same symlink-pinned atomic replace) and delete the sidecar. A config
+/// whose parent is gone holds no plaintext, so its sidecar is just
+/// dropped; a config that fails the symlink check keeps its sidecar and
+/// warns, so the next boot retries instead of writing through a link.
+/// Returns how many configs were restored. Call next to
+/// [`fail_interrupted`]: at boot no deploy runs, so nothing races this.
+pub fn scrub_interrupted_injections(data_dir: &Path) -> anyhow::Result<u64> {
+    let dir = secret_sidecar_dir(data_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => anyhow::bail!("cannot list secrets sidecar dir: {e:#}"),
+    };
+    let mut restored = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|e| anyhow::anyhow!("cannot list secrets sidecar dir: {e:#}"))?;
+        let orig_path = entry.path();
+        if orig_path.extension().is_none_or(|ext| ext != "orig") {
+            continue;
+        }
+        let target_path = orig_path.with_extension("target");
+        let original = match std::fs::read(&orig_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(path = %orig_path.display(), error = %format!("{e:#}"), "unreadable secrets sidecar; skipping");
+                continue;
+            }
+        };
+        let target_meta = match std::fs::read_to_string(&target_path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(path = %target_path.display(), error = %format!("{e:#}"), "secrets sidecar target missing; dropping orphaned plaintext backup");
+                let _ = std::fs::remove_file(&orig_path);
+                continue;
+            }
+        };
+        let (mode_text, config_text) = target_meta
+            .split_once('\n')
+            .unwrap_or(("", target_meta.as_str()));
+        let mode = u32::from_str_radix(mode_text.trim(), 8).unwrap_or(0o644);
+        let config = PathBuf::from(config_text.trim());
+        if config.as_os_str().is_empty() {
+            tracing::warn!(path = %target_path.display(), "empty secrets sidecar target; dropping");
+            let _ = std::fs::remove_file(&orig_path);
+            let _ = std::fs::remove_file(&target_path);
+            continue;
+        }
+        if config.parent().is_none_or(|parent| !parent.is_dir()) {
+            tracing::info!(path = %config.display(), "injected config dir gone; dropping secrets sidecar");
+            let _ = std::fs::remove_file(&orig_path);
+            let _ = std::fs::remove_file(&target_path);
+            continue;
+        }
+        match atomic_replace_no_follow(&config, &original, mode) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&orig_path);
+                let _ = std::fs::remove_file(&target_path);
+                restored += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path = %config.display(), error = %format!("{e:#}"), "cannot scrub injected secrets config; keeping sidecar for the next boot");
+            }
+        }
+    }
+    Ok(restored)
 }
 
 /// Deploys kept per app (spec §13: the console shows the last 50).
@@ -530,7 +860,7 @@ impl Deployer {
         self.migrate_step(pool, app, deploy_id, &deploy_root, journal)
             .await?;
         let version = self
-            .deploy_step(app, deploy_id, &deploy_root.root, journal)
+            .deploy_step(pool, app, deploy_id, &deploy_root, journal)
             .await?;
         Ok((version, crons))
     }
@@ -541,14 +871,29 @@ impl Deployer {
     /// migrate failure uploads nothing at all.
     async fn deploy_step(
         &self,
+        pool: &SqlitePool,
         app: &App,
         deploy_id: &str,
-        root: &Path,
+        deploy_root: &DeployRoot,
         journal: &mut Journal,
     ) -> Result<Option<String>, StepEnd> {
         let Journal { steps, log } = journal;
         let started = Instant::now();
-        match self.celld_deploy(app, deploy_id, root).await {
+        // Decrypt after the gate: a blocked deploy never touches secrets.
+        let injected = self
+            .inject_secrets(pool, app, deploy_root)
+            .await
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("deploy", &e)))?;
+        let outcome = self.celld_deploy(app, deploy_id, deploy_root).await;
+        // The patched config held plaintext: dropping the guard restores it
+        // byte-identically, pass or fail — and would too on panic, since the
+        // restore lives in `Drop`, not in a manual call.
+        if let Some(guard) = injected {
+            let line = guard.journal_line();
+            drop(guard);
+            log.push_str(&line);
+        }
+        match outcome {
             Ok((out, version)) => {
                 push_step(steps, log, "deploy", started, false, &out);
                 Ok(version)
@@ -750,7 +1095,9 @@ impl Deployer {
     /// the upload can never disagree about which config won.
     fn deploy_root(&self, app: &App) -> anyhow::Result<(DeployRoot, Vec<String>, String)> {
         let work = self.work_dir(&app.slug);
-        let config = find_deploy_config(&work).ok_or_else(|| {
+        // Discovery refuses symlinks (fail closed): a planted link is a
+        // deploy error, never a resolved path.
+        let config = find_deploy_config(&work)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "no wrangler config: looked for dist/wrangler.json, wrangler.jsonc, wrangler.json under {}",
                 work.display()
@@ -774,7 +1121,7 @@ impl Deployer {
         &self,
         app: &App,
         deploy_id: &str,
-        root: &Path,
+        deploy_root: &DeployRoot,
     ) -> anyhow::Result<(String, Option<String>)> {
         let prefix = FleetStorage::fleet_prefix(&app.slug);
         let creds = self
@@ -807,7 +1154,7 @@ impl Deployer {
         }
         let args = vec![
             "deploy".to_string(),
-            root.to_string_lossy().into_owned(),
+            deploy_root.root.to_string_lossy().into_owned(),
             "--bucket".to_string(),
             bucket,
             "--endpoint".to_string(),
@@ -833,6 +1180,89 @@ impl Deployer {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         Ok((out, version))
+    }
+    /// Decrypt the app's secrets into the deploy-root config `vars`, for this
+    /// deploy only. Returns `None` when the app has no (usable) secrets (the
+    /// config is untouched), else a guard holding the original bytes: the
+    /// caller runs the upload, and the guard restores byte-identically on
+    /// drop (see [`InjectedSecrets`]).
+    ///
+    /// Code-defined `vars` keys lose to same-named secrets; the overwrite is
+    /// journaled by name (names are public via `list_secrets`, values never
+    /// are). The patched file is `0o600` while it holds plaintext; the
+    /// upload carries it to `fleets/<slug>/`, where celld needs it.
+    ///
+    /// Rows whose names are platform-reserved or fail the name shape are
+    /// skipped with a warning: the sink re-checks because pre-existing or
+    /// DB-written rows predate the tool-time checks, and must never override
+    /// platform vars. The config symlink checks run again here (discovery
+    /// ran before the build): a planted link fails the deploy closed.
+    async fn inject_secrets(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        deploy_root: &DeployRoot,
+    ) -> anyhow::Result<Option<InjectedSecrets>> {
+        let secrets =
+            crate::secrets::decrypt_all(pool, &app.id, &self.settings.secrets_key).await?;
+        let mut usable: Vec<(String, Vec<u8>)> = Vec::with_capacity(secrets.len());
+        for (name, value) in secrets {
+            if crate::secrets::check_name(&name).is_err()
+                || crate::secrets::check_reserved(&name).is_err()
+            {
+                tracing::warn!(name = %name, app = %app.slug, "skipping secret with reserved or invalid name during injection");
+                continue;
+            }
+            usable.push((name, value));
+        }
+        if usable.is_empty() {
+            return Ok(None);
+        }
+        let path = deploy_root.config.clone();
+        let (original, mode) = read_no_follow(&path)
+            .map_err(|e| anyhow::anyhow!("reading deploy config {}: {e:#}", path.display()))?;
+        let raw = String::from_utf8(original.clone())
+            .map_err(|_| anyhow::anyhow!("deploy config {} is not valid UTF-8", path.display()))?;
+        let mut parsed: serde_json::Value = if path.extension().is_some_and(|e| e == "jsonc") {
+            serde_json::from_str(&strip_jsonc_comments(&raw))?
+        } else {
+            serde_json::from_str(&raw)?
+        };
+        let obj = parsed
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("deploy config {} is not an object", path.display()))?;
+        let vars = obj
+            .entry("vars".to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        let vars = vars.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("deploy config {} has a non-object vars", path.display())
+        })?;
+        let mut overwritten = Vec::new();
+        for (name, value) in &usable {
+            let text = String::from_utf8(value.clone()).map_err(|_| {
+                anyhow::anyhow!("secret {name:?} is not valid UTF-8; refusing to inject")
+            })?;
+            if vars.contains_key(name.as_str()) {
+                overwritten.push(name.clone());
+            }
+            vars.insert(name.clone(), serde_json::Value::String(text));
+        }
+        let patched = serde_json::to_string_pretty(&parsed)?;
+        // Stash the pre-inject bytes first: a crash past this point leaves
+        // the sidecar for the boot scrub to replay.
+        let (sidecar_orig, sidecar_target) =
+            stash_secret_sidecar(&self.settings.data_dir, &app.slug, &path, mode, &original)?;
+        atomic_replace_no_follow(&path, patched.as_bytes(), 0o600)
+            .map_err(|e| anyhow::anyhow!("writing deploy config {}: {e:#}", path.display()))?;
+        Ok(Some(InjectedSecrets {
+            path,
+            original,
+            mode,
+            injected: usable.len(),
+            overwritten,
+            sidecar_orig: Some(sidecar_orig),
+            sidecar_target: Some(sidecar_target),
+        }))
     }
     /// Apply pending D1 migrations, then record what was applied.
     /// Returns `(skipped, journal)`: skipped when the built config declares
@@ -1371,19 +1801,46 @@ fn should_skip_install(stored: Option<&str>, current: &str, node_modules: bool) 
 }
 
 /// Deploy-root discovery order: `dist/wrangler.json`, else root
-/// `wrangler.jsonc`, else root `wrangler.json`.
-fn find_deploy_config(work: &Path) -> Option<PathBuf> {
-    [
+/// `wrangler.jsonc`, else root `wrangler.json`. Returns the pinned path —
+/// every component is checked with `symlink_metadata`, so a config (or a
+/// parent like `dist`) planted as a symlink fails the deploy closed instead
+/// of resolving through the link. `is_file` would follow links, so it is
+/// never used here. `Ok(None)` means no config exists; `Err` means a link
+/// (or an unreadable entry) refused the discovery.
+fn find_deploy_config(work: &Path) -> anyhow::Result<Option<PathBuf>> {
+    for candidate in [
         work.join("dist").join("wrangler.json"),
         work.join("wrangler.jsonc"),
         work.join("wrangler.json"),
-    ]
-    .into_iter()
-    .find(|candidate| candidate.is_file())
+    ] {
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                anyhow::bail!("cannot stat deploy config {}: {e:#}", candidate.display());
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing deploy config {}: it is a symlink",
+                    candidate.display()
+                );
+            }
+            Ok(meta) if !meta.file_type().is_file() => continue,
+            Ok(_) => {
+                refuse_symlink_components(&candidate)?;
+                return Ok(Some(candidate));
+            }
+        }
+    }
+    Ok(None)
 }
-/// Parse one wrangler file (JSON, or JSONC with comments stripped).
+/// Parse one wrangler file (JSON, or JSONC with comments stripped),
+/// opening with `O_NOFOLLOW` so a path swapped for a symlink between
+/// discovery and this read fails instead of handing over foreign bytes.
 fn read_config_file(config: &Path) -> anyhow::Result<serde_json::Value> {
-    let raw = std::fs::read_to_string(config)?;
+    let (bytes, _) = read_no_follow(config)
+        .map_err(|e| anyhow::anyhow!("reading deploy config {}: {e:#}", config.display()))?;
+    let raw = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("deploy config {} is not valid UTF-8", config.display()))?;
     Ok(if config.extension().is_some_and(|e| e == "jsonc") {
         serde_json::from_str(&strip_jsonc_comments(&raw))?
     } else {
@@ -2230,25 +2687,63 @@ mod tests {
     fn deploy_root_prefers_dist_then_jsonc_then_json() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path();
-        assert!(find_deploy_config(work).is_none());
+        assert!(find_deploy_config(work).unwrap().is_none());
 
         std::fs::write(work.join("wrangler.json"), "{}").unwrap();
         assert_eq!(
-            find_deploy_config(work).unwrap(),
+            find_deploy_config(work).unwrap().unwrap(),
             work.join("wrangler.json")
         );
 
         std::fs::write(work.join("wrangler.jsonc"), "{}").unwrap();
         assert_eq!(
-            find_deploy_config(work).unwrap(),
+            find_deploy_config(work).unwrap().unwrap(),
             work.join("wrangler.jsonc")
         );
 
         std::fs::create_dir_all(work.join("dist")).unwrap();
         std::fs::write(work.join("dist").join("wrangler.json"), "{}").unwrap();
         assert_eq!(
-            find_deploy_config(work).unwrap(),
+            find_deploy_config(work).unwrap().unwrap(),
             work.join("dist").join("wrangler.json")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_discovery_refuses_a_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path();
+        // The attacker's target: planted elsewhere, must stay untouched.
+        let elsewhere = dir.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, r#"{"name":"victim"}"#).unwrap();
+        std::fs::create_dir_all(work.join("dist")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, work.join("dist").join("wrangler.json")).unwrap();
+        let err = format!("{:#}", find_deploy_config(work).unwrap_err());
+        assert!(
+            err.contains("symlink"),
+            "fails closed naming the link: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            r#"{"name":"victim"}"#,
+            "the link target is never read or written"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_discovery_refuses_a_symlinked_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path();
+        let real_dist = dir.path().join("real-dist");
+        std::fs::create_dir_all(&real_dist).unwrap();
+        std::fs::write(real_dist.join("wrangler.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&real_dist, work.join("dist")).unwrap();
+        let err = format!("{:#}", find_deploy_config(work).unwrap_err());
+        assert!(
+            err.contains("symlink"),
+            "fails closed naming the link: {err}"
         );
     }
 
@@ -2371,6 +2866,7 @@ mod tests {
             cache_purge: None,
             jev: None,
             wake: None,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
         }
     }
 
@@ -2985,8 +3481,12 @@ if [ "$1" = "deploy" ]; then
   bucket=$(state_of_bucket "$@")
   statedir=$(printf '%s' "$bucket" | sed -e 's|^s3://||' -e 's|/fleets/.*||')
   mkdir -p "$statedir"
-  printf '%s\n' "$*" >> "$statedir/calls.log"
-  printf '{"version":"fake-v1"}\n'
+   printf '%s\n' "$*" >> "$statedir/calls.log"
+   root="$2"
+   for f in "$root"/wrangler.json "$root"/wrangler.jsonc; do
+     [ -f "$f" ] && cp "$f" "$statedir/deployed-config"
+   done
+   printf '{"version":"fake-v1"}\n'
   exit 0
 fi
 bucket=$(state_of_bucket "$@")
@@ -3010,6 +3510,27 @@ exit 0
 "#,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+    /// A fake `bun` for the install and build steps: records argv and the
+    /// full step env, then succeeds. Secrets must never appear in a build
+    /// step's env (builds run untrusted code), so the test greps this log.
+    fn install_fake_bun(state: &Path) -> PathBuf {
+        let script = state.join("fake-bun");
+        std::fs::write(
+             &script,
+             format!(
+                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}/build-calls.log\"\nenv | sort >> \"{}/build-env.log\"\nexit 0\n",
+                 state.display(),
+                 state.display()
+             ),
+         )
+         .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3237,6 +3758,339 @@ exit 0
                 .await
                 .unwrap();
         assert_eq!(last_sha.as_deref(), Some(sha.as_str()));
+    }
+    #[tokio::test]
+    async fn secrets_land_in_deploy_vars_not_in_build_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        // A code-defined `vars` entry: secrets merge over it, and the merge
+        // is journaled by name. `package.json` forces the install and build
+        // steps through the fake `bun`, which records their env.
+        let sha = commit_tree(
+             &cfg,
+             &store,
+             &sync,
+             "grocery",
+             vec![
+                 write(
+                     "dist/wrangler.json",
+                     r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","vars":{"CLASH":"code","KEPT":"code"}}"#,
+                 ),
+                 write("package.json", r#"{"name":"t","scripts":{"build":"echo built"}}"#),
+                 write("bun.lock", "lock"),
+             ],
+         )
+         .await;
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10201);
+        insert_test_app(&pool, &app).await;
+        let key = crate::secrets::SecretsKey::test_key();
+        let marker = "DEPLOY_SECRET_MARKER_8H7G6F";
+        for (name, value) in [("MY_KEY", marker), ("CLASH", "secret-wins")] {
+            let blob = crate::secrets::encrypt(&key, &app.id, name, value.as_bytes());
+            let capped = crate::secrets::set(&pool, &app.id, name, &blob, 1)
+                .await
+                .unwrap();
+            assert!(!capped, "{name} fits");
+        }
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let bun = install_fake_bun(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = migrate_settings(&data, state.path(), &script);
+        settings.bun_bin = bun.to_string_lossy().into_owned();
+        let deployer = Deployer::new(settings, 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        // The uploaded config carries the decrypted values: the fresh var,
+        // the overwrite winning over code, and the untouched code var.
+        let deployed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state.path().join("deployed-config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deployed["vars"]["MY_KEY"], marker);
+        assert_eq!(deployed["vars"]["CLASH"], "secret-wins");
+        assert_eq!(deployed["vars"]["KEPT"], "code");
+        assert!(
+            outcome.log_tail.contains("injected 2 vars"),
+            "journaled: {}",
+            outcome.log_tail
+        );
+        assert!(
+            outcome.log_tail.contains("CLASH"),
+            "overwrite journaled: {}",
+            outcome.log_tail
+        );
+        // Both sandboxed build steps ran through the fake, and neither saw
+        // a value: builds run untrusted code, so they never get secrets.
+        let build_calls = std::fs::read_to_string(state.path().join("build-calls.log")).unwrap();
+        assert!(
+            build_calls.contains("install"),
+            "install ran: {build_calls}"
+        );
+        assert!(
+            build_calls.contains("run build"),
+            "build ran: {build_calls}"
+        );
+        let build_env = std::fs::read_to_string(state.path().join("build-env.log")).unwrap();
+        assert!(!build_env.contains(marker), "build env carries no secret");
+        assert!(
+            !build_env.contains("secret-wins"),
+            "build env carries no secret"
+        );
+        // The worktree config is restored byte-identically: no plaintext
+        // lingers on disk past the upload.
+        let work_config = deployer.work_dir(&app.slug).join("dist/wrangler.json");
+        let restored = std::fs::read_to_string(&work_config).unwrap();
+        assert!(!restored.contains(marker), "scrubbed: {restored}");
+        assert!(!restored.contains("secret-wins"), "scrubbed: {restored}");
+        let restored_json: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(
+            restored_json["vars"],
+            serde_json::json!({"CLASH": "code", "KEPT": "code"}),
+            "byte-identical restore"
+        );
+    }
+
+    /// Deploy-root config, one secret row per `(name, value)`, and the
+    /// pristine config bytes: the harness every injection test builds on.
+    #[cfg(unix)]
+    async fn inject_harness(
+        rows: &[(&str, &str)],
+    ) -> (
+        tempfile::TempDir,
+        Deployer,
+        SqlitePool,
+        App,
+        PathBuf,
+        Vec<u8>,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10301);
+        insert_test_app(&pool, &app).await;
+        let key = crate::secrets::SecretsKey::test_key();
+        for (name, value) in rows {
+            let blob = crate::secrets::encrypt(&key, &app.id, name, value.as_bytes());
+            crate::secrets::set(&pool, &app.id, name, &blob, 1)
+                .await
+                .unwrap();
+        }
+        let work = deployer.work_dir(&app.slug);
+        std::fs::create_dir_all(work.join("dist")).unwrap();
+        let config = work.join("dist").join("wrangler.json");
+        let original =
+            br#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","vars":{"KEPT":"code"}}"#
+                .to_vec();
+        std::fs::write(&config, &original).unwrap();
+        (data, deployer, pool, app, config, original)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_guard_restores_byte_identically_on_drop_and_clears_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_data, deployer, pool, app, config, original) =
+            inject_harness(&[("MY_KEY", "s3cr3t")]).await;
+        let mode_before = std::fs::metadata(&config).unwrap().permissions().mode();
+        let (root, _, _) = deployer.deploy_root(&app).unwrap();
+        assert_eq!(root.config, config);
+        let guard = deployer
+            .inject_secrets(&pool, &app, &root)
+            .await
+            .unwrap()
+            .expect("one usable row injects");
+        assert_eq!(guard.injected, 1);
+        // The sidecar lands before the worktree file is touched, and the
+        // patched file is 0600 from creation — never write-then-chmod.
+        let sidecar_dir = secret_sidecar_dir(&deployer.settings.data_dir);
+        assert!(sidecar_dir.join("grocery.orig").is_file());
+        assert!(sidecar_dir.join("grocery.target").is_file());
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "injected config is owner-only"
+        );
+        assert!(
+            std::fs::read_to_string(&config).unwrap().contains("s3cr3t"),
+            "plaintext present in the window"
+        );
+        drop(guard);
+        assert_eq!(std::fs::read(&config).unwrap(), original, "byte-identical");
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode(),
+            mode_before,
+            "mode restored"
+        );
+        assert!(
+            !sidecar_dir.join("grocery.orig").exists(),
+            "sidecar cleared after restore"
+        );
+        assert!(!sidecar_dir.join("grocery.target").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_guard_restores_when_the_upload_panics() {
+        let (_data, deployer, pool, app, config, original) =
+            inject_harness(&[("MY_KEY", "s3cr3t")]).await;
+        let (root, _, _) = deployer.deploy_root(&app).unwrap();
+        let guard = deployer
+            .inject_secrets(&pool, &app, &root)
+            .await
+            .unwrap()
+            .expect("one usable row injects");
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = guard;
+            panic!("simulated upload panic");
+        }));
+        assert!(crashed.is_err(), "the panic really happened");
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            original,
+            "Drop scrubbed the plaintext on the unwind path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_refuses_symlinked_config_and_leaves_target_untouched() {
+        let (_data, deployer, pool, app, config, _original) =
+            inject_harness(&[("MY_KEY", "s3cr3t")]).await;
+        let elsewhere = deployer.settings.data_dir.join("elsewhere.json");
+        std::fs::write(&elsewhere, r#"{"name":"victim"}"#).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &config).unwrap();
+        // Discovery fails closed first …
+        let err = format!("{:#}", deployer.deploy_root(&app).unwrap_err());
+        assert!(err.contains("symlink"), "fails closed: {err}");
+        // … and the sink re-checks even when handed the path directly.
+        let root = DeployRoot {
+            root: config.parent().unwrap().to_path_buf(),
+            config: config.clone(),
+        };
+        let err = match deployer.inject_secrets(&pool, &app, &root).await {
+            Ok(_) => panic!("injecting through a symlink must fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("symlink"), "fails closed: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            r#"{"name":"victim"}"#,
+            "never written through the link"
+        );
+        assert!(
+            !secret_sidecar_dir(&deployer.settings.data_dir)
+                .join("grocery.orig")
+                .exists(),
+            "no sidecar stashed for a refused inject"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inject_skips_reserved_and_misshapen_secret_rows() {
+        // `set` takes whatever the DB holds: rows written before the
+        // tool-time checks (or straight into the DB) reach the sink.
+        let (_data, deployer, pool, app, config, _original) = inject_harness(&[
+            ("GOOD_KEY", "good"),
+            ("PORT", "platform-override"),
+            ("BUN_FOO", "bun-claim"),
+            ("BUN_INSTALL_CACHE_DIR", "cache-claim"),
+            ("lower", "misshapen"),
+        ])
+        .await;
+        let (root, _, _) = deployer.deploy_root(&app).unwrap();
+        let guard = deployer
+            .inject_secrets(&pool, &app, &root)
+            .await
+            .unwrap()
+            .expect("one usable row still injects");
+        assert_eq!(guard.injected, 1, "only GOOD_KEY counts");
+        assert!(guard.overwritten.is_empty());
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(patched["vars"]["GOOD_KEY"], "good");
+        for banned in ["PORT", "BUN_FOO", "BUN_INSTALL_CACHE_DIR", "lower"] {
+            assert!(
+                patched["vars"].get(banned).is_none(),
+                "{banned} must never reach platform vars"
+            );
+        }
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_scrub_replays_sidecar_and_deletes_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = data.path().join("work").join("grocery").join("dist");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("wrangler.json");
+        let original = br#"{"name":"t","vars":{}}"#.to_vec();
+        std::fs::write(&config, &original).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        // Simulate the crash: stash, then clobber the worktree file.
+        let (orig_sidecar, target_sidecar) =
+            stash_secret_sidecar(data.path(), "grocery", &config, 0o640, &original).unwrap();
+        std::fs::write(&config, r#"{"name":"t","vars":{"MY_KEY":"plaintext"}}"#).unwrap();
+        assert_eq!(scrub_interrupted_injections(data.path()).unwrap(), 1);
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "mode replayed from the sidecar"
+        );
+        assert!(!orig_sidecar.exists() && !target_sidecar.exists());
+        assert_eq!(
+            scrub_interrupted_injections(data.path()).unwrap(),
+            0,
+            "idempotent"
+        );
+        // An orphaned `.orig` (target write crashed) is dropped, never
+        // replayed blindly: there is no verified destination.
+        std::fs::write(
+            data.path().join("secret-sidecars").join("grocery.orig"),
+            b"x",
+        )
+        .unwrap();
+        assert_eq!(scrub_interrupted_injections(data.path()).unwrap(), 0);
+        assert!(!data
+            .path()
+            .join("secret-sidecars")
+            .join("grocery.orig")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_scrub_keeps_sidecar_when_config_is_a_link() {
+        let data = tempfile::tempdir().unwrap();
+        let config_dir = data.path().join("work").join("grocery").join("dist");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("wrangler.json");
+        let original = br#"{"name":"t","vars":{}}"#.to_vec();
+        std::fs::write(&config, &original).unwrap();
+        let (orig_sidecar, _) =
+            stash_secret_sidecar(data.path(), "grocery", &config, 0o644, &original).unwrap();
+        let elsewhere = data.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, r#"{"name":"victim"}"#).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &config).unwrap();
+        assert_eq!(scrub_interrupted_injections(data.path()).unwrap(), 0);
+        assert!(orig_sidecar.exists(), "kept for the next boot");
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            r#"{"name":"victim"}"#,
+            "never written through the link"
+        );
     }
 
     #[tokio::test]
@@ -4230,6 +5084,7 @@ exit 0
             cache_purge: None,
             jev: None,
             wake: None,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
         };
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();

@@ -265,6 +265,7 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
     let pool = db::open(&config.db_path()).await?;
     let rt = &config.runtime;
     let jev = jev_client(config)?;
+    let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
     let deployer = Deployer::new(
         DeploySettings {
             data_dir: config.data_dir.clone(),
@@ -282,6 +283,7 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
             // before any upload for an existing app, after the upload for a
             // first deploy (which uploads first).
             wake: None,
+            secrets_key: secrets_key.clone(),
         },
         rt.build_concurrency,
     );
@@ -531,6 +533,16 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             "closed deploy rows a restart cut off (marked failed)"
         );
     }
+    // A crash mid-upload leaves injected plaintext in the worktree: put the
+    // stashed pre-inject bytes back and delete the sidecars (next boot
+    // retries whatever still fails the symlink check).
+    let scrubbed = outer::deploy::scrub_interrupted_injections(&config.data_dir)?;
+    if scrubbed > 0 {
+        tracing::warn!(
+            scrubbed,
+            "restored deploy configs a restart cut off mid secret-injection"
+        );
+    }
     // Bind before claiming the bucket: a second instance that can't listen
     // must not take ownership away from the one that's serving.
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -589,6 +601,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         outer::cron::WAKE_LEAD,
     );
 
+    let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
     let deployer = outer::deploy::Deployer::new(
         outer::deploy::DeploySettings {
             data_dir: config.data_dir.clone(),
@@ -604,6 +617,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             // The migrate step wakes a sleeping fleet before applying D1
             // migrations (`celld d1` reaches the database through a node).
             wake: Some(fleets.clone()),
+            secrets_key: secrets_key.clone(),
         },
         rt.build_concurrency,
     );
@@ -633,6 +647,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(&config),
         },
+        secrets_key,
     };
     // Request metrics (spec §13): owned by the proxy state, flushed to
     // SQLite every few seconds by the sweep below (and once more on

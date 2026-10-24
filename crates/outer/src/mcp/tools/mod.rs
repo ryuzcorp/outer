@@ -9,6 +9,7 @@ pub(crate) mod account;
 pub(crate) mod apps;
 pub(crate) mod code;
 pub(crate) mod runtime;
+pub(crate) mod secrets;
 
 use std::time::Duration;
 
@@ -761,6 +762,15 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "app_errors" => runtime::app_errors(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "list_secrets" => secrets::list_secrets(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "set_secret" => secrets::set_secret(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "unset_secret" => secrets::unset_secret(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         _ => Err(CallError::Rpc(-32602, format!("unknown tool {tool:?}"))),
