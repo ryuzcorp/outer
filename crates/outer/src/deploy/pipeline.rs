@@ -69,6 +69,10 @@ pub struct DeploySettings {
     /// and in tests with a fake `celld`, where no fleet can be woken and the
     /// apply fails loudly when no fleet serves the app.
     pub wake: Option<crate::fleet::manager::FleetManager>,
+    /// AES-256-GCM key for app secrets, derived from `OUTER_SECRET` at boot.
+    /// Secrets are decrypted only for the `celld deploy` step and injected
+    /// into the deploy-root config `vars`; builds never see them.
+    pub secrets_key: crate::secrets::SecretsKey,
 }
 
 /// One pipeline step's timing for the `deploy` row's `steps` JSON.
@@ -115,6 +119,50 @@ pub struct DeployOutcome {
 pub struct DeployRoot {
     pub root: PathBuf,
     pub config: PathBuf,
+}
+/// The patched deploy-root config while its `vars` hold plaintext: the
+/// original bytes plus their mode, for a byte-identical restore once the
+/// upload has the file. Plaintext lives only between `inject_secrets`
+/// and [`InjectedSecrets::restore`], plus the uploaded copy under
+/// `fleets/<slug>/`, where celld needs it to serve `env.*`.
+struct InjectedSecrets {
+    path: PathBuf,
+    original: Vec<u8>,
+    #[allow(dead_code)]
+    mode: u32,
+    injected: usize,
+    overwritten: Vec<String>,
+}
+impl InjectedSecrets {
+    /// One journal line: counts and overwritten names only, never values.
+    fn journal_line(&self) -> String {
+        if self.overwritten.is_empty() {
+            format!("secrets: injected {} vars\n", self.injected)
+        } else {
+            format!(
+                "secrets: injected {} vars (overwrote code-defined {})\n",
+                self.injected,
+                self.overwritten.join(", ")
+            )
+        }
+    }
+    /// Byte-identical restore, pass or fail. Best-effort: a restore
+    /// failure warns but must not fail a deploy whose upload succeeded.
+    fn restore(self) {
+        if let Err(e) = std::fs::write(&self.path, &self.original) {
+            tracing::warn!(path = %self.path.display(), error = %format!("{e:#}"), "restoring deploy config after secrets injection");
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode))
+            {
+                tracing::warn!(path = %self.path.display(), error = %format!("{e:#}"), "restoring deploy config mode after secrets injection");
+            }
+        }
+    }
 }
 pub struct Deployer {
     settings: DeploySettings,
@@ -530,7 +578,7 @@ impl Deployer {
         self.migrate_step(pool, app, deploy_id, &deploy_root, journal)
             .await?;
         let version = self
-            .deploy_step(app, deploy_id, &deploy_root.root, journal)
+            .deploy_step(pool, app, deploy_id, &deploy_root, journal)
             .await?;
         Ok((version, crons))
     }
@@ -541,14 +589,28 @@ impl Deployer {
     /// migrate failure uploads nothing at all.
     async fn deploy_step(
         &self,
+        pool: &SqlitePool,
         app: &App,
         deploy_id: &str,
-        root: &Path,
+        deploy_root: &DeployRoot,
         journal: &mut Journal,
     ) -> Result<Option<String>, StepEnd> {
         let Journal { steps, log } = journal;
         let started = Instant::now();
-        match self.celld_deploy(app, deploy_id, root).await {
+        // Decrypt after the gate: a blocked deploy never touches secrets.
+        let injected = self
+            .inject_secrets(pool, app, deploy_root)
+            .await
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("deploy", &e)))?;
+        let outcome = self.celld_deploy(app, deploy_id, deploy_root).await;
+        // The patched config held plaintext: byte-identical restore, pass or
+        // fail, before the result is journaled.
+        if let Some(guard) = injected {
+            let line = guard.journal_line();
+            guard.restore();
+            log.push_str(&line);
+        }
+        match outcome {
             Ok((out, version)) => {
                 push_step(steps, log, "deploy", started, false, &out);
                 Ok(version)
@@ -774,7 +836,7 @@ impl Deployer {
         &self,
         app: &App,
         deploy_id: &str,
-        root: &Path,
+        deploy_root: &DeployRoot,
     ) -> anyhow::Result<(String, Option<String>)> {
         let prefix = FleetStorage::fleet_prefix(&app.slug);
         let creds = self
@@ -807,7 +869,7 @@ impl Deployer {
         }
         let args = vec![
             "deploy".to_string(),
-            root.to_string_lossy().into_owned(),
+            deploy_root.root.to_string_lossy().into_owned(),
             "--bucket".to_string(),
             bucket,
             "--endpoint".to_string(),
@@ -833,6 +895,81 @@ impl Deployer {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         Ok((out, version))
+    }
+    /// Decrypt the app's secrets into the deploy-root config `vars`, for this
+    /// deploy only. Returns `None` when the app has no secrets (the config is
+    /// untouched), else a guard holding the original bytes: the caller runs
+    /// the upload, then restores byte-identically (see [`InjectedSecrets`]).
+    ///
+    /// Code-defined `vars` keys lose to same-named secrets; the overwrite is
+    /// journaled by name (names are public via `list_secrets`, values never
+    /// are). The patched file is `0o600` while it holds plaintext; the
+    /// upload carries it to `fleets/<slug>/`, where celld needs it.
+    async fn inject_secrets(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        deploy_root: &DeployRoot,
+    ) -> anyhow::Result<Option<InjectedSecrets>> {
+        let secrets =
+            crate::secrets::decrypt_all(pool, &app.id, &self.settings.secrets_key).await?;
+        if secrets.is_empty() {
+            return Ok(None);
+        }
+        let path = deploy_root.config.clone();
+        let original = std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("reading deploy config {}: {e:#}", path.display()))?;
+        let mode = std::fs::metadata(&path)
+            .map(|m| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode()
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = m;
+                    0o644
+                }
+            })
+            .unwrap_or(0o644);
+        let mut parsed = read_config_file(&path)?;
+        let obj = parsed
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("deploy config {} is not an object", path.display()))?;
+        let vars = obj
+            .entry("vars".to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        let vars = vars.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("deploy config {} has a non-object vars", path.display())
+        })?;
+        let mut overwritten = Vec::new();
+        for (name, value) in &secrets {
+            let text = String::from_utf8(value.clone()).map_err(|_| {
+                anyhow::anyhow!("secret {name:?} is not valid UTF-8; refusing to inject")
+            })?;
+            if vars.contains_key(name.as_str()) {
+                overwritten.push(name.clone());
+            }
+            vars.insert(name.clone(), serde_json::Value::String(text));
+        }
+        let patched = serde_json::to_string_pretty(&parsed)?;
+        std::fs::write(&path, patched.as_bytes())
+            .map_err(|e| anyhow::anyhow!("writing deploy config {}: {e:#}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| anyhow::anyhow!("locking down deploy config {}: {e:#}", path.display()),
+            )?;
+        }
+        Ok(Some(InjectedSecrets {
+            path,
+            original,
+            mode,
+            injected: secrets.len(),
+            overwritten,
+        }))
     }
     /// Apply pending D1 migrations, then record what was applied.
     /// Returns `(skipped, journal)`: skipped when the built config declares
@@ -2371,6 +2508,7 @@ mod tests {
             cache_purge: None,
             jev: None,
             wake: None,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
         }
     }
 
@@ -2985,8 +3123,12 @@ if [ "$1" = "deploy" ]; then
   bucket=$(state_of_bucket "$@")
   statedir=$(printf '%s' "$bucket" | sed -e 's|^s3://||' -e 's|/fleets/.*||')
   mkdir -p "$statedir"
-  printf '%s\n' "$*" >> "$statedir/calls.log"
-  printf '{"version":"fake-v1"}\n'
+   printf '%s\n' "$*" >> "$statedir/calls.log"
+   root="$2"
+   for f in "$root"/wrangler.json "$root"/wrangler.jsonc; do
+     [ -f "$f" ] && cp "$f" "$statedir/deployed-config"
+   done
+   printf '{"version":"fake-v1"}\n'
   exit 0
 fi
 bucket=$(state_of_bucket "$@")
@@ -3010,6 +3152,27 @@ exit 0
 "#,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+    /// A fake `bun` for the install and build steps: records argv and the
+    /// full step env, then succeeds. Secrets must never appear in a build
+    /// step's env (builds run untrusted code), so the test greps this log.
+    fn install_fake_bun(state: &Path) -> PathBuf {
+        let script = state.join("fake-bun");
+        std::fs::write(
+             &script,
+             format!(
+                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}/build-calls.log\"\nenv | sort >> \"{}/build-env.log\"\nexit 0\n",
+                 state.display(),
+                 state.display()
+             ),
+         )
+         .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3237,6 +3400,103 @@ exit 0
                 .await
                 .unwrap();
         assert_eq!(last_sha.as_deref(), Some(sha.as_str()));
+    }
+    #[tokio::test]
+    async fn secrets_land_in_deploy_vars_not_in_build_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        // A code-defined `vars` entry: secrets merge over it, and the merge
+        // is journaled by name. `package.json` forces the install and build
+        // steps through the fake `bun`, which records their env.
+        let sha = commit_tree(
+             &cfg,
+             &store,
+             &sync,
+             "grocery",
+             vec![
+                 write(
+                     "dist/wrangler.json",
+                     r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","vars":{"CLASH":"code","KEPT":"code"}}"#,
+                 ),
+                 write("package.json", r#"{"name":"t","scripts":{"build":"echo built"}}"#),
+                 write("bun.lock", "lock"),
+             ],
+         )
+         .await;
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10201);
+        insert_test_app(&pool, &app).await;
+        let key = crate::secrets::SecretsKey::test_key();
+        let marker = "DEPLOY_SECRET_MARKER_8H7G6F";
+        for (name, value) in [("MY_KEY", marker), ("CLASH", "secret-wins")] {
+            let blob = crate::secrets::encrypt(&key, &app.id, name, value.as_bytes());
+            let capped = crate::secrets::set(&pool, &app.id, name, &blob, 1)
+                .await
+                .unwrap();
+            assert!(!capped, "{name} fits");
+        }
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let bun = install_fake_bun(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = migrate_settings(&data, state.path(), &script);
+        settings.bun_bin = bun.to_string_lossy().into_owned();
+        let deployer = Deployer::new(settings, 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        // The uploaded config carries the decrypted values: the fresh var,
+        // the overwrite winning over code, and the untouched code var.
+        let deployed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state.path().join("deployed-config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deployed["vars"]["MY_KEY"], marker);
+        assert_eq!(deployed["vars"]["CLASH"], "secret-wins");
+        assert_eq!(deployed["vars"]["KEPT"], "code");
+        assert!(
+            outcome.log_tail.contains("injected 2 vars"),
+            "journaled: {}",
+            outcome.log_tail
+        );
+        assert!(
+            outcome.log_tail.contains("CLASH"),
+            "overwrite journaled: {}",
+            outcome.log_tail
+        );
+        // Both sandboxed build steps ran through the fake, and neither saw
+        // a value: builds run untrusted code, so they never get secrets.
+        let build_calls = std::fs::read_to_string(state.path().join("build-calls.log")).unwrap();
+        assert!(
+            build_calls.contains("install"),
+            "install ran: {build_calls}"
+        );
+        assert!(
+            build_calls.contains("run build"),
+            "build ran: {build_calls}"
+        );
+        let build_env = std::fs::read_to_string(state.path().join("build-env.log")).unwrap();
+        assert!(!build_env.contains(marker), "build env carries no secret");
+        assert!(
+            !build_env.contains("secret-wins"),
+            "build env carries no secret"
+        );
+        // The worktree config is restored byte-identically: no plaintext
+        // lingers on disk past the upload.
+        let work_config = deployer.work_dir(&app.slug).join("dist/wrangler.json");
+        let restored = std::fs::read_to_string(&work_config).unwrap();
+        assert!(!restored.contains(marker), "scrubbed: {restored}");
+        assert!(!restored.contains("secret-wins"), "scrubbed: {restored}");
+        let restored_json: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(
+            restored_json["vars"],
+            serde_json::json!({"CLASH": "code", "KEPT": "code"}),
+            "byte-identical restore"
+        );
     }
 
     #[tokio::test]
@@ -4230,6 +4490,7 @@ exit 0
             cache_purge: None,
             jev: None,
             wake: None,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
         };
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
