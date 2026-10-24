@@ -43,6 +43,25 @@ hand-write it: set bindings in `void.config.ts` and rebuild.
 - A fleet stops after about 30 minutes without requests (the deployment's
   idle setting) and wakes on the next request; a sleeping app adopts the
   newest deploy when it wakes.
+ ## Secrets
+
+ Apps that call external APIs keep keys outside the code with three MCP
+ tools. `set_secret {app, key, value}` stores a value encrypted at rest
+ (AES-256-GCM, one key per app derived from the platform secret);
+ `list_secrets {app}` shows names and when each was set; `unset_secret
+ {app, key}` removes one. Values are never returned, logged, or echoed —
+ not even to the app's owner.
+
+ Rules: names match `^[A-Z_][A-Z0-9_]{0,63}$`; platform-reserved names
+ (`PORT`, `AWS_*`, `OUTER_*`, `LD_*`, …) are refused; values hold at most
+ 4 KiB; at most 50 secrets per app.
+
+ Each deploy decrypts the values into the deploy-root config `vars`, so
+ the app reads them as Worker env vars (`env.MY_KEY`). They apply on the
+ next deploy: setting a secret never touches the running fleet. A
+ same-named `vars` entry in code loses to the secret, and the deploy log
+ names the overwrite. Builds never see secrets — `bun install` and `bun
+ run build` run without them, so build scripts must not require them.
 
 ## PWA
 

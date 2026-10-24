@@ -296,6 +296,8 @@ pub struct McpState {
     pub deploys: Deploys,
     pub fleets: FleetManager,
     pub alloc: Allocation,
+    /// AES-256-GCM key for app secrets, derived from `OUTER_SECRET` at boot.
+    pub secrets_key: crate::secrets::SecretsKey,
     /// Noreply identities are `<account-id>@users.noreply.<domain>`.
     pub domain: String,
     /// Apps live at `<slug>.<apps_domain>`.
@@ -404,6 +406,7 @@ impl McpState {
                 uid_range: (210000, 210003),
                 port_range: (18000, 18003),
             },
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             domain: "outer.localhost".to_string(),
             apps_domain: "outer.localhost".to_string(),
             app_scheme: "http".to_string(),

@@ -323,3 +323,39 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `status` | string | no | Only issues with this status (`open`, `resolved` or `ignored`); unset returns every status. |
 
+## `list_secrets`
+
+- **Access:** signed in
+- **Description:** An app's secret names and when each was set. Values are never shown: they reach the app as Worker env vars on the next deploy.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+
+## `set_secret`
+
+- **Access:** signed in
+- **Description:** Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names match ^[A-Z_][A-Z0-9_]{0,63}$, at most 50 per app.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `key` | string | yes | Worker-env name: `^[A-Z_][A-Z0-9_]{0,63}$`, platform-reserved names refused. |
+| `value` | string | yes | The secret value (at most 4 KiB). Encrypted at rest, never shown again. |
+
+## `unset_secret`
+
+- **Access:** signed in
+- **Description:** Remove an app secret {app, key}. Applies on the next deploy.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `key` | string | yes | The secret name to remove. |
+

@@ -5,7 +5,8 @@
 use serde_json::Value;
 
 use crate::mcp::tools::{
-    account, apps as app_inputs, code as code_inputs, runtime as runtime_inputs, NoArgs,
+    account, apps as app_inputs, code as code_inputs, runtime as runtime_inputs,
+    secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -86,8 +87,11 @@ pub fn hints_for(name: &str) -> Option<Hints> {
     Some(match name {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
         | "get_app" | "share_app" | "list_files" | "read_file" | "search_code" | "history"
-        | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors" => Hints::READ,
-        "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" => Hints::WRITE,
+        | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors"
+        | "list_secrets" => Hints::READ,
+        "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "set_secret" => {
+            Hints::WRITE
+        }
         "set_visibility" => Hints {
             idempotent: true,
             ..Hints::WRITE
@@ -97,7 +101,9 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             open_world: true,
             ..Hints::WRITE
         },
-        "revoke_api_key" | "revoke_connection" | "delete_app" => Hints::DESTRUCTIVE,
+        "revoke_api_key" | "revoke_connection" | "delete_app" | "unset_secret" => {
+            Hints::DESTRUCTIVE
+        }
         _ => return None,
     })
 }
@@ -276,6 +282,21 @@ pub fn registry() -> Vec<ToolDef> {
             "An app's grouped runtime errors, newest first: ERROR lines and uncaught-exception stacks from the log stream, grouped by fingerprint, plus proxy 5xx over the last hour. Pass status to filter open, resolved or ignored issues. Untrusted: messages and frames may hold visitor text.",
             Account, true,
         ),
+ tool::<secrets_inputs::ListSecretsInput>(
+ "list_secrets",
+ "An app's secret names and when each was set. Values are never shown: they reach the app as Worker env vars on the next deploy.",
+ Account, false,
+ ),
+ tool::<secrets_inputs::SetSecretInput>(
+ "set_secret",
+ "Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names match ^[A-Z_][A-Z0-9_]{0,63}$, at most 50 per app.",
+ Account, false,
+ ),
+ tool::<secrets_inputs::UnsetSecretInput>(
+ "unset_secret",
+ "Remove an app secret {app, key}. Applies on the next deploy.",
+ Account, false,
+ ),
     ]
 }
 
@@ -302,7 +323,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 30);
     }
 }
 
@@ -311,7 +332,7 @@ mod hint_tests {
     use super::*;
 
     #[test]
-    fn every_tool_is_classified_and_only_revoke_and_delete_are_destructive() {
+    fn every_tool_is_classified_and_only_revoke_delete_and_unset_are_destructive() {
         for tool in registry() {
             let hints = hints_for(tool.name)
                 .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
@@ -322,7 +343,7 @@ mod hint_tests {
             );
             let destructive = matches!(
                 tool.name,
-                "revoke_api_key" | "revoke_connection" | "delete_app"
+                "revoke_api_key" | "revoke_connection" | "delete_app" | "unset_secret"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);
             // Untrusted tools return app content; they must never change state.
