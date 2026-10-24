@@ -50,6 +50,46 @@ export interface LogLine {
   line: string;
 }
 
+
+export interface MetricsBucket {
+  hour: number;
+  requests: number;
+  s4xx: number;
+  s5xx: number;
+}
+
+export interface PathStat {
+  path: string;
+  requests: number;
+  s5xx: number;
+}
+
+export interface MetricsSummary {
+  requests: number;
+  visitors: number;
+  s4xx: number;
+  s5xx: number;
+  p50_ms: number;
+  p95_ms: number;
+  buckets: MetricsBucket[];
+  top_paths: PathStat[];
+}
+
+export interface ActionEntry {
+  id: string;
+  at: number;
+  tool: string;
+  summary: string;
+  outcome: string;
+  error_code: string | null;
+  duration_ms: number;
+  by: string;
+}
+
+export interface ActionsPage {
+  actions: ActionEntry[];
+  next: string | null;
+}
 export function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }

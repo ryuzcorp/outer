@@ -814,6 +814,7 @@ pub struct PathStat {
 /// ending mid-day covers today and yesterday), so a visitor active on N
 /// days counts N times. `p50_ms`/`p95_ms` come from the merged histogram
 /// at bucket resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub requests: i64,
     pub visitors: i64,

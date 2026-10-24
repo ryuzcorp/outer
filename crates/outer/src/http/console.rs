@@ -11,6 +11,11 @@
 //! - `GET /api/console/apps`: the caller's apps (same rows as MCP
 //!   `list_apps`, plus `last_request_at` and the last deploy).
 //! - `GET /api/console/apps/:slug`: the app plus its last 20 deploys.
+//! - `GET /api/console/apps/:slug/actions?before=&limit=`: the agent
+//!   action log, newest first (same rows as `actions::list`).
+//! - `GET /api/console/apps/:slug/metrics?hours=`: requests, visitors,
+//!   4xx/5xx, latency p50/p95, hourly buckets and top paths (same rows as
+//!   `metrics::summary`; `hours` is 24, 168 or 720).
 //! - `GET /api/console/apps/:slug/logs?since=&limit=`: the fleet's
 //!   in-memory log ring (same lines as MCP `app_logs`).
 //! - `POST /api/console/sign-out`: deletes the session, clears the cookie.
@@ -23,10 +28,7 @@
 //! drive the API off the user's cookie); JSON errors; `Cache-Control:
 //! no-store` on everything.
 //!
-//! INTEGRATOR SEAM (parallel branches): the agent action log
-//! (`actions::list`) and metrics (`metrics::summary`) merge into the app
-//! detail response here once those endpoints exist. Until then no such
-//! fields are emitted and the pages render no such panels.
+//!
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -50,6 +52,8 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/me", get(api_me))
         .route("/api/console/apps", get(api_apps))
         .route("/api/console/apps/{slug}", get(api_app))
+        .route("/api/console/apps/{slug}/actions", get(api_actions))
+        .route("/api/console/apps/{slug}/metrics", get(api_metrics))
         .route("/api/console/apps/{slug}/logs", get(api_logs))
         .route("/api/console/sign-out", post(api_sign_out))
         .with_state(state)
@@ -250,9 +254,8 @@ async fn api_app(
     let last = latest_deploy(&mcp.pool, &app.id).await.unwrap_or(None);
     let status =
         crate::mcp::tools::apps::app_status(&app, last.as_ref().map(|r| r.status.as_str()));
-    // INTEGRATOR SEAM: `actions::list` (agent action log) and
-    // `metrics::summary` (requests/visitors/latency/top paths) join this
-    // object in the parallel branches. Nothing is emitted for them here.
+    // The action log and metrics live behind their own endpoints, so this
+    // object stays small and each panel loads independently.
     let rows: Vec<DeployListRow> = match sqlx::query_as::<_, DeployListRow>(
         "SELECT id, sha, status, error, findings, created_at, finished_at \
          FROM deploy WHERE app_id = ?1 ORDER BY created_at DESC LIMIT 20",
@@ -354,6 +357,160 @@ async fn api_logs(
         .into_response()
 }
 
+/// `GET /api/console/apps/:slug/actions`: the app's agent action log,
+/// newest first. `before` is the opaque `<created_at>:<id>` cursor of the
+/// last row on the previous page; `limit` defaults to 20 and clamps to
+/// 1–100. Answers `{actions, next?}` where `next` is the cursor for the
+/// following page. The caller MUST own the app (see `owned_app`): anything
+/// else answers 404 exactly like a missing app.
+async fn api_actions(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    let app = match owned_app(mcp, &account, &slug).await {
+        Ok(Some(app)) => app,
+        Ok(None) => return not_found(),
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load the app right now",
+            );
+        }
+    };
+    let limit = query
+        .get("limit")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let before = match query.get("before") {
+        None => None,
+        Some(raw) => match parse_action_cursor(raw) {
+            Some(cursor) => Some(cursor),
+            None => {
+                return nostore_json(
+                    StatusCode::BAD_REQUEST,
+                    "bad_cursor",
+                    "before must be the next cursor from the previous page",
+                );
+            }
+        },
+    };
+    // One extra row tells a full page from the last one.
+    let rows = match crate::mcp::actions::list(&mcp.pool, &app.id, before, limit + 1).await {
+        Ok(rows) => rows,
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load the action log right now",
+            );
+        }
+    };
+    let (page, next) = match rows.len() as u64 > limit {
+        true => (&rows[..limit as usize], {
+            let last = &rows[limit as usize - 1];
+            Some(action_cursor(last.created_at, &last.id))
+        }),
+        false => (&rows[..], None),
+    };
+    let actions: Vec<serde_json::Value> = page
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.id,
+                "at": row.created_at,
+                "tool": row.tool,
+                "summary": row.summary,
+                "outcome": row.outcome,
+                "error_code": row.error_code,
+                "duration_ms": row.duration_ms,
+                "by": row.client_label,
+            })
+        })
+        .collect();
+    ok_json(json!({"actions": actions, "next": next}))
+}
+
+/// Parse the opaque `before` cursor back into the `(created_at, id)` pair
+/// that `actions::list` pages on. Anything else is a 400.
+fn parse_action_cursor(raw: &str) -> Option<(i64, String)> {
+    let (at, id) = raw.split_once(':')?;
+    let at: i64 = at.parse().ok()?;
+    if at < 0 || id.is_empty() || id.contains(':') {
+        return None;
+    }
+    Some((at, id.to_string()))
+}
+
+/// Render one `actions::list` page edge as the opaque `before` cursor.
+fn action_cursor(created_at: i64, id: &str) -> String {
+    format!("{created_at}:{id}")
+}
+
+/// `GET /api/console/apps/:slug/metrics?hours=`: the `metrics::summary`
+/// view over 24 h, 7 d or 30 d. Anything but `24|168|720` is a 400.
+async fn api_metrics(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    let app = match owned_app(mcp, &account, &slug).await {
+        Ok(Some(app)) => app,
+        Ok(None) => return not_found(),
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load the app right now",
+            );
+        }
+    };
+    let hours: i64 = match query.get("hours").and_then(|s| s.parse().ok()) {
+        Some(hours @ (24 | 168 | 720)) => hours,
+        _ => {
+            return nostore_json(
+                StatusCode::BAD_REQUEST,
+                "bad_hours",
+                "hours must be one of 24, 168, 720",
+            );
+        }
+    };
+    match crate::observe::metrics::summary(&mcp.pool, &app.id, hours).await {
+        Ok(summary) => ok_json(serde_json::to_value(summary).unwrap_or(json!({}))),
+        Err(_) => nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not load metrics right now",
+        ),
+    }
+}
+
+/// A 200 JSON answer with the same `no-store` rules as the error shape.
+fn ok_json(body: serde_json::Value) -> Response {
+    (
+        StatusCode::OK,
+        [
+            ("cache-control", "no-store"),
+            ("content-type", "application/json"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
 async fn api_sign_out(State(state): State<super::AppState>, headers: HeaderMap) -> Response {
     let mcp = &state.mcp;
     let Some(session) = crate::auth::session_from_headers(&headers) else {
@@ -1122,5 +1279,293 @@ mod tests {
             body.contains("Outer console"),
             "Rust sign-in page wins, got: {body}"
         );
+    }
+
+    async fn seed_action(
+        pool: &SqlitePool,
+        app_id: &str,
+        id: &str,
+        tool: &str,
+        outcome: &str,
+        created_at: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO agent_action (id, app_id, account_id, grant_id, api_key_id, \
+             tool, summary, outcome, error_code, duration_ms, created_at) \
+             VALUES (?1, ?2, 'acct-ana@example.com', NULL, NULL, ?3, 'did a thing', ?4, NULL, 120, ?5)",
+        )
+        .bind(id)
+        .bind(app_id)
+        .bind(tool)
+        .bind(outcome)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actions_and_metrics_need_session_and_same_origin() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let paths = [
+            "/api/console/apps/groceries/actions".to_string(),
+            "/api/console/apps/groceries/metrics?hours=24".to_string(),
+        ];
+        for path in &paths {
+            let (status, headers, _) = send(
+                &app,
+                same_origin(Request::get(path)).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(headers["cache-control"], "no-store", "{path}");
+        }
+        let session = login(&pool, "ana@example.com").await;
+        for path in &paths {
+            let (status, _, _) = send(
+                &app,
+                Request::get(path)
+                    .header("cookie", session.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn actions_and_metrics_are_owner_scoped() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "ben@example.com", "benblog", now).await;
+        let session = login(&pool, "ana@example.com").await;
+        for prefix in ["actions", "metrics?hours=24"] {
+            let (status, _, foreign) = send(
+                &app,
+                authed(&format!("/api/console/apps/benblog/{prefix}"), &session),
+            )
+            .await;
+            let (missing_status, _, missing) = send(
+                &app,
+                authed(&format!("/api/console/apps/nope/{prefix}"), &session),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{prefix}");
+            assert_eq!(missing_status, StatusCode::NOT_FOUND, "{prefix}");
+            assert_eq!(foreign, missing, "foreign answers like missing: {prefix}");
+        }
+    }
+
+    #[tokio::test]
+    async fn actions_rejects_bad_cursor() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let session = login(&pool, "ana@example.com").await;
+        for before in ["bogus", "abc:xyz", "-5:zzz", "123:", ":zzz", "12:34:56"] {
+            let (status, _, body) = send(
+                &app,
+                authed(
+                    &format!("/api/console/apps/groceries/actions?before={before}"),
+                    &session,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{before}");
+            assert_eq!(
+                body.parse::<serde_json::Value>().unwrap()["error"],
+                "bad_cursor",
+                "{before}"
+            );
+        }
+        // No cursor: the first page, empty here.
+        let (status, headers, body) = send(
+            &app,
+            authed("/api/console/apps/groceries/actions", &session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["actions"], json!([]));
+        assert!(body["next"].is_null());
+    }
+
+    #[tokio::test]
+    async fn actions_page_newest_first_with_cursor_round_trip() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_action(
+            &pool,
+            "app-groceries",
+            "a1",
+            "get_app",
+            "success",
+            now - 3000,
+        )
+        .await;
+        seed_action(
+            &pool,
+            "app-groceries",
+            "a2",
+            "commit",
+            "blocked",
+            now - 2000,
+        )
+        .await;
+        seed_action(
+            &pool,
+            "app-groceries",
+            "a3",
+            "rollback",
+            "failed",
+            now - 2000,
+        )
+        .await;
+        let session = login(&pool, "ana@example.com").await;
+        let (status, _, body) = send(
+            &app,
+            authed("/api/console/apps/groceries/actions?limit=2", &session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        let ids: Vec<&str> = body["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        // Same `created_at` breaks the tie by id, newest first.
+        assert_eq!(ids, vec!["a3", "a2"]);
+        let first = &body["actions"][0];
+        assert_eq!(first["at"], now - 2000);
+        assert_eq!(first["tool"], "rollback");
+        assert_eq!(first["summary"], "did a thing");
+        assert_eq!(first["outcome"], "failed");
+        assert!(first["error_code"].is_null());
+        assert_eq!(first["duration_ms"], 120);
+        assert_eq!(first["by"], "API key");
+        let next = body["next"]
+            .as_str()
+            .expect("full page carries next")
+            .to_string();
+        let (status, _, body) = send(
+            &app,
+            authed(
+                &format!("/api/console/apps/groceries/actions?limit=2&before={next}"),
+                &session,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        let ids: Vec<&str> = body["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["a1"]);
+        assert!(body["next"].is_null(), "last page carries no cursor");
+    }
+
+    #[tokio::test]
+    async fn metrics_rejects_bad_hours() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let session = login(&pool, "ana@example.com").await;
+        for query in ["", "?hours=25", "?hours=abc", "?hours=0", "?hours=48"] {
+            let (status, _, body) = send(
+                &app,
+                authed(
+                    &format!("/api/console/apps/groceries/metrics{query}"),
+                    &session,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query:?}");
+            assert_eq!(
+                body.parse::<serde_json::Value>().unwrap()["error"],
+                "bad_hours",
+                "{query:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_happy_path_shape() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let minute = now / 60_000 * 60_000;
+        let hour = now / 3_600_000 * 3_600_000;
+        let hist = "[0,0,0,0,0,10,0,0,0,0,0,0,0,0]";
+        sqlx::query(
+            "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) \
+             VALUES ('app-groceries', ?1, 10, 2, 1, ?2, 0, 0)",
+        )
+        .bind(minute)
+        .bind(hist)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Outside the 24 h window: must not leak in.
+        sqlx::query(
+            "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) \
+             VALUES ('app-groceries', ?1, 100, 0, 0, NULL, 0, 0)",
+        )
+        .bind(minute - 25 * 3_600_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO path_hour (app_id, hour, path, requests, s5xx) VALUES \
+             ('app-groceries', ?1, '/', 10, 1), ('app-groceries', ?1, '/about', 4, 0)",
+        )
+        .bind(hour)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO visitor_day (app_id, day, visitors) VALUES ('app-groceries', ?1, 7)",
+        )
+        .bind(now.div_euclid(86_400_000))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session = login(&pool, "ana@example.com").await;
+        let (status, headers, body) = send(
+            &app,
+            authed("/api/console/apps/groceries/metrics?hours=24", &session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["requests"], 10);
+        assert_eq!(body["visitors"], 7);
+        assert_eq!(body["s4xx"], 2);
+        assert_eq!(body["s5xx"], 1);
+        assert_eq!(body["p50_ms"], 50);
+        assert_eq!(body["p95_ms"], 50);
+        let buckets = body["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 25, "zero-filled hourly buckets over 24 h");
+        let total: i64 = buckets
+            .iter()
+            .map(|b| b["requests"].as_i64().unwrap())
+            .sum();
+        assert_eq!(total, 10);
+        let paths = body["top_paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0]["path"], "/");
+        assert_eq!(paths[0]["requests"], 10);
+        assert_eq!(paths[0]["s5xx"], 1);
     }
 }
