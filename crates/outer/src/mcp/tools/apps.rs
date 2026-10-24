@@ -148,7 +148,7 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     ))
 }
 
-fn app_status(app: &App, last_status: Option<&str>) -> &'static str {
+pub(crate) fn app_status(app: &App, last_status: Option<&str>) -> &'static str {
     if app.asleep_since.is_some() {
         return "sleeping";
     }

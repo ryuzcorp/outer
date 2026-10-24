@@ -253,6 +253,13 @@ fn file_response(
     negotiated: bool,
     relative: &str,
 ) -> Response {
+    // The console CSP hashes the page's own inline blocks, so hash the
+    // bytes before they move into the body.
+    let console_csp = if relative == "console" || relative.starts_with("console/") {
+        Some(console_csp(&bytes))
+    } else {
+        None
+    };
     let body = if method == "HEAD" {
         axum::body::Body::empty()
     } else {
@@ -273,7 +280,101 @@ fn file_response(
     if negotiated {
         headers.insert(axum::http::header::VARY, "Accept".parse().unwrap());
     }
+    if let Some(csp) = console_csp {
+        headers.insert(
+            "content-security-policy",
+            csp.parse().expect("hashes are header-safe"),
+        );
+        headers.insert(
+            "x-content-type-options",
+            "nosniff".parse().expect("static header parses"),
+        );
+        headers.insert(
+            "referrer-policy",
+            "same-origin".parse().expect("static header parses"),
+        );
+    }
     res
+}
+
+/// The `/console/*` content security policy (spec §13.1): strict
+/// same-origin, no framing. Astro inlines its island runtime (and a small
+/// style rule) into these shells, so `script-src`/`style-src` carry sha256
+/// hashes of every inline block, computed over the exact bytes being served:
+/// rebuilds change the hashes, never the checking. Anything else stays
+/// `'self`-only; the no-sniff and referrer headers join it in
+/// [`file_response`].
+fn console_csp(html: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let mut csp = String::from("default-src 'none'; script-src 'self'");
+    for body in inline_bodies(html, b"script") {
+        let hash = Sha256::digest(body);
+        csp.push_str(&format!(
+            " 'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(hash)
+        ));
+    }
+    csp.push_str("; style-src 'self'");
+    for body in inline_bodies(html, b"style") {
+        let hash = Sha256::digest(body);
+        csp.push_str(&format!(
+            " 'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(hash)
+        ));
+    }
+    csp.push_str(
+        "; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+         base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    );
+    csp
+}
+
+/// Bodies of the inline `<script>`/`<style>` elements in `html`: every open
+/// tag without a `src` attribute through its matching close tag, over the
+/// exact served bytes. External files (`src=`) are already covered by
+/// `'self` and contribute no hash.
+fn inline_bodies<'a>(html: &'a [u8], tag: &[u8]) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    // `<script` / `<style`, then the open tag, then `</tag>`.
+    let mut open_tag = Vec::with_capacity(tag.len() + 1);
+    open_tag.push(b'<');
+    open_tag.extend_from_slice(tag);
+    let mut close_tag = Vec::with_capacity(tag.len() + 3);
+    close_tag.extend_from_slice(b"</");
+    close_tag.extend_from_slice(tag);
+    close_tag.push(b'>');
+    while let Some(start) = find_bytes(rest, &open_tag) {
+        let after_open = &rest[start + open_tag.len()..];
+        let Some(end_of_open) = find_bytes(after_open, b">") else {
+            break;
+        };
+        let attrs = &after_open[..end_of_open];
+        let body_starts = start + open_tag.len() + end_of_open + 1;
+        // A tag boundary, not `<scripts>` or `<stylesheet>`: the name ends
+        // here (whitespace, `/`, or the `>` that left `attrs` empty).
+        if !attrs.is_empty() && !matches!(attrs.first(), Some(b' ' | b'\t' | b'\n' | b'\r' | b'/'))
+        {
+            rest = &rest[start + 1..];
+            continue;
+        }
+        if attrs.windows(4).any(|w| w.eq_ignore_ascii_case(b"src=")) {
+            rest = &rest[body_starts..];
+            continue;
+        }
+        let after_body = &rest[body_starts..];
+        let Some(end) = find_bytes(after_body, &close_tag) else {
+            break;
+        };
+        out.push(&after_body[..end]);
+        rest = &after_body[end + close_tag.len()..];
+    }
+    out
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn text(status: StatusCode, body: &str, content_type: &'static str) -> Response {
@@ -518,7 +619,6 @@ mod tests {
             "text/html; charset=utf-8"
         );
     }
-
     #[tokio::test]
     async fn non_get_falls_through_to_auth() {
         let (_dir, site) = fixture();
@@ -526,6 +626,50 @@ mod tests {
             .serve_request("POST", "/", None, &headers(None))
             .await
             .is_none());
+    }
+
+    /// `/console/*` pages carry the strict console headers; docs pages do
+    /// not.
+    #[tokio::test]
+    async fn console_pages_carry_strict_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("console")).unwrap();
+        std::fs::write(
+            dir.path().join("console/index.html"),
+            "<h1>Console</h1><script>island()</script>",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("index.html"), "<h1>Outer</h1>").unwrap();
+        let site = SiteDir::new(dir.path());
+        let (status, hdrs, _) = body_text(
+            site.serve_request("GET", "/console", None, &headers(None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let csp = hdrs["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("script-src 'self'"), "got: {csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "got: {csp}");
+        // The inline block's hash rides along, so the page's own scripts
+        // pass while anything else stays blocked.
+        let body = b"island()";
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(body);
+        use base64::Engine as _;
+        let expect = format!(
+            "'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(hash)
+        );
+        assert!(csp.contains(&expect), "inline script hashed, got: {csp}");
+
+        let (_, hdrs, _) = body_text(
+            site.serve_request("GET", "/", None, &headers(None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!hdrs.contains_key("content-security-policy"));
     }
 
     #[test]

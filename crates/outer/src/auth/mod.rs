@@ -893,6 +893,18 @@ pub fn session_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     })
 }
 
+/// The `web_session.id_hash` for a presented session id (sign-out deletes
+/// by hash; the raw id never reaches storage).
+pub fn session_hash(session_id: &str) -> String {
+    tokens::sha256_hex(session_id.trim())
+}
+
+/// Expire the session cookie in the browser (sign-out answers this alongside
+/// the deleted row).
+pub fn clear_session_cookie() -> String {
+    format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+}
+
 #[cfg(test)]
 mod tests;
 

@@ -12,6 +12,10 @@
     "validate": "bun ./node_modules/blume/bin/blume.mjs validate"
   },
   "dependencies": {
-    "blume": "^2.2.4"
+    "@ilha/astro": "^0.4.0",
+    "blume": "^2.2.4",
+    "daisyui": "^5.7.50",
+    "ilha": "^0.16.0",
+    "tailwindcss": "^4.3.3"
   }
 }

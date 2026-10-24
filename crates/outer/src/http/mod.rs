@@ -2,6 +2,7 @@
 //! later) and every app host through [`proxy`].
 
 pub mod client_ip;
+pub mod console;
 pub mod proxy;
 pub mod site;
 pub mod tls;
@@ -26,6 +27,11 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    // The console API and sign-in are explicit routes, so they win over the
+    // site fallback below (which serves the static `/console` pages): even
+    // if a build ever emitted `console/sign-in/index.html`, the Rust
+    // handler still answers `/console/sign-in`.
+    let console = console::router(state.clone());
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -33,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         // never serves app hosts. GET/DELETE on /mcp answer 405 from the
         // method router; the handler refuses bodies over 32 MiB (§8.1).
         .route("/mcp", post(crate::mcp::mcp_handler))
+        .merge(console)
         .fallback(platform_fallback)
         .with_state(state)
 }
