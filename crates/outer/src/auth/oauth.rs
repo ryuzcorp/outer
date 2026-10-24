@@ -1070,3 +1070,31 @@ async fn revoke(
     )
         .into_response()
 }
+
+/// Delete expired authorization leftovers (the daily prune): unclaimed
+/// `oauth_request` rows past `expires_at` (claimed ones are deleted by the
+/// exchange), expired `oauth_token` rows (also deleted opportunistically on
+/// every token call), and DCR clients with no token issued in 30 days (also
+/// deleted opportunistically on register). Only rows no reader can still
+/// accept go (`expires_at < now`, matching the `now > expires_at` checks).
+/// Returns `(requests, tokens, stale_clients)` removed.
+pub async fn prune_expired(pool: &sqlx::SqlitePool, now: i64) -> anyhow::Result<(u64, u64, u64)> {
+    let requests = sqlx::query("DELETE FROM oauth_request WHERE expires_at < ?")
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let tokens = sqlx::query("DELETE FROM oauth_token WHERE expires_at < ?")
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let stale_clients = sqlx::query(
+        "DELETE FROM oauth_client WHERE kind = 'dcr' AND last_token_at IS NULL AND created_at < ?",
+    )
+    .bind(now - STALE_DCR_MS)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok((requests, tokens, stale_clients))
+}

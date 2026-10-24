@@ -360,6 +360,17 @@ pub async fn delete_row(pool: &SqlitePool, app_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Delete quarantine rows whose slug is claimable again (the daily prune).
+/// `create` treats `until > now` as taken and deletes the row otherwise, so
+/// `until <= now` is exactly the dead set. Returns the rows removed.
+pub async fn prune_quarantine(pool: &SqlitePool, now: i64) -> anyhow::Result<u64> {
+    let result = sqlx::query("DELETE FROM slug_quarantine WHERE until <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// The app with `slug`, if any.
 pub async fn get_by_slug(pool: &SqlitePool, slug: &str) -> anyhow::Result<Option<App>> {
     let row: Option<AppRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -654,5 +665,24 @@ mod tests {
             get_by_slug(&pool, "doomed").await.unwrap().is_some(),
             "a failed quarantine must leave the app row (and the slug) claimable by nobody"
         );
+    }
+
+    #[tokio::test]
+    async fn prune_quarantine_deletes_only_releasable_slugs() {
+        let (_dir, pool, _owner) = setup().await;
+        for (slug, until) in [("old-quar", 99), ("edge-quar", 100), ("live-quar", 200)] {
+            sqlx::query("INSERT INTO slug_quarantine (slug, until) VALUES (?1, ?2)")
+                .bind(slug)
+                .bind(until)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(prune_quarantine(&pool, 100).await.unwrap(), 2);
+        let kept: Vec<String> = sqlx::query_scalar("SELECT slug FROM slug_quarantine")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, vec!["live-quar"]);
     }
 }

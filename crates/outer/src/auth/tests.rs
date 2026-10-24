@@ -1428,3 +1428,141 @@ fn consent_page_never_warns_and_notes_only_self_registered_apps() {
         assert!(!page.contains("Only continue if you trust"), "{page}");
     }
 }
+
+/// The daily prune deletes only codes and sessions every reader agrees are
+/// dead: `expires_at == now` is still acceptable on the verify paths, so it
+/// stays for the next tick.
+#[tokio::test]
+async fn prune_expired_keeps_live_and_boundary_rows() {
+    let pool = test_pool().await;
+    sqlx::query(
+        "INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'a@example.com', 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (email, expires_at) in [
+        ("old@example.com", 99),
+        ("live@example.com", 200),
+        ("edge@example.com", 100),
+    ] {
+        sqlx::query(
+            "INSERT INTO email_code (email, code_hash, expires_at, created_at) VALUES (?, 'h', ?, 0)",
+        )
+        .bind(email)
+        .bind(expires_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for (hash, expires_at) in [("dead", 99), ("live", 200), ("edge", 100)] {
+        sqlx::query(
+            "INSERT INTO web_session (id_hash, account_id, expires_at) VALUES (?, 'a1', ?)",
+        )
+        .bind(hash)
+        .bind(expires_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let (codes, sessions) = auth::prune_expired(&pool, 100).await.unwrap();
+    assert_eq!((codes, sessions), (1, 1));
+    let kept_codes: Vec<String> = sqlx::query_scalar("SELECT email FROM email_code ORDER BY email")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept_codes, vec!["edge@example.com", "live@example.com"]);
+    let kept_sessions: Vec<String> =
+        sqlx::query_scalar("SELECT id_hash FROM web_session ORDER BY id_hash")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept_sessions, vec!["edge", "live"]);
+}
+
+/// The daily prune deletes expired unclaimed requests, expired tokens and
+/// stale DCR clients, keeping live rows, boundary rows (`expires_at == now`
+/// is still acceptable) and non-DCR clients of any age.
+#[tokio::test]
+async fn oauth_prune_expired_keeps_live_and_other_kinds() {
+    let pool = test_pool().await;
+    // Realistic clock: the stale-DCR cutoff is 30 days, so toy timestamps
+    // would make every client "fresh".
+    let now: i64 = 3_000_000_000;
+    sqlx::query(
+        "INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'a@example.com', 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (id, expires_at) in [
+        ("r-old", now - 1),
+        ("r-live", now + 86_400_000),
+        ("r-edge", now),
+    ] {
+        sqlx::query(
+            "INSERT INTO oauth_request (id, client_id, redirect_uri, code_challenge, csrf, expires_at) \
+             VALUES (?, 'c', 'https://x.example/cb', 'ch', 'csrf', ?)",
+        )
+        .bind(id)
+        .bind(expires_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO oauth_grant (id, account_id, client_id, scope, resource, created_at) \
+         VALUES ('g1', 'a1', 'c', 'apps', 'r', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (hash, expires_at) in [
+        ("t-old", now - 1),
+        ("t-live", now + 86_400_000),
+        ("t-edge", now),
+    ] {
+        sqlx::query(
+            "INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, 'g1', 'access', ?)",
+        )
+        .bind(hash)
+        .bind(expires_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for (client_id, kind, created_at) in [
+        ("dcr-old", "dcr", 100),
+        ("dcr-fresh", "dcr", now - 1_000),
+        ("cimd-old", "cimd", 100),
+    ] {
+        sqlx::query(
+            "INSERT INTO oauth_client (client_id, kind, redirect_uris, created_at) VALUES (?, ?, '[]', ?)",
+        )
+        .bind(client_id)
+        .bind(kind)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let (requests, tokens, clients) = auth::oauth::prune_expired(&pool, now).await.unwrap();
+    assert_eq!((requests, tokens, clients), (1, 1, 1));
+    let kept_requests: Vec<String> = sqlx::query_scalar("SELECT id FROM oauth_request ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept_requests, vec!["r-edge", "r-live"]);
+    let kept_tokens: Vec<String> =
+        sqlx::query_scalar("SELECT token_hash FROM oauth_token ORDER BY token_hash")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept_tokens, vec!["t-edge", "t-live"]);
+    let kept_clients: Vec<String> =
+        sqlx::query_scalar("SELECT client_id FROM oauth_client ORDER BY client_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept_clients, vec!["cimd-old", "dcr-fresh"]);
+}
