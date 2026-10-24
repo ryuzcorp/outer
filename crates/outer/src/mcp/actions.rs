@@ -29,6 +29,8 @@
 //! - `deploy_status` / `deploy_log`: `<tool> [deploy <id-short>]`
 //! - `app_logs`: `app_logs [limit=<n>] [since=<seq>]`
 //! - `app_errors`: `app_errors [status=<s>]`
+//! - `list_secrets`: `list_secrets`
+//! - `set_secret` / `unset_secret`: `<tool> <name>` (never the value)
 
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -58,6 +60,9 @@ const LOGGED_TOOLS: &[&str] = &[
     "deploy_log",
     "app_logs",
     "app_errors",
+    "list_secrets",
+    "set_secret",
+    "unset_secret",
 ];
 
 /// Truncate to `n` chars on a char boundary, marking the cut.
@@ -164,6 +169,10 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             arg_str(args, "visibility").unwrap_or("?")
         ),
         "share_app" | "get_app" => tool.to_string(),
+        "list_secrets" => tool.to_string(),
+        "set_secret" | "unset_secret" => {
+            format!("{} {}", tool, arg_str(args, "key").unwrap_or("?"),)
+        }
         "search_code" => {
             let mut s = format!(
                 "search_code {:?}",

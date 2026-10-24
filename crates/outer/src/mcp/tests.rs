@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 27);
+    assert_eq!(anon.len(), 30);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 25);
+    assert_eq!(authed.len(), 28);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -2199,4 +2199,231 @@ async fn set_visibility_purges_the_app_host() {
     let requests = fake.requests.lock().unwrap();
     let host = format!("groceries.{}", state.delete_cfg.apps_domain);
     assert_eq!(requests.last().unwrap().body["hosts"][0], host);
+
+#[tokio::test]
+async fn secrets_set_list_unset_roundtrip_without_values() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let marker = "SECRET_VALUE_MARKER_9Z8Y7X";
+    let (_, set) = call(
+        &state,
+        Some(&token),
+        "set_secret",
+        json!({"app": "groceries", "key": "MAIL_KEY", "value": marker}),
+    )
+    .await;
+    assert_eq!(
+        result(&set)["structuredContent"],
+        json!({"ok": true, "applies": "next deploy"})
+    );
+    let body = serde_json::to_string(&set).unwrap();
+    assert!(!body.contains(marker), "the value never echoes: {body}");
+    let (_, list) = call(
+        &state,
+        Some(&token),
+        "list_secrets",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let secrets = result(&list)["structuredContent"]["secrets"].clone();
+    assert_eq!(secrets.as_array().unwrap().len(), 1);
+    assert_eq!(secrets[0]["name"], "MAIL_KEY");
+    assert!(
+        secrets[0]
+            .get("updated_at")
+            .and_then(Value::as_i64)
+            .unwrap()
+            > 0
+    );
+    assert!(
+        secrets[0].get("value").is_none(),
+        "list carries no value: {secrets}"
+    );
+    assert!(
+        !serde_json::to_string(&list).unwrap().contains(marker),
+        "list never carries the value"
+    );
+    let (_, set2) = call(
+        &state,
+        Some(&token),
+        "set_secret",
+        json!({"app": "groceries", "key": "MAIL_KEY", "value": "second"}),
+    )
+    .await;
+    assert_eq!(result(&set2)["structuredContent"]["ok"], true);
+    let (_, list2) = call(
+        &state,
+        Some(&token),
+        "list_secrets",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&list2)["structuredContent"]["secrets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, unset) = call(
+        &state,
+        Some(&token),
+        "unset_secret",
+        json!({"app": "groceries", "key": "MAIL_KEY"}),
+    )
+    .await;
+    assert_eq!(
+        result(&unset)["structuredContent"],
+        json!({"ok": true, "applies": "next deploy"})
+    );
+    let (_, empty) = call(
+        &state,
+        Some(&token),
+        "list_secrets",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(result(&empty)["structuredContent"]["secrets"], json!([]));
+    let (_, missing) = call(
+        &state,
+        Some(&token),
+        "unset_secret",
+        json!({"app": "groceries", "key": "MAIL_KEY"}),
+    )
+    .await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+}
+#[tokio::test]
+async fn secrets_refuse_bad_names_reserved_values_and_strangers() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    for key in ["my_key", "9LIVES", "HAS-DASH", "HAS SPACE", ""] {
+        let (_, bad) = call(
+            &state,
+            Some(&ana),
+            "set_secret",
+            json!({"app": "groceries", "key": key, "value": "v"}),
+        )
+        .await;
+        let err = is_error(&bad);
+        assert_eq!(err["error"], "invalid_argument", "{key}");
+        assert!(
+            err["message"].as_str().unwrap().contains("secret name"),
+            "{key}: {}",
+            err["message"]
+        );
+    }
+    for key in [
+        "PORT",
+        "AWS_SECRET_ACCESS_KEY",
+        "OUTER_SECRET",
+        "LD_PRELOAD",
+    ] {
+        let (_, bad) = call(
+            &state,
+            Some(&ana),
+            "set_secret",
+            json!({"app": "groceries", "key": key, "value": "v"}),
+        )
+        .await;
+        let err = is_error(&bad);
+        assert_eq!(err["error"], "invalid_argument", "{key}");
+        assert!(
+            err["message"].as_str().unwrap().contains("reserved"),
+            "{key}: {}",
+            err["message"]
+        );
+    }
+    let (_, big) = call(
+        &state,
+        Some(&ana),
+        "set_secret",
+        json!({"app": "groceries", "key": "K", "value": "x".repeat(4097)}),
+    )
+    .await;
+    assert_eq!(is_error(&big)["error"], "invalid_argument");
+    let marker = "STRANGER_SECRET_MARKER_1A2B3C";
+    let (_, foreign) = call(
+        &state,
+        Some(&bob),
+        "set_secret",
+        json!({"app": "groceries", "key": "K", "value": marker}),
+    )
+    .await;
+    assert_eq!(is_error(&foreign)["error"], "not_found");
+    let (_, foreign_list) = call(
+        &state,
+        Some(&bob),
+        "list_secrets",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&foreign_list)["error"], "not_found");
+    let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM app_secret")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+}
+#[tokio::test]
+async fn secrets_cap_counts_distinct_names_and_values_stay_out_of_logs() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let marker = "LOG_SECRET_MARKER_4D5E6F";
+    for n in 0..50 {
+        let (_, set) = call(
+            &state,
+            Some(&token),
+            "set_secret",
+            json!({"app": "groceries", "key": format!("K{n:02}"), "value": marker}),
+        )
+        .await;
+        assert_eq!(
+            result(&set)["structuredContent"]["ok"],
+            true,
+            "K{n:02} fits"
+        );
+    }
+    let (_, capped) = call(
+        &state,
+        Some(&token),
+        "set_secret",
+        json!({"app": "groceries", "key": "ONE_TOO_MANY", "value": "v"}),
+    )
+    .await;
+    let err = is_error(&capped);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(
+        err["message"].as_str().unwrap().contains("50"),
+        "{}",
+        err["message"]
+    );
+    for row in action_rows(&state, "groceries").await {
+        assert!(
+            !row.summary.contains(marker),
+            "value leaked into log: {}",
+            row.summary
+        );
+    }
+    let summaries: Vec<String> = sqlx::query_scalar("SELECT summary FROM agent_action")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert!(
+        !summaries.iter().any(|s| s.contains(marker)),
+        "{summaries:?}"
+    );
+    assert!(
+        summaries.iter().any(|s| s.contains("K00")),
+        "name-only summaries: {summaries:?}"
+    );
+    let tools: Vec<String> = sqlx::query_scalar("SELECT DISTINCT tool FROM agent_action")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert!(tools.contains(&"set_secret".to_string()), "{tools:?}");
 }
