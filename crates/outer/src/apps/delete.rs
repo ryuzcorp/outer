@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
 
+use crate::cloudflare::purge_host_cache;
 use crate::fleet::manager::FleetManager;
 use crate::git::{manifest, GitConfig, GitSync};
 use crate::store::Store;
@@ -34,12 +35,9 @@ pub struct DeleteConfig {
     pub cache_purge: Option<CachePurge>,
 }
 
-/// Cloudflare zone purge credentials (spec §4.5, §7.6).
-#[derive(Debug, Clone)]
-pub struct CachePurge {
-    pub zone_id: String,
-    pub api_token: String,
-}
+/// Cloudflare zone purge credentials (spec §4.5, §7.6). Shared with the
+/// deploy pipeline; see [`crate::cloudflare::CachePurge`].
+pub use crate::cloudflare::CachePurge;
 
 /// Proof the caller serialized this deletion against deploys, rollbacks and
 /// wakes. The MCP path holds all three; the operator CLI (its own process)
@@ -243,56 +241,5 @@ async fn remove_file(path: &Path) -> anyhow::Result<()> {
             "removing local file {}: {err}",
             path.display()
         )),
-    }
-}
-
-/// Purge `host` from the Cloudflare edge cache (spec §4.5). `None` skips
-/// with a warn (localhost dev without `CLOUDFLARE_ZONE_ID`); failures warn
-/// and continue — the app row is already gone, so there is nothing to retry
-/// against, and the entry expires on its own.
-async fn purge_host_cache(purge: Option<&CachePurge>, host: &str) {
-    let Some(purge) = purge else {
-        tracing::warn!(
-            host,
-            "no CLOUDFLARE_ZONE_ID: skipping edge cache purge (localhost dev)"
-        );
-        return;
-    };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build();
-    let Ok(client) = client else {
-        tracing::warn!(host, "cache purge client failed to build; skipping purge");
-        return;
-    };
-    let url = format!(
-        "https://api.cloudflare.com/client/v4/zones/{}/purge_cache",
-        purge.zone_id
-    );
-    let response = client
-        .post(&url)
-        .bearer_auth(&purge.api_token)
-        .json(&serde_json::json!({ "hosts": [host] }))
-        .send()
-        .await;
-    match response {
-        Err(err) => tracing::warn!(
-            host,
-            error = %format!("{err:#}"),
-            "edge cache purge failed; the entry expires on its own"
-        ),
-        Ok(response) => {
-            let status = response.status();
-            let body: serde_json::Value = response.json().await.unwrap_or_default();
-            if !status.is_success() || body.get("success").and_then(|v| v.as_bool()) != Some(true) {
-                tracing::warn!(
-                    host,
-                    %status,
-                    body = %body.to_string(),
-                    "edge cache purge refused; the entry expires on its own"
-                );
-            }
-        }
     }
 }

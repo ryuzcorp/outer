@@ -250,6 +250,17 @@ fn jev_client(config: &Config) -> anyhow::Result<Option<outer::moderation::JevCl
     )?))
 }
 
+/// What deploys, rollbacks and deletes purge from the edge cache: the zone
+/// plus the API token. `None` skips the purge at debug (localhost dev
+/// without `CLOUDFLARE_ZONE_ID`).
+fn cache_purge(config: &Config) -> Option<outer::cloudflare::CachePurge> {
+    config.cloudflare.as_ref().and_then(|cf| {
+        cf.zone_id
+            .clone()
+            .map(|zone_id| outer::cloudflare::CachePurge::new(zone_id, cf.api_token.clone()))
+    })
+}
+
 async fn platform(config: &Config) -> anyhow::Result<Platform> {
     std::fs::create_dir_all(&config.data_dir)?;
     let store = build_store(config)?;
@@ -265,6 +276,8 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
             storage: fleet_storage(config)?,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
+            apps_domain: rt.apps_domain.clone(),
+            cache_purge: cache_purge(config),
             jev,
         },
         rt.build_concurrency,
@@ -353,14 +366,7 @@ async fn app_delete(config: Config, slug: String) -> anyhow::Result<()> {
         data_dir: config.data_dir.clone(),
         cgroups: cgroups(),
         apps_domain: config.runtime.apps_domain.clone(),
-        cache_purge: config.cloudflare.as_ref().and_then(|cf| {
-            cf.zone_id
-                .clone()
-                .map(|zone_id| outer::apps::delete::CachePurge {
-                    zone_id,
-                    api_token: cf.api_token.clone(),
-                })
-        }),
+        cache_purge: cache_purge(&config),
     };
     let out = ops::delete_app(&p, &cfg, &slug, &slug, locks).await?;
     println!(
@@ -574,6 +580,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             storage,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
+            apps_domain: rt.apps_domain.clone(),
+            cache_purge: cache_purge(&config),
             jev: jev_client(&config)?,
         },
         rt.build_concurrency,
@@ -601,14 +609,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             data_dir: config.data_dir.clone(),
             cgroups: cgroups(),
             apps_domain: rt.apps_domain.clone(),
-            cache_purge: config.cloudflare.as_ref().and_then(|cf| {
-                cf.zone_id
-                    .clone()
-                    .map(|zone_id| outer::apps::delete::CachePurge {
-                        zone_id,
-                        api_token: cf.api_token.clone(),
-                    })
-            }),
+            cache_purge: cache_purge(&config),
         },
     };
     let app = http::app(

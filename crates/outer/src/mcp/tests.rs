@@ -908,6 +908,151 @@ async fn rollback_redeploys_an_earlier_success() {
     assert_eq!(is_error(&refused)["error"], "invalid_argument");
 }
 
+/// Arm the fake's success path to purge at `fake`, the way the pipeline
+/// purges after a successful deploy.
+async fn arm_purge(state: &McpState) -> crate::cloudflare::fake::FakePurge {
+    let fake = crate::cloudflare::fake::FakePurge::start().await;
+    state.deploys.set_purge(
+        Some(
+            crate::cloudflare::CachePurge::new("zone-1".to_string(), "token-1".to_string())
+                .with_api_base(fake.base_url.clone()),
+        ),
+        &state.apps_domain,
+    );
+    fake
+}
+
+#[tokio::test]
+async fn successful_deploy_purges_the_app_host_once() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let purge = arm_purge(&state).await;
+    create_app(&state, &token, "groceries").await;
+    assert_eq!(
+        purge.wait_for(1, std::time::Duration::from_secs(5)).await,
+        1,
+        "a successful deploy purges exactly once"
+    );
+    let recorded = purge.requests.lock().unwrap();
+    assert_eq!(recorded[0].path, "/zones/zone-1/purge_cache");
+    assert_eq!(recorded[0].bearer.as_deref(), Some("token-1"));
+    assert_eq!(
+        recorded[0].body,
+        json!({"hosts": ["groceries.outer.localhost"]}),
+        "the purge targets slug.<apps_domain>"
+    );
+}
+
+#[tokio::test]
+async fn failed_and_blocked_deploys_skip_the_purge() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let purge = arm_purge(&state).await;
+    create_app(&state, &token, "groceries").await;
+    assert_eq!(
+        purge.wait_for(1, std::time::Duration::from_secs(5)).await,
+        1
+    );
+
+    state.deploys.set_fake(FakeOutcome::failed());
+    let (_, failed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "broken",
+                   "writes": [{"path": "q.txt", "content": "q"}]}),
+    )
+    .await;
+    assert_eq!(
+        result(&failed)["structuredContent"]["deploy"]["status"],
+        "failed"
+    );
+
+    state.deploys.set_fake(FakeOutcome::blocked());
+    let (_, blocked) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "profane",
+                   "writes": [{"path": "p.txt", "content": "p"}]}),
+    )
+    .await;
+    assert_eq!(
+        result(&blocked)["structuredContent"]["deploy"]["status"],
+        "blocked"
+    );
+
+    // Neither failure path spawns a purge; the settle wait only guards
+    // against a stray detached task.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        purge.calls(),
+        1,
+        "failed and blocked deploys leave the old version serving: nothing more to purge"
+    );
+}
+
+#[tokio::test]
+async fn rollback_purges_the_app_host_once() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let purge = arm_purge(&state).await;
+    let created = create_app(&state, &token, "groceries").await;
+    let sha1 = created["deploy"]["sha"].as_str().unwrap().to_string();
+    let (_, second) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "two",
+                   "writes": [{"path": "a.txt", "content": "a"}]}),
+    )
+    .await;
+    assert_eq!(
+        result(&second)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+    assert_eq!(
+        purge.wait_for(2, std::time::Duration::from_secs(5)).await,
+        2
+    );
+
+    let (_, rolled) = call(
+        &state,
+        Some(&token),
+        "rollback",
+        json!({"app": "groceries", "sha": &sha1[..8]}),
+    )
+    .await;
+    assert_eq!(
+        result(&rolled)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+    assert_eq!(
+        purge.wait_for(3, std::time::Duration::from_secs(5)).await,
+        3,
+        "a rollback redeploys, so it purges exactly once more"
+    );
+    assert!(
+        purge
+            .bodies()
+            .iter()
+            .all(|b| *b == json!({"hosts": ["groceries.outer.localhost"]})),
+        "every purge targets slug.<apps_domain>"
+    );
+}
+
+#[tokio::test]
+async fn no_zone_id_sends_no_purge_request() {
+    let (state, _) = setup().await;
+    // `setup` leaves the purge unarmed (`None`): localhost dev without
+    // `CLOUDFLARE_ZONE_ID`.
+    let token = api_key_for(&state, "ana@example.com").await;
+    let listener = crate::cloudflare::fake::FakePurge::start().await;
+    create_app(&state, &token, "groceries").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(listener.calls(), 0, "None sends no request anywhere");
+}
+
 #[tokio::test]
 async fn slow_deploys_return_in_progress() {
     let (state, _) = setup().await;
