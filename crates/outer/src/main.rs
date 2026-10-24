@@ -331,8 +331,8 @@ async fn app_create(config: Config, slug: String, rest: Vec<&str>) -> anyhow::Re
     };
     let p = platform(&config).await?;
     let (app, outcome) = ops::create_app(&p, owner, &slug, flag(&flags, "--name")).await?;
-    let reloaded = outcome.status == "success" && ops::reload_if_awake(&app).await;
-    print_outcome(&config, &app, &outcome, reloaded)?;
+    p.deployer.purges().drain().await;
+    print_outcome(&config, &app, &outcome, outcome.reloaded)?;
     end_outcome(&outcome)?;
     Ok(())
 }
@@ -343,8 +343,8 @@ async fn app_deploy(config: Config, slug: String) -> anyhow::Result<()> {
     let app = apps::get_by_slug(&p.pool, &slug)
         .await?
         .expect("deployed app exists");
-    let reloaded = outcome.status == "success" && ops::reload_if_awake(&app).await;
-    print_outcome(&config, &app, &outcome, reloaded)?;
+    p.deployer.purges().drain().await;
+    print_outcome(&config, &app, &outcome, outcome.reloaded)?;
     end_outcome(&outcome)?;
     Ok(())
 }
@@ -586,6 +586,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         },
         rt.build_concurrency,
     );
+    let purges = deployer.purges();
     let auth = auth_state(&config, &pool)?;
     let mcp = outer::mcp::McpState {
         pool: pool.clone(),
@@ -664,6 +665,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
 
     tracing::info!("shutting down: stopping fleets, then writing the final state snapshot");
+    purges.drain().await;
     fleets.stop_all().await;
     store::snapshot::final_snapshot(&sync, &pool, &store, &snapshot_cfg).await;
     pool.close().await;

@@ -2,8 +2,6 @@
 //! in M1. Each one composes the registry, the git WAL, the template and the
 //! deploy pipeline.
 
-use std::time::Duration;
-
 use anyhow::Context as _;
 use sqlx::SqlitePool;
 
@@ -104,21 +102,6 @@ pub async fn deploy_app(p: &Platform, slug: &str) -> anyhow::Result<DeployOutcom
     p.deployer.deploy(&p.pool, &p.git, &app, &sha).await
 }
 
-/// Ask the app's fleet to adopt the new deploy now. A sleeping fleet isn't
-/// listening, which is fine: it adopts the deploy when it wakes, and an
-/// awake fleet would also pick it up on its own pointer poll.
-pub async fn reload_if_awake(app: &App) -> bool {
-    let url = format!("http://127.0.0.1:{}/reload", app.internal_port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build();
-    let Ok(client) = client else { return false };
-    client
-        .post(url)
-        .send()
-        .await
-        .is_ok_and(|r| r.status().is_success())
-}
 /// Delete `slug`: the operator CLI's path to the same core the MCP
 /// `delete_app` tool runs. `confirm` is the slug itself there (the operator
 /// typed the command). No fleet manager runs in this process: the serve
