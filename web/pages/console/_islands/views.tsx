@@ -668,9 +668,9 @@ export function MetricsView({
           sub="response headers"
         />
       </div>
-      <section class="card" aria-label="Hourly requests">
+      <section class="card" aria-label={summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}>
         <div class="card-head">
-          <h2>Hourly requests</h2>
+          <h2>{summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}</h2>
         </div>
         {summary.buckets.length === 0 ? (
           <p class="muted" role="status">
