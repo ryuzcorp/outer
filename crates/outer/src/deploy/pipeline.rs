@@ -142,10 +142,13 @@ async fn reload_if_awake(app: &App) -> bool {
 const LOG_TAIL_CAP: usize = 64 * 1024;
 /// Cap on one `error` line stored in the row.
 const ERROR_CAP: usize = 1024;
-/// Bounds for one build's cgroup leaf (spec §12.2: 2 GiB parent, 1 GiB leaf).
-const BUILD_PARENT_MEMORY_MAX: u64 = 2 * 1024 * 1024 * 1024;
+/// Bounds for one build's cgroup leaf (spec §12.2: 4 GiB parent, 2 GiB leaf).
+/// The template's Vite build (Rolldown, Tailwind/daisyUI, the PWA plugin)
+/// peaks around 1.5 GB RSS in native memory a heap cap doesn't reach, and a
+/// 1 GiB leaf OOM-killed it intermittently on the 8-core host.
+const BUILD_PARENT_MEMORY_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const BUILD_PARENT_CPU_WEIGHT: u64 = 20;
-const BUILD_LEAF_MEMORY_MAX: u64 = 1024 * 1024 * 1024;
+const BUILD_LEAF_MEMORY_MAX: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Top-level wrangler keys celld accepts. Anything else fails `deploy-root`.
 const ACCEPTED_CONFIG_KEYS: &[&str] = &[
