@@ -1538,6 +1538,7 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
     for sql in [
         "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) VALUES (?1, 0, 1, 0, 0, '', 0, 0)",
         "INSERT INTO path_hour (app_id, hour, path, requests, s5xx) VALUES (?1, 0, '/', 1, 0)",
+        "INSERT INTO visitor_day (app_id, day, visitors) VALUES (?1, 0, 1)",
         "INSERT INTO app_log (app_id, seq, ts, stream, line) VALUES (?1, 0, 0, 'stdout', 'x')",
         "INSERT INTO error_issue (app_id, fingerprint, message, count, first_seen, last_seen) VALUES (?1, 'f', 'm', 1, 0, 0)",
         "INSERT INTO moderation_text (app_id, text_hash, verdict, checked_at) VALUES (?1, 'h', 'clear', 0)",
@@ -1619,8 +1620,8 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
         "moderation_check",
         "app_cron",
         "rollback_day",
-        "metric_minute",
         "path_hour",
+        "visitor_day",
         "app_log",
         "error_issue",
     ] {

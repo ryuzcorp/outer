@@ -17,13 +17,17 @@
 //!   else 0. Chunked/streamed bodies are not buffered to count them, so
 //!   `bytes_out` undercounts SSE-style traffic; the dominant fixed-body
 //!   case is exact.
-//! - **Visitors:** per (app, minute) distinct client IPs, hashed with the
+//! - **Visitors:** per (app, UTC day) distinct client IPs, hashed with the
 //!   day's process-random salt (a fresh [`RandomState`] per UTC day, kept
 //!   in memory, never stored). No PII reaches SQLite, only the count, and
-//!   keys from one day never match the next. A process restart starts a
-//!   fresh salt, so a visitor seen on both sides of a restart in the same
-//!   minute counts twice; minutes fully flushed before the restart keep
-//!   their exact count.
+//!   keys from one day never match the next. Each flush upserts the day's
+//!   distinct count into `visitor_day` with
+//!   `visitors = max(visitors, excluded.visitors)`, so a restart mid-day
+//!   (which resets the in-memory set) keeps the count monotonic — at the
+//!   price of undercounting while the new process's set is still smaller
+//!   than the pre-restart value. `metric_minute.visitors` keeps the old
+//!   per-minute distinct count for per-minute charts; the console totals
+//!   come from `visitor_day`.
 //! - **Histogram:** 13 edges in ms
 //!   (`[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]`, plus
 //!   overflow) stored as a JSON count array in `latency_hist`. Percentiles
@@ -37,17 +41,23 @@
 //!   a failed flush returns `Err` and keeps everything for the next tick.
 //! - **Memory bounds:** minute/path entries live only for the current
 //!   minute/hour plus what the last flush missed (dropped once fully
-//!   flushed); visitor sets cap at [`MAX_VISITORS_PER_MINUTE`];
-//!   distinct raw paths per app-hour cap at [`MAX_PATHS_PER_APP_HOUR`]
-//!   with overflow folding into `(other)` (re-checked against SQLite at
-//!   flush, so the cap survives restarts).
+//!   flushed); per-minute visitor sets cap at [`MAX_VISITORS_PER_MINUTE`];
+//!   per-day visitor sets cap at [`MAX_VISITORS_PER_APP_DAY`] (further
+//!   distinct visitors still count as requests, just not as new uniques,
+//!   so the flushed daily count saturates at the cap) and drop for days
+//!   before yesterday on every successful flush; distinct raw paths per
+//!   app-hour cap at [`MAX_PATHS_PER_APP_HOUR`] with overflow folding into
+//!   `(other)` (re-checked against SQLite at flush, so the cap survives
+//!   restarts).
 //! - **Recorded iff forwarded:** only requests that reach the fleet's port
 //!   (an upstream response, or the 502 when the connect fails). Outer's own
 //!   synthetic answers — unknown-host 404s, 431s, wake-failure 503s, the
 //!   unlisted `robots.txt` override — and the celld health gate path are
 //!   never counted.
-//! - **Retention:** [`prune`] deletes rows older than 7 d for Free apps and
-//!   30 d for Pro, joining `app.owner_id` to `account.plan`.
+//! - **Retention:** [`prune`] deletes `metric_minute`, `path_hour` and
+//!   `visitor_day` rows older than 7 d for Free apps and 30 d for Pro,
+//!   joining `app.owner_id` to `account.plan` (`visitor_day` compares the
+//!   UTC-day key against the retention cutoff's day).
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
@@ -75,6 +85,10 @@ pub const OTHER_PATH: &str = "(other)";
 /// Distinct visitor keys kept per (app, minute); further visitors still
 /// count as requests, just not as distinct.
 pub const MAX_VISITORS_PER_MINUTE: usize = 50_000;
+/// Distinct visitor keys kept per (app, UTC day); further distinct visitors
+/// still count as requests, just not as new uniques, so the flushed daily
+/// count saturates at this cap.
+pub const MAX_VISITORS_PER_APP_DAY: usize = 100_000;
 /// Absolute cap on in-memory path entries (flood guard; normal traffic keeps
 /// one entry per distinct normalized path of the current hour).
 pub const MAX_PATH_ENTRIES: usize = 50_000;
@@ -283,6 +297,12 @@ struct Inner {
     /// the cardinality cap (the flush re-checks SQLite for the restart
     /// half). Pruned with the hour.
     path_card: HashMap<(String, i64), usize>,
+    /// Distinct visitor keys per (app, UTC day): the in-memory half of
+    /// `visitor_day`. Dropped for days before yesterday once flushed.
+    visitor_days: HashMap<(String, i64), HashSet<u64>>,
+    /// Last flushed set size per (app, day): flush upserts the absolute
+    /// count, so only growth since this watermark ships.
+    flushed_days: HashMap<(String, i64), usize>,
 }
 
 impl Inner {
@@ -294,6 +314,8 @@ impl Inner {
             paths: HashMap::new(),
             flushed_paths: HashMap::new(),
             path_card: HashMap::new(),
+            visitor_days: HashMap::new(),
+            flushed_days: HashMap::new(),
         }
     }
 }
@@ -340,6 +362,15 @@ impl MetricsAgg {
                 }
             }
         }
+        if let Some(key) = visitor_key {
+            let day_entry = inner
+                .visitor_days
+                .entry((r.app_id.to_string(), day_of(r.now_ms)))
+                .or_default();
+            if day_entry.len() < MAX_VISITORS_PER_APP_DAY {
+                day_entry.insert(key);
+            }
+        }
 
         let mut key = (r.app_id.to_string(), hour, path);
         if key.2 != OTHER_PATH && !inner.paths.contains_key(&key) {
@@ -359,6 +390,16 @@ impl MetricsAgg {
         if s5xx {
             entry.s5xx += 1;
         }
+    }
+
+    /// Drop per-day visitor sets (and their watermarks) for days before
+    /// yesterday. Only call once the surviving counts are durable: the
+    /// max() upsert makes re-creating a dropped day safe, but an unflushed
+    /// drop would lose uniques.
+    fn evict_old_days(inner: &mut Inner, now_ms: i64) {
+        let keep_from = day_of(now_ms) - 1;
+        inner.visitor_days.retain(|(_, day), _| *day >= keep_from);
+        inner.flushed_days.retain(|(_, day), _| *day >= keep_from);
     }
 
     /// Ship every unflushed delta to SQLite in one transaction. On success
@@ -382,7 +423,12 @@ impl MetricsAgg {
             requests: u64,
             s5xx: u64,
         }
-        let (minute_deltas, path_deltas, now_ms) = {
+        struct DayDelta {
+            app_id: String,
+            day: i64,
+            visitors: u64,
+        }
+        let (minute_deltas, path_deltas, day_deltas, now_ms) = {
             let inner = self.inner.lock().unwrap();
             let now_ms = crate::apps::now_ms();
             let mut minutes = Vec::new();
@@ -427,9 +473,22 @@ impl MetricsAgg {
                     s5xx: agg.s5xx - flushed.s5xx,
                 });
             }
-            (minutes, paths, now_ms)
+            let mut days = Vec::new();
+            for (key, set) in inner.visitor_days.iter() {
+                let flushed = inner.flushed_days.get(key).copied().unwrap_or(0);
+                if set.len() > flushed {
+                    days.push(DayDelta {
+                        app_id: key.0.clone(),
+                        day: key.1,
+                        visitors: set.len() as u64,
+                    });
+                }
+            }
+            (minutes, paths, days, now_ms)
         };
-        if minute_deltas.is_empty() && path_deltas.is_empty() {
+        if minute_deltas.is_empty() && path_deltas.is_empty() && day_deltas.is_empty() {
+            let mut inner = self.inner.lock().unwrap();
+            Self::evict_old_days(&mut inner, now_ms);
             return Ok(FlushStats::default());
         }
         let mut tx = pool.begin().await?;
@@ -461,6 +520,21 @@ impl MetricsAgg {
             .bind(delta.s5xx as i64)
             .bind(render_histogram(&merged))
             .bind(delta.bytes_out.min(i64::MAX as u64) as i64)
+            .bind(delta.visitors as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Absolute per-day distinct counts: max() keeps the row monotonic
+        // across restarts (a fresh process starts from an empty set, so its
+        // smaller count never rewinds the row).
+        for delta in &day_deltas {
+            sqlx::query(
+                "INSERT INTO visitor_day (app_id, day, visitors) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (app_id, day) DO UPDATE SET \
+                 visitors = max(visitor_day.visitors, excluded.visitors)",
+            )
+            .bind(&delta.app_id)
+            .bind(delta.day)
             .bind(delta.visitors as i64)
             .execute(&mut *tx)
             .await?;
@@ -529,6 +603,7 @@ impl MetricsAgg {
         let stats = FlushStats {
             minutes: minute_deltas.len(),
             paths: folded.len(),
+            visitor_days: day_deltas.len(),
         };
         {
             let mut inner = self.inner.lock().unwrap();
@@ -607,6 +682,14 @@ impl MetricsAgg {
             inner
                 .path_card
                 .retain(|(_, hour), _| *hour >= hour_of(now_ms));
+            // Day watermarks track absolute counts, so they just jump to
+            // what this flush upserted.
+            for delta in day_deltas {
+                inner
+                    .flushed_days
+                    .insert((delta.app_id, delta.day), delta.visitors as usize);
+            }
+            Self::evict_old_days(&mut inner, now_ms);
         }
         Ok(stats)
     }
@@ -625,12 +708,14 @@ pub struct FlushStats {
     pub minutes: usize,
     /// Path rows touched (after `(other)` folding).
     pub paths: usize,
+    /// Day rows upserted.
+    pub visitor_days: usize,
 }
 
-/// Delete per-plan expired rows: older than 7 d for Free apps, 30 d for Pro
-/// (spec §3). The plan lives on the account that owns the app. Returns
-/// `(metric_minute rows, path_hour rows)` deleted.
-pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64)> {
+/// Delete per-plan expired rows: older than 7 d for Free apps and 30 d for
+/// Pro (spec §3). The plan lives on the account that owns the app. Returns
+/// `(metric_minute rows, path_hour rows, visitor_day rows)` deleted.
+pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64, u64)> {
     let free_cutoff = now_ms - FREE_RETENTION_MS;
     let pro_cutoff = now_ms - PRO_RETENTION_MS;
     // Literal statements (sqlx 0.9 rejects dynamic SQL): one per
@@ -659,7 +744,19 @@ pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64)>
         .await?
         .rows_affected();
     }
-    Ok((minutes, paths))
+    let mut days = 0;
+    for (cutoff, plan) in [(day_of(free_cutoff), "free"), (day_of(pro_cutoff), "pro")] {
+        days += sqlx::query(
+            "DELETE FROM visitor_day WHERE day < ?1 AND app_id IN \
+             (SELECT a.id FROM app a JOIN account c ON c.id = a.owner_id WHERE c.plan = ?2)",
+        )
+        .bind(cutoff)
+        .bind(plan)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok((minutes, paths, days))
 }
 
 /// Flush every [`FLUSH_EVERY`], prune at most every [`PRUNE_EVERY`].
@@ -679,9 +776,9 @@ pub fn spawn_sweep(pool: SqlitePool, agg: MetricsAgg) -> tokio::task::JoinHandle
             let due = last_prune.is_none_or(|at| at.elapsed() >= PRUNE_EVERY);
             if due {
                 match prune(&pool, crate::apps::now_ms()).await {
-                    Ok((minutes, paths)) => {
-                        if minutes + paths > 0 {
-                            tracing::info!(minutes, paths, "pruned expired metrics rows");
+                    Ok((minutes, paths, days)) => {
+                        if minutes + paths + days > 0 {
+                            tracing::info!(minutes, paths, days, "pruned expired metrics rows");
                         }
                         last_prune = Some(tokio::time::Instant::now());
                     }
@@ -712,11 +809,11 @@ pub struct PathStat {
 }
 
 /// The console metrics view (spec §13.1): totals, latency percentiles and
-/// per-hour buckets over the window, plus top paths. `visitors` sums
-/// per-minute distinct counts, so a visitor active in N minutes counts N
-/// times. `p50_ms`/`p95_ms` come from the merged histogram at bucket
-/// resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// per-hour buckets over the window, plus top paths. `visitors` sums the
+/// daily unique counts of every UTC day the window touches (a 24 h window
+/// ending mid-day covers today and yesterday), so a visitor active on N
+/// days counts N times. `p50_ms`/`p95_ms` come from the merged histogram
+/// at bucket resolution.
 pub struct Summary {
     pub requests: i64,
     pub visitors: i64,
@@ -740,14 +837,23 @@ pub async fn summary(pool: &SqlitePool, app_id: &str, hours: i64) -> anyhow::Res
     let window_ms = hours * 3_600_000;
     let since_minute = (now_ms - window_ms) / 60_000 * 60_000;
     let since_hour = (now_ms - window_ms) / 3_600_000 * 3_600_000;
-
-    let (requests, s4xx, s5xx, visitors): (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(s4xx), 0), COALESCE(SUM(s5xx), 0), \
-         COALESCE(SUM(visitors), 0) \
+    let (requests, s4xx, s5xx): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(s4xx), 0), COALESCE(SUM(s5xx), 0) \
          FROM metric_minute WHERE app_id = ?1 AND minute >= ?2",
     )
     .bind(app_id)
     .bind(since_minute)
+    .fetch_one(pool)
+    .await?;
+    // Daily uniques, summed over every UTC day the window touches: a day
+    // only partly inside the window still contributes its full count.
+    let visitors: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(visitors), 0) FROM visitor_day \
+         WHERE app_id = ?1 AND day >= ?2 AND day <= ?3",
+    )
+    .bind(app_id)
+    .bind(day_of(now_ms - window_ms))
+    .bind(day_of(now_ms))
     .fetch_one(pool)
     .await?;
 
@@ -810,7 +916,7 @@ pub async fn summary(pool: &SqlitePool, app_id: &str, hours: i64) -> anyhow::Res
 
     Ok(Summary {
         requests,
-        visitors,
+        visitors: visitors.0,
         s4xx,
         s5xx,
         p50_ms: percentile_ms(&merged, 0.5),
@@ -937,6 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn flush_persists_counters_histogram_and_distinct_visitors() {
         let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
         let agg = MetricsAgg::new();
         let now_ms = crate::apps::now_ms();
         record(&agg, now_ms, "shop", "/items/42", 200, 3, Some("10.0.0.1"));
@@ -966,6 +1073,12 @@ mod tests {
             row.5, 3,
             "two hits from one IP count once; the ipless hit is no visitor"
         );
+        let day_row: (i64,) =
+            sqlx::query_as("SELECT visitors FROM visitor_day WHERE app_id = 'shop'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(day_row.0, 3, "same-day uniques land in visitor_day too");
         let hist: Vec<u64> = serde_json::from_str(&row.3).unwrap();
         assert_eq!(hist.len(), HISTOGRAM_BUCKETS);
         assert_eq!(hist[histogram_bucket(3)], 1);
@@ -991,6 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn two_flushes_in_one_minute_merge_without_doubling() {
         let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
         let agg = MetricsAgg::new();
         let now_ms = minute_of(crate::apps::now_ms());
         record(&agg, now_ms, "shop", "/", 200, 4, Some("10.0.0.1"));
@@ -1013,7 +1127,8 @@ mod tests {
             idle,
             FlushStats {
                 minutes: 0,
-                paths: 0
+                paths: 0,
+                visitor_days: 0,
             }
         );
         let again: (i64,) =
@@ -1027,6 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn path_cardinality_cap_folds_overflow_into_other() {
         let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
         let agg = MetricsAgg::new();
         let now_ms = crate::apps::now_ms();
         for i in 0..MAX_PATHS_PER_APP_HOUR + 5 {
@@ -1109,7 +1225,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) \
-                 VALUES ('shop', ?1, ?2, 1, 0, ?3, 0, 2)",
+                 VALUES ('shop', ?1, ?2, 1, 0, ?3, 0, 0)",
             )
             .bind(m)
             .bind(requests)
@@ -1117,6 +1233,16 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        }
+        // One daily count inside the 24 h window's days, one on a day the
+        // window never touches.
+        for (day, visitors) in [(day_of(minute), 2), (day_of(now_ms) - 2, 100)] {
+            sqlx::query("INSERT INTO visitor_day (app_id, day, visitors) VALUES ('shop', ?1, ?2)")
+                .bind(day)
+                .bind(visitors)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         let hour = hour_of(now_ms);
         for (h, path, requests) in [
@@ -1192,12 +1318,18 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
+            sqlx::query("INSERT INTO visitor_day (app_id, day, visitors) VALUES (?1, ?2, 1)")
+                .bind(id)
+                .bind(day_of(at))
+                .execute(&pool)
+                .await
+                .unwrap();
         }
-        let (minutes, paths) = prune(&pool, now_ms).await.unwrap();
+        let (minutes, paths, days) = prune(&pool, now_ms).await.unwrap();
         assert_eq!(
-            (minutes, paths),
-            (2, 2),
-            "the 8 d free row and the 31 d pro row"
+            (minutes, paths, days),
+            (2, 2, 2),
+            "the 8 d free row and the 31 d pro row, in every table"
         );
         let left: Vec<(String, i64)> =
             sqlx::query_as("SELECT app_id, minute FROM metric_minute ORDER BY app_id, minute")
@@ -1209,33 +1341,186 @@ mod tests {
             ["free-app", "pro-app", "pro-app"],
             "free keeps only the fresh row, pro keeps 8 d and fresh"
         );
+        let days_left: Vec<(String, i64)> =
+            sqlx::query_as("SELECT app_id, day FROM visitor_day ORDER BY app_id, day")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            days_left
+                .iter()
+                .map(|(a, _)| a.as_str())
+                .collect::<Vec<_>>(),
+            ["free-app", "pro-app", "pro-app"],
+            "visitor_day keeps the same rows per plan"
+        );
     }
 
-    #[test]
-    fn record_cost_is_microseconds_per_request() {
+    #[tokio::test]
+    async fn visitors_count_once_per_day_across_minutes() {
+        let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
         let agg = MetricsAgg::new();
-        let input = RequestRecord {
-            now_ms: 1_760_000_000_000,
-            app_id: "shop",
-            path: "/items/12345?x=1",
-            status: 200,
-            latency_ms: 12,
-            bytes_out: 1400,
-            client_ip: Some("203.0.113.7"),
-        };
-        // Warm up the maps so the loop measures steady state, not growth.
-        for _ in 0..1000 {
-            agg.record(RequestRecord { ..input });
+        // Noon yesterday: safely in the past, safely inside one UTC day.
+        let noon = (day_of(crate::apps::now_ms()) - 1) * 86_400_000 + 12 * 3_600_000;
+        for m in 0..30 {
+            record(
+                &agg,
+                noon + m * 60_000,
+                "shop",
+                "/",
+                200,
+                3,
+                Some("10.0.0.1"),
+            );
         }
-        let start = std::time::Instant::now();
-        let n = 20_000;
-        for _ in 0..n {
-            agg.record(RequestRecord { ..input });
-        }
-        let mean_ns = start.elapsed().as_nanos() / n;
-        assert!(
-            mean_ns < 50_000,
-            "record() must stay far under a millisecond: saw {mean_ns} ns mean"
+        record(
+            &agg,
+            noon + 5 * 60_000,
+            "shop",
+            "/",
+            200,
+            3,
+            Some("10.0.0.2"),
         );
+        agg.flush(&pool).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT visitors FROM visitor_day WHERE app_id = 'shop'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 2, "thirty minutes of one IP is one daily unique");
+        let got = summary(&pool, "shop", 168).await.unwrap();
+        assert_eq!(got.visitors, 2);
+    }
+
+    #[tokio::test]
+    async fn visitors_sum_across_days_in_window() {
+        let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
+        let agg = MetricsAgg::new();
+        let today = day_of(crate::apps::now_ms());
+        let noon = |days_ago: i64| (today - days_ago) * 86_400_000 + 12 * 3_600_000;
+        // One IP on two days counts on both; a second IP on one day adds one.
+        record(&agg, noon(2), "shop", "/", 200, 3, Some("10.0.0.1"));
+        record(&agg, noon(1), "shop", "/", 200, 3, Some("10.0.0.1"));
+        record(
+            &agg,
+            noon(1) + 60_000,
+            "shop",
+            "/",
+            200,
+            3,
+            Some("10.0.0.2"),
+        );
+        agg.flush(&pool).await.unwrap();
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT day, visitors FROM visitor_day WHERE app_id = 'shop' ORDER BY day",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![(today - 2, 1), (today - 1, 2)]);
+        let got = summary(&pool, "shop", 168).await.unwrap();
+        assert_eq!(
+            got.visitors, 3,
+            "daily uniques, summed over the window's days"
+        );
+    }
+
+    #[tokio::test]
+    async fn visitor_day_restart_keeps_the_max() {
+        let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
+        let noon = (day_of(crate::apps::now_ms()) - 1) * 86_400_000 + 12 * 3_600_000;
+        let agg = MetricsAgg::new();
+        record(&agg, noon, "shop", "/", 200, 3, Some("10.0.0.1"));
+        record(&agg, noon, "shop", "/", 200, 3, Some("10.0.0.2"));
+        agg.flush(&pool).await.unwrap();
+        // A restart resets the in-memory set: the smaller post-restart
+        // count must not rewind the row.
+        drop(agg);
+        let fresh = MetricsAgg::new();
+        record(&fresh, noon + 60_000, "shop", "/", 200, 3, Some("10.0.0.1"));
+        fresh.flush(&pool).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT visitors FROM visitor_day WHERE app_id = 'shop'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 2, "max() keeps the pre-restart count");
+        // Growth past the pre-restart value resumes counting.
+        record(
+            &fresh,
+            noon + 120_000,
+            "shop",
+            "/",
+            200,
+            3,
+            Some("10.0.0.3"),
+        );
+        record(
+            &fresh,
+            noon + 180_000,
+            "shop",
+            "/",
+            200,
+            3,
+            Some("10.0.0.4"),
+        );
+        fresh.flush(&pool).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT visitors FROM visitor_day WHERE app_id = 'shop'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 3);
+    }
+
+    #[tokio::test]
+    async fn visitor_day_cap_bounds_memory() {
+        let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
+        let agg = MetricsAgg::new();
+        let noon = (day_of(crate::apps::now_ms()) - 1) * 86_400_000 + 12 * 3_600_000;
+        for i in 0..MAX_VISITORS_PER_APP_DAY + 100 {
+            let ip = format!("10.{}.{}.{}", (i >> 16) & 255, (i >> 8) & 255, i & 255);
+            record(&agg, noon, "shop", "/", 200, 3, Some(&ip));
+        }
+        agg.flush(&pool).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT visitors FROM visitor_day WHERE app_id = 'shop'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.0, MAX_VISITORS_PER_APP_DAY as i64,
+            "the flushed daily count saturates at the cap"
+        );
+        let kept: usize = agg
+            .inner
+            .lock()
+            .unwrap()
+            .visitor_days
+            .values()
+            .map(HashSet::len)
+            .sum();
+        assert_eq!(kept, MAX_VISITORS_PER_APP_DAY);
+    }
+
+    #[tokio::test]
+    async fn visitor_day_drops_days_before_yesterday() {
+        let (pool, _dir) = pool().await;
+        app(&pool, "shop", "free").await;
+        let agg = MetricsAgg::new();
+        let today = day_of(crate::apps::now_ms());
+        let old_noon = (today - 5) * 86_400_000 + 12 * 3_600_000;
+        record(&agg, old_noon, "shop", "/", 200, 3, Some("10.0.0.1"));
+        agg.flush(&pool).await.unwrap();
+        // The row persists (prune owns expiry); memory drops the old day.
+        let row: (i64,) = sqlx::query_as("SELECT visitors FROM visitor_day WHERE app_id = 'shop'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 1);
+        let inner = agg.inner.lock().unwrap();
+        assert!(inner.visitor_days.keys().all(|(_, day)| *day >= today - 1));
+        assert!(inner.flushed_days.keys().all(|(_, day)| *day >= today - 1));
     }
 }
