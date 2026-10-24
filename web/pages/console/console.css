@@ -430,3 +430,13 @@ a.rail-tile:hover {
     transition: none;
   }
 }
+
+/* The reference's look: the brand tile is a dark rounded square, and the
+   selected sidebar row is a soft gray, not daisyUI's filled primary. */
+.rail-logo {
+  @apply bg-neutral text-neutral-content;
+}
+.side .menu :where(li > .menu-active),
+.side .menu :where(li > a.menu-active) {
+  @apply bg-base-200 text-base-content font-medium;
+}

@@ -536,7 +536,7 @@ export function Console() {
       </a>
       <nav class="rail" aria-label="Applications">
         <a
-          class="rail-tile tooltip tooltip-right"
+          class="rail-tile rail-logo tooltip tooltip-right"
           data-tip="Outer console"
           href="/console"
           aria-label="Outer console"
