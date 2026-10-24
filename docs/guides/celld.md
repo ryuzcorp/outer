@@ -44,9 +44,27 @@ hand-write it: set bindings in `void.config.ts` and rebuild.
   idle setting) and wakes on the next request; a sleeping app adopts the
   newest deploy when it wakes.
 
+## PWA
+
+Every app is installable by default: `vite-plugin-pwa` (`autoUpdate`,
+`generateSW`) owns the manifest, the service worker and all icons, built
+into `dist/client/` from the single source `public/favicon.svg` — edit
+the SVG and the build regenerates matching PNGs. Never commit icon PNGs
+or a hand-written manifest. The SSR app has no `index.html`, so
+`pages/_pwa.ts` registers the service worker on the client (manual
+`virtual:pwa-register`) and `void.config.ts` `head` carries the
+manifest/icon links.
+
+What not to break: never set `navigateFallback` or precache HTML —
+navigations go to the network so reloads always show fresh D1 data.
+Rename the app via `manifest` `name` in `vite.config.ts` + `head` `title`
+in `void.config.ts`.
+
 ## Sources
 
 - The template's build config (celld config derivation):
-  <https://github.com/ryuzcorp/noite-template-ilha/blob/636715ea44d8944701652abda734ab610e75c69d/vite.config.ts>
+  <https://github.com/ryuzcorp/outer-template/blob/9571514d8d604be68f74d1ce5bc1cd1705572cae/vite.config.ts>
+- The PWA registration:
+  <https://github.com/ryuzcorp/outer-template/blob/9571514d8d604be68f74d1ce5bc1cd1705572cae/pages/_pwa.ts>
 - celld's runtime docs: <https://celld.dev/docs/>
 - Outer's deploy pipeline: `crates/outer/src/deploy/pipeline.rs`
