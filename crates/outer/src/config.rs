@@ -87,6 +87,7 @@ impl std::fmt::Debug for Config {
             .field("signup_open", &self.signup_open)
             .field("ai_gateway", &self.ai_gateway)
             .field("admin_emails", &self.admin_emails)
+            .field("outer_secret", &"<redacted>")
             .field("oauth_access_ttl", &self.oauth_access_ttl)
             .field("oauth_refresh_ttl", &self.oauth_refresh_ttl)
             .field("tool_wait", &self.tool_wait)
@@ -128,6 +129,9 @@ pub struct Config {
     pub admin_emails: Vec<String>,
     /// `OUTER_TERMS_VERSION`: changing it re-asks every account at next sign-in.
     pub terms_version: String,
+    /// `OUTER_SECRET`: HMAC and AES key derivation. A dev value is refused
+    /// off localhost.
+    pub outer_secret: String,
     /// `OUTER_EMAIL_FROM` (default `Outer <hello@outer.now>`).
     pub email_from: String,
     /// `OUTER_OAUTH_ACCESS_TTL_S` (default 3600).
@@ -308,6 +312,7 @@ impl Config {
             })
             .unwrap_or_default();
         let terms_version = get("OUTER_TERMS_VERSION").map(str::to_string);
+        let outer_secret = get("OUTER_SECRET").unwrap_or("dev").to_string();
         let email_from = get("OUTER_EMAIL_FROM")
             .unwrap_or("Outer <hello@outer.now>")
             .to_string();
@@ -408,6 +413,7 @@ impl Config {
             ai_gateway,
             admin_emails,
             terms_version: terms_version.unwrap_or_else(|| "dev".to_string()),
+            outer_secret,
             email_from,
             oauth_access_ttl,
             oauth_refresh_ttl,
@@ -473,6 +479,12 @@ impl Config {
                 "OUTER_TERMS_VERSION is required when OUTER_DOMAIN is not a localhost dev domain (changing it re-asks every account at next sign-in)"
                     .to_string(),
             );
+        }
+        if !self.is_local() && self.outer_secret == "dev" {
+            problems.push(
+ "OUTER_SECRET is required when OUTER_DOMAIN is not a localhost dev domain (HMAC and AES key derivation)"
+ .to_string(),
+ );
         }
         if self.oauth_access_ttl.is_zero() {
             problems.push("OUTER_OAUTH_ACCESS_TTL_S must be at least 1".to_string());
@@ -755,6 +767,7 @@ mod tests {
             ("OUTER_TERMS_VERSION", "2026-10-23"),
             ("OUTER_ADMIN_EMAILS", " Owner@Example.com ,"),
             ("OUTER_SIGNUP", "closed"),
+            ("OUTER_SECRET", "test-outer-secret"),
         ]))
         .unwrap();
         let StoreKind::R2(r2) = &cfg.store else {
@@ -773,6 +786,7 @@ mod tests {
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("s3cret"), "{shown}");
         assert!(!shown.contains("cf-token"), "{shown}");
+        assert!(!shown.contains("test-outer-secret"), "{shown}");
     }
 
     #[test]
@@ -797,6 +811,7 @@ mod tests {
         for name in [
             "OUTER_SIGNUP",
             "OUTER_TERMS_VERSION",
+            "OUTER_SECRET",
             "OUTER_OAUTH_ACCESS_TTL_S",
             "OUTER_OAUTH_REFRESH_TTL_D",
         ] {
