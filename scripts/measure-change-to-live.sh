@@ -19,7 +19,13 @@ BASE=${4:-https://outer.now}
 
 KEY=$(tr -d '[:space:]' < "$KEY_FILE")
 OUT=$(mktemp)
-trap 'rm -f "$OUT"' EXIT INT TERM
+HDR=$(mktemp)
+trap 'rm -f "$OUT" "$HDR"' EXIT INT TERM
+# The Bearer key travels in a 0600 header file (`curl -H @file`), never in
+# argv where any local user could read it off the process list.
+printf 'Authorization: Bearer %s' "$KEY" > "$HDR"
+chmod 600 "$HDR"
+unset KEY
 
 i=1
 while [ "$i" -le "$N" ]; do
@@ -29,7 +35,7 @@ while [ "$i" -le "$N" ]; do
             writes:[{path:".measure-ping.txt", content:$content}], wait:true}}}')
     start=$(date +%s%3N)
     code=$(curl -sS -o "$OUT" -w '%{http_code}' --max-time 120 \
-        -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+        -H @"$HDR" -H 'Content-Type: application/json' \
         -d "$body" "$BASE/mcp" || echo CURL_FAIL)
     end=$(date +%s%3N)
     wall=$((end - start))
@@ -57,4 +63,4 @@ else:
     p95 = xs[min(n - 1, int(n * 0.95))]
     print(f"wall_ms n={n} min={xs[0]} p50={p50} p95={p95} max={xs[-1]}")
 '
-grep -c 'status=success' "$OUT.runs" | xargs echo "successful runs:"
+grep -c 'status=success' "$OUT.runs" | xargs echo "successful runs:" || true

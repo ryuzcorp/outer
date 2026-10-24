@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -603,6 +604,12 @@ impl Deployer {
         ) {
             return Ok((true, "dependencies unchanged; skipping install".to_string()));
         }
+        // Deps changed (or first install): the persistent tmp may hold stale
+        // artifacts keyed to the old tree, so wipe it before installing.
+        #[cfg(unix)]
+        if stored.as_deref() != Some(current.as_str()) {
+            wipe_cache_tmp(&self.cache_dir(&app.slug), app.uid, app.uid)?;
+        }
 
         let mut args = vec!["install".to_string()];
         if lock_bytes.is_some() {
@@ -637,6 +644,12 @@ impl Deployer {
             .is_some_and(|s| !s.trim().is_empty());
         if !has_build {
             return Ok((true, "no scripts.build; skipping build".to_string()));
+        }
+        // Cap the persistent tmp before building: an overgrown tmp is wiped
+        // rather than carried into the build.
+        #[cfg(unix)]
+        if tmp_needs_wipe(&self.cache_dir(&app.slug)) {
+            wipe_cache_tmp(&self.cache_dir(&app.slug), app.uid, app.uid)?;
         }
         let out = self
             .run_sandboxed_step(
@@ -1192,55 +1205,507 @@ fn hand_worktree_to_app(slug: &str, work: &Path, uid: u32) {
     }
 }
 
+/// Test hook for [`chown_tree_with`]: called once per visited path in the
+/// window where the old path-based walk was racable. `None` skips the hook.
+#[cfg(unix)]
+type ChownHook<'a> = Option<&'a dyn Fn(&Path, u32, u32) -> bool>;
+
 /// Recursively hand `path` to (`uid`, `gid`) without following symlinks (cf.
 /// Noite's `lchown_tree`): an app-writable tree can link anywhere, and a
 /// following chown run by root would hand platform files to the app uid.
-/// `symlink_metadata` reports a link as a link, so `lchown` changes the link
-/// itself; links are never descended into and paths are never canonicalized.
-/// Returns false when any entry could not be changed.
+/// The walk is fd-based: the root is opened `O_NOFOLLOW`, entries are listed
+/// through the open fd, changed with `fchownat(…, AT_SYMLINK_NOFOLLOW)`, and
+/// descended into with `openat(…, O_NOFOLLOW)` — a path string is never
+/// re-resolved after its parent fd is pinned, so an app-uid process swapping
+/// a checked directory for a symlink mid-walk only fails that entry closed
+/// (the swap is never followed). Links are handed over themselves and never
+/// descended into. Returns false when any entry could not be changed.
 #[cfg(unix)]
 fn chown_tree(path: &Path, uid: u32, gid: u32) -> bool {
-    chown_tree_with(path, uid, gid, &|p, uid, gid| {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let Ok(path) = CString::new(p.as_os_str().as_bytes()) else {
-            return false;
-        };
-        // SAFETY: `lchown` changes the link itself; it never follows it.
-        unsafe { libc::lchown(path.as_ptr(), uid, gid) == 0 }
-    })
+    chown_tree_with(path, uid, gid, &|_, _, _| true)
 }
 
-/// [`chown_tree`] with the per-entry change injected, so tests can record
-/// the visited paths without privileges.
+/// [`chown_tree`] with a hook called once per visited path, in the window
+/// where the old path-based walk was racable (after the entry is pinned by
+/// its parent fd, before descending into it): tests use it to swap an entry
+/// mid-walk and prove the swap is never followed.
 #[cfg(unix)]
 fn chown_tree_with(
     path: &Path,
     uid: u32,
     gid: u32,
-    chown: &dyn Fn(&Path, u32, u32) -> bool,
+    hook: &dyn Fn(&Path, u32, u32) -> bool,
 ) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::RawFd;
+    let Ok(root) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `open` with `O_NOFOLLOW|O_DIRECTORY` fails rather than
+    // following a link; the fd pins the root for the whole walk. A root
+    // link fails closed here.
+    let fd: RawFd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    chown_opened_dir(fd, path, uid, gid, Some(hook), true)
+}
+
+/// Hand over the dir pinned by `fd` (owned: listed via `fdopendir`, which
+/// closes it, or closed here when that fails). `logical` only labels hook
+/// calls and test records — it is never re-resolved. `chown_self` hands
+/// over the dir itself too; subdirs arrive already handed over by their
+/// parent's `fchownat` and pass false.
+#[cfg(unix)]
+fn chown_opened_dir(
+    fd: std::os::unix::io::RawFd,
+    logical: &Path,
+    uid: u32,
+    gid: u32,
+    hook: ChownHook<'_>,
+    chown_self: bool,
+) -> bool {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
     let mut ok = true;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
-            ok = false;
-            continue;
-        };
-        if !chown(&p, uid, gid) {
+    if chown_self {
+        // SAFETY: `fchown` acts on the open dir itself; nothing to follow.
+        if unsafe { libc::fchown(fd, uid, gid) } != 0 {
             ok = false;
         }
-        if meta.file_type().is_dir() {
-            let Ok(rd) = std::fs::read_dir(&p) else {
+        if let Some(hook) = hook {
+            if !hook(logical, uid, gid) {
                 ok = false;
-                continue;
-            };
-            for entry in rd.flatten() {
-                stack.push(entry.path());
             }
         }
     }
+    // SAFETY: `fdopendir` takes ownership of `fd` on success; on failure
+    // the fd stays ours and is closed below.
+    let dirp = unsafe { libc::fdopendir(fd) };
+    if dirp.is_null() {
+        // SAFETY: `fd` is ours; `fdopendir` failed and did not take it.
+        unsafe { libc::close(fd) };
+        return false;
+    }
+    loop {
+        // SAFETY: `dirp` is live until `closedir` below; `readdir` returns
+        // NULL at the end or a pointer valid until the next call. A NULL
+        // from a mid-stream error just ends the walk of this dir; the
+        // entries already visited were still handed over by fd.
+        let entry = unsafe { libc::readdir(dirp) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated by the kernel.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let child = logical.join(OsStr::from_bytes(name.to_bytes()));
+        // SAFETY: `fchownat` with `AT_SYMLINK_NOFOLLOW` changes the entry
+        // itself relative to the pinned `fd`; no path is re-resolved.
+        if unsafe { libc::fchownat(fd, name.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            ok = false;
+        }
+        // The old race window: after the entry is pinned by its parent fd,
+        // before descending. A swap here only renames what is never
+        // re-resolved.
+        if let Some(hook) = hook {
+            if !hook(&child, uid, gid) {
+                ok = false;
+            }
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fstatat` reports the entry itself; the buffer is ours.
+        if unsafe { libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            ok = false;
+            continue;
+        }
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            // SAFETY: `openat` with `O_NOFOLLOW` refuses a swapped-in link;
+            // the new fd pins the real dir for the recursion.
+            let sub = unsafe {
+                libc::openat(
+                    fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if sub < 0 {
+                ok = false;
+                continue;
+            }
+            if !chown_opened_dir(sub, &child, uid, gid, hook, false) {
+                ok = false;
+            }
+        }
+    }
+    // SAFETY: `dirp` is live; `closedir` also closes the `fdopendir` fd.
+    unsafe { libc::closedir(dirp) };
     ok
+}
+
+/// Cap on `cache/<slug>/tmp` before a build wipes it: bun's node-compile
+/// cache is worth keeping warm, but an unbounded tmp is a disk-fill vector
+/// for an app filling its own cache.
+#[cfg(unix)]
+const MAX_CACHE_TMP_BYTES: u64 = 1 << 30;
+
+/// Budget bounding the tmp size walk: an app filling its tmp with millions
+/// of entries must not stall the deploy measuring it. Past the budget the
+/// tree counts as over cap and gets wiped.
+#[cfg(unix)]
+const TMP_WALK_BUDGET: u64 = 100_000;
+
+/// Remove the tree pinned by `fd` (owned: consumed via `fdopendir`) without
+/// re-resolving a path string: entries are unlinked with `unlinkat` relative
+/// to the open parent, subdirs are recursed into with `openat(…,
+/// O_NOFOLLOW)` and removed with `AT_REMOVEDIR` once emptied. A symlink is
+/// unlinked itself, never followed. Vanished entries count as removed.
+#[cfg(unix)]
+fn remove_opened_dir(fd: std::os::unix::io::RawFd) -> bool {
+    use std::ffi::CStr;
+    let mut ok = true;
+    // SAFETY: `fdopendir` takes ownership of `fd` on success; on failure
+    // the fd stays ours and is closed below.
+    let dirp = unsafe { libc::fdopendir(fd) };
+    if dirp.is_null() {
+        // SAFETY: `fd` is ours; `fdopendir` failed and did not take it.
+        unsafe { libc::close(fd) };
+        return false;
+    }
+    loop {
+        // SAFETY: `dirp` is live until `closedir` below; see
+        // `chown_opened_dir` for the readdir contract. Entries created
+        // concurrently may be missed (documented): the caller retries the
+        // walk before giving up.
+        let entry = unsafe { libc::readdir(dirp) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `d_name` is NUL-terminated by the kernel.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fstatat` reports the entry itself; the buffer is ours.
+        if unsafe { libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+                ok = false;
+            }
+            continue;
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            // SAFETY: `unlinkat` without flags removes the link or file
+            // itself relative to the pinned `fd`.
+            if unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } != 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
+            {
+                ok = false;
+            }
+            continue;
+        }
+        // SAFETY: `openat` with `O_NOFOLLOW` refuses a swapped-in link; the
+        // new fd pins the real dir for the recursion.
+        let sub = unsafe {
+            libc::openat(
+                fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if sub >= 0 && !remove_opened_dir(sub) {
+            ok = false;
+            continue;
+        }
+        // SAFETY: `AT_REMOVEDIR` removes the emptied dir itself relative to
+        // the pinned `fd`. A vanished dir is already gone.
+        if unsafe { libc::unlinkat(fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
+        {
+            ok = false;
+        }
+    }
+    // SAFETY: `dirp` is live; `closedir` also closes the `fdopendir` fd.
+    unsafe { libc::closedir(dirp) };
+    ok
+}
+
+/// Whether the tmp tree pinned by `fd` (owned) stays within `limit` bytes
+/// (`st_blocks`, so sparseness counts) and `budget` entries, counted with a
+/// no-follow walk. False on overuse, over budget, or any error: all three
+/// wipe.
+#[cfg(unix)]
+fn tmp_within_limit(fd: std::os::unix::io::RawFd, limit: u64, budget: u64) -> bool {
+    use std::ffi::CStr;
+    struct Usage {
+        bytes: u64,
+        left: u64,
+    }
+    let mut usage = Usage {
+        bytes: 0,
+        left: budget,
+    };
+    fn walk(fd: std::os::unix::io::RawFd, limit: u64, usage: &mut Usage) -> bool {
+        // SAFETY: ownership transfer as in `remove_opened_dir`.
+        let dirp = unsafe { libc::fdopendir(fd) };
+        if dirp.is_null() {
+            // SAFETY: `fd` is ours; `fdopendir` failed and did not take it.
+            unsafe { libc::close(fd) };
+            return false;
+        }
+        let mut ok = true;
+        loop {
+            // SAFETY: as in `remove_opened_dir`.
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: `d_name` is NUL-terminated by the kernel.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            if usage.left == 0 {
+                return false;
+            }
+            usage.left -= 1;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: no-follow; the buffer is ours.
+            if unsafe { libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0
+            {
+                ok = false;
+                continue;
+            }
+            usage.bytes = usage
+                .bytes
+                .saturating_add((st.st_blocks as u64).saturating_mul(512));
+            if usage.bytes > limit {
+                // SAFETY: `dirp` is live.
+                unsafe { libc::closedir(dirp) };
+                return false;
+            }
+            if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+                // SAFETY: `O_NOFOLLOW` pins the real dir.
+                let sub = unsafe {
+                    libc::openat(
+                        fd,
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if sub < 0 {
+                    ok = false;
+                    continue;
+                }
+                if !walk(sub, limit, usage) {
+                    // SAFETY: `dirp` is live.
+                    unsafe { libc::closedir(dirp) };
+                    return false;
+                }
+            }
+        }
+        // SAFETY: `dirp` is live.
+        unsafe { libc::closedir(dirp) };
+        ok
+    }
+    walk(fd, limit, &mut usage)
+}
+
+/// Whether `cache/<slug>/tmp` must be wiped: missing (create it), not a real
+/// dir (planted link/file), or over [`MAX_CACHE_TMP_BYTES`] by a bounded
+/// no-follow walk. Measurement errors wipe too: an unreadable tmp is not a
+/// tmp to build on.
+#[cfg(unix)]
+fn tmp_needs_wipe(cache_root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = cache_root.join("tmp");
+    let Ok(meta) = std::fs::symlink_metadata(&tmp) else {
+        return true;
+    };
+    if !meta.file_type().is_dir() {
+        return true;
+    }
+    let Ok(path) = std::ffi::CString::new(tmp.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: `O_NOFOLLOW|O_DIRECTORY` pins the real dir or fails.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return true;
+    }
+    !tmp_within_limit(fd, MAX_CACHE_TMP_BYTES, TMP_WALK_BUDGET)
+}
+
+/// Rename `tmp` aside (rename never follows the final component) and remove
+/// the renamed tree with an fd-based walk, then recreate `tmp` 0700 for
+/// (`uid`, `gid`). Missing `tmp` is just created. Fails closed: a tmp that
+/// cannot be removed or recreated fails the step rather than building on an
+/// attacker-planted tree.
+#[cfg(unix)]
+fn wipe_cache_tmp(cache_root: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::RawFd;
+    // A missing root is a fresh app (the step's own ensure would create it
+    // next): create it here so the wipe below converges. The parents
+    // (`<data>/cache`) are platform-owned; a root that exists as a link
+    // fails closed at the `O_NOFOLLOW` open below.
+    if std::fs::symlink_metadata(cache_root).is_err() {
+        std::fs::create_dir_all(cache_root)?;
+    }
+    let root = CString::new(cache_root.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("cache root has an interior NUL"))?;
+    // SAFETY: `O_NOFOLLOW|O_DIRECTORY` pins the real root or fails.
+    let fd: RawFd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening cache root {}", cache_root.display()));
+    }
+    struct Close(RawFd);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            // SAFETY: ours until now; nothing else closes it.
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let _close = Close(fd);
+    let tmp = CString::new("tmp").expect("literal has no NUL");
+    if fd_has_entry(fd, &tmp) {
+        // First free `tmp.old.<n>`: stale ones mean an earlier wipe died
+        // mid-removal; they are cleared in place, then the name is reused.
+        let mut old: Option<CString> = None;
+        for n in 0..64 {
+            let name = CString::new(format!("tmp.old.{n}")).expect("no NUL in a number");
+            if clear_stale_old(fd, &name) {
+                old = Some(name);
+                break;
+            }
+        }
+        let Some(old) = old else {
+            anyhow::bail!("no free tmp.old.<n> under {}", cache_root.display());
+        };
+        // SAFETY: `renameat` never follows the final components; the names
+        // themselves move.
+        if unsafe { libc::renameat(fd, tmp.as_ptr(), fd, old.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("renaming aside {}", cache_root.join("tmp").display()));
+        }
+        remove_renamed_tmp(fd, &old, cache_root)?;
+    }
+    // SAFETY: `mkdirat` never follows the final component.
+    if unsafe { libc::mkdirat(fd, tmp.as_ptr(), 0o700) } != 0
+        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("recreating {}", cache_root.join("tmp").display()));
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: no-follow; the buffer is ours.
+    if unsafe { libc::fstatat(fd, tmp.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0
+        || (st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+    {
+        anyhow::bail!("tmp under {} is not a real dir", cache_root.display());
+    }
+    // Best-effort like `lchown_one`: production runs as root and hands the
+    // fresh dir over; an unprivileged (dev, test) outer cannot chown to an
+    // app uid and must not fail the deploy for it — the step itself runs as
+    // the current user there anyway.
+    // SAFETY: `fchownat` with `AT_SYMLINK_NOFOLLOW` changes the confirmed
+    // dir itself.
+    if unsafe { libc::fchownat(fd, tmp.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        tracing::debug!(uid, gid, "tmp handover failed; continuing");
+    }
+    Ok(())
+}
+
+/// Whether `name` exists under the pinned `fd` (no follow).
+#[cfg(unix)]
+fn fd_has_entry(fd: std::os::unix::io::RawFd, name: &std::ffi::CString) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: no-follow; the buffer is ours.
+    (unsafe { libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0)
+}
+
+/// Make `name` under the pinned `fd` reusable as a rename target: missing is
+/// free; a non-dir is unlinked (never followed); a leftover dir is removed
+/// in place with retries. False when the name stays occupied.
+#[cfg(unix)]
+fn clear_stale_old(fd: std::os::unix::io::RawFd, name: &std::ffi::CString) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: no-follow; the buffer is ours.
+    if unsafe { libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return true;
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        // SAFETY: not a dir; removing the name itself never follows.
+        return (unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } == 0);
+    }
+    remove_child_dir(fd, name)
+}
+
+/// Remove the dir `name` under the pinned `fd` with an fd-based walk,
+/// retrying twice for entries created concurrently with a walk. The opened
+/// fd is consumed by each walk; a name that vanishes counts as removed.
+#[cfg(unix)]
+fn remove_child_dir(fd: std::os::unix::io::RawFd, name: &std::ffi::CString) -> bool {
+    for _ in 0..3 {
+        // SAFETY: `O_NOFOLLOW` pins the real dir.
+        let sub = unsafe {
+            libc::openat(
+                fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if sub < 0 {
+            // A link, file, or vanished name: unlinking the name itself
+            // (never the target) converges it.
+            // SAFETY: never follows the final component.
+            return (unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } == 0)
+                || std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound;
+        }
+        let emptied = remove_opened_dir(sub);
+        // SAFETY: `AT_REMOVEDIR` removes the emptied dir itself.
+        if unsafe { libc::unlinkat(fd, name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+            return true;
+        }
+        if emptied && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove the renamed-aside tmp (`old` under the pinned `fd`): it may be a
+/// dir (walk + `AT_REMOVEDIR`, one retry), a link or file (unlink the name),
+/// or already vanished. Anything else fails the wipe closed.
+#[cfg(unix)]
+fn remove_renamed_tmp(
+    fd: std::os::unix::io::RawFd,
+    old: &std::ffi::CString,
+    cache_root: &Path,
+) -> anyhow::Result<()> {
+    if remove_child_dir(fd, old) {
+        return Ok(());
+    }
+    anyhow::bail!("removing {}", cache_root.join("tmp").display())
 }
 
 /// Mark the deploy `deploying` before `celld deploy` runs. A separate
@@ -2417,9 +2882,13 @@ mod tests {
     fn chown_tree_hands_over_links_without_descending_into_them() {
         use std::cell::RefCell;
         let (_dir, _outside, root, _target) = symlink_tree();
+        let me = unsafe { libc::geteuid() };
+        let mine = unsafe { libc::getegid() };
         let visited = RefCell::new(Vec::new());
-        let ok = chown_tree_with(&root, 1000, 1000, &|p, uid, gid| {
-            assert_eq!((uid, gid), (1000, 1000));
+        // The walk really chowns (to our own ids, so it succeeds
+        // unprivileged) while the hook records the visited paths.
+        let ok = chown_tree_with(&root, me, mine, &|p, uid, gid| {
+            assert_eq!((uid, gid), (me, mine));
             visited.borrow_mut().push(p.to_path_buf());
             true
         });
@@ -2441,6 +2910,211 @@ mod tests {
             visited.len(),
             5,
             "no traversal outside the tree: {visited:?}"
+        );
+    }
+
+    /// The old walk (`symlink_metadata` then `read_dir` on a path string)
+    /// was TOCTOU-racable: an app-uid process swapping a checked dir for a
+    /// symlink between the check and the listing made root traverse and
+    /// hand over an arbitrary tree. The hook replays that swap in the same
+    /// window (after the entry is pinned, before descending): the fd walk
+    /// must never follow it.
+    #[test]
+    #[cfg(unix)]
+    fn chown_tree_ignores_a_mid_walk_dir_for_symlink_swap() {
+        use std::cell::{Cell, RefCell};
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "platform").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "file").unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "inner").unwrap();
+        let me = unsafe { libc::geteuid() };
+        let mine = unsafe { libc::getegid() };
+        let swapped = Cell::new(false);
+        let visited = RefCell::new(Vec::new());
+        let ok = chown_tree_with(&root, me, mine, &|p, _, _| {
+            visited.borrow_mut().push(p.to_path_buf());
+            if p == sub && !swapped.get() {
+                swapped.set(true);
+                // The attacker: replace the checked dir with a link to an
+                // outside tree before the walk descends into it.
+                std::fs::rename(&sub, root.join("sub.orig")).unwrap();
+                symlink(outside.path(), &sub).unwrap();
+            }
+            true
+        });
+        assert!(swapped.get(), "the swap must have run mid-walk");
+        // The swap is not followed: the post-swap `fstatat` reports a link,
+        // which is handed over itself and never descended into — while
+        // everything pinned is still handed over: success.
+        assert!(ok, "the rest of the tree is still handed over");
+        let visited = visited.borrow();
+        assert!(
+            !visited.iter().any(|p| p.starts_with(outside.path())),
+            "nothing outside the tree was visited: {visited:?}"
+        );
+        assert!(
+            !visited.contains(&sub.join("inner.txt")),
+            "the pre-swap contents were not descended into either: {visited:?}"
+        );
+        for expected in [root.clone(), root.join("file.txt"), sub.clone()] {
+            assert!(
+                visited.contains(&expected),
+                "pinned entries are still handed over: {expected:?} not in {visited:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "platform",
+            "the outside tree is untouched"
+        );
+    }
+
+    /// The tmp wipe removes the whole tree without following links: a
+    /// symlinked tmp entry and a dir link into an outside tree are unlinked
+    /// themselves, and the fresh tmp is a real 0700 dir for the app ids.
+    #[test]
+    #[cfg(unix)]
+    fn wipe_cache_tmp_removes_the_tree_without_following_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("platform.txt");
+        std::fs::write(&marker, "platform").unwrap();
+        let sub = outside.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "inner").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let tmp = cache.join("tmp");
+        std::fs::create_dir_all(tmp.join("realdir")).unwrap();
+        std::fs::write(tmp.join("a.txt"), "a").unwrap();
+        std::fs::write(tmp.join("realdir").join("b.txt"), "b").unwrap();
+        symlink(outside.path().join("platform.txt"), tmp.join("link")).unwrap();
+        symlink(&sub, tmp.join("dirlink")).unwrap();
+        let me = unsafe { libc::geteuid() };
+        let mine = unsafe { libc::getegid() };
+        wipe_cache_tmp(&cache, me, mine).unwrap();
+        let meta = std::fs::symlink_metadata(&tmp).unwrap();
+        assert!(meta.file_type().is_dir(), "tmp is a real dir again");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::read_dir(&tmp).unwrap().count(),
+            0,
+            "the old tree is gone"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "platform");
+        assert_eq!(
+            std::fs::read_to_string(sub.join("inner.txt")).unwrap(),
+            "inner",
+            "the linked outside dir is untouched"
+        );
+    }
+
+    /// A planted file or link in tmp's place is replaced with a real dir
+    /// (never followed), and a stale `tmp.old.0` from a died wipe is cleared
+    /// instead of blocking the rename.
+    #[test]
+    #[cfg(unix)]
+    fn wipe_cache_tmp_replaces_planted_non_dirs_and_clears_stale_olds() {
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("platform.txt");
+        std::fs::write(&marker, "platform").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        symlink(&marker, cache.join("tmp")).unwrap();
+        let stale = cache.join("tmp.old.0");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("junk.txt"), "junk").unwrap();
+        let me = unsafe { libc::geteuid() };
+        let mine = unsafe { libc::getegid() };
+        wipe_cache_tmp(&cache, me, mine).unwrap();
+        assert!(
+            std::fs::symlink_metadata(cache.join("tmp"))
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "planted link replaced with a real dir"
+        );
+        assert!(
+            !cache.join("tmp.old.0").exists(),
+            "the stale rename target was cleared and reused"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "platform");
+        // Missing tmp is just created.
+        std::fs::remove_dir(cache.join("tmp")).unwrap();
+        wipe_cache_tmp(&cache, me, mine).unwrap();
+        assert!(cache.join("tmp").is_dir());
+    }
+
+    /// Open `path` `O_NOFOLLOW|O_DIRECTORY` for the `tmp_within_limit`
+    /// tests below.
+    #[cfg(unix)]
+    fn open_dir_for_test(path: &Path) -> std::os::unix::io::RawFd {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: test-only opener for a tempdir path.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "opening test dir {}", path.to_string_lossy());
+        fd
+    }
+
+    /// The size walk counts real bytes (never following links), fails a
+    /// tiny limit, and counts an entry flood as over cap without walking
+    /// it all.
+    #[test]
+    #[cfg(unix)]
+    fn tmp_within_limit_counts_bytes_and_bounds_the_walk() {
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("big.txt"), "x".repeat(4096)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.txt"), "hello").unwrap();
+        symlink(outside.path().join("big.txt"), tmp.join("link")).unwrap();
+        // A link counts as itself, not its 4 KiB target.
+        assert!(tmp_within_limit(open_dir_for_test(&tmp), 1 << 20, 1000));
+        assert!(
+            !tmp_within_limit(open_dir_for_test(&tmp), 0, 1000),
+            "any content exceeds a zero limit"
+        );
+        // Two entries (a.txt, link, sub) under a budget of one: over.
+        assert!(
+            !tmp_within_limit(open_dir_for_test(&tmp), 1 << 20, 1),
+            "an entry flood counts as over cap"
+        );
+    }
+
+    /// `tmp_needs_wipe`: missing or planted tmp wipes (it is created or
+    /// replaced), a small real dir does not.
+    #[test]
+    #[cfg(unix)]
+    fn tmp_needs_wipe_flags_missing_and_planted_but_keeps_small_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        assert!(tmp_needs_wipe(&cache), "missing tmp is created by the wipe");
+        std::os::unix::fs::symlink(dir.path(), cache.join("tmp")).unwrap();
+        assert!(tmp_needs_wipe(&cache), "a planted link is replaced");
+        std::fs::remove_file(cache.join("tmp")).unwrap();
+        std::fs::create_dir_all(cache.join("tmp").join("sub")).unwrap();
+        std::fs::write(cache.join("tmp").join("a.txt"), "hello").unwrap();
+        assert!(
+            !tmp_needs_wipe(&cache),
+            "a small real tmp survives under the 1 GiB cap"
         );
     }
 
