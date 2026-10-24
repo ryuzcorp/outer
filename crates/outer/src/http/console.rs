@@ -44,6 +44,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use maud::{html, Markup};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::auth::{AccountRow, AuthState};
@@ -55,6 +56,16 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
     Router::new()
         .route("/console/sign-in", get(sign_in_get).post(sign_in_post))
         .route("/api/console/me", get(api_me))
+        .route("/api/console/invites", get(api_invites))
+        .route(
+            "/api/console/admin/invites",
+            get(api_admin_invites).post(api_admin_create_invites),
+        )
+        .route(
+            "/api/console/admin/invites/{code}/revoke",
+            post(api_admin_revoke_invite),
+        )
+        .route("/api/console/admin/waitlist", get(api_admin_waitlist))
         .route("/api/console/apps", get(api_apps))
         .route("/api/console/apps/{slug}", get(api_app))
         .route("/api/console/apps/{slug}/actions", get(api_actions))
@@ -147,15 +158,225 @@ async fn api_me(State(state): State<super::AppState>, headers: HeaderMap) -> Res
     let plan = plan_of(&mcp.pool, &account.id)
         .await
         .unwrap_or_else(|_| "free".into());
+    let is_admin = crate::auth::is_admin(&mcp.auth.config, &account.email);
     (
         StatusCode::OK,
         [
             ("cache-control", "no-store"),
             ("content-type", "application/json"),
         ],
-        json!({"email": account.email, "plan": plan}).to_string(),
+        json!({"email": account.email, "plan": plan, "is_admin": is_admin}).to_string(),
     )
         .into_response()
+}
+
+/// The `guard` plus the admin check: non-admins get 403, decided by the
+/// `OUTER_ADMIN_EMAILS` config like everywhere else.
+async fn admin_guard(auth: &AuthState, headers: &HeaderMap) -> Result<AccountRow, Box<Response>> {
+    let account = guard(auth, headers).await?;
+    if !crate::auth::is_admin(&auth.config, &account.email) {
+        return Err(nostore_json(StatusCode::FORBIDDEN, "forbidden", "admin only").into());
+    }
+    Ok(account)
+}
+
+fn invite_json(row: &crate::auth::invites::InviteRow) -> serde_json::Value {
+    json!({
+        "code": row.code,
+        "kind": row.kind,
+        "note": row.note,
+        "createdAt": row.created_at,
+        "redeemedAt": row.redeemed_at,
+        "redeemedByEmail": row.redeemed_by_email,
+        "revokedAt": row.revoked_at,
+    })
+}
+
+fn admin_invite_json(row: &crate::auth::invites::InviteRow) -> serde_json::Value {
+    let mut v = invite_json(row);
+    v["createdByEmail"] = json!(row.created_by_email);
+    v
+}
+
+/// `GET /api/console/invites`: the caller's own codes, newest first.
+async fn api_invites(State(state): State<super::AppState>, headers: HeaderMap) -> Response {
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    match crate::auth::invites::list_for_user(&mcp.pool, &account.id).await {
+        Ok(rows) => ok_json(json!({"codes": rows.iter().map(invite_json).collect::<Vec<_>>()})),
+        Err(_) => nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "invites are unavailable right now",
+        ),
+    }
+}
+
+/// `GET /api/console/admin/invites?limit=&before=`: every code, newest
+/// first. `before` is the opaque `<createdAt>:<code>` cursor of the last
+/// row on the previous page.
+async fn api_admin_invites(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mcp = &state.mcp;
+    if let Err(res) = admin_guard(&mcp.auth, &headers).await {
+        return *res;
+    }
+    let limit = query
+        .get("limit")
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let before = match query.get("before") {
+        None => None,
+        Some(raw) => match raw.split_once(':') {
+            Some((at, code)) if !code.is_empty() => match at.parse::<i64>() {
+                Ok(at) => Some((at, code.to_string())),
+                Err(_) => {
+                    return nostore_json(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_cursor",
+                        "before must be <createdAt>:<code>",
+                    );
+                }
+            },
+            _ => {
+                return nostore_json(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cursor",
+                    "before must be <createdAt>:<code>",
+                );
+            }
+        },
+    };
+    match crate::auth::invites::list_all(&mcp.pool, limit + 1, before).await {
+        Ok(rows) => {
+            let (page, next) = if rows.len() as i64 > limit {
+                let next = rows
+                    .get(limit as usize - 1)
+                    .map(|row| format!("{}:{}", row.created_at, row.code));
+                (&rows[..limit as usize], next)
+            } else {
+                (&rows[..], None)
+            };
+            let mut body = json!({"codes": page.iter().map(admin_invite_json).collect::<Vec<_>>()});
+            if let Some(next) = next {
+                body["next"] = json!(next);
+            }
+            ok_json(body)
+        }
+        Err(_) => nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "invites are unavailable right now",
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateInvites {
+    count: i64,
+    note: Option<String>,
+}
+
+/// `POST /api/console/admin/invites {count 1..50, note?}`: mint admin codes.
+async fn api_admin_create_invites(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    body: axum::Json<CreateInvites>,
+) -> Response {
+    let mcp = &state.mcp;
+    let account = match admin_guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    if !(1..=crate::auth::invites::MAX_ADMIN_BATCH).contains(&body.count) {
+        return nostore_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_count",
+            "count must be between 1 and 50",
+        );
+    }
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map(|note| note.chars().take(200).collect::<String>());
+    let now = crate::auth::now_ms();
+    match crate::auth::invites::mint_admin(&mcp.pool, &account.id, body.count, note.as_deref(), now)
+        .await
+    {
+        Ok(codes) => ok_json(json!({"codes": codes})),
+        Err(_) => nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "invites are unavailable right now",
+        ),
+    }
+}
+
+/// `POST /api/console/admin/invites/{code}/revoke`: revoke an unused code.
+/// Redeemed codes refuse; unknown codes 404.
+async fn api_admin_revoke_invite(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Response {
+    let mcp = &state.mcp;
+    if let Err(res) = admin_guard(&mcp.auth, &headers).await {
+        return *res;
+    }
+    let code = crate::auth::invites::normalize_invite_code(&code).unwrap_or(code);
+    match crate::auth::invites::revoke(&mcp.pool, &code, crate::auth::now_ms()).await {
+        Ok(crate::auth::invites::RevokeOutcome::Missing) => {
+            nostore_json(StatusCode::NOT_FOUND, "not_found", "no such invite code")
+        }
+        Ok(crate::auth::invites::RevokeOutcome::Redeemed) => nostore_json(
+            StatusCode::BAD_REQUEST,
+            "already_used",
+            "that code was already used and cannot be revoked",
+        ),
+        Ok(
+            crate::auth::invites::RevokeOutcome::Revoked
+            | crate::auth::invites::RevokeOutcome::AlreadyRevoked,
+        ) => ok_json(json!({"revoked": true})),
+        Err(_) => nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "invites are unavailable right now",
+        ),
+    }
+}
+
+/// `GET /api/console/admin/waitlist?limit=`: the waitlist, newest first.
+async fn api_admin_waitlist(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mcp = &state.mcp;
+    if let Err(res) = admin_guard(&mcp.auth, &headers).await {
+        return *res;
+    }
+    let limit = query
+        .get("limit")
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    match crate::auth::invites::waitlist(&mcp.pool, limit).await {
+        Ok(entries) => ok_json(json!({"entries": entries})),
+        Err(_) => nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "the waitlist is unavailable right now",
+        ),
+    }
 }
 
 fn deploy_brief(row: &crate::mcp::tools::DeployRow) -> serde_json::Value {
@@ -694,7 +915,7 @@ fn layout(title: &str, body: Markup) -> Markup {
     }
 }
 
-fn email_form(error: Option<&str>) -> Markup {
+fn email_form(error: Option<&str>, invite_open: bool, invite_value: &str) -> Markup {
     layout(
         "Sign in",
         html! {
@@ -708,6 +929,17 @@ fn email_form(error: Option<&str>) -> Markup {
                     "Email" br;
                     input type="email" name="email" required autocomplete="email"
                         style="width:100%;padding:.5rem;margin:.25rem 0";
+                }
+                br;
+                details open[invite_open] {
+                    summary { "Have an invite code?" }
+                    p { "Outer is in closed beta. New here without an allowlisted email? Paste the code someone on Outer shared with you." }
+                    label {
+                        "Invite code (optional)" br;
+                        input type="text" name="invite_code" value=(invite_value)
+                            autocomplete="off" placeholder="OUTER-XXXX-XXXX"
+                            style="width:100%;padding:.5rem;margin:.25rem 0";
+                    }
                 }
                 br;
                 button type="submit" style="padding:.5rem 1rem" { "Send code" }
@@ -816,7 +1048,7 @@ async fn sign_in_get(State(state): State<super::AppState>, headers: HeaderMap) -
             );
         }
     }
-    page(StatusCode::OK, email_form(None), None)
+    page(StatusCode::OK, email_form(None, false, ""), None)
 }
 
 /// `POST /console/sign-in`: one step per form (`email` → `code` → `terms`).
@@ -833,7 +1065,11 @@ async fn sign_in_post(
     if !fetch_ok(&headers) {
         return page(
             StatusCode::FORBIDDEN,
-            email_form(Some("Open the sign-in page on outer.now and try again.")),
+            email_form(
+                Some("Open the sign-in page on outer.now and try again."),
+                false,
+                "",
+            ),
             None,
         );
     }
@@ -842,7 +1078,19 @@ async fn sign_in_post(
     match form.get("step").map(String::as_str) {
         Some("email") => {
             let email = form.get("email").cloned().unwrap_or_default();
-            match crate::auth::send_code(&mcp.pool, &mcp.auth.config, &email, ip.as_deref()).await {
+            let invite_value = form
+                .get("invite_code")
+                .map(|raw| raw.trim().to_string())
+                .unwrap_or_default();
+            match crate::auth::send_code(
+                &mcp.pool,
+                &mcp.auth.config,
+                &email,
+                (!invite_value.is_empty()).then_some(invite_value.as_str()),
+                ip.as_deref(),
+            )
+            .await
+            {
                 Ok(_) => page(
                     StatusCode::OK,
                     code_form(&crate::auth::normalize_email(&email), None),
@@ -856,7 +1104,11 @@ async fn sign_in_post(
                     };
                     page(
                         status,
-                        email_form(Some(crate::auth::pages::friendly_error(err.code))),
+                        email_form(
+                            Some(crate::auth::pages::friendly_error(err.code)),
+                            err.code == "closed_beta",
+                            &invite_value,
+                        ),
                         None,
                     )
                 }
@@ -902,7 +1154,7 @@ async fn sign_in_post(
             let Some(session) = crate::auth::session_from_headers(&headers) else {
                 return page(
                     StatusCode::BAD_REQUEST,
-                    email_form(Some("Sign in with email first.")),
+                    email_form(Some("Sign in with email first."), false, ""),
                     None,
                 );
             };
@@ -910,7 +1162,7 @@ async fn sign_in_post(
             else {
                 return page(
                     StatusCode::BAD_REQUEST,
-                    email_form(Some("Sign in with email first.")),
+                    email_form(Some("Sign in with email first."), false, ""),
                     None,
                 );
             };
@@ -941,7 +1193,7 @@ async fn sign_in_post(
         }
         _ => page(
             StatusCode::BAD_REQUEST,
-            email_form(Some("Unknown sign-in step.")),
+            email_form(Some("Unknown sign-in step."), false, ""),
             None,
         ),
     }
@@ -1111,7 +1363,7 @@ mod tests {
         let (app, pool, config, codes) = test_app().await;
         // A real account with a real API key: the Authorization header
         // must still not authenticate the console API.
-        crate::auth::send_code(&pool, &config, "ana@example.com", None)
+        crate::auth::send_code(&pool, &config, "ana@example.com", None, None)
             .await
             .unwrap();
         let code = captured(&codes, "ana@example.com");
@@ -1223,7 +1475,7 @@ mod tests {
         let body: serde_json::Value = body.parse().unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"email": "ana@example.com", "plan": "free"})
+            serde_json::json!({"email": "ana@example.com", "plan": "free", "is_admin": false})
         );
     }
 
@@ -1847,5 +2099,240 @@ mod tests {
             foreign_body.parse::<serde_json::Value>().unwrap()["error"],
             "not_found"
         );
+    }
+    fn post_json(path: &str, cookie: &str, body: serde_json::Value) -> Request<Body> {
+        same_origin(Request::post(path).header("content-type", "application/json"))
+            .header("cookie", cookie)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A bare account (no apps): the invite endpoints need none.
+    async fn seed_account(pool: &SqlitePool, email: &str) {
+        sqlx::query(
+            "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES (?, ?, 0, 0, 0)",
+        )
+        .bind(format!("acct-{email}"))
+        .bind(email)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn console_me_reports_is_admin() {
+        let (app, pool, _, _) = test_app().await;
+        seed_account(&pool, "ana@example.com").await;
+        seed_account(&pool, "owner@example.com").await;
+        let ana = login(&pool, "ana@example.com").await;
+        let owner = login(&pool, "owner@example.com").await;
+
+        let (status, _, body) = send(&app, authed("/api/console/me", &ana)).await;
+        assert_eq!(status, StatusCode::OK);
+        let me: serde_json::Value = body.parse().unwrap();
+        assert_eq!(me["is_admin"], false);
+        let (status, _, body) = send(&app, authed("/api/console/me", &owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        let me: serde_json::Value = body.parse().unwrap();
+        assert_eq!(me["is_admin"], true, "OUTER_ADMIN_EMAILS decides");
+    }
+
+    #[tokio::test]
+    async fn console_admin_endpoints_forbid_non_admins() {
+        let (app, pool, _, _) = test_app().await;
+        seed_account(&pool, "ana@example.com").await;
+        let ana = login(&pool, "ana@example.com").await;
+
+        let (status, _, body) = send(&app, authed("/api/console/admin/invites", &ana)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["error"],
+            "forbidden"
+        );
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/admin/invites",
+                &ana,
+                serde_json::json!({"count": 1}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/admin/invites/OUTER-AAAA-BBBB/revoke",
+                &ana,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = send(&app, authed("/api/console/admin/waitlist", &ana)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn console_invites_list_own_codes_with_status() {
+        let (app, pool, _, _) = test_app().await;
+        seed_account(&pool, "ana@example.com").await;
+        seed_account(&pool, "owner@example.com").await;
+        let first =
+            crate::auth::invites::mint_admin(&pool, "acct-ana@example.com", 1, Some("beta"), 7)
+                .await
+                .unwrap();
+        let second =
+            crate::auth::invites::mint_admin(&pool, "acct-ana@example.com", 1, Some("beta"), 8)
+                .await
+                .unwrap();
+        let made = [first[0].clone(), second[0].clone()];
+        // One code joined by the owner, one revoked.
+        sqlx::query("UPDATE invite_code SET redeemedBy = 'acct-owner@example.com', redeemedAt = 9 WHERE code = ?")
+            .bind(&made[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::auth::invites::revoke(&pool, &made[1], 10)
+            .await
+            .unwrap();
+        let ana = login(&pool, "ana@example.com").await;
+
+        let (status, headers, body) = send(&app, authed("/api/console/invites", &ana)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        let list: serde_json::Value = body.parse().unwrap();
+        let codes = list["codes"].as_array().unwrap();
+        assert_eq!(codes.len(), 2);
+        assert_eq!(codes[0]["code"], made[1].as_str(), "newest first");
+        assert_eq!(codes[0]["kind"], "admin");
+        assert_eq!(codes[0]["note"], "beta");
+        assert_eq!(codes[0]["revokedAt"], 10);
+        assert_eq!(codes[0]["redeemedByEmail"], serde_json::Value::Null);
+        assert_eq!(codes[1]["code"], made[0].as_str());
+        assert_eq!(codes[1]["redeemedAt"], 9);
+        assert_eq!(codes[1]["redeemedByEmail"], "owner@example.com");
+        assert_eq!(codes[1]["revokedAt"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn console_admin_invites_create_list_revoke() {
+        let (app, pool, _, _) = test_app().await;
+        seed_account(&pool, "owner@example.com").await;
+        let owner = login(&pool, "owner@example.com").await;
+
+        for (count, want) in [(0, StatusCode::BAD_REQUEST), (51, StatusCode::BAD_REQUEST)] {
+            let (status, _, _) = send(
+                &app,
+                post_json(
+                    "/api/console/admin/invites",
+                    &owner,
+                    serde_json::json!({"count": count}),
+                ),
+            )
+            .await;
+            assert_eq!(status, want, "count {count} refuses");
+        }
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/admin/invites",
+                &owner,
+                serde_json::json!({"count": 3, "note": "beta friends"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let created: serde_json::Value = body.parse().unwrap();
+        assert_eq!(created["codes"].as_array().unwrap().len(), 3);
+        let first = created["codes"][0].as_str().unwrap().to_string();
+
+        // Paging: two per page, newest first, cursor continues.
+        let (status, _, body) =
+            send(&app, authed("/api/console/admin/invites?limit=2", &owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = body.parse().unwrap();
+        assert_eq!(page["codes"].as_array().unwrap().len(), 2);
+        for code in page["codes"].as_array().unwrap() {
+            assert_eq!(code["createdByEmail"], "owner@example.com");
+            assert_eq!(code["note"], "beta friends");
+        }
+        let next = page["next"].as_str().unwrap().to_string();
+        let (status, _, body) = send(
+            &app,
+            authed(
+                &format!("/api/console/admin/invites?limit=2&before={next}"),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rest: serde_json::Value = body.parse().unwrap();
+        assert_eq!(rest["codes"].as_array().unwrap().len(), 1);
+        assert!(rest.get("next").is_none(), "last page carries no cursor");
+
+        // Revoke an unused code, then refuse the redeemed one.
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                &format!("/api/console/admin/invites/{first}/revoke"),
+                &owner,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.parse::<serde_json::Value>().unwrap()["revoked"], true);
+        sqlx::query("UPDATE invite_code SET redeemedBy = 'acct-owner@example.com', redeemedAt = 1 WHERE code = ?")
+            .bind(&first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                &format!("/api/console/admin/invites/{first}/revoke"),
+                &owner,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["error"],
+            "already_used"
+        );
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/admin/invites/OUTER-ZZZZ-YYYY/revoke",
+                &owner,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn console_admin_waitlist_lists_entries() {
+        let (app, pool, _, _) = test_app().await;
+        seed_account(&pool, "owner@example.com").await;
+        sqlx::query(
+            "INSERT INTO waitlist (email, first_seen, attempts) VALUES \
+             ('early@example.com', 5, 2), ('late@example.com', 9, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let owner = login(&pool, "owner@example.com").await;
+
+        let (status, _, body) = send(&app, authed("/api/console/admin/waitlist", &owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = body.parse().unwrap();
+        let entries = list["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["email"], "late@example.com", "newest first");
+        assert_eq!(entries[1]["attempts"], 2);
     }
 }

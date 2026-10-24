@@ -92,7 +92,7 @@ impl ToolError {
             "rate_limited" => Self::rate_limited(message, err.retry_after_s.unwrap_or(60)),
             "forbidden" | "closed_beta" => Self::forbidden(message),
             "invalid_email" | "invalid_code" | "too_many_attempts" | "code_expired"
-            | "invalid_token" | "terms_required" => Self::invalid_argument(message),
+            | "invalid_token" | "terms_required" | "invite_used" => Self::invalid_argument(message),
             _ => {
                 tracing::warn!(code = err.code, message = %err.message, "auth module error");
                 Self::internal("sign-in failed on our side; try again in a minute")

@@ -10,7 +10,7 @@ at the same account.
 
 Just use a tool. Your client opens Outer's sign-in page:
 
-1. Enter your email. During the closed beta, an email that is not allowed in gets "Outer is in closed beta. You're on the waitlist."
+1. Enter your email. During the closed beta, an email that is not allowed in gets "Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist." — unless you paste an invite code (`OUTER-XXXX-XXXX`) into the "Have an invite code?" field.
 2. Enter the 6-digit code from your inbox.
 3. On first sign-in only, accept the Terms and Privacy Policy.
 4. Approve the client ("Allow Claude to create, change and delete apps on your Outer account?").
@@ -22,11 +22,19 @@ time with the `list_connections` / `revoke_connection` tools.
 
 For scripts, older clients and agent harnesses without OAuth:
 
-1. `sign_in` with your email — Outer emails a 6-digit code (10-minute expiry, 5 attempts).
+1. `sign_in` with your email — Outer emails a 6-digit code (10-minute expiry, 5 attempts). During the closed beta, a new email that is not allowlisted also passes `invite_code`.
 2. Ask your human for the code, then `verify_code` with your email, the code, and `accept_terms: true` on first use.
 3. Save the returned API key in your MCP config and send it as the `Authorization: Bearer` header.
 
 After sign-in, `sign_in` and `verify_code` disappear from the tool list.
+
+## Invite codes
+
+Every new account gets 3 invite codes to share (`OUTER-XXXX-XXXX`, shown on
+the console's Invites page). A code admits one new account and is spent when
+that account signs in — allowlisted and existing emails never burn one. Admins
+generate codes in bulk from the console's Admin page instead of getting
+automatic ones.
 
 ## API keys
 

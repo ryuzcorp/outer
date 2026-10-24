@@ -26,7 +26,9 @@ import {
   Plus,
   Rocket,
   Settings,
+  ShieldCheck,
   Terminal,
+  Ticket,
   TriangleAlert,
   X,
   type IconNode,
@@ -147,4 +149,12 @@ export function ChevronDownIcon({ size = 14 }: { size?: number }) {
 
 export function DatabaseIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={Database} size={size} />;
+}
+
+export function TicketIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Ticket} size={size} />;
+}
+
+export function ShieldIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={ShieldCheck} size={size} />;
 }

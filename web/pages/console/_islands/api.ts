@@ -12,6 +12,22 @@ export async function api<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+export async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) {
+    globalThis.location.assign("/console/sign-in");
+    throw new Error("signed out");
+  }
+  if (!res.ok) {
+    throw new Error(`request failed: ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
 export interface LastDeploy {
   sha: string;
   status: string;
@@ -112,6 +128,36 @@ export interface SecretEntry {
 
 export interface SecretsSummary {
   secrets: SecretEntry[];
+}
+
+export interface InviteEntry {
+  code: string;
+  kind: string;
+  note: string | null;
+  createdAt: number;
+  redeemedAt: number | null;
+  redeemedByEmail: string | null;
+  revokedAt: number | null;
+  createdByEmail?: string | null;
+}
+
+export interface InvitesSummary {
+  codes: InviteEntry[];
+}
+
+export interface AdminInvitesPage {
+  codes: InviteEntry[];
+  next?: string;
+}
+
+export interface WaitlistEntry {
+  email: string;
+  first_seen: number;
+  attempts: number;
+}
+
+export interface WaitlistSummary {
+  entries: WaitlistEntry[];
 }
 
 export function shortSha(sha: string): string {

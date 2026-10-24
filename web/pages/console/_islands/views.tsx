@@ -12,16 +12,21 @@
 // with an ellipsis (`truncate`) and exposes the full text via `title`.
 // Tables are `table-fixed` with column widths. `break-words` is reserved
 // for text that should wrap: log lines and the expanded deploy message.
+import { atom } from "ilha";
 import {
   shortSha,
   when,
+  type AdminInvitesPage,
   type AppDetail,
   type ConsoleDeploy,
   type ErrorsSummary,
+  type InviteEntry,
+  type InvitesSummary,
   type LogLine,
   type MetricsBucket,
   type MetricsSummary,
   type SecretsSummary,
+  type WaitlistSummary,
 } from "./api.ts";
 import {
   CopyButton,
@@ -1175,5 +1180,450 @@ export function SettingsView({ app }: { app: AppDetail }) {
         </div>
       </section>
     </div>
+  );
+}
+
+// --- Invites (account) ---------------------------------------------------------
+
+function inviteStatus(entry: InviteEntry): { label: string; badge: string } {
+  if (entry.revokedAt != null) {
+    return { label: "Revoked", badge: "badge-ghost" };
+  }
+  if (entry.redeemedAt != null) {
+    return { label: "Joined", badge: "badge-success" };
+  }
+  return { label: "Available", badge: "badge-info" };
+}
+
+export function InvitesView({
+  panel,
+  isAdmin,
+  onRetry,
+}: {
+  panel: Panel<InvitesSummary>;
+  isAdmin: boolean;
+  onRetry: () => void;
+}) {
+  if (panel.kind === "loading") {
+    return <Loading label="Loading invite codes" />;
+  }
+  if (panel.kind === "error") {
+    return (
+      <div class="flex min-w-0 flex-col gap-3">
+        <Err message={panel.message} />
+        <div class="min-w-0">
+          <button type="button" class="btn btn-sm" onclick={onRetry}>
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const codes = panel.value.codes;
+  const available = codes.filter(
+    (c) => c.revokedAt == null && c.redeemedAt == null,
+  ).length;
+  return (
+    <div class="flex min-w-0 flex-col gap-3">
+      <section class="card card-border bg-base-100 min-w-0" aria-label="About invite codes">
+        <div class="card-body min-w-0">
+          <p class="m-0 min-w-0 break-words opacity-60">
+            Outer is in closed beta: one code admits one new account. Share a
+            code with a friend and it is spent when they sign in
+            {available === 1 ? " — you have 1 unused code left." : ` — you have ${available} unused codes left.`}
+          </p>
+        </div>
+      </section>
+      {codes.length === 0 ? (
+        <Empty>
+          {isAdmin
+            ? "Admins get no automatic codes — generate some on the Admin page."
+            : "You have no invite codes."}
+        </Empty>
+      ) : (
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Your invite codes">
+          <div class="card-body min-w-0">
+            <div class="min-w-0 overflow-x-auto">
+              <table class="table table-fixed w-full max-sm:[&_td]:px-2 max-sm:[&_th]:px-2">
+                <colgroup>
+                  <col class="sm:w-48" />
+                  <col class="w-20 max-sm:hidden" />
+                  <col class="w-28" />
+                  <col class="max-sm:hidden" />
+                  <col class="w-28 max-sm:hidden" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col">Code</th>
+                    <th scope="col" class="max-sm:hidden">Kind</th>
+                    <th scope="col">Status</th>
+                    <th scope="col" class="max-sm:hidden">Joined by</th>
+                    <th scope="col" class="max-sm:hidden">Created</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {codes.map((entry) => {
+                    const status = inviteStatus(entry);
+                    return (
+                      <tr key={entry.code}>
+                        <td class="min-w-0">
+                          <span class="flex min-w-0 items-center gap-2">
+                            <span class="min-w-0 flex-1 truncate font-mono max-sm:text-xs" title={entry.code}>
+                              {entry.code}
+                            </span>
+                            <CopyButton value={entry.code} label={`Copy ${entry.code}`} />
+                          </span>
+                        </td>
+                        <td class="truncate max-sm:hidden" title={entry.kind}>
+                          {entry.kind}
+                        </td>
+                        <td class="min-w-0">
+                          <span class={`badge badge-soft ${status.badge}`} title={status.label}>
+                            {status.label}
+                          </span>
+                        </td>
+                        <td
+                          class="min-w-0 truncate max-sm:hidden"
+                          title={entry.redeemedByEmail ?? entry.note ?? ""}
+                        >
+                          {entry.redeemedByEmail ?? entry.note ?? "—"}
+                        </td>
+                        <td class="whitespace-nowrap max-sm:hidden" title={when(entry.createdAt)}>
+                          {timeAgo(entry.createdAt)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// --- Admin (account) -----------------------------------------------------------
+
+export function AdminView({
+  codes,
+  waitlist,
+  isAdmin,
+  onGenerate,
+  onRevoke,
+  onMoreCodes,
+  onRetry,
+}: {
+  codes: Panel<AdminInvitesPage>;
+  waitlist: Panel<WaitlistSummary>;
+  isAdmin: boolean;
+  onGenerate: (count: number, note: string) => Promise<void>;
+  onRevoke: (code: string) => Promise<void>;
+  onMoreCodes: () => void;
+  onRetry: () => void;
+}) {
+  if (!isAdmin) {
+    return (
+      <div class="flex min-w-0 flex-col gap-3">
+        <div class="alert alert-warning alert-soft min-w-0" role="alert">
+          <span class="min-w-0">Admins only — this page lists every invite code and the waitlist.</span>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div class="flex min-w-0 flex-col gap-3">
+      <GenerateCard onGenerate={onGenerate} />
+      <AdminCodesCard
+        panel={codes}
+        onRevoke={onRevoke}
+        onMore={onMoreCodes}
+        onRetry={onRetry}
+      />
+      <WaitlistCard panel={waitlist} onRetry={onRetry} />
+    </div>
+  );
+}
+
+function GenerateCard({
+  onGenerate,
+}: {
+  onGenerate: (count: number, note: string) => Promise<void>;
+}) {
+  const busy = atom(false);
+  const error = atom<string | null>(null);
+  async function submit(): Promise<void> {
+    const countInput = document.getElementById("invite-count") as HTMLInputElement | null;
+    const noteInput = document.getElementById("invite-note") as HTMLInputElement | null;
+    const count = Number(countInput?.value ?? "");
+    if (!Number.isInteger(count) || count < 1 || count > 50) {
+      error.set("Count must be between 1 and 50.");
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await onGenerate(count, (noteInput?.value ?? "").trim());
+    } catch {
+      error.set("Couldn't generate codes. Try again.");
+    } finally {
+      busy.set(false);
+    }
+  }
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Generate invite codes">
+      <div class="card-body min-w-0">
+        <h2 class="card-title m-0 min-w-0 text-base">Generate codes</h2>
+        <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end">
+          <label class="form-control min-w-0 flex-1" for="invite-count">
+            <span class="label min-w-0">
+              <span class="label-text truncate" title="How many codes to mint (1–50)">
+                Count (1–50)
+              </span>
+            </span>
+            <input
+              type="number"
+              id="invite-count"
+              class="input input-bordered w-full min-w-0"
+              min="1"
+              max="50"
+              value="5"
+            />
+          </label>
+          <label class="form-control min-w-0 flex-[2]" for="invite-note">
+            <span class="label min-w-0">
+              <span class="label-text truncate" title="An optional note stored with each code">
+                Note (optional)
+              </span>
+            </span>
+            <input
+              type="text"
+              id="invite-note"
+              class="input input-bordered w-full min-w-0"
+              maxlength="200"
+              placeholder="e.g. friends of Ana"
+            />
+          </label>
+          <button
+            type="button"
+            class="btn btn-neutral min-w-0 shrink-0"
+            disabled={busy()}
+            onclick={() => void submit()}
+          >
+            {busy() ? "Generating…" : "Generate"}
+          </button>
+        </div>
+        {error() && (
+          <p class="m-0 min-w-0 break-words text-sm text-error" role="alert">
+            {error()}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function AdminCodesCard({
+  panel,
+  onRevoke,
+  onMore,
+  onRetry,
+}: {
+  panel: Panel<AdminInvitesPage>;
+  onRevoke: (code: string) => Promise<void>;
+  onMore: () => void;
+  onRetry: () => void;
+}) {
+  const revoking = atom<string | null>(null);
+  const error = atom<string | null>(null);
+  if (panel.kind === "loading") {
+    return <Loading label="Loading invite codes" />;
+  }
+  if (panel.kind === "error") {
+    return (
+      <div class="flex min-w-0 flex-col gap-3">
+        <Err message={panel.message} />
+        <div class="min-w-0">
+          <button type="button" class="btn btn-sm" onclick={onRetry}>
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const page = panel.value;
+  async function revoke(code: string): Promise<void> {
+    revoking.set(code);
+    error.set(null);
+    try {
+      await onRevoke(code);
+    } catch {
+      error.set("Couldn't revoke that code. Try again.");
+    } finally {
+      revoking.set(null);
+    }
+  }
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="All invite codes">
+      <div class="card-body min-w-0">
+        <h2 class="card-title m-0 min-w-0 text-base">All codes</h2>
+        {error() && (
+          <p class="m-0 min-w-0 break-words text-sm text-error" role="alert">
+            {error()}
+          </p>
+        )}
+        {page.codes.length === 0 ? (
+          <Empty>No codes yet — generate some above.</Empty>
+        ) : (
+          <div class="min-w-0 overflow-x-auto">
+            <table class="table table-fixed w-full max-sm:[&_td]:px-2 max-sm:[&_th]:px-2">
+              <colgroup>
+                <col class="sm:w-48" />
+                <col class="w-20 max-md:hidden" />
+                <col class="max-md:hidden" />
+                <col class="max-sm:hidden" />
+                <col class="w-28 max-md:hidden" />
+                <col class="w-20 sm:w-28" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th scope="col">Code</th>
+                  <th scope="col" class="max-md:hidden">Kind</th>
+                  <th scope="col" class="max-md:hidden">Creator</th>
+                  <th scope="col" class="max-sm:hidden">Note / joined by</th>
+                  <th scope="col" class="max-md:hidden">Created</th>
+                  <th scope="col">
+                    <span class="sr-only">Actions</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {page.codes.map((entry) => {
+                  const status = inviteStatus(entry);
+                  const usable = entry.revokedAt == null && entry.redeemedAt == null;
+                  return (
+                    <tr key={entry.code}>
+                      <td class="min-w-0">
+                        <span class="flex min-w-0 items-center gap-2">
+                          <span class="min-w-0 flex-1 truncate font-mono max-sm:text-xs" title={entry.code}>
+                            {entry.code}
+                          </span>
+                          <CopyButton value={entry.code} label={`Copy ${entry.code}`} />
+                        </span>
+                      </td>
+                      <td class="truncate max-md:hidden" title={entry.kind}>
+                        {entry.kind}
+                      </td>
+                      <td class="min-w-0 truncate max-md:hidden" title={entry.createdByEmail ?? ""}>
+                        {entry.createdByEmail ?? "—"}
+                      </td>
+                      <td
+                        class="min-w-0 truncate max-sm:hidden"
+                        title={entry.redeemedByEmail ?? entry.note ?? status.label}
+                      >
+                        {entry.redeemedByEmail ?? entry.note ?? status.label}
+                      </td>
+                      <td class="whitespace-nowrap max-md:hidden" title={when(entry.createdAt)}>
+                        {timeAgo(entry.createdAt)}
+                      </td>
+                      <td class="min-w-0">
+                        {usable ? (
+                          <button
+                            type="button"
+                            class="btn btn-ghost btn-xs"
+                            disabled={revoking() === entry.code}
+                            title={`Revoke ${entry.code}`}
+                            onclick={() => void revoke(entry.code)}
+                          >
+                            {revoking() === entry.code ? "Revoking…" : "Revoke"}
+                          </button>
+                        ) : (
+                          <span class={`badge badge-soft ${status.badge}`} title={status.label}>
+                            {status.label}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {page.next && (
+          <div class="mt-2 min-w-0">
+            <button type="button" class="btn btn-sm" onclick={onMore}>
+              Load more
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function WaitlistCard({
+  panel,
+  onRetry,
+}: {
+  panel: Panel<WaitlistSummary>;
+  onRetry: () => void;
+}) {
+  if (panel.kind === "loading") {
+    return <Loading label="Loading waitlist" />;
+  }
+  if (panel.kind === "error") {
+    return (
+      <div class="flex min-w-0 flex-col gap-3">
+        <Err message={panel.message} />
+        <div class="min-w-0">
+          <button type="button" class="btn btn-sm" onclick={onRetry}>
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const entries = panel.value.entries;
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Waitlist">
+      <div class="card-body min-w-0">
+        <h2 class="card-title m-0 min-w-0 text-base">Waitlist</h2>
+        {entries.length === 0 ? (
+          <Empty>Nobody waiting.</Empty>
+        ) : (
+          <div class="min-w-0 overflow-x-auto">
+            <table class="table table-fixed w-full">
+              <colgroup>
+                <col />
+                <col class="w-24" />
+                <col class="w-24" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th scope="col">Email</th>
+                  <th scope="col">Tries</th>
+                  <th scope="col">First seen</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((entry) => (
+                  <tr key={entry.email}>
+                    <td class="min-w-0 truncate font-mono" title={entry.email}>
+                      {entry.email}
+                    </td>
+                    <td class="whitespace-nowrap">{entry.attempts}</td>
+                    <td class="whitespace-nowrap" title={when(entry.first_seen)}>
+                      {timeAgo(entry.first_seen)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }

@@ -14,7 +14,14 @@ export const VIEWS = [
   { id: "settings", label: "Settings" },
 ] as const;
 
-export type ViewId = (typeof VIEWS)[number]["id"];
+export const ACCOUNT_VIEWS = [
+  { id: "invites", label: "Invite codes" },
+  { id: "admin", label: "Admin" },
+] as const;
+
+export type AccountViewId = (typeof ACCOUNT_VIEWS)[number]["id"];
+
+export type ViewId = (typeof VIEWS)[number]["id"] | AccountViewId;
 
 export const RANGES = [
   { hours: 24, label: "24h", title: "Last 24 hours" },
@@ -29,7 +36,10 @@ export interface Route {
 }
 
 export function toViewId(raw: string | null): ViewId {
-  return VIEWS.some((v) => v.id === raw) ? (raw as ViewId) : "overview";
+  if (VIEWS.some((v) => v.id === raw) || ACCOUNT_VIEWS.some((v) => v.id === raw)) {
+    return raw as ViewId;
+  }
+  return "overview";
 }
 
 export function toRange(raw: string | null): number {

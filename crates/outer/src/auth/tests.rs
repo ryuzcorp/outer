@@ -1282,7 +1282,7 @@ async fn otp_attempts_expiry_and_limits() {
     };
 
     // Five wrong codes burn the row.
-    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None)
+    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None, None)
         .await
         .unwrap();
     for _ in 0..5 {
@@ -1317,7 +1317,7 @@ async fn otp_attempts_expiry_and_limits() {
     assert_eq!(err.code, "invalid_code", "burned row reads as unknown");
 
     // Expired codes are rejected and cleared.
-    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None)
+    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None, None)
         .await
         .unwrap();
     let code = captured(&codes, "ana@example.com");
@@ -1340,14 +1340,14 @@ async fn otp_attempts_expiry_and_limits() {
 
     // Five sends per hour per email.
     for _ in 0..4 {
-        auth::otp_sign_in(&pool, &state.config, "limited@example.com", None)
+        auth::otp_sign_in(&pool, &state.config, "limited@example.com", None, None)
             .await
             .unwrap();
     }
-    auth::otp_sign_in(&pool, &state.config, "limited@example.com", None)
+    auth::otp_sign_in(&pool, &state.config, "limited@example.com", None, None)
         .await
         .unwrap();
-    let err = auth::otp_sign_in(&pool, &state.config, "limited@example.com", None)
+    let err = auth::otp_sign_in(&pool, &state.config, "limited@example.com", None, None)
         .await
         .unwrap_err();
     assert_eq!(err.code, "rate_limited");
@@ -1359,6 +1359,7 @@ async fn otp_attempts_expiry_and_limits() {
             &pool,
             &state.config,
             &format!("user{index}@example.com"),
+            None,
             Some("10.0.0.1"),
         )
         .await
@@ -1368,6 +1369,7 @@ async fn otp_attempts_expiry_and_limits() {
         &pool,
         &state.config,
         "one-more@example.com",
+        None,
         Some("10.0.0.1"),
     )
     .await
@@ -1385,13 +1387,13 @@ async fn closed_beta_waitlists_by_default() {
         config,
     };
 
-    let err = auth::otp_sign_in(&pool, &state.config, "new@example.com", None)
+    let err = auth::otp_sign_in(&pool, &state.config, "new@example.com", None, None)
         .await
         .unwrap_err();
     assert_eq!(err.code, "closed_beta");
     assert_eq!(
         err.user_message.as_deref(),
-        Some("Outer is in closed beta. You're on the waitlist.")
+        Some("Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist.")
     );
     let (attempts,): (i64,) =
         sqlx::query_as("SELECT attempts FROM waitlist WHERE email = 'new@example.com'")
@@ -1399,7 +1401,7 @@ async fn closed_beta_waitlists_by_default() {
             .await
             .unwrap();
     assert_eq!(attempts, 1);
-    let _ = auth::otp_sign_in(&pool, &state.config, "new@example.com", None)
+    let _ = auth::otp_sign_in(&pool, &state.config, "new@example.com", None, None)
         .await
         .unwrap_err();
     let (attempts,): (i64,) =
@@ -1414,12 +1416,241 @@ async fn closed_beta_waitlists_by_default() {
         .execute(&pool)
         .await
         .unwrap();
-    auth::otp_sign_in(&pool, &state.config, "friend@example.com", None)
+    auth::otp_sign_in(&pool, &state.config, "friend@example.com", None, None)
         .await
         .unwrap();
-    auth::otp_sign_in(&pool, &state.config, "owner@example.com", None)
+    auth::otp_sign_in(&pool, &state.config, "owner@example.com", None, None)
         .await
         .unwrap();
+}
+
+/// A fresh account mints exactly 3 grant codes; an admin account mints none.
+#[tokio::test]
+async fn fresh_account_gets_three_grants_admin_gets_none() {
+    let pool = test_pool().await;
+    let (config, codes) = test_config();
+
+    for email in ["ana@example.com", "owner@example.com"] {
+        auth::otp_sign_in(&pool, &config, email, None, None)
+            .await
+            .unwrap();
+    }
+    for email in ["ana@example.com", "owner@example.com"] {
+        let code = captured(&codes, email);
+        auth::otp_verify(&pool, &config, email, &code, true, None, None)
+            .await
+            .unwrap();
+    }
+    let (ana_grants,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM invite_code WHERE kind = 'grant' AND createdBy = \
+         (SELECT id FROM user WHERE email = 'ana@example.com')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ana_grants, 3);
+    let (owner_grants,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM invite_code WHERE createdBy = \
+         (SELECT id FROM user WHERE email = 'owner@example.com')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner_grants, 0, "admins get no automatic codes");
+}
+
+/// The full invite round trip: a valid code admits a new email, verify
+/// consumes the code and the new account holds 3 fresh grants.
+#[tokio::test]
+async fn invite_code_admits_and_is_consumed_on_verify() {
+    let pool = test_pool().await;
+    let (mut config, codes) = test_config();
+    config.signup_open = false;
+
+    let granter = "granter@example.com";
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('granter', ?, 0, 0, 0)")
+        .bind(granter)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let made = auth::invites::mint_admin(&pool, "granter", 1, None, 0)
+        .await
+        .unwrap();
+    let invite = made[0].clone();
+
+    // The code normalizes (lowercase, no prefix or dashes).
+    let loose = invite
+        .strip_prefix("OUTER-")
+        .unwrap()
+        .replace('-', "")
+        .to_lowercase();
+    auth::otp_sign_in(&pool, &config, "joined@example.com", Some(&loose), None)
+        .await
+        .unwrap();
+    let otp = captured(&codes, "joined@example.com");
+    auth::otp_verify(&pool, &config, "joined@example.com", &otp, true, None, None)
+        .await
+        .unwrap();
+
+    let (redeemed_by,): (Option<String>,) =
+        sqlx::query_as("SELECT redeemedBy FROM invite_code WHERE code = ?")
+            .bind(&invite)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (joined_id,): (String,) =
+        sqlx::query_as("SELECT id FROM user WHERE email = 'joined@example.com'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(redeemed_by, Some(joined_id.clone()));
+    let (grants,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM invite_code WHERE kind = 'grant' AND createdBy = ?")
+            .bind(&joined_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(grants, 3, "invite joiners get their own 3 codes");
+}
+
+/// Invalid, redeemed and revoked codes refuse with the waitlist path and
+/// send no OTP.
+#[tokio::test]
+async fn bad_invite_codes_waitlist_without_otp() {
+    let pool = test_pool().await;
+    let (mut config, codes) = test_config();
+    config.signup_open = false;
+
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let made = auth::invites::mint_admin(&pool, "a1", 3, None, 0)
+        .await
+        .unwrap();
+    // Redeem one via a first joiner, revoke another.
+    auth::otp_sign_in(&pool, &config, "first@example.com", Some(&made[0]), None)
+        .await
+        .unwrap();
+    let otp = captured(&codes, "first@example.com");
+    auth::otp_verify(&pool, &config, "first@example.com", &otp, true, None, None)
+        .await
+        .unwrap();
+    auth::invites::revoke(&pool, &made[1], 1).await.unwrap();
+
+    for (email, code) in [
+        ("bad1@example.com", "OUTER-N0PE-XXXX"),
+        ("bad2@example.com", &made[0]),
+        ("bad3@example.com", &made[1]),
+    ] {
+        let err = auth::otp_sign_in(&pool, &config, email, Some(code), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "closed_beta", "{email} with {code}");
+        assert!(
+            !codes.lock().unwrap().contains_key(email),
+            "no OTP is sent for {email}"
+        );
+        let (attempts,): (i64,) = sqlx::query_as("SELECT attempts FROM waitlist WHERE email = ?")
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+    }
+}
+
+/// Two emails hold the same code: the first verify wins, the second is
+/// refused and creates no account.
+#[tokio::test]
+async fn invite_double_spend_second_verify_refused() {
+    let pool = test_pool().await;
+    let (mut config, codes) = test_config();
+    config.signup_open = false;
+
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let made = auth::invites::mint_admin(&pool, "a1", 1, None, 0)
+        .await
+        .unwrap();
+
+    for email in ["racer1@example.com", "racer2@example.com"] {
+        auth::otp_sign_in(&pool, &config, email, Some(&made[0]), None)
+            .await
+            .unwrap();
+    }
+    let first = captured(&codes, "racer1@example.com");
+    auth::otp_verify(
+        &pool,
+        &config,
+        "racer1@example.com",
+        &first,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let second = captured(&codes, "racer2@example.com");
+    let err = auth::otp_verify(
+        &pool,
+        &config,
+        "racer2@example.com",
+        &second,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "invite_used");
+    assert_eq!(
+        err.user_message.as_deref(),
+        Some("That invite code was just used.")
+    );
+    let (users,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM user WHERE email = 'racer2@example.com'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(users, 0, "the losing verify creates no account");
+}
+
+/// An allowlisted email that offers a code is admitted without burning it.
+#[tokio::test]
+async fn allowlisted_email_ignores_invite_code() {
+    let pool = test_pool().await;
+    let (mut config, codes) = test_config();
+    config.signup_open = false;
+
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let made = auth::invites::mint_admin(&pool, "a1", 1, None, 0)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO beta_allowlist (email, added_at) VALUES ('friend@example.com', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    auth::otp_sign_in(&pool, &config, "friend@example.com", Some(&made[0]), None)
+        .await
+        .unwrap();
+    let otp = captured(&codes, "friend@example.com");
+    auth::otp_verify(&pool, &config, "friend@example.com", &otp, true, None, None)
+        .await
+        .unwrap();
+    let (redeemed_by,): (Option<String>,) =
+        sqlx::query_as("SELECT redeemedBy FROM invite_code WHERE code = ?")
+            .bind(&made[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(redeemed_by, None, "allowlisted sign-in burns no code");
 }
 
 #[tokio::test]
@@ -1431,7 +1662,7 @@ async fn api_keys_create_list_revoke_and_resolve() {
         config,
     };
 
-    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None)
+    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None, None)
         .await
         .unwrap();
     let code = captured(&codes, "ana@example.com");
