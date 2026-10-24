@@ -140,7 +140,7 @@ pub fn resets_at_utc() -> String {
 
 /// The account's plan (`free` unless the row says `pro`).
 pub async fn plan_of(pool: &sqlx::SqlitePool, account_id: &str) -> Result<String, ToolError> {
-    let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM account WHERE id = ?1")
+    let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM user WHERE id = ?1")
         .bind(account_id)
         .fetch_optional(pool)
         .await
@@ -169,7 +169,7 @@ pub async fn changes_used_today(
     account_id: &str,
 ) -> Result<u64, ToolError> {
     let used: Option<i64> =
-        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE account_id = ?1 AND day = ?2")
+        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1 AND day = ?2")
             .bind(account_id)
             .bind(today_utc())
             .fetch_optional(pool)
@@ -194,8 +194,8 @@ pub async fn claim_change(pool: &sqlx::SqlitePool, account_id: &str) -> Result<C
     let plan = plan_of(pool, account_id).await?;
     let limit = change_limit(&plan);
     let rows = sqlx::query(
-        "INSERT INTO usage_day (account_id, day, code_changes) VALUES (?1, ?2, 1) \
-         ON CONFLICT(account_id, day) DO UPDATE SET code_changes = code_changes + 1 \
+        "INSERT INTO usage_day (userId, day, code_changes) VALUES (?1, ?2, 1) \
+         ON CONFLICT(userId, day) DO UPDATE SET code_changes = code_changes + 1 \
          WHERE code_changes < ?3",
     )
     .bind(account_id)
@@ -228,7 +228,7 @@ pub async fn claim_change(pool: &sqlx::SqlitePool, account_id: &str) -> Result<C
 pub async fn refund_change(pool: &sqlx::SqlitePool, account_id: &str) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE usage_day SET code_changes = code_changes - 1 \
-         WHERE account_id = ?1 AND day = ?2 AND code_changes > 0",
+         WHERE userId = ?1 AND day = ?2 AND code_changes > 0",
     )
     .bind(account_id)
     .bind(today_utc())

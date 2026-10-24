@@ -497,7 +497,7 @@ mod tests {
         let pool = crate::db::open(&dir.path().join("outer.sqlite"))
             .await
             .unwrap();
-        sqlx::query("INSERT INTO account (id, email, last_active_at, created_at) VALUES ('o', 'o@x.com', 0, 0)")
+        sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('o', 'o@x.com', 0, 0, 0)")
             .execute(&pool)
             .await
             .unwrap();

@@ -48,7 +48,7 @@ pub async fn create_app(
     let template = templates::materialize(&p.store, &tree).await?;
 
     let owner_id = apps::ensure_account(&p.pool, owner_email).await?;
-    let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM account WHERE id = ?1")
+    let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM user WHERE id = ?1")
         .bind(&owner_id)
         .fetch_optional(&p.pool)
         .await?;

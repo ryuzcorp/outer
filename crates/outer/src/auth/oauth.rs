@@ -186,7 +186,7 @@ struct PendingRequest {
 }
 
 /// One pending authorization row: id, client_id, redirect_uri, state,
-/// code_challenge, scope, resource, account_id, csrf, expires_at.
+/// code_challenge, scope, resource, userId, csrf, expires_at.
 type PendingRow = (
     String,
     String,
@@ -200,7 +200,7 @@ type PendingRow = (
     i64,
 );
 /// One issued authorization code row: id, client_id, redirect_uri, state,
-/// code_challenge, scope, resource, account_id, expires_at.
+/// code_challenge, scope, resource, userId, expires_at.
 type CodeRow = (
     String,
     String,
@@ -212,10 +212,21 @@ type CodeRow = (
     Option<String>,
     i64,
 );
-/// One refresh token row: grant_id, account_id, client_id, scope, resource,
-/// expires_at, rotated_at.
-type RefreshRow = (String, String, String, String, String, i64, Option<i64>);
-
+/// One refresh token row: consent id, userId, clientId, scopes, resources,
+/// expiresAt, rotatedAt, the user's banned flag and ban expiry.
+/// `resources`/`expiresAt` arrive `None` only from rows
+/// Outer never writes (it always sets both); `None` expires immediately.
+type RefreshRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<i64>,
+);
 async fn load_request(
     pool: &SqlitePool,
     id: &str,
@@ -223,7 +234,7 @@ async fn load_request(
 ) -> anyhow::Result<Option<PendingRequest>> {
     let row: Option<PendingRow> =
         sqlx::query_as(
-            "SELECT id, client_id, redirect_uri, state, code_challenge, scope, resource, account_id, csrf, expires_at \
+            "SELECT id, client_id, redirect_uri, state, code_challenge, scope, resource, userId, csrf, expires_at \
              FROM oauth_request WHERE id = ?",
         )
         .bind(id)
@@ -334,7 +345,7 @@ async fn authorize_get(
     // Returning session: the sign-in already happened, skip email and code.
     if let Some(session_id) = super::session_from_headers(&headers) {
         if let Ok(Some(account)) = super::account_from_session(&state.pool, &session_id).await {
-            sqlx::query("UPDATE oauth_request SET account_id = ? WHERE id = ?")
+            sqlx::query("UPDATE oauth_request SET userId = ? WHERE id = ?")
                 .bind(&account.id)
                 .bind(&id)
                 .execute(&state.pool)
@@ -460,7 +471,7 @@ async fn authorize_post(
                 .await
             {
                 Ok((account_id, terms_ok)) => {
-                    sqlx::query("UPDATE oauth_request SET account_id = ? WHERE id = ?")
+                    sqlx::query("UPDATE oauth_request SET userId = ? WHERE id = ?")
                         .bind(&account_id)
                         .bind(&pending.id)
                         .execute(&state.pool)
@@ -630,7 +641,7 @@ async fn register(
             .into_response();
     }
     sqlx::query(
-        "DELETE FROM oauth_client WHERE kind = 'dcr' AND last_token_at IS NULL AND created_at < ?",
+        "DELETE FROM oauthClient WHERE kind = 'dcr' AND lastTokenAt IS NULL AND createdAt < ?",
     )
     .bind(now - STALE_DCR_MS)
     .execute(&state.pool)
@@ -691,13 +702,15 @@ async fn register(
         .unwrap_or_default();
     let client_id = format!("dcr_{}", hex::encode(rand::random::<[u8; 16]>()));
     sqlx::query(
-        "INSERT INTO oauth_client (client_id, kind, name, host, redirect_uris, verified, created_at) \
-         VALUES (?, 'dcr', ?, ?, ?, 0, ?)",
+        "INSERT INTO oauthClient (id, clientId, kind, name, host, redirectUris, verified, createdAt, updatedAt) \
+         VALUES (?, ?, 'dcr', ?, ?, ?, 0, ?, ?)",
     )
+    .bind(tokens::new_id())
     .bind(&client_id)
     .bind(&name)
     .bind(&host)
     .bind(serde_json::to_string(&redirect_uris).unwrap_or_default())
+    .bind(now)
     .bind(now)
     .execute(&state.pool)
     .await
@@ -721,10 +734,10 @@ async fn register(
 }
 
 /// `POST /oauth/token` (form): authorization_code (single use, 60 s TTL,
-/// PKCE S256 required, redirect_uri match, `resource` checked when sent) and
-/// refresh_token (rotated every use, 90-day sliding; reusing a rotated token
-/// revokes the whole grant). Proper OAuth JSON errors + `Cache-Control:
-/// no-store`.
+/// PKCE S256 required, `client_id`/redirect_uri/`resource` bound to the
+/// authorize request) and refresh_token (rotated every use in one
+/// transaction, 90-day sliding; reusing a rotated token revokes the whole
+/// grant). Proper OAuth JSON errors + `Cache-Control: no-store`.
 async fn token(
     State(state): State<AuthState>,
     headers: HeaderMap,
@@ -733,7 +746,12 @@ async fn token(
 ) -> Response {
     let _ = request_ip(&headers, state.config.origin_locked, Some(peer));
     let now = now_ms();
-    sqlx::query("DELETE FROM oauth_token WHERE expires_at < ?")
+    sqlx::query("DELETE FROM oauthAccessToken WHERE expiresAt < ?")
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM oauthRefreshToken WHERE expiresAt < ?")
         .bind(now)
         .execute(&state.pool)
         .await
@@ -752,6 +770,12 @@ async fn token(
 async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i64) -> Response {
     let bad =
         |code: &str, description: &str| oauth_error(StatusCode::BAD_REQUEST, code, description);
+    // Public clients authenticate by `client_id` alone (RFC 6749 §4.1.3,
+    // RFC 8414: `token_endpoint_auth_methods_supported: ["none"]`), so a
+    // missing id is an authentication failure, not a bad grant.
+    let Some(form_client) = form.get("client_id").filter(|id| !id.is_empty()) else {
+        return bad("invalid_client", "client_id is required for public clients");
+    };
     let (Some(code), Some(redirect_uri), Some(verifier)) = (
         form.get("code"),
         form.get("redirect_uri"),
@@ -771,7 +795,7 @@ async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i6
     let hash = tokens::sha256_hex(code);
     let row: Option<CodeRow> =
         sqlx::query_as(
-            "SELECT id, client_id, redirect_uri, state, code_challenge, scope, resource, account_id, expires_at \
+            "SELECT id, client_id, redirect_uri, state, code_challenge, scope, resource, userId, expires_at \
              FROM oauth_request WHERE code_hash = ?",
         )
         .bind(&hash)
@@ -804,6 +828,12 @@ async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i6
     if !claimed {
         return bad("invalid_grant", "the authorization code was already used");
     }
+    if form_client != &client_id {
+        return bad(
+            "invalid_grant",
+            "client_id does not match the authorize request",
+        );
+    }
     if now > expires_at {
         return bad("invalid_grant", "the authorization code expired");
     }
@@ -816,8 +846,12 @@ async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i6
     if !tokens::ct_eq(&tokens::pkce_s256(verifier), &challenge) {
         return bad("invalid_grant", "PKCE verification failed");
     }
+    // The token request is bound to the authorize request's resource (RFC
+    // 8707): omitting it keeps the stored value, sending a different one —
+    // including the server default — is a downgrade and fails.
     if let Some(resource) = form.get("resource") {
-        if stored_resource.as_ref() != Some(resource) && *resource != state.config.resource {
+        let expected = stored_resource.as_ref().unwrap_or(&state.config.resource);
+        if resource != expected {
             return bad(
                 "invalid_target",
                 "resource does not match the authorize request",
@@ -827,37 +861,90 @@ async fn exchange_code(state: &AuthState, form: HashMap<String, String>, now: i6
     let Some(account_id) = account_id else {
         return bad("invalid_grant", "the authorization was never completed");
     };
+    if user_banned(&state.pool, &account_id, now).await {
+        return bad("invalid_grant", "the account is no longer active");
+    }
     let scope = scope.unwrap_or_else(|| "apps".to_string());
     let resource = stored_resource.unwrap_or_else(|| state.config.resource.clone());
     issue_grant(state, &client_id, &account_id, &scope, &resource, now).await
 }
 
-/// Refresh-token reuse: revoke the grant and drop all of its tokens.
+/// Refresh-token reuse: revoke the consent and drop all of its tokens. One
+/// transaction, so a concurrent rotation either lands fully before the
+/// revoke (and is wiped with everything else) or fails closed after it —
+/// never a fresh token minted onto a revoked consent.
 async fn revoke_grant_tokens(pool: &sqlx::SqlitePool, grant_id: &str, now: i64) {
-    sqlx::query("UPDATE oauth_grant SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
-        .bind(now)
-        .bind(grant_id)
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("DELETE FROM oauth_token WHERE grant_id = ?")
-        .bind(grant_id)
-        .execute(pool)
-        .await
-        .ok();
+    let Ok(mut tx) = pool.begin().await else {
+        return;
+    };
+    let done = sqlx::query(
+        "UPDATE oauthConsent SET revokedAt = ?, updatedAt = ? WHERE id = ? AND revokedAt IS NULL",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(grant_id)
+    .execute(&mut *tx)
+    .await
+    .is_ok()
+        && sqlx::query("DELETE FROM oauthAccessToken WHERE referenceId = ?")
+            .bind(grant_id)
+            .execute(&mut *tx)
+            .await
+            .is_ok()
+        && sqlx::query("DELETE FROM oauthRefreshToken WHERE referenceId = ?")
+            .bind(grant_id)
+            .execute(&mut *tx)
+            .await
+            .is_ok();
+    if done {
+        tx.commit().await.ok();
+    }
+}
+
+/// A banned user (or a code/refresh pointing at a deleted user) must stop
+/// authenticating. An expired temporary ban no longer counts.
+async fn user_banned(pool: &sqlx::SqlitePool, user_id: &str, now: i64) -> bool {
+    let row: Option<(i64, Option<i64>)> =
+        sqlx::query_as("SELECT banned, banExpires FROM user WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+    match row {
+        None => true,
+        Some((banned, expires)) => banned != 0 && expires.is_none_or(|until| now < until),
+    }
 }
 
 async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now: i64) -> Response {
     let bad =
         |code: &str, description: &str| oauth_error(StatusCode::BAD_REQUEST, code, description);
+    let unavailable = || {
+        oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "the token store is unavailable",
+        )
+    };
+    // Same public-client binding as the code exchange (RFC 6749 §6): a
+    // missing id fails authentication, a wrong one fails the grant. Both
+    // checks run before any state change, so a mismatched id never revokes
+    // someone else's grant.
+    let Some(form_client) = form.get("client_id").filter(|id| !id.is_empty()) else {
+        return bad("invalid_client", "client_id is required for public clients");
+    };
     let Some(refresh) = form.get("refresh_token") else {
         return bad("invalid_request", "refresh_token is required");
     };
     let hash = tokens::sha256_hex(refresh);
+    // The `user` join rejects banned accounts and deleted users (a missing
+    // user yields no row: `invalid_grant`, same as an unknown token).
     let row: Option<RefreshRow> = sqlx::query_as(
-        "SELECT t.grant_id, g.account_id, g.client_id, g.scope, g.resource, t.expires_at, t.rotated_at \
-         FROM oauth_token t JOIN oauth_grant g ON g.id = t.grant_id \
-         WHERE t.token_hash = ? AND t.kind = 'refresh'",
+        "SELECT t.referenceId, c.userId, c.clientId, c.scopes, c.resources, t.expiresAt, t.rotatedAt, \
+                u.banned, u.banExpires \
+         FROM oauthRefreshToken t JOIN oauthConsent c ON c.id = t.referenceId \
+         JOIN user u ON u.id = c.userId \
+         WHERE t.token = ?",
     )
     .bind(&hash)
     .fetch_optional(&state.pool)
@@ -871,17 +958,29 @@ async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now:
         grant_resource,
         expires_at,
         rotated_at,
+        banned,
+        ban_expires,
     )) = row
     else {
         return bad("invalid_grant", "the refresh token is unknown");
     };
+    if form_client != &client_id {
+        return bad("invalid_grant", "client_id does not match the grant");
+    }
+    if banned != 0 && ban_expires.is_none_or(|until| now < until) {
+        return bad("invalid_grant", "the account is no longer active");
+    }
+    // Outer always writes `resources` and `expiresAt`; `None` comes only
+    // from a foreign row and expires immediately.
+    let grant_resource = grant_resource.unwrap_or_else(|| state.config.resource.clone());
+    let expires_at = expires_at.unwrap_or(0);
     // Reusing a rotated refresh token revokes the whole grant.
     if rotated_at.is_some() {
         revoke_grant_tokens(&state.pool, &grant_id, now).await;
         return bad("invalid_grant", "the refresh token was already used");
     }
     if now > expires_at {
-        sqlx::query("DELETE FROM oauth_token WHERE token_hash = ?")
+        sqlx::query("DELETE FROM oauthRefreshToken WHERE token = ?")
             .bind(&hash)
             .execute(&state.pool)
             .await
@@ -907,47 +1006,86 @@ async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now:
         }
         None => grant_scope.clone(),
     };
-    // Rotate: the old refresh dies, the sliding window restarts now.
+    // Rotate inside one transaction: re-check the consent is live, claim the
+    // old token, then mint the new pair. The claim UPDATE takes the write
+    // lock, so a concurrent reuse either lands fully before this commit (and
+    // the reuse path revokes everything, this pair included) or blocks until
+    // after it and sees `rotatedAt` set. Either way no fresh token survives
+    // on a revoked consent — and `resolve_bearer` requires
+    // `revokedAt IS NULL` as a second barrier.
     let (access, access_hash) = tokens::new_access_token();
     let (refresh, refresh_hash) = tokens::new_refresh_token();
     let access_ttl_ms = ttl_ms(state.config.access_ttl, 3_600_000);
     let refresh_ttl_ms = ttl_ms(state.config.refresh_ttl, 90 * 86_400_000);
-    // Claim the rotation atomically: of two concurrent uses only one
-    // updates the row; the other is reuse and revokes the grant.
+    let Ok(mut tx) = state.pool.begin().await else {
+        return unavailable();
+    };
+    let live: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT revokedAt FROM oauthConsent WHERE id = ?")
+            .bind(&grant_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap_or(None);
+    if live.is_none_or(|(revoked,)| revoked.is_some()) {
+        return bad("invalid_grant", "the grant was revoked");
+    }
     let claimed = sqlx::query(
-        "UPDATE oauth_token SET rotated_at = ? WHERE token_hash = ? AND rotated_at IS NULL",
+        "UPDATE oauthRefreshToken SET rotatedAt = ? WHERE token = ? AND rotatedAt IS NULL",
     )
     .bind(now)
     .bind(&hash)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map(|done| done.rows_affected() == 1)
     .unwrap_or(false);
     if !claimed {
+        tx.rollback().await.ok();
         revoke_grant_tokens(&state.pool, &grant_id, now).await;
         return bad("invalid_grant", "the refresh token was already used");
     }
-    sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'access', ?)")
+    let refresh_id = tokens::new_id();
+    let inserted = sqlx::query(
+        "INSERT INTO oauthRefreshToken (id, token, clientId, userId, referenceId, scopes, resources, expiresAt, createdAt) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&refresh_id)
+    .bind(&refresh_hash)
+    .bind(&client_id)
+    .bind(&account_id)
+    .bind(&grant_id)
+    .bind(&scope)
+    .bind(&grant_resource)
+    .bind(now + refresh_ttl_ms)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .is_ok()
+        && sqlx::query(
+            "INSERT INTO oauthAccessToken (id, token, clientId, userId, referenceId, refreshId, scopes, resources, expiresAt, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(tokens::new_id())
         .bind(&access_hash)
+        .bind(&client_id)
+        .bind(&account_id)
         .bind(&grant_id)
+        .bind(&refresh_id)
+        .bind(&scope)
+        .bind(&grant_resource)
         .bind(now + access_ttl_ms)
-        .execute(&state.pool)
+        .bind(now)
+        .execute(&mut *tx)
         .await
-        .ok();
-    sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'refresh', ?)")
-        .bind(&refresh_hash)
-        .bind(&grant_id)
-        .bind(now + refresh_ttl_ms)
-        .execute(&state.pool)
-        .await
-        .ok();
-    sqlx::query("UPDATE oauth_client SET last_token_at = ? WHERE client_id = ?")
+        .is_ok();
+    if !inserted || tx.commit().await.is_err() {
+        return unavailable();
+    }
+    sqlx::query("UPDATE oauthClient SET lastTokenAt = ? WHERE clientId = ?")
         .bind(now)
         .bind(&client_id)
         .execute(&state.pool)
         .await
         .ok();
-    let _ = (account_id, grant_resource);
     json_nostore(json!({
         "access_token": access,
         "token_type": "Bearer",
@@ -958,7 +1096,7 @@ async fn exchange_refresh(state: &AuthState, form: HashMap<String, String>, now:
 }
 
 async fn grant_revoked(pool: &SqlitePool, grant_id: &str) -> bool {
-    sqlx::query_as::<_, (Option<i64>,)>("SELECT revoked_at FROM oauth_grant WHERE id = ?")
+    sqlx::query_as::<_, (Option<i64>,)>("SELECT revokedAt FROM oauthConsent WHERE id = ?")
         .bind(grant_id)
         .fetch_optional(pool)
         .await
@@ -978,46 +1116,69 @@ async fn issue_grant(
 ) -> Response {
     let grant_id = tokens::new_id();
     sqlx::query(
-        "INSERT INTO oauth_grant (id, account_id, client_id, scope, resource, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO oauthConsent (id, clientId, userId, scopes, resources, createdAt, updatedAt) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&grant_id)
-    .bind(account_id)
     .bind(client_id)
+    .bind(account_id)
     .bind(scope)
     .bind(resource)
+    .bind(now)
     .bind(now)
     .execute(&state.pool)
     .await
     .ok();
     let (access, access_hash) = tokens::new_access_token();
     let access_ttl_ms = ttl_ms(state.config.access_ttl, 3_600_000);
-    sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'access', ?)")
-        .bind(&access_hash)
-        .bind(&grant_id)
-        .bind(now + access_ttl_ms)
-        .execute(&state.pool)
-        .await
-        .ok();
     let mut response = json!({
         "access_token": access,
         "token_type": "Bearer",
         "expires_in": access_ttl_ms / 1000,
         "scope": scope,
     });
+    let mut refresh_id: Option<String> = None;
     if scope.split(' ').any(|part| part == "offline_access") {
         let (refresh, refresh_hash) = tokens::new_refresh_token();
         let refresh_ttl_ms = ttl_ms(state.config.refresh_ttl, 90 * 86_400_000);
-        sqlx::query("INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, ?, 'refresh', ?)")
-            .bind(&refresh_hash)
-            .bind(&grant_id)
-            .bind(now + refresh_ttl_ms)
-            .execute(&state.pool)
-            .await
-            .ok();
+        let id = tokens::new_id();
+        sqlx::query(
+            "INSERT INTO oauthRefreshToken (id, token, clientId, userId, referenceId, scopes, resources, expiresAt, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&refresh_hash)
+        .bind(client_id)
+        .bind(account_id)
+        .bind(&grant_id)
+        .bind(scope)
+        .bind(resource)
+        .bind(now + refresh_ttl_ms)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .ok();
         response["refresh_token"] = json!(refresh);
+        refresh_id = Some(id);
     }
-    sqlx::query("UPDATE oauth_client SET last_token_at = ? WHERE client_id = ?")
+    sqlx::query(
+        "INSERT INTO oauthAccessToken (id, token, clientId, userId, referenceId, refreshId, scopes, resources, expiresAt, createdAt) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(tokens::new_id())
+    .bind(&access_hash)
+    .bind(client_id)
+    .bind(account_id)
+    .bind(&grant_id)
+    .bind(&refresh_id)
+    .bind(scope)
+    .bind(resource)
+    .bind(now + access_ttl_ms)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .ok();
+    sqlx::query("UPDATE oauthClient SET lastTokenAt = ? WHERE clientId = ?")
         .bind(now)
         .bind(client_id)
         .execute(&state.pool)
@@ -1042,29 +1203,24 @@ async fn revoke(
 ) -> Response {
     if let Some(token) = form.get("token") {
         let hash = tokens::sha256_hex(token.trim());
-        let grant: Option<(String,)> =
-            sqlx::query_as("SELECT grant_id FROM oauth_token WHERE token_hash = ?")
+        let mut grant: Option<(String,)> =
+            sqlx::query_as("SELECT referenceId FROM oauthAccessToken WHERE token = ?")
                 .bind(&hash)
                 .fetch_optional(&state.pool)
                 .await
                 .unwrap_or(None);
-        if let Some((grant_id,)) = grant {
-            sqlx::query(
-                "UPDATE oauth_grant SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
-            )
-            .bind(now_ms())
-            .bind(&grant_id)
-            .execute(&state.pool)
-            .await
-            .ok();
-            sqlx::query("DELETE FROM oauth_token WHERE grant_id = ?")
-                .bind(&grant_id)
-                .execute(&state.pool)
+        if grant.is_none() {
+            grant = sqlx::query_as("SELECT referenceId FROM oauthRefreshToken WHERE token = ?")
+                .bind(&hash)
+                .fetch_optional(&state.pool)
                 .await
-                .ok();
+                .unwrap_or(None);
+        }
+        if let Some((grant_id,)) = grant {
+            revoke_grant_tokens(&state.pool, &grant_id, now_ms()).await;
         } else {
             sqlx::query(
-                "UPDATE api_key SET revoked_at = ? WHERE key_hash = ? AND revoked_at IS NULL",
+                "UPDATE apikey SET enabled = 0, updatedAt = ? WHERE key = ? AND enabled != 0",
             )
             .bind(now_ms())
             .bind(&hash)
@@ -1083,10 +1239,11 @@ async fn revoke(
 
 /// Delete expired authorization leftovers (the daily prune): unclaimed
 /// `oauth_request` rows past `expires_at` (claimed ones are deleted by the
-/// exchange), expired `oauth_token` rows (also deleted opportunistically on
-/// every token call), and DCR clients with no token issued in 30 days (also
-/// deleted opportunistically on register). Only rows no reader can still
-/// accept go (`expires_at < now`, matching the `now > expires_at` checks).
+/// exchange), expired token rows in `oauthAccessToken`/`oauthRefreshToken`
+/// (also deleted opportunistically on every token call), and DCR clients
+/// with no token issued in 30 days (also deleted opportunistically on
+/// register). Only rows no reader can still accept go (`expiresAt < now`,
+/// matching the `now > expiresAt` checks).
 /// Returns `(requests, tokens, stale_clients)` removed.
 pub async fn prune_expired(pool: &sqlx::SqlitePool, now: i64) -> anyhow::Result<(u64, u64, u64)> {
     let requests = sqlx::query("DELETE FROM oauth_request WHERE expires_at < ?")
@@ -1094,17 +1251,22 @@ pub async fn prune_expired(pool: &sqlx::SqlitePool, now: i64) -> anyhow::Result<
         .execute(pool)
         .await?
         .rows_affected();
-    let tokens = sqlx::query("DELETE FROM oauth_token WHERE expires_at < ?")
+    let access = sqlx::query("DELETE FROM oauthAccessToken WHERE expiresAt < ?")
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let refresh = sqlx::query("DELETE FROM oauthRefreshToken WHERE expiresAt < ?")
         .bind(now)
         .execute(pool)
         .await?
         .rows_affected();
     let stale_clients = sqlx::query(
-        "DELETE FROM oauth_client WHERE kind = 'dcr' AND last_token_at IS NULL AND created_at < ?",
+        "DELETE FROM oauthClient WHERE kind = 'dcr' AND lastTokenAt IS NULL AND createdAt < ?",
     )
     .bind(now - STALE_DCR_MS)
     .execute(pool)
     .await?
     .rows_affected();
-    Ok((requests, tokens, stale_clients))
+    Ok((requests, access + refresh, stale_clients))
 }

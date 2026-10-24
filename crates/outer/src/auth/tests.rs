@@ -324,6 +324,7 @@ async fn allow(
 
 async fn exchange(
     flow: &Flow,
+    client_id: &str,
     params: &HashMap<String, String>,
     redirect_uri: &str,
 ) -> serde_json::Value {
@@ -333,6 +334,7 @@ async fn exchange(
             "/oauth/token",
             &form(&[
                 ("grant_type", "authorization_code"),
+                ("client_id", client_id),
                 ("code", &params["code"]),
                 ("redirect_uri", redirect_uri),
                 ("code_verifier", VERIFIER),
@@ -372,7 +374,7 @@ async fn full_authorize_flow_mints_a_working_token() {
     assert!(body.contains("expired") || body.contains("Start over"));
 
     let params = allow(&flow, &request_id, &csrf, &session).await;
-    let tokens: serde_json::Value = exchange(&flow, &params, redirect_uri).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_id, &params, redirect_uri).await;
     assert_eq!(tokens["token_type"], "Bearer");
     assert_eq!(tokens["scope"], SCOPE);
     assert!(tokens["refresh_token"]
@@ -401,6 +403,7 @@ async fn full_authorize_flow_mints_a_working_token() {
             "/oauth/token",
             &form(&[
                 ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
                 ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
             ]),
         ),
@@ -417,6 +420,7 @@ async fn full_authorize_flow_mints_a_working_token() {
             "/oauth/token",
             &form(&[
                 ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
                 ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
             ]),
         ),
@@ -476,6 +480,7 @@ async fn concurrent_code_and_refresh_reuse_cannot_double_spend() {
                 "/oauth/token",
                 &form(&[
                     ("grant_type", "authorization_code"),
+                    ("client_id", &client_id),
                     ("code", &params["code"]),
                     ("redirect_uri", redirect_uri),
                     ("code_verifier", VERIFIER),
@@ -497,7 +502,11 @@ async fn concurrent_code_and_refresh_reuse_cannot_double_spend() {
             &flow.app,
             post_form(
                 "/oauth/token",
-                &form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]),
+                &form(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", &client_id),
+                    ("refresh_token", &refresh),
+                ]),
             ),
         )
     };
@@ -588,6 +597,7 @@ async fn codes_are_single_use_expiring_and_pkce_bound() {
             "/oauth/token",
             &form(&[
                 ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
                 ("code", &params["code"]),
                 ("redirect_uri", redirect_uri),
                 ("code_verifier", "wrong-verifier"),
@@ -605,6 +615,7 @@ async fn codes_are_single_use_expiring_and_pkce_bound() {
             "/oauth/token",
             &form(&[
                 ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
                 ("code", &params["code"]),
                 ("redirect_uri", "https://evil.example/cb"),
                 ("code_verifier", VERIFIER),
@@ -624,6 +635,7 @@ async fn codes_are_single_use_expiring_and_pkce_bound() {
             "/oauth/token",
             &form(&[
                 ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
                 ("code", &params["code"]),
                 ("redirect_uri", redirect_uri),
                 ("code_verifier", VERIFIER),
@@ -649,6 +661,7 @@ async fn codes_are_single_use_expiring_and_pkce_bound() {
             "/oauth/token",
             &form(&[
                 ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
                 ("code", &params["code"]),
                 ("redirect_uri", redirect_uri),
                 ("code_verifier", VERIFIER),
@@ -658,6 +671,522 @@ async fn codes_are_single_use_expiring_and_pkce_bound() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("invalid_grant"));
+}
+
+#[tokio::test]
+async fn token_endpoint_binds_client_id() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_a = dcr_client(&flow.app, redirect_uri).await;
+    let client_b = dcr_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_a, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let code = params["code"].clone();
+
+    // Missing client_id fails closed as invalid_client and does NOT consume
+    // the code: the id check runs before the row is even loaded.
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", VERIFIER),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_client"), "{body}");
+
+    // Another client's id fails as invalid_grant and consumes the code:
+    // single use survives the theft attempt.
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_b),
+                ("code", &code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", VERIFIER),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+
+    // The right client now finds the code already spent.
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_a),
+                ("code", &code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", VERIFIER),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+
+    // Refresh binding: a live grant for the mismatch probes.
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_a, redirect_uri, "bob@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_a, &params, redirect_uri).await;
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    // Missing client_id: invalid_client, grant untouched.
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_client"), "{body}");
+
+    // Wrong client_id: invalid_grant, and the grant is NOT revoked — a
+    // mismatched id never counts as reuse.
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_b),
+                ("refresh_token", &refresh),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+
+    // The grant survives both probes: the real client rotates fine.
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_a),
+                ("refresh_token", &refresh),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Two concurrent refreshes of one token: at most one succeeds, and once
+/// the consent is revoked nothing from the family authenticates — not even
+/// a token planted directly on the revoked row (`resolve_bearer` joins
+/// `revokedAt IS NULL`, the second barrier behind the rotation
+/// transaction).
+#[tokio::test]
+async fn refresh_race_and_revocation_leave_no_survivors() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_id = dcr_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_id, &params, redirect_uri).await;
+    let first_access = tokens["access_token"].as_str().unwrap().to_string();
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    let principal = auth::resolve_bearer(&flow.state.pool, &flow.state.config, &first_access)
+        .await
+        .unwrap()
+        .expect("fresh access resolves");
+    let grant_id = match &principal.credential {
+        auth::Credential::OAuth { grant_id } => grant_id.clone(),
+        _ => panic!("expected an OAuth grant"),
+    };
+
+    // Race the same refresh twice: at most one rotation commits.
+    let use_refresh = || {
+        send(
+            &flow.app,
+            post_form(
+                "/oauth/token",
+                &form(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", &client_id),
+                    ("refresh_token", &refresh),
+                ]),
+            ),
+        )
+    };
+    let (a, b) = tokio::join!(use_refresh(), use_refresh());
+    let winners: Vec<serde_json::Value> = [&a, &b]
+        .into_iter()
+        .filter(|r| r.0 == StatusCode::OK)
+        .map(|r| r.2.parse().unwrap())
+        .collect();
+    assert!(
+        winners.len() <= 1,
+        "a refresh token rotates once: {a:?} {b:?}"
+    );
+    let mut family = vec![first_access.clone()];
+    for won in &winners {
+        family.push(won["access_token"].as_str().unwrap().to_string());
+    }
+
+    // Explicit revocation wipes the family: no survivor authenticates, the
+    // refresh is dead, and the token rows are gone. (When the race had a
+    // winner, the loser already revoked the grant — `revoke_connection`
+    // then reports false, which is fine: the end state is identical.)
+    let _ = auth::revoke_connection(&flow.state.pool, &principal.account_id, &grant_id).await;
+    for token in &family {
+        assert!(
+            auth::resolve_bearer(&flow.state.pool, &flow.state.config, token)
+                .await
+                .unwrap()
+                .is_none(),
+            "revoked consent stops resolving"
+        );
+    }
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("refresh_token", &refresh),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+    let (left,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM oauthAccessToken WHERE referenceId = ?")
+            .bind(&grant_id)
+            .fetch_one(&flow.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "revocation deletes the family's tokens");
+
+    // Even a token minted behind the revocation's back (the rotation-race
+    // shape: committed onto a revoked consent) cannot authenticate: the
+    // `revokedAt IS NULL` join blocks it.
+    let (planted, planted_hash) = auth::tokens::new_access_token();
+    sqlx::query(
+        "INSERT INTO oauthAccessToken (id, token, clientId, userId, referenceId, scopes, expiresAt, createdAt) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(auth::tokens::new_id())
+    .bind(&planted_hash)
+    .bind(&client_id)
+    .bind(&principal.account_id)
+    .bind(&grant_id)
+    .bind("apps offline_access")
+    .bind(auth::now_ms() + 3_600_000)
+    .bind(auth::now_ms())
+    .execute(&flow.state.pool)
+    .await
+    .unwrap();
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &planted)
+            .await
+            .unwrap()
+            .is_none(),
+        "token on a revoked consent does not resolve"
+    );
+}
+/// Banned users fail closed at both grant types; an expired temporary ban
+/// does not. The access token stops resolving while banned, and deleting
+/// the user kills the grant (the join finds no row: `invalid_grant`).
+#[tokio::test]
+async fn banned_users_cannot_redeem_or_refresh() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_id = dcr_client(&flow.app, redirect_uri).await;
+    // A live grant for the refresh probes, minted before the ban.
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "bob@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_id, &params, redirect_uri).await;
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    let mut refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    fn refresh_post(client_id: &str, refresh: &str) -> Request<Body> {
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id),
+                ("refresh_token", refresh),
+            ]),
+        )
+    }
+
+    sqlx::query("UPDATE user SET banned = 1 WHERE email = 'bob@example.com'")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send(&flow.app, refresh_post(&client_id, &refresh)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &access)
+            .await
+            .unwrap()
+            .is_none(),
+        "banned user's access token stops resolving"
+    );
+
+    // An expired temporary ban no longer counts: rotation works again.
+    sqlx::query("UPDATE user SET banExpires = 0 WHERE email = 'bob@example.com'")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send(&flow.app, refresh_post(&client_id, &refresh)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    refresh = body.parse::<serde_json::Value>().unwrap()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // An active temporary ban fails again.
+    sqlx::query("UPDATE user SET banExpires = 9999999999999 WHERE email = 'bob@example.com'")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send(&flow.app, refresh_post(&client_id, &refresh)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+
+    // A deleted user is an unknown grant: the join finds no row.
+    sqlx::query("DELETE FROM user WHERE email = 'bob@example.com'")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send(&flow.app, refresh_post(&client_id, &refresh)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+
+    // Code redemption fails closed for banned users too.
+    // Fresh code for ana, banned before redeeming:
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    sqlx::query("UPDATE user SET banned = 1, banExpires = NULL WHERE email = 'ana@example.com'")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
+                ("code", &params["code"]),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", VERIFIER),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+}
+
+/// `apikey.expiresAt` is enforced and the token `revoked` flag is honored:
+/// expired keys and revoked-flagged access tokens do not resolve, live ones
+/// do.
+#[tokio::test]
+async fn bearer_rejects_expired_keys_and_revoked_tokens() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_id = dcr_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_id, &params, redirect_uri).await;
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    let principal = auth::resolve_bearer(&flow.state.pool, &flow.state.config, &access)
+        .await
+        .unwrap()
+        .expect("fresh access resolves");
+    let access_hash = auth::tokens::sha256_hex(&access);
+
+    // A set `revoked` flag blocks the access token; clearing it restores it.
+    sqlx::query("UPDATE oauthAccessToken SET revoked = 1 WHERE token = ?")
+        .bind(&access_hash)
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &access)
+            .await
+            .unwrap()
+            .is_none(),
+        "revoked-flagged access token does not resolve"
+    );
+    sqlx::query("UPDATE oauthAccessToken SET revoked = 0 WHERE token = ?")
+        .bind(&access_hash)
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &access)
+            .await
+            .unwrap()
+            .is_some(),
+        "unflagged access token resolves again"
+    );
+
+    // API keys: no expiry resolves, a past expiry does not, a future one
+    // does.
+    let created = auth::create_api_key(&flow.state.pool, &principal.account_id, None)
+        .await
+        .unwrap();
+    let key_hash = auth::tokens::sha256_hex(&created.key);
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &created.key)
+            .await
+            .unwrap()
+            .is_some(),
+        "unexpiring key resolves"
+    );
+    sqlx::query("UPDATE apikey SET expiresAt = 0 WHERE key = ?")
+        .bind(&key_hash)
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &created.key)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired key does not resolve"
+    );
+    sqlx::query("UPDATE apikey SET expiresAt = 9999999999999 WHERE key = ?")
+        .bind(&key_hash)
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &created.key)
+            .await
+            .unwrap()
+            .is_some(),
+        "unexpired key resolves"
+    );
+}
+
+/// The token request cannot change the authorize request's resource (RFC
+/// 8707): omitting it binds the stored value, sending anything else —
+/// including the server default over a non-default stored value — fails
+/// with `invalid_target`.
+#[tokio::test]
+async fn token_resource_must_match_authorize_request() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_id = dcr_client(&flow.app, redirect_uri).await;
+    // Four distinct users up front: account creation is limited to 3/day
+    // per IP, and the OTP flow enforces it.
+    for n in 1..=4u32 {
+        sqlx::query(
+            "INSERT INTO user (id, email, emailVerified, lastActiveAt, createdAt, updatedAt) \
+             VALUES (?, ?, 1, 0, 0, 0)",
+        )
+        .bind(format!("user-{n}"))
+        .bind(format!("ana{n}@example.com"))
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    }
+    async fn mint_code(flow: &Flow, client_id: &str, redirect_uri: &str, n: u32) -> String {
+        let email = format!("ana{n}@example.com");
+        let (request_id, csrf, session) = sign_in(flow, client_id, redirect_uri, &email).await;
+        allow(flow, &request_id, &csrf, &session).await["code"].clone()
+    }
+    let redeem = |code: &str, resource: Option<&str>| {
+        let mut pairs = vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id.as_str()),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", VERIFIER),
+        ];
+        if let Some(resource) = resource {
+            pairs.push(("resource", resource));
+        }
+        send(&flow.app, post_form("/oauth/token", &form(&pairs)))
+    };
+
+    // A resource the authorize request never saw is rejected.
+    let code = mint_code(&flow, &client_id, redirect_uri, 1).await;
+    let (status, _, body) = redeem(&code, Some("https://other.example/mcp")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_target"), "{body}");
+
+    // Omitting it binds the stored value and succeeds.
+    let code = mint_code(&flow, &client_id, redirect_uri, 2).await;
+    let (status, _, body) = redeem(&code, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Stored non-default + server default sent: a downgrade, rejected. (The
+    // authorize page only issues the default, so plant the foreign shape
+    // directly.)
+    const FOREIGN: &str = "https://foreign.example/mcp";
+    let code = mint_code(&flow, &client_id, redirect_uri, 3).await;
+    sqlx::query("UPDATE oauth_request SET resource = ? WHERE code_hash = ?")
+        .bind(FOREIGN)
+        .bind(auth::tokens::sha256_hex(&code))
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = redeem(&code, Some(RESOURCE)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_target"), "{body}");
+
+    // The matching stored value succeeds and the grant carries it.
+    let code = mint_code(&flow, &client_id, redirect_uri, 4).await;
+    sqlx::query("UPDATE oauth_request SET resource = ? WHERE code_hash = ?")
+        .bind(FOREIGN)
+        .bind(auth::tokens::sha256_hex(&code))
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = redeem(&code, Some(FOREIGN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let issued: serde_json::Value = body.parse().unwrap();
+    let principal = auth::resolve_bearer(
+        &flow.state.pool,
+        &flow.state.config,
+        issued["access_token"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("bound token resolves");
+    let grant_id = match &principal.credential {
+        auth::Credential::OAuth { grant_id } => grant_id.clone(),
+        _ => panic!("expected an OAuth grant"),
+    };
+    let (resources,): (Option<String>,) =
+        sqlx::query_as("SELECT resources FROM oauthConsent WHERE id = ?")
+            .bind(&grant_id)
+            .fetch_one(&flow.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(resources.as_deref(), Some(FOREIGN));
 }
 
 #[tokio::test]
@@ -792,7 +1321,7 @@ async fn otp_attempts_expiry_and_limits() {
         .await
         .unwrap();
     let code = captured(&codes, "ana@example.com");
-    sqlx::query("UPDATE email_code SET expires_at = 0 WHERE email = 'ana@example.com'")
+    sqlx::query("UPDATE verification SET expiresAt = 0 WHERE identifier = 'email-verification:ana@example.com'")
         .execute(&pool)
         .await
         .unwrap();
@@ -920,12 +1449,11 @@ async fn api_keys_create_list_revoke_and_resolve() {
     assert!(verified.api_key.starts_with("outer_"));
 
     // Terms are stored on first verify.
-    let (terms,): (Option<String>,) =
-        sqlx::query_as("SELECT terms_version FROM account WHERE id = ?")
-            .bind(&verified.account_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (terms,): (Option<String>,) = sqlx::query_as("SELECT termsVersion FROM user WHERE id = ?")
+        .bind(&verified.account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(terms.as_deref(), Some("2026-10-23"));
 
     let principal = auth::resolve_bearer(&pool, &state.config, &verified.api_key)
@@ -1082,7 +1610,7 @@ async fn revoke_endpoint_kills_tokens() {
     let (request_id, csrf, session) =
         sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
     let params = allow(&flow, &request_id, &csrf, &session).await;
-    let tokens: serde_json::Value = exchange(&flow, &params, redirect_uri).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_id, &params, redirect_uri).await;
     let access = tokens["access_token"].as_str().unwrap().to_string();
 
     let (status, _, _) = send(
@@ -1114,7 +1642,7 @@ async fn connections_list_record_and_revoke() {
     let (request_id, csrf, session) =
         sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
     let params = allow(&flow, &request_id, &csrf, &session).await;
-    let tokens: serde_json::Value = exchange(&flow, &params, redirect_uri).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_id, &params, redirect_uri).await;
     let access = tokens["access_token"].as_str().unwrap();
 
     let principal = auth::resolve_bearer(&flow.state.pool, &flow.state.config, access)
@@ -1433,7 +1961,7 @@ fn consent_page_never_warns_and_notes_only_self_registered_apps() {
 async fn prune_expired_keeps_live_and_boundary_rows() {
     let pool = test_pool().await;
     sqlx::query(
-        "INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'a@example.com', 0, 0)",
+        "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)",
     )
     .execute(&pool)
     .await
@@ -1444,9 +1972,10 @@ async fn prune_expired_keeps_live_and_boundary_rows() {
         ("edge@example.com", 100),
     ] {
         sqlx::query(
-            "INSERT INTO email_code (email, code_hash, expires_at, created_at) VALUES (?, 'h', ?, 0)",
+            "INSERT INTO verification (id, identifier, value, expiresAt, createdAt, updatedAt) VALUES (?, ?, 'h', ?, 0, 0)",
         )
         .bind(email)
+        .bind(format!("email-verification:{email}"))
         .bind(expires_at)
         .execute(&pool)
         .await
@@ -1454,8 +1983,9 @@ async fn prune_expired_keeps_live_and_boundary_rows() {
     }
     for (hash, expires_at) in [("dead", 99), ("live", 200), ("edge", 100)] {
         sqlx::query(
-            "INSERT INTO web_session (id_hash, account_id, expires_at) VALUES (?, 'a1', ?)",
+            "INSERT INTO session (id, token, userId, expiresAt, createdAt, updatedAt) VALUES (?, ?, 'a1', ?, 0, 0)",
         )
+        .bind(hash)
         .bind(hash)
         .bind(expires_at)
         .execute(&pool)
@@ -1464,16 +1994,22 @@ async fn prune_expired_keeps_live_and_boundary_rows() {
     }
     let (codes, sessions) = auth::prune_expired(&pool, 100).await.unwrap();
     assert_eq!((codes, sessions), (1, 1));
-    let kept_codes: Vec<String> = sqlx::query_scalar("SELECT email FROM email_code ORDER BY email")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert_eq!(kept_codes, vec!["edge@example.com", "live@example.com"]);
-    let kept_sessions: Vec<String> =
-        sqlx::query_scalar("SELECT id_hash FROM web_session ORDER BY id_hash")
+    let kept_codes: Vec<String> =
+        sqlx::query_scalar("SELECT identifier FROM verification ORDER BY identifier")
             .fetch_all(&pool)
             .await
             .unwrap();
+    assert_eq!(
+        kept_codes,
+        vec![
+            "email-verification:edge@example.com",
+            "email-verification:live@example.com"
+        ]
+    );
+    let kept_sessions: Vec<String> = sqlx::query_scalar("SELECT token FROM session ORDER BY token")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
     assert_eq!(kept_sessions, vec!["edge", "live"]);
 }
 
@@ -1487,7 +2023,7 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
     // would make every client "fresh".
     let now: i64 = 3_000_000_000;
     sqlx::query(
-        "INSERT INTO account (id, email, last_active_at, created_at) VALUES ('a1', 'a@example.com', 0, 0)",
+        "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)",
     )
     .execute(&pool)
     .await
@@ -1507,9 +2043,27 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
         .await
         .unwrap();
     }
+    for (client_id, kind, created_at) in [
+        ("c", "cimd", 100),
+        ("dcr-old", "dcr", 100),
+        ("dcr-fresh", "dcr", now - 1_000),
+        ("cimd-old", "cimd", 100),
+    ] {
+        sqlx::query(
+            "INSERT INTO oauthClient (id, clientId, kind, redirectUris, verified, createdAt, updatedAt) VALUES (?, ?, ?, '[]', 0, ?, ?)",
+        )
+        .bind(format!("oc-{client_id}"))
+        .bind(client_id)
+        .bind(kind)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
     sqlx::query(
-        "INSERT INTO oauth_grant (id, account_id, client_id, scope, resource, created_at) \
-         VALUES ('g1', 'a1', 'c', 'apps', 'r', 0)",
+        "INSERT INTO oauthConsent (id, clientId, userId, scopes, resources, createdAt, updatedAt) \
+         VALUES ('g1', 'c', 'a1', 'apps', 'r', 0, 0)",
     )
     .execute(&pool)
     .await
@@ -1520,25 +2074,11 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
         ("t-edge", now),
     ] {
         sqlx::query(
-            "INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) VALUES (?, 'g1', 'access', ?)",
+            "INSERT INTO oauthAccessToken (id, token, clientId, userId, referenceId, scopes, expiresAt, createdAt) VALUES (?, ?, 'c', 'a1', 'g1', 'apps', ?, 0)",
         )
         .bind(hash)
+        .bind(hash)
         .bind(expires_at)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    for (client_id, kind, created_at) in [
-        ("dcr-old", "dcr", 100),
-        ("dcr-fresh", "dcr", now - 1_000),
-        ("cimd-old", "cimd", 100),
-    ] {
-        sqlx::query(
-            "INSERT INTO oauth_client (client_id, kind, redirect_uris, created_at) VALUES (?, ?, '[]', ?)",
-        )
-        .bind(client_id)
-        .bind(kind)
-        .bind(created_at)
         .execute(&pool)
         .await
         .unwrap();
@@ -1551,15 +2091,15 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
         .unwrap();
     assert_eq!(kept_requests, vec!["r-edge", "r-live"]);
     let kept_tokens: Vec<String> =
-        sqlx::query_scalar("SELECT token_hash FROM oauth_token ORDER BY token_hash")
+        sqlx::query_scalar("SELECT token FROM oauthAccessToken ORDER BY token")
             .fetch_all(&pool)
             .await
             .unwrap();
     assert_eq!(kept_tokens, vec!["t-edge", "t-live"]);
     let kept_clients: Vec<String> =
-        sqlx::query_scalar("SELECT client_id FROM oauth_client ORDER BY client_id")
+        sqlx::query_scalar("SELECT clientId FROM oauthClient ORDER BY clientId")
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(kept_clients, vec!["cimd-old", "dcr-fresh"]);
+    assert_eq!(kept_clients, vec!["c", "cimd-old", "dcr-fresh"]);
 }

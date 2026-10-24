@@ -161,12 +161,12 @@ pub async fn ensure_account(pool: &SqlitePool, email: &str) -> anyhow::Result<St
     let email = email.trim().to_lowercase();
     anyhow::ensure!(!email.is_empty(), "email is empty");
     let now = now_ms();
-    if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM account WHERE email = ?1")
+    if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE email = ?1")
         .bind(&email)
         .fetch_optional(pool)
         .await?
     {
-        sqlx::query("UPDATE account SET last_active_at = ?1 WHERE id = ?2")
+        sqlx::query("UPDATE user SET lastActiveAt = ?1, updatedAt = ?1 WHERE id = ?2")
             .bind(now)
             .bind(&id)
             .execute(pool)
@@ -175,7 +175,8 @@ pub async fn ensure_account(pool: &SqlitePool, email: &str) -> anyhow::Result<St
     }
     let id = uuid::Uuid::new_v4().to_string();
     let insert = sqlx::query(
-        "INSERT INTO account (id, email, last_active_at, created_at) VALUES (?1, ?2, ?3, ?3)",
+        "INSERT INTO user (id, email, emailVerified, lastActiveAt, createdAt, updatedAt) \
+         VALUES (?1, ?2, 1, ?3, ?3, ?3)",
     )
     .bind(&id)
     .bind(&email)
@@ -186,11 +187,11 @@ pub async fn ensure_account(pool: &SqlitePool, email: &str) -> anyhow::Result<St
         Ok(_) => Ok(id),
         Err(e) if is_unique_violation(&e) => {
             // A concurrent caller inserted the same email first.
-            let id = sqlx::query_scalar::<_, String>("SELECT id FROM account WHERE email = ?1")
+            let id = sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE email = ?1")
                 .bind(&email)
                 .fetch_one(pool)
                 .await?;
-            sqlx::query("UPDATE account SET last_active_at = ?1 WHERE id = ?2")
+            sqlx::query("UPDATE user SET lastActiveAt = ?1, updatedAt = ?1 WHERE id = ?2")
                 .bind(now)
                 .bind(&id)
                 .execute(pool)
@@ -479,7 +480,7 @@ mod tests {
         let second = ensure_account(&pool, "  ANA@example.com ").await.unwrap();
         assert_eq!(first, second, "same email lowercases to the same account");
         let (email, last_active_at): (String, i64) =
-            sqlx::query_as("SELECT email, last_active_at FROM account WHERE id = ?1")
+            sqlx::query_as("SELECT email, lastActiveAt FROM user WHERE id = ?1")
                 .bind(&first)
                 .fetch_one(&pool)
                 .await
