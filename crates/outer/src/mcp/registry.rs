@@ -238,7 +238,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<code_inputs::CommitInput>(
             "commit",
-            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), deletes and moves. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix.",
+            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), deletes and moves. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why.",
             Account, false,
         ),
         tool::<code_inputs::HistoryInput>(

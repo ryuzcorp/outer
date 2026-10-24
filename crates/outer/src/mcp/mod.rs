@@ -395,9 +395,7 @@ impl McpState {
             pool,
             auth,
             store: Store::memory(),
-            git: GitConfig {
-                repos_dir: data_dir.join("git"),
-            },
+            git: GitConfig::new(data_dir.join("git"), None),
             sync: GitSync::default(),
             deploys: Deploys::fake(FakeOutcome::success()),
             fleets,

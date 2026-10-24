@@ -216,7 +216,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `commit`
 
 - **Access:** signed in
-- **Description:** Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), deletes and moves. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix.
+- **Description:** Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), deletes and moves. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why.
 
 **Input:**
 

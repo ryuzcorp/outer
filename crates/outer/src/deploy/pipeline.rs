@@ -1457,9 +1457,7 @@ mod tests {
         slug: &str,
     ) -> (tempfile::TempDir, GitConfig, Store, GitSync, String, String) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, slug)
@@ -1809,9 +1807,7 @@ mod tests {
     async fn blocked_deploy_issues_no_purge() {
         // Same profane tree as `blocked_deploy_never_reaches_the_deploy_step`.
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, "grocery")
@@ -1885,9 +1881,7 @@ mod tests {
         // pass-through would fail at `deploy`: `blocked` proves the gate
         // stopped the pipeline, with nothing uploaded.
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, "grocery")
@@ -2008,9 +2002,7 @@ mod tests {
         // Nothing is uploaded, the previous version keeps serving, and
         // nothing is cached as clear.
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, "grocery")
@@ -2154,9 +2146,7 @@ mod tests {
     #[tokio::test]
     async fn deploy_with_invalid_cron_fails_at_deploy_root_and_writes_no_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, "grocery")
@@ -2291,9 +2281,7 @@ mod tests {
 
         let slug = "e2e";
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         manifest::init_repo(&store, &cfg, &sync, slug)

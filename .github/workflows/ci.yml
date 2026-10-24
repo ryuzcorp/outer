@@ -27,6 +27,22 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # Real-oxfmt coverage for format-on-commit: the same install and shim
+      # as docker/Dockerfile (pinned oxfmt run by an absolute bun path,
+      # because commits run the formatter with a cleared environment).
+      # Filtered to the one ignored test so no other ignored (privileged)
+      # tests run.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: |
+          mkdir -p /tmp/oxfmt-install && cd /tmp/oxfmt-install
+          bun add --exact oxfmt@0.74.0
+          printf '#!/bin/sh\nexec %s /tmp/oxfmt-install/node_modules/oxfmt/dist/cli.js "$@"\n' "$(command -v bun)" > /tmp/oxfmt
+          chmod +x /tmp/oxfmt
+          env -i /tmp/oxfmt --version
+          cd "$GITHUB_WORKSPACE"
+          OUTER_TEST_OXFMT_BIN=/tmp/oxfmt cargo test --locked format_real_oxfmt -- --ignored
 
   docs:
     runs-on: ubuntu-latest

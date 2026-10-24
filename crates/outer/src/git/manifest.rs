@@ -25,6 +25,29 @@ pub const MAIN_REF: &str = "refs/heads/main";
 pub struct GitConfig {
     /// Local bare mirrors live here: `{repos_dir}/{slug}.git`.
     pub repos_dir: PathBuf,
+    /// Platform-owned oxfmt binary that formats commits. `None` disables
+    /// formatting (commit still works); tests use `None` or a fake script.
+    pub oxfmt_bin: Option<PathBuf>,
+    /// Process-wide cap on concurrent formatter processes. Cloned configs
+    /// share the permits (one `GitConfig` is built per process in `serve`,
+    /// then cloned per commit), so a burst of concurrent commits cannot
+    /// fork-bomb the host. No global static: the owner passes this down.
+    pub oxfmt_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+/// Most formatter processes running anywhere in this process at once.
+pub const OXFMT_PROCESS_LIMIT: usize = 8;
+
+impl GitConfig {
+    /// Fresh config with a process-local formatter semaphore. Clone the
+    /// returned config (not `new` again) wherever commits share a process.
+    pub fn new(repos_dir: PathBuf, oxfmt_bin: Option<PathBuf>) -> Self {
+        Self {
+            repos_dir,
+            oxfmt_bin,
+            oxfmt_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(OXFMT_PROCESS_LIMIT)),
+        }
+    }
 }
 
 /// Key of a slug's manifest in the bucket.
@@ -632,9 +655,7 @@ mod tests {
 
     async fn setup(slug: &str) -> (tempfile::TempDir, GitConfig, Store, GitSync) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = GitConfig {
-            repos_dir: dir.path().join("git"),
-        };
+        let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
         let sync = GitSync::default();
         init_repo(&store, &cfg, &sync, slug).await.unwrap();

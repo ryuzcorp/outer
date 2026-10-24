@@ -90,6 +90,7 @@ impl std::fmt::Debug for Config {
             .field("oauth_access_ttl", &self.oauth_access_ttl)
             .field("oauth_refresh_ttl", &self.oauth_refresh_ttl)
             .field("tool_wait", &self.tool_wait)
+            .field("oxfmt_bin", &self.oxfmt_bin)
             .field("log_filter", &self.log_filter)
             .field("runtime", &self.runtime)
             .finish()
@@ -135,6 +136,14 @@ pub struct Config {
     pub oauth_refresh_ttl: Duration,
     /// `OUTER_TOOL_WAIT_S` (default 50): cap on one awaited tool call.
     pub tool_wait: Duration,
+    /// `OUTER_OXFMT_BIN` (default `/usr/local/bin/oxfmt`): the platform-owned
+    /// oxfmt binary that formats agent commits. Missing at runtime skips
+    /// formatting (commit still works); localhost dev has none.
+    pub oxfmt_bin: PathBuf,
+    /// True when `OUTER_OXFMT_BIN` was set explicitly: a missing binary is
+    /// a prod misconfiguration (`error!`), not the localhost default
+    /// (`warn!`).
+    pub oxfmt_bin_explicit: bool,
     /// Log filter directives (`RUST_LOG`, default `info`).
     pub log_filter: String,
     /// Running apps: allocation ranges, binaries, limits, sleep.
@@ -403,6 +412,11 @@ impl Config {
             oauth_access_ttl,
             oauth_refresh_ttl,
             tool_wait,
+            oxfmt_bin: PathBuf::from(resolve_bin(
+                get("OUTER_OXFMT_BIN").unwrap_or("/usr/local/bin/oxfmt"),
+                vars.get("PATH").map(String::as_str).unwrap_or(""),
+            )),
+            oxfmt_bin_explicit: get("OUTER_OXFMT_BIN").is_some(),
             log_filter,
             runtime,
         };
@@ -509,6 +523,12 @@ impl Config {
         self.tls_cert.is_some() && self.tls_key.is_some() && self.origin_pull_ca.is_some()
     }
 
+    /// True when the platform oxfmt binary exists and is executable.
+    /// Formatting is skipped (commits still work) when this is false.
+    pub fn oxfmt_available(&self) -> bool {
+        is_executable(&self.oxfmt_bin)
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("outer.sqlite")
     }
@@ -613,7 +633,7 @@ fn resolve_bin(bin: &str, path: &str) -> String {
     bin.to_string()
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
@@ -1053,5 +1073,27 @@ mod tests {
         ]))
         .unwrap();
         assert!(!cfg.tls_enabled());
+    }
+
+    #[test]
+    fn oxfmt_bin_defaults_to_image_path_and_passes_through() {
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "apps.localhost"),
+            ("OUTER_STORE", "memory"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.oxfmt_bin, PathBuf::from("/usr/local/bin/oxfmt"));
+        assert!(!cfg.oxfmt_bin_explicit, "default path: localhost case");
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "apps.localhost"),
+            ("OUTER_STORE", "memory"),
+            ("OUTER_OXFMT_BIN", "/opt/oxfmt/oxfmt"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.oxfmt_bin, PathBuf::from("/opt/oxfmt/oxfmt"));
+        assert!(
+            cfg.oxfmt_bin_explicit,
+            "explicit path: missing means misconfig"
+        );
     }
 }

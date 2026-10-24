@@ -10,6 +10,10 @@
 # Origin CA certificate plus Authenticated Origin Pulls (mTLS).
 ARG CELLD_VERSION=0.6.2
 ARG ESBUILD_VERSION=0.28.2
+# Pinned formatter for agent commits. Keep in step with the template's
+# `oxfmt` devDependency, `.github/workflows/ci.yml`, and the extension list
+# in `crates/outer/src/git/format.rs`.
+ARG OXFMT_VERSION=0.74.0
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
@@ -24,6 +28,16 @@ COPY web/package.json web/bun.lock web/blume.config.ts ./
 COPY web/docs ./docs
 RUN bun install --frozen-lockfile \
  && bun ./node_modules/blume/bin/blume.mjs build
+
+# --- oxfmt (agent-commit formatter) ------------------------------------------
+# oxfmt ships as a JS CLI plus a native binding, not a standalone binary:
+# it runs under the runtime image's bun. The whole install dir (package +
+# platform binding) is copied; `/usr/local/bin/oxfmt` below is a shim.
+FROM docker.io/oven/bun:1.4-slim AS oxfmt
+ARG OXFMT_VERSION
+WORKDIR /oxfmt
+RUN bun add --exact oxfmt@${OXFMT_VERSION} \
+ && bun /oxfmt/node_modules/oxfmt/dist/cli.js --version
 
 # --- outer binary -------------------------------------------------------------
 FROM docker.io/library/rust:1-bookworm AS build
@@ -74,6 +88,13 @@ COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=build /out/outer /usr/local/bin/outer
 # The built web site, served on the platform host from OUTER_SITE_DIR.
 COPY --from=site /site/web/dist /usr/share/outer/site
+# Pinned formatter for agent commits (`OUTER_OXFMT_BIN`, default
+# `/usr/local/bin/oxfmt`). Absolute bun path: commits run oxfmt with a
+# cleared environment, so no PATH lookup.
+COPY --from=oxfmt /oxfmt /opt/oxfmt
+RUN printf '#!/bin/sh\nexec /usr/local/bin/bun /opt/oxfmt/node_modules/oxfmt/dist/cli.js "$@"\n' > /usr/local/bin/oxfmt \
+ && chmod 0755 /usr/local/bin/oxfmt \
+ && oxfmt --version
 # Apache-2.0 §4(a) and §4(d): the image carries the License and the NOTICE.
 COPY LICENSE NOTICE /licenses/
 WORKDIR /data
