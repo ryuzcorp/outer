@@ -626,6 +626,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             cache_purge: cache_purge(&config),
         },
     };
+    // Request metrics (spec §13): owned by the proxy state, flushed to
+    // SQLite every few seconds by the sweep below (and once more on
+    // shutdown), pruned per plan by the same sweep.
+    let metrics = outer::observe::metrics::MetricsAgg::new();
+    let metrics_sweep = outer::observe::metrics::spawn_sweep(pool.clone(), metrics.clone());
     let app = http::app(
         http::AppState {
             pool: pool.clone(),
@@ -639,6 +644,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             fleets.clone(),
             rt.apps_domain.clone(),
             config.tls_enabled(),
+            metrics.clone(),
         ),
         config.domain.clone(),
     );
@@ -678,6 +684,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
 
     tracing::info!("shutting down: stopping fleets, then writing the final state snapshot");
+    // The sweep may be mid-flush; aborting it is safe (its transaction
+    // rolls back) and the drain below re-ships the same deltas.
+    metrics_sweep.abort();
+    if let Err(err) = metrics.flush(&pool).await {
+        tracing::warn!(error = %err, "final metrics flush failed; counts stay in memory only");
+    }
     purges.drain().await;
     fleets.stop_all().await;
     store::snapshot::final_snapshot(&sync, &pool, &store, &snapshot_cfg).await;

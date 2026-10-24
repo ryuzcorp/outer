@@ -15,6 +15,7 @@ pub mod git;
 pub mod http;
 pub mod mcp;
 pub mod moderation;
+pub mod observe;
 pub mod ops;
 pub mod store;
 pub mod templates;
