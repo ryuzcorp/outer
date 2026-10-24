@@ -27,8 +27,7 @@ CI (`.github/workflows/ci.yml`) runs exactly the first three. A PR is ready when
 | `crates/outer/src/store/` | `Store` (R2 over S3, or in-memory) and the SQLite snapshot to the bucket |
 | `crates/outer/src/git/` | Each app's repo: a bucket WAL (tip bundle + `MANIFEST.json`) and worktree-free commits |
 | `crates/outer/src/fleet/` | Sandboxed processes, cgroup v2 leaves, nft egress rules, the celld supervisor |
-| `docker/` | The production image |
-
+| `web/` | Blume site (whole web surface): `blume.config.ts`, `package.json`, `docs/` content, built with `bun run build` inside `web/` |
 ## Rules
 
 - **Borrowed code.** Outer lifts specific functions from Noite (`github.com/ryuzcorp/noite`, `apps/runner/src/host/`). A lifted file starts with `// Derived from noite apps/runner/src/host/<file>.rs @ <sha> (Apache-2.0).` and one line saying what changed. Lift a function, not a feature: anything Outer's spec doesn't have stays in Noite.

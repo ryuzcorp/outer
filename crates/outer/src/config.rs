@@ -99,7 +99,7 @@ impl std::fmt::Debug for Config {
 pub struct Config {
     /// Platform host; apps live at `<slug>.<domain>` (`OUTER_DOMAIN`).
     pub domain: String,
-    /// Built docs site served on the platform host (`OUTER_SITE_DIR`).
+    /// Built web site served on the platform host (`OUTER_SITE_DIR`).
     pub site_dir: PathBuf,
     /// SQLite, git mirrors, worktrees and caches (`OUTER_DATA`).
     pub data_dir: PathBuf,
@@ -182,7 +182,7 @@ impl Config {
             .unwrap_or(DEFAULT_DOMAIN)
             .to_ascii_lowercase();
         let data_dir = PathBuf::from(get("OUTER_DATA").unwrap_or("./data"));
-        let site_dir = PathBuf::from(get("OUTER_SITE_DIR").unwrap_or("./dist"));
+        let site_dir = PathBuf::from(get("OUTER_SITE_DIR").unwrap_or("./web/dist"));
         let listen = match get("OUTER_LISTEN").unwrap_or(DEFAULT_LISTEN).parse() {
             Ok(addr) => addr,
             Err(_) => {
@@ -643,9 +643,9 @@ mod tests {
     }
 
     #[test]
-    fn site_dir_defaults_to_dist_and_overrides() {
+    fn site_dir_defaults_to_web_dist_and_overrides() {
         let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
-        assert_eq!(cfg.site_dir, PathBuf::from("./dist"));
+        assert_eq!(cfg.site_dir, PathBuf::from("./web/dist"));
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
             ("OUTER_SITE_DIR", "/usr/share/outer/site"),
