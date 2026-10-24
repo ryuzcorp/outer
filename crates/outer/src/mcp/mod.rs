@@ -58,7 +58,7 @@ pub struct Deploys {
 enum DeploysInner {
     Live(Box<Deployer>),
     #[cfg(test)]
-    Fake(Box<FakeDeploys>),
+    Fake(FakeDeploys),
 }
 
 impl Deploys {
@@ -73,11 +73,10 @@ impl Deploys {
     #[cfg(test)]
     pub fn fake(outcome: FakeOutcome) -> Self {
         Self {
-            inner: Arc::new(DeploysInner::Fake(Box::new(FakeDeploys {
+            inner: Arc::new(DeploysInner::Fake(FakeDeploys {
                 outcome: std::sync::Mutex::new(outcome),
                 locks: std::sync::Mutex::new(HashMap::new()),
-                purge: std::sync::Mutex::new(None),
-            }))),
+            })),
         }
     }
 
@@ -86,19 +85,6 @@ impl Deploys {
     pub fn set_fake(&self, outcome: FakeOutcome) {
         if let DeploysInner::Fake(fake) = &*self.inner {
             *fake.outcome.lock().expect("fake outcome poisoned") = outcome;
-        }
-    }
-
-    /// Point the fake's success path at an edge purge (tests only): mirrors
-    /// the pipeline, which purges `<slug>.<apps_domain>` after a successful
-    /// deploy. `None` (the default) purges nothing.
-    #[cfg(test)]
-    pub fn set_purge(&self, purge: Option<crate::cloudflare::CachePurge>, apps_domain: &str) {
-        if let DeploysInner::Fake(fake) = &*self.inner {
-            *fake.purge.lock().expect("fake purge poisoned") = purge.map(|purge| FakePurge {
-                purge,
-                apps_domain: apps_domain.to_string(),
-            });
         }
     }
 
@@ -203,15 +189,6 @@ impl FakeOutcome {
 struct FakeDeploys {
     outcome: std::sync::Mutex<FakeOutcome>,
     locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    purge: std::sync::Mutex<Option<FakePurge>>,
-}
-
-/// The fake's edge purge target: mirrors `DeploySettings`' purge fields.
-#[cfg(test)]
-#[derive(Clone)]
-struct FakePurge {
-    purge: crate::cloudflare::CachePurge,
-    apps_domain: String,
 }
 
 #[cfg(test)]
@@ -255,15 +232,6 @@ impl FakeDeploys {
         .await?;
         if outcome.status == "success" {
             crate::apps::set_last_deploy(pool, &app.id, sha).await?;
-            // Mirror the pipeline: the new version is live, so purge the
-            // host off the critical path. Failed and blocked deploys leave
-            // the previous version serving and purge nothing.
-            if let Some(target) = self.purge.lock().expect("fake purge poisoned").clone() {
-                let host = format!("{}.{}", app.slug, target.apps_domain);
-                tokio::spawn(async move {
-                    crate::cloudflare::purge_host_cache(Some(&target.purge), &host).await;
-                });
-            }
         }
         Ok(DeployOutcome {
             deploy_id,

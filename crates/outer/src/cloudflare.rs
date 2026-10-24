@@ -141,15 +141,6 @@ pub(crate) mod fake {
             self.requests.lock().unwrap().len()
         }
 
-        pub(crate) fn bodies(&self) -> Vec<serde_json::Value> {
-            self.requests
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| r.body.clone())
-                .collect()
-        }
-
         /// Poll until `n` requests arrived or `timeout` passes; returns what
         /// arrived. The purge fires from a detached task, so a plain assert
         /// would race it.
