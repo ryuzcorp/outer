@@ -106,6 +106,20 @@ fn split_log_prefix(line: &str) -> (Option<&'static str>, &str) {
                     let (target, msg) = rest.split_at(idx);
                     if !target.contains(char::is_whitespace) {
                         rest = msg[2..].trim_start();
+                        // celld logs a Worker's `console.*` at tracing INFO
+                        // under `cell_console`, with the console method's
+                        // level as the message's first word:
+                        // `INFO cell_console: ERROR SyntaxError: ...`. That
+                        // console level is the one that matters.
+                        if target == "cell_console" {
+                            for console in ["ERROR", "WARN", "INFO", "LOG", "DEBUG"] {
+                                if let Some(msg) = rest.strip_prefix(console) {
+                                    if msg.starts_with(char::is_whitespace) {
+                                        return (Some(console), msg.trim_start());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 return (Some(level), rest);
@@ -758,6 +772,42 @@ mod tests {
             since = last;
         }
         assert_eq!(seen, ring, "no line falls behind the cursor");
+    }
+
+    /// Captured from a real fleet on the VPS (celld 0.6.2): a Worker's
+    /// uncaught `JSON.parse` failure arrives as tracing INFO under
+    /// `cell_console`, the console level as the first word, then V8 frames.
+    #[test]
+    fn real_celld_console_error_groups_into_one_event() {
+        let lines = [
+            "2026-10-24T11:01:41.495156Z  WARN celld: HTTP connections failed event=\"http_connection_failures\" total=1",
+            "2026-10-24T11:01:42.855685Z  INFO cell_console: ERROR SyntaxError: Unexpected token 'o', \"not json {\" is not valid JSON",
+            "    at JSON.parse (<anonymous>)",
+            "    at worker.js:11034:57",
+            "    at async handlePageMutation (worker.js:12973:32)",
+            "2026-10-24T11:01:43.101010Z  INFO cell_console: LOG served / in 3ms",
+            "2026-10-24T11:01:44.000001Z  INFO cell_console: ERROR SyntaxError: Unexpected token 'g', \"garbage\" is not valid JSON",
+            "    at JSON.parse (<anonymous>)",
+        ];
+        let events = scan_errors(lines.iter().enumerate().map(|(i, l)| (i as i64, *l)));
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events[0].message.contains("SyntaxError: Unexpected token"),
+            "{}",
+            events[0].message
+        );
+        // Same error, different input: one issue.
+        assert_eq!(
+            fingerprint(&events[0].message, events[0].frame.as_deref()),
+            fingerprint(&events[1].message, events[1].frame.as_deref()),
+        );
+        // console.log / console.warn through cell_console are not errors.
+        assert!(!is_error_start(
+            "2026-10-24T11:01:43Z  INFO cell_console: LOG all good"
+        ));
+        assert!(!is_error_start(
+            "2026-10-24T11:01:43Z  INFO cell_console: WARN slow ERROR path"
+        ));
     }
 
     #[test]
