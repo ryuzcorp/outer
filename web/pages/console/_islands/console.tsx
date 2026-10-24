@@ -76,6 +76,44 @@ function monogram(slug: string): string {
   return (clean.slice(0, 1) || "?").toUpperCase();
 }
 
+// daisyUI mappings: status pills are `badge badge-soft`, rail dots are
+// `indicator-item` dots with theme backgrounds.
+function statusBadge(status: string): string {
+  if (status === "success" || status === "running" || status === "ok") {
+    return "badge-success";
+  }
+  if (
+    status === "building" ||
+    status === "deploying" ||
+    status === "reviewing" ||
+    status === "queued"
+  ) {
+    return "badge-info";
+  }
+  if (status === "failed" || status === "error" || status === "blocked") {
+    return "badge-error";
+  }
+  return "badge-ghost";
+}
+
+function statusDot(status: string): string {
+  if (status === "success" || status === "running" || status === "ok") {
+    return "bg-success";
+  }
+  if (
+    status === "building" ||
+    status === "deploying" ||
+    status === "reviewing" ||
+    status === "queued"
+  ) {
+    return "bg-warning";
+  }
+  if (status === "failed" || status === "error" || status === "blocked") {
+    return "bg-error";
+  }
+  return "bg-base-300";
+}
+
 async function loadActionsPage(
   slug: string,
   before: string | null,
@@ -412,6 +450,14 @@ export function Console() {
         apps.set({ kind: "error", message: String(err) });
         detail.set({ kind: "error", message: String(err) });
       });
+    window.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        const current = ui();
+        if (current.createOpen || current.accountOpen || current.drawer) {
+          ui.set({ ...current, createOpen: false, accountOpen: false, drawer: false });
+        }
+      }
+    });
     window.addEventListener("popstate", () => {
       const r = readRoute();
       route.set(r);
@@ -443,17 +489,18 @@ export function Console() {
   if (appsPanel.kind === "loading") {
     return (
       <div class="console-boot" role="status" aria-label="Loading console">
-        <div class="skeleton-rail" />
-        <div class="skeleton-side" />
-        <div class="skeleton-main" />
+        <div class="skeleton rounded-box min-h-[calc(100dvh-24px)]" />
+        <div class="skeleton rounded-box min-h-[60dvh]" />
       </div>
     );
   }
   if (appsPanel.kind === "error") {
     return (
       <div class="console-error" role="alert">
-        <p>Couldn't load your apps: {appsPanel.message}</p>
-        <a href="/console/sign-in">Sign in</a>
+        <div class="alert alert-error alert-soft max-w-md">
+          <span class="min-w-0">Couldn't load your apps: {appsPanel.message}</span>
+        </div>
+        <a class="btn btn-neutral" href="/console/sign-in">Sign in</a>
       </div>
     );
   }
@@ -489,9 +536,9 @@ export function Console() {
       </a>
       <nav class="rail" aria-label="Applications">
         <a
-          class="rail-tile rail-mark"
+          class="rail-tile tooltip tooltip-right"
+          data-tip="Outer console"
           href="/console"
-          title="Outer console"
           aria-label="Outer console"
           onclick={(e: Event) => {
             e.preventDefault();
@@ -506,8 +553,8 @@ export function Console() {
               key={a.slug}
               type="button"
               role="listitem"
-              class={`rail-tile rail-app tint-${tintIndex(a.slug)}${a.slug === r.app ? " is-active" : ""}`}
-              title={`${a.slug} · ${a.status}`}
+              class="tooltip tooltip-right rounded-[14px]"
+              data-tip={`${a.slug} · ${a.status}`}
               aria-label={`${a.slug}, ${a.status}`}
               aria-current={a.slug === r.app ? "page" : undefined}
               onclick={() => {
@@ -516,21 +563,29 @@ export function Console() {
                 }
               }}
             >
-              <span class="rail-mono" aria-hidden="true">
-                {monogram(a.slug)}
+              <span class="indicator">
+                <span
+                  class={`indicator-item indicator-bottom indicator-end h-2.5 w-2.5 rounded-full border-2 border-base-100 ${statusDot(a.status)}`}
+                  aria-hidden="true"
+                />
+                <span class="avatar avatar-placeholder">
+                  <span
+                    class={`flex h-11 w-11 items-center justify-center rounded-[14px] text-xl font-bold ${a.slug === r.app ? "border border-base-300 bg-base-100 shadow-sm" : `tint-${tintIndex(a.slug)}`}`}
+                  >
+                    <span aria-hidden="true">
+                      {monogram(a.slug)}
+                    </span>
+                  </span>
+                </span>
               </span>
-              <span
-                class={`status-dot is-${a.status}`}
-                aria-hidden="true"
-              />
             </button>
           ))}
         </div>
-        <div class="rail-create">
+        <div class={`dropdown dropdown-right${ui().createOpen ? " dropdown-open" : ""}`}>
           <button
             type="button"
-            class="rail-tile"
-            title="New app"
+            class="rail-tile tooltip tooltip-right"
+            data-tip="How apps are created"
             aria-label="How apps are created"
             aria-expanded={ui().createOpen}
             onclick={() => patchUi({ createOpen: !ui().createOpen })}
@@ -538,270 +593,283 @@ export function Console() {
             <PlusIcon />
           </button>
           {ui().createOpen && (
-            <div class="rail-pop" role="dialog" aria-label="Creating apps">
-              <div class="rail-pop-head">
-                <strong>Apps are created by your agent</strong>
+            <div class="dropdown-content card card-border bg-base-100 w-64 p-4 text-left shadow-lg" role="dialog" aria-label="Creating apps">
+              <div class="mb-1 flex min-w-0 items-center justify-between gap-2">
+                <strong class="min-w-0 flex-1 truncate">Apps are created by your agent</strong>
                 <button
                   type="button"
-                  class="icon-btn"
+                  class="btn btn-ghost btn-square btn-xs shrink-0"
                   aria-label="Close"
                   onclick={() => patchUi({ createOpen: false })}
                 >
                   <CloseIcon size={14} />
                 </button>
               </div>
-              <p>
+              <p class="my-1.5 min-w-0 text-sm opacity-70">
                 There is no click-to-create here. Ask your agent to create an
                 app over MCP:
               </p>
-              <p class="rail-pop-row">
-                <code>https://outer.now/mcp</code>
+              <p class="mt-1.5 flex min-w-0 items-center gap-2">
+                <code class="min-w-0 flex-1 truncate font-mono text-xs" title="https://outer.now/mcp">https://outer.now/mcp</code>
                 <CopyButton
                   value="https://outer.now/mcp"
                   label="Copy MCP URL"
                 />
               </p>
+              <p class="mt-2 min-w-0 text-xs opacity-60">
+                Press <kbd class="kbd kbd-xs">Esc</kbd> to close
+              </p>
             </div>
           )}
         </div>
         <div class="rail-foot">
-          <a class="rail-tile" href="/" title="Docs" aria-label="Docs">
+          <a class="rail-tile tooltip tooltip-right" data-tip="Docs" href="/" aria-label="Docs">
             <DocsIcon />
           </a>
-          <button
-            type="button"
-            class="rail-tile"
-            title={email() || "Account"}
-            aria-label={email() ? `Account: ${email()}` : "Account"}
-            aria-expanded={ui().accountOpen}
-            onclick={() => patchUi({ accountOpen: !ui().accountOpen })}
-          >
-            <span class="rail-mono" aria-hidden="true">
-              {(email() || "?").slice(0, 1).toUpperCase()}
-            </span>
-          </button>
-          {ui().accountOpen && (
-            <div
-              class="rail-pop rail-account"
-              role="dialog"
-              aria-label="Account"
+          <div class={`dropdown dropdown-right dropdown-top${ui().accountOpen ? " dropdown-open" : ""}`}>
+            <button
+              type="button"
+              class="tooltip tooltip-right rounded-[14px]"
+              data-tip={email() ? `Account: ${email()}` : "Account"}
+              aria-label={email() ? `Account: ${email()}` : "Account"}
+              aria-expanded={ui().accountOpen}
+              onclick={() => patchUi({ accountOpen: !ui().accountOpen })}
             >
-              <p class="rail-account-email" title={email()}>
-                {email()}
-              </p>
-              <button
-                type="button"
-                class="menu-row"
-                onclick={() => {
-                  void fetch("/api/console/sign-out", {
-                    method: "POST",
-                  }).finally(() => {
-                    window.location.assign("/console/sign-in");
-                  });
-                }}
-              >
-                <SignOutIcon size={16} />
-                Sign out
-              </button>
-            </div>
-          )}
+              <span class="avatar avatar-placeholder">
+                <span class="bg-base-300 flex h-11 w-11 items-center justify-center rounded-[14px] text-xl font-bold">
+                  <span aria-hidden="true">
+                    {(email() || "?").slice(0, 1).toUpperCase()}
+                  </span>
+                </span>
+              </span>
+            </button>
+            {ui().accountOpen && (
+              <ul class="dropdown-content menu bg-base-100 rounded-box border border-base-300 w-60 min-w-0 p-2 shadow-lg" role="menu" aria-label="Account">
+                <li class="menu-title min-w-0">
+                  <span class="block truncate" title={email()}>
+                    {email() || "Account"}
+                  </span>
+                </li>
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => {
+                      void fetch("/api/console/sign-out", {
+                        method: "POST",
+                      }).finally(() => {
+                        window.location.assign("/console/sign-in");
+                      });
+                    }}
+                  >
+                    <SignOutIcon size={16} />
+                    Sign out
+                  </button>
+                </li>
+              </ul>
+            )}
+          </div>
         </div>
       </nav>
 
       {active && (
-        <aside
-          class={`side${ui().drawer ? " is-open" : ""}`}
-          aria-label="App navigation"
-        >
-          <div class="side-head">
-            <div class="side-id">
-              <p class="side-name" title={active.slug}>
-                {active.slug}
-              </p>
-              <a class="side-url" href={active.url} title={active.url}>
-                {active.url.replace(/^https?:\/\//, "")}
-              </a>
-            </div>
-            <span class={`pill is-${active.status}`}>{active.status}</span>
-            <button
-              type="button"
-              class="icon-btn side-collapse"
-              title="Collapse sidebar"
-              aria-label="Collapse sidebar"
-              onclick={() => patchUi({ collapsed: true })}
-            >
-              <CollapseIcon />
-            </button>
-          </div>
-          <p class="side-label">App</p>
-          <ul class="side-list">
-            {VIEWS.map((v) => (
-              <li key={v.id}>
+        <div class={`drawer min-w-0${ui().collapsed ? "" : " md:drawer-open"}`}>
+          <input
+            id="console-nav"
+            type="checkbox"
+            class="drawer-toggle"
+            checked={ui().drawer}
+            aria-label="App navigation toggle"
+            onchange={(e: Event) => patchUi({ drawer: (e.target as HTMLInputElement).checked })}
+          />
+          <div class="drawer-content min-w-0">
+            <main class="main" id="console-main" tabindex={-1}>
+              <div class="main-head">
                 <button
                   type="button"
-                  class={`side-item${r.view === v.id ? " is-active" : ""}`}
-                  aria-current={r.view === v.id ? "page" : undefined}
-                  onclick={() => navigate({ view: v.id as ViewId })}
+                  class="btn btn-ghost btn-square btn-sm shrink-0 md:hidden"
+                  aria-label="Open navigation"
+                  onclick={() => patchUi({ drawer: true })}
                 >
-                  <ViewIcon id={v.id as ViewId} />
-                  <span>{v.label}</span>
-                  {v.id === "errors" && openErrors > 0 && (
-                    <span class="count-badge" aria-label={`${openErrors} open`}>
-                      {openErrors}
+                  <MenuIcon />
+                </button>
+                <h1 class="main-title">{VIEW_TITLES[r.view]}</h1>
+                {(r.view === "overview" || r.view === "metrics") && (
+                  <div class="join ml-auto shrink-0" role="group" aria-label="Metrics range">
+                    {RANGES.map((opt) => (
+                      <button
+                        key={opt.hours}
+                        type="button"
+                        class={`btn btn-sm join-item${r.range === opt.hours ? " btn-neutral" : ""}`}
+                        title={opt.title}
+                        aria-pressed={r.range === opt.hours}
+                        onclick={() => navigate({ r: opt.hours } as Partial<Route>)}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {ui().collapsed && (
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-square btn-sm shrink-0"
+                    title="Expand sidebar"
+                    aria-label="Expand sidebar"
+                    onclick={() => patchUi({ collapsed: false })}
+                  >
+                    <MenuIcon />
+                  </button>
+                )}
+              </div>
+              <div class="tabs tabs-box tabs-sm mb-3 w-full min-w-0 overflow-x-auto md:hidden" role="tablist" aria-label="Views">
+                {VIEWS.map((v) => (
+                  <button
+                    key={v.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={r.view === v.id}
+                    class={`tab shrink-0${r.view === v.id ? " tab-active" : ""}`}
+                    onclick={() => navigate({ view: v.id as ViewId })}
+                  >
+                    {v.label}
+                  </button>
+                ))}
+              </div>
+              <div class="main-body">
+                {detailPanel.kind === "loading" && (
+                  <div class="flex min-w-0 flex-col gap-3" role="status" aria-label="Loading app">
+                    <div class="skeleton rounded-box h-30 w-full" />
+                    <div class="skeleton rounded-box h-70 w-full" />
+                    <div class="skeleton rounded-box h-30 w-full" />
+                  </div>
+                )}
+                {detailPanel.kind === "error" && (
+                  <div class="alert alert-error alert-soft" role="alert">
+                    <span class="min-w-0">Couldn't load this app (unknown or not yours).</span>
+                    <button
+                      type="button"
+                      class="btn btn-sm min-w-0 max-w-full shrink-0"
+                      onclick={() => navigate({ app: list[0].slug, view: "overview" })}
+                    >
+                      <span class="truncate" title={`Back to ${list[0].slug}`}>
+                        Back to {list[0].slug}
+                      </span>
+                    </button>
+                  </div>
+                )}
+                {detailPanel.kind === "ready" && (
+                  <ViewBody
+                    route={r}
+                    app={detailPanel.value}
+                    metrics={metrics()}
+                    actions={actions()}
+                    errors={errors()}
+                    logs={logs()}
+                    secrets={secrets()}
+                    expanded={ui().expanded}
+                    onToggleExpand={(id) => {
+                      const cur = ui().expanded;
+                      patchUi({
+                        expanded: cur.includes(id)
+                          ? cur.filter((x) => x !== id)
+                          : [...cur, id],
+                      });
+                    }}
+                    onLoadMore={loadMoreActions}
+                    onRefreshLogs={() => {
+                      const slug = route().app;
+                      if (!slug) {
+                        return;
+                      }
+                      logs.set({ kind: "loading" });
+                      api<{ lines: LogLine[] }>(
+                        `/api/console/apps/${encodeURIComponent(slug)}/logs?limit=100`,
+                      )
+                        .then((data) => {
+                          logs.set({ kind: "ready", value: data.lines });
+                        })
+                        .catch((err: unknown) => {
+                          logs.set({ kind: "error", message: String(err) });
+                        });
+                    }}
+                  />
+                )}
+              </div>
+            </main>
+          </div>
+          <div class="drawer-side">
+            <label for="console-nav" class="drawer-overlay" aria-label="Close navigation" />
+            <aside class="side max-md:min-h-dvh min-w-0" aria-label="App navigation">
+              <div class="side-head">
+                <div class="side-id">
+                  <p class="m-0 min-w-0 truncate text-[15px] font-bold" title={active.slug}>
+                    {active.slug}
+                  </p>
+                  <a class="block truncate text-xs opacity-60 hover:opacity-100 hover:underline" href={active.url} title={active.url}>
+                    {active.url.replace(/^https?:\/\//, "")}
+                  </a>
+                </div>
+                <span class={`badge badge-soft ${statusBadge(active.status)} shrink-0`} title={active.status}>{active.status}</span>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-square btn-sm hidden shrink-0 md:inline-flex"
+                  title="Collapse sidebar"
+                  aria-label="Collapse sidebar"
+                  onclick={() => patchUi({ collapsed: true })}
+                >
+                  <CollapseIcon />
+                </button>
+              </div>
+              <ul class="menu w-full min-w-0 gap-0.5 p-0">
+                <li class="menu-title">App</li>
+                {VIEWS.map((v) => (
+                  <li key={v.id} class="min-w-0">
+                    <button
+                      type="button"
+                      class={r.view === v.id ? "menu-active min-w-0" : "min-w-0"}
+                      aria-current={r.view === v.id ? "page" : undefined}
+                      onclick={() => navigate({ view: v.id as ViewId })}
+                    >
+                      <ViewIcon id={v.id as ViewId} />
+                      <span class="min-w-0 flex-1 truncate">{v.label}</span>
+                      {v.id === "errors" && openErrors > 0 && (
+                        <span class="indicator shrink-0">
+                          <span class="indicator-item badge badge-error badge-xs" aria-label={`${openErrors} open`}>
+                            {openErrors}
+                          </span>
+                          <span class="block h-4 w-4" aria-hidden="true" />
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                ))}
+                <li class="menu-title">Data</li>
+                {(["D1", "R2", "Durable Objects"] as const).map((name) => (
+                  <li key={name} class="menu-disabled min-w-0" title="Coming later">
+                    <span class="min-w-0">
+                      <DatabaseIcon />
+                      <span class="truncate">{name}</span>
+                      <span class="badge badge-ghost badge-xs ml-auto shrink-0">Soon</span>
                     </span>
-                  )}
-                </button>
-              </li>
-            ))}
-          </ul>
-          <p class="side-label">Data</p>
-          <ul class="side-list">
-            {(["D1", "R2", "Durable Objects"] as const).map((name) => (
-              <li key={name}>
-                <span
-                  class="side-item is-disabled"
-                  aria-disabled="true"
-                  title="Coming later"
-                >
-                  <DatabaseIcon />
-                  <span>{name}</span>
-                  <span class="soon-pill">Soon</span>
-                </span>
-              </li>
-            ))}
-          </ul>
-          <div class="side-foot">
-            <p class="side-foot-url mono trim" title={active.url}>
-              {active.url}
-            </p>
-            <div class="side-foot-row">
-              <CopyButton value={active.url} label="Copy app URL" />
-              <a class="link" href={active.url}>
-                Open app
-              </a>
-            </div>
+                  </li>
+                ))}
+              </ul>
+              <div class="side-foot">
+                <div class="divider my-2" aria-hidden="true" />
+                <p class="m-0 min-w-0 truncate font-mono text-xs opacity-60" title={active.url}>
+                  {active.url}
+                </p>
+                <div class="mt-2 flex min-w-0 items-center gap-2">
+                  <CopyButton value={active.url} label="Copy app URL" />
+                  <a class="link min-w-0 flex-1 truncate" href={active.url} title={active.url}>
+                    Open app
+                  </a>
+                </div>
+              </div>
+            </aside>
           </div>
-        </aside>
-      )}
-      {ui().drawer && active && (
-        <button
-          type="button"
-          class="scrim"
-          aria-label="Close navigation"
-          onclick={() => patchUi({ drawer: false })}
-        />
-      )}
-
-      <main class="main" id="console-main" tabindex={-1}>
-        <div class="main-head">
-          {active && (
-            <button
-              type="button"
-              class="icon-btn main-menu"
-              aria-label="Open navigation"
-              onclick={() => patchUi({ drawer: true })}
-            >
-              <MenuIcon />
-            </button>
-          )}
-          <h1 class="main-title">{active ? VIEW_TITLES[r.view] : "Console"}</h1>
-          {active && (r.view === "overview" || r.view === "metrics") && (
-            <div
-              class="range"
-              role="group"
-              aria-label="Metrics range"
-            >
-              {RANGES.map((opt) => (
-                <button
-                  key={opt.hours}
-                  type="button"
-                  class={`range-btn${r.range === opt.hours ? " is-active" : ""}`}
-                  title={opt.title}
-                  aria-pressed={r.range === opt.hours}
-                  onclick={() => navigate({ r: opt.hours } as Partial<Route>)}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          )}
-          {active && ui().collapsed && (
-            <button
-              type="button"
-              class="icon-btn"
-              title="Expand sidebar"
-              aria-label="Expand sidebar"
-              onclick={() => patchUi({ collapsed: false })}
-            >
-              <MenuIcon />
-            </button>
-          )}
         </div>
-        <div class="main-body">
-          {!active && (
-            <div class="card" role="status">
-              <p>Select an app from the rail.</p>
-            </div>
-          )}
-          {active && detailPanel.kind === "loading" && (
-            <div class="stack" role="status" aria-label="Loading app">
-              <div class="skeleton-card" />
-              <div class="skeleton-chart" />
-              <div class="skeleton-card" />
-            </div>
-          )}
-          {active && detailPanel.kind === "error" && (
-            <div class="card" role="alert">
-              <p>Couldn't load this app (unknown or not yours).</p>
-              <button
-                type="button"
-                class="btn"
-                onclick={() => navigate({ app: list[0].slug, view: "overview" })}
-              >
-                Back to {list[0].slug}
-              </button>
-            </div>
-          )}
-          {active && detailPanel.kind === "ready" && (
-            <ViewBody
-              route={r}
-              app={detailPanel.value}
-              metrics={metrics()}
-              actions={actions()}
-              errors={errors()}
-              logs={logs()}
-              secrets={secrets()}
-              expanded={ui().expanded}
-              onToggleExpand={(id) => {
-                const cur = ui().expanded;
-                patchUi({
-                  expanded: cur.includes(id)
-                    ? cur.filter((x) => x !== id)
-                    : [...cur, id],
-                });
-              }}
-              onRange={(hours) => navigate({ r: hours } as Partial<Route>)}
-              onLoadMore={loadMoreActions}
-              onRefreshLogs={() => {
-                const slug = route().app;
-                if (!slug) {
-                  return;
-                }
-                logs.set({ kind: "loading" });
-                api<{ lines: LogLine[] }>(
-                  `/api/console/apps/${encodeURIComponent(slug)}/logs?limit=100`,
-                )
-                  .then((data) => {
-                    logs.set({ kind: "ready", value: data.lines });
-                  })
-                  .catch((err: unknown) => {
-                    logs.set({ kind: "error", message: String(err) });
-                  });
-              }}
-            />
-          )}
-        </div>
-      </main>
+      )}
     </div>
   );
 }
@@ -837,7 +905,6 @@ function ViewBody(props: {
   secrets: Panel<SecretsSummary>;
   expanded: string[];
   onToggleExpand: (id: string) => void;
-  onRange: (hours: number) => void;
   onLoadMore: () => void;
   onRefreshLogs: () => void;
 }) {
@@ -849,12 +916,11 @@ function ViewBody(props: {
           metrics={props.metrics}
           actions={props.actions}
           errors={props.errors}
-          onRange={props.onRange}
           onView={(view) => navigate({ view })}
         />
       );
     case "metrics":
-      return <MetricsView metrics={props.metrics} onRange={props.onRange} />;
+      return <MetricsView metrics={props.metrics} />;
     case "actions":
       return <ActionsView panel={props.actions} onMore={props.onLoadMore} />;
     case "deploys":

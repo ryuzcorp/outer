@@ -100,7 +100,7 @@ export function CopyButton({ value, label }: { value: string; label: string }) {
   return (
     <button
       type="button"
-      class="icon-btn"
+      class="btn btn-ghost btn-square btn-xs shrink-0"
       title={label}
       aria-label={label}
       onclick={() => {

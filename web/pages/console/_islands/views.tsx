@@ -2,11 +2,16 @@
 // Data shapes ported from Noite's $lib/app-detail/{metrics,deploys,errors,
 // events,logs}.tsx; interaction details follow Noite (loading skeletons,
 // empty states, relative times with absolute titles on hover, copy buttons
-// for shas/URLs, keyboard-focusable rows). Charts are monochrome inline SVG:
-// near-black series, light-gray comparison series, dashed vertical
-// gridlines, minimal axes, muted tick labels. No `style=` attributes — the
-// console CSP only hashes inline scripts/styles, so all sizing rides on
-// SVG attributes.
+// for shas/URLs). Charts are monochrome inline SVG: near-black series,
+// light-gray comparison series, dashed vertical gridlines, minimal axes,
+// muted tick labels. No `style=` attributes — the console CSP only hashes
+// inline scripts/styles, so all sizing rides on classes and SVG attrs.
+//
+// Overflow armor: every flex/grid child that holds text carries `min-w-0`,
+// every label, cell, slug, URL, sha, path, summary and message truncates
+// with an ellipsis (`truncate`) and exposes the full text via `title`.
+// Tables are `table-fixed` with column widths. `break-words` is reserved
+// for text that should wrap: log lines and the expanded deploy message.
 import {
   shortSha,
   when,
@@ -27,7 +32,6 @@ import {
 } from "./common.tsx";
 import {
   ActionsIcon,
-  ChevronDownIcon,
   ErrorsIcon,
   MetricsIcon,
   OverviewIcon,
@@ -37,26 +41,28 @@ import {
 
 function Loading({ label }: { label: string }) {
   return (
-    <div class="stack" role="status" aria-label={label}>
-      <div class="skeleton-card" />
-      <div class="skeleton-chart" />
+    <div class="flex min-w-0 flex-col gap-3" role="status" aria-label={label}>
+      <div class="skeleton rounded-box h-30 w-full" />
+      <div class="skeleton rounded-box h-70 w-full" />
     </div>
   );
 }
 
 function Err({ message }: { message: string }) {
   return (
-    <div class="card" role="alert">
-      <p>Couldn't load this view: {message}</p>
+    <div class="alert alert-error alert-soft min-w-0" role="alert">
+      <span class="min-w-0 break-words">Couldn't load this view: {message}</span>
     </div>
   );
 }
 
 function Empty({ children }: { children?: unknown }) {
   return (
-    <div class="card" role="status">
-      <p>{children}</p>
-    </div>
+    <section class="card card-border bg-base-100 min-w-0" role="status">
+      <div class="card-body min-w-0">
+        <p class="m-0 min-w-0 opacity-60">{children}</p>
+      </div>
+    </section>
   );
 }
 
@@ -68,9 +74,10 @@ function compact(n: number): string {
   return `${n}`;
 }
 
-function statusClass(status: string): string {
+// daisyUI badge variants for app/deploy status and action outcomes.
+function statusBadge(status: string): string {
   if (status === "success" || status === "running" || status === "ok") {
-    return "is-ok";
+    return "badge-success";
   }
   if (
     status === "building" ||
@@ -78,28 +85,28 @@ function statusClass(status: string): string {
     status === "reviewing" ||
     status === "queued"
   ) {
-    return "is-info";
+    return "badge-info";
   }
   if (status === "failed" || status === "error" || status === "blocked") {
-    return "is-bad";
+    return "badge-error";
   }
   if (status === "sleeping") {
-    return "is-muted";
+    return "badge-ghost";
   }
-  return "is-neutral";
+  return "badge-ghost";
 }
 
-function outcomeClass(outcome: string): string {
+function outcomeBadge(outcome: string): string {
   if (outcome === "success" || outcome === "ok") {
-    return "is-ok";
+    return "badge-success";
   }
   if (outcome === "failed" || outcome === "error") {
-    return "is-bad";
+    return "badge-error";
   }
   if (outcome === "blocked") {
-    return "is-warn";
+    return "badge-warning";
   }
-  return "is-neutral";
+  return "badge-ghost";
 }
 
 function axisLabel(ms: number, hours: number): string {
@@ -119,59 +126,6 @@ function bucketTitle(bucket: MetricsBucket, hours: number): string {
   return `${label}: ${bucket.requests} requests, ${bucket.s4xx} 4xx, ${bucket.s5xx} 5xx`;
 }
 
-// Second-half vs first-half percentage change (the stat-card delta pills).
-function halfChange(buckets: MetricsBucket[]): string | null {
-  if (buckets.length < 2) {
-    return null;
-  }
-  const mid = Math.floor(buckets.length / 2);
-  const first = buckets
-    .slice(0, mid)
-    .reduce((a, b) => a + b.requests, 0);
-  const second = buckets.slice(mid).reduce((a, b) => a + b.requests, 0);
-  if (first === 0) {
-    return second > 0 ? "new" : null;
-  }
-  const pct = Math.round(((second - first) / first) * 100);
-  return `${pct >= 0 ? "+" : ""}${pct}%`;
-}
-
-// Error rate: exact 0% only when there are no 5xx; sub-1% rates keep two
-// decimals so e.g. 6 / 28,845 reads 0.02% instead of 0.0%.
-function fmtRate(s5xx: number, requests: number): string {
-  if (requests <= 0) {
-    return "—";
-  }
-  if (s5xx <= 0) {
-    return "0%";
-  }
-  const pct = (100 * s5xx) / requests;
-  if (pct >= 1) {
-    return `${pct.toFixed(1)}%`;
-  }
-  if (pct >= 0.005) {
-    return `${pct.toFixed(2)}%`;
-  }
-  return "<0.01%";
-}
-
-// Y-axis ticks with a round ceiling (0, 10, 20, … like the reference).
-function niceTicks(max: number, count = 5): number[] {
-  if (max <= 0) {
-    return [0];
-  }
-  const raw = max / (count - 1);
-  const mag = 10 ** Math.floor(Math.log10(raw));
-  const norm = raw / mag;
-  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
-  const top = Math.ceil(max / step) * step;
-  const ticks: number[] = [];
-  for (let v = 0; v <= top + step / 2; v += step) {
-    ticks.push(Math.round((v / step)) * step);
-  }
-  return ticks;
-}
-
 // --- Stat cards --------------------------------------------------------------
 
 function StatCard({
@@ -188,19 +142,19 @@ function StatCard({
   sub?: string;
 }) {
   return (
-    <section class="card stat" aria-label={label}>
-      <p class="stat-label">
+    <div class="stat min-w-0">
+      <div class="stat-title flex min-w-0 items-center gap-2">
         {icon}
-        <span>{label}</span>
-      </p>
-      <p class="stat-value">
+        <span class="min-w-0 flex-1 truncate" title={label}>{label}</span>
+      </div>
+      <div class="stat-value min-w-0 truncate text-3xl" title={pill ? `${value} ${pill}` : value}>
         {value}
         {pill != null && pill !== "" && (
-          <span class="delta-pill">{pill}</span>
+          <span class="badge badge-soft badge-sm ml-2 shrink-0 align-middle">{pill}</span>
         )}
-      </p>
-      {sub && <p class="stat-sub">{sub}</p>}
-    </section>
+      </div>
+      {sub && <div class="stat-desc min-w-0 truncate" title={sub}>{sub}</div>}
+    </div>
   );
 }
 
@@ -418,12 +372,65 @@ function Bars({
           );
         })}
       </svg>
-      <figcaption class="axis-ends" aria-hidden="true">
-        <span>{first ? axisLabel(first.hour, grouped ? 168 : hours) : ""}</span>
-        <span>{last ? axisLabel(last.hour, grouped ? 168 : hours) : ""}</span>
+      <figcaption class="mt-1 flex min-w-0 justify-between gap-3 text-xs opacity-60" aria-hidden="true">
+        <span class="min-w-0 truncate">{first ? axisLabel(first.hour, grouped ? 168 : hours) : ""}</span>
+        <span class="min-w-0 truncate">{last ? axisLabel(last.hour, grouped ? 168 : hours) : ""}</span>
       </figcaption>
     </figure>
   );
+}
+
+// Second-half vs first-half percentage change (the stat-card delta pills).
+function halfChange(buckets: MetricsBucket[]): string | null {
+  if (buckets.length < 2) {
+    return null;
+  }
+  const mid = Math.floor(buckets.length / 2);
+  const first = buckets
+    .slice(0, mid)
+    .reduce((a, b) => a + b.requests, 0);
+  const second = buckets.slice(mid).reduce((a, b) => a + b.requests, 0);
+  if (first === 0) {
+    return second > 0 ? "new" : null;
+  }
+  const pct = Math.round(((second - first) / first) * 100);
+  return `${pct >= 0 ? "+" : ""}${pct}%`;
+}
+
+// Error rate: exact 0% only when there are no 5xx; sub-1% rates keep two
+// decimals so e.g. 6 / 28,845 reads 0.02% instead of 0.0%.
+function fmtRate(s5xx: number, requests: number): string {
+  if (requests <= 0) {
+    return "—";
+  }
+  if (s5xx <= 0) {
+    return "0%";
+  }
+  const pct = (100 * s5xx) / requests;
+  if (pct >= 1) {
+    return `${pct.toFixed(1)}%`;
+  }
+  if (pct >= 0.005) {
+    return `${pct.toFixed(2)}%`;
+  }
+  return "<0.01%";
+}
+
+// Y-axis ticks with a round ceiling (0, 10, 20, … like the reference).
+function niceTicks(max: number, count = 5): number[] {
+  if (max <= 0) {
+    return [0];
+  }
+  const raw = max / (count - 1);
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const norm = raw / mag;
+  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+  const top = Math.ceil(max / step) * step;
+  const ticks: number[] = [];
+  for (let v = 0; v <= top + step / 2; v += step) {
+    ticks.push(Math.round((v / step)) * step);
+  }
+  return ticks;
 }
 
 // --- Overview ------------------------------------------------------------------
@@ -433,120 +440,123 @@ export function OverviewView({
   metrics,
   actions,
   errors,
-  onRange,
   onView,
 }: {
   app: AppDetail;
   metrics: Panel<{ hours: number; summary: MetricsSummary }>;
   actions: ActionsPanel;
   errors: Panel<ErrorsSummary>;
-  onRange: (hours: number) => void;
   onView: (view: ViewId) => void;
 }) {
   return (
-    <div class="stack">
+    <div class="flex min-w-0 flex-col gap-3">
       {metrics.kind === "loading" && <Loading label="Loading overview" />}
       {metrics.kind === "error" && <Err message={metrics.message} />}
       {metrics.kind === "ready" && (
         <OverviewReady
           summary={metrics.value.summary}
           hours={metrics.value.hours}
-          onRange={onRange}
         />
       )}
-      <div class="grid-2">
-        <section class="card" aria-label="Latest deploy">
-          <div class="card-head">
-            <h2>Latest deploy</h2>
-            <button
-              type="button"
-              class="link-btn"
-              onclick={() => onView("deploys")}
-            >
-              View all
-            </button>
-          </div>
-          {app.deploys.length === 0 ? (
-            <p class="muted" role="status">
-              No deploys yet.
-            </p>
-          ) : (
-            <DeployRow deploy={app.deploys[0]} />
-          )}
-        </section>
-        <section class="card" aria-label="Latest agent actions">
-          <div class="card-head">
-            <h2>Latest agent actions</h2>
-            <button
-              type="button"
-              class="link-btn"
-              onclick={() => onView("actions")}
-            >
-              View all
-            </button>
-          </div>
-          {actions.kind === "loading" && (
-            <p class="muted" role="status">
-              Loading actions…
-            </p>
-          )}
-          {actions.kind === "error" && (
-            <p class="muted" role="alert">
-              Couldn't load actions: {actions.message}
-            </p>
-          )}
-          {actions.kind === "ready" &&
-            (actions.state.actions.length === 0 ? (
-              <p class="muted" role="status">
-                No agent actions yet.
+      <div class="grid min-w-0 grid-cols-1 gap-3 xl:grid-cols-2">
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Latest deploy">
+          <div class="card-body min-w-0">
+            <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+              <h2 class="card-title min-w-0 truncate" title="Latest deploy">Latest deploy</h2>
+              <button
+                type="button"
+                class="link shrink-0 text-sm"
+                onclick={() => onView("deploys")}
+              >
+                View all
+              </button>
+            </div>
+            {app.deploys.length === 0 ? (
+              <p class="m-0 min-w-0 opacity-60" role="status">
+                No deploys yet.
               </p>
             ) : (
-              <ul class="mini-list">
-                {actions.state.actions.slice(0, 5).map((a) => (
-                  <li key={a.id} class="mini-row">
-                    <span class={`pill ${outcomeClass(a.outcome)}`}>
-                      {a.outcome}
-                    </span>
-                    <span class="mono trim" title={a.summary}>
-                      {a.summary || a.tool}
-                    </span>
-                    <span class="muted" title={when(a.at)}>
-                      {timeAgo(a.at)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            ))}
+              <DeployRow deploy={app.deploys[0]} />
+            )}
+          </div>
+        </section>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Latest agent actions">
+          <div class="card-body min-w-0">
+            <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+              <h2 class="card-title min-w-0 truncate" title="Latest agent actions">Latest agent actions</h2>
+              <button
+                type="button"
+                class="link shrink-0 text-sm"
+                onclick={() => onView("actions")}
+              >
+                View all
+              </button>
+            </div>
+            {actions.kind === "loading" && (
+              <p class="m-0 min-w-0 opacity-60" role="status">
+                Loading actions…
+              </p>
+            )}
+            {actions.kind === "error" && (
+              <p class="m-0 min-w-0 break-words opacity-60" role="alert">
+                Couldn't load actions: {actions.message}
+              </p>
+            )}
+            {actions.kind === "ready" &&
+              (actions.state.actions.length === 0 ? (
+                <p class="m-0 min-w-0 opacity-60" role="status">
+                  No agent actions yet.
+                </p>
+              ) : (
+                <ul class="m-0 flex min-w-0 list-none flex-col gap-2 p-0">
+                  {actions.state.actions.slice(0, 5).map((a) => (
+                    <li key={a.id} class="flex min-w-0 items-center gap-2.5 text-[13px]">
+                      <span class={`badge badge-soft ${outcomeBadge(a.outcome)} shrink-0`} title={a.outcome}>
+                        {a.outcome}
+                      </span>
+                      <span class="min-w-0 flex-1 truncate font-mono text-xs" title={a.summary}>
+                        {a.summary || a.tool}
+                      </span>
+                      <span class="shrink-0 whitespace-nowrap text-xs opacity-60" title={when(a.at)}>
+                        {timeAgo(a.at)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ))}
+          </div>
         </section>
       </div>
       {errors.kind === "ready" && errors.value.issues.length > 0 && (
-        <section class="card" aria-label="Open errors">
-          <div class="card-head">
-            <h2>Open errors</h2>
-            <button
-              type="button"
-              class="link-btn"
-              onclick={() => onView("errors")}
-            >
-              View all
-            </button>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Open errors">
+          <div class="card-body min-w-0">
+            <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+              <h2 class="card-title min-w-0 truncate" title="Open errors">Open errors</h2>
+              <button
+                type="button"
+                class="link shrink-0 text-sm"
+                onclick={() => onView("errors")}
+              >
+                View all
+              </button>
+            </div>
+            <ul class="m-0 flex min-w-0 list-none flex-col gap-2 p-0">
+              {errors.value.issues
+                .filter((i) => i.status === "open")
+                .slice(0, 3)
+                .map((i) => (
+                  <li key={i.fingerprint} class="flex min-w-0 items-center gap-2.5 text-[13px]">
+                    <span class="min-w-0 flex-1 truncate font-mono text-xs" title={i.message}>
+                      {i.message}
+                    </span>
+                    <span class="shrink-0 whitespace-nowrap text-xs opacity-60">
+                      {i.count.toLocaleString()}× ·{" "}
+                      <span title={when(i.last_seen)}>{timeAgo(i.last_seen)}</span>
+                    </span>
+                  </li>
+                ))}
+            </ul>
           </div>
-          <ul class="mini-list">
-            {errors.value.issues
-              .filter((i) => i.status === "open")
-              .slice(0, 3)
-              .map((i) => (
-                <li key={i.fingerprint} class="mini-row">
-                  <span class="mono trim" title={i.message}>
-                    {i.message}
-                  </span>
-                  <span class="muted">
-                    {i.count.toLocaleString()}× ·{" "}
-                    <span title={when(i.last_seen)}>{timeAgo(i.last_seen)}</span>
-                  </span>
-                </li>
-              ))}
-          </ul>
         </section>
       )}
     </div>
@@ -556,16 +566,14 @@ export function OverviewView({
 function OverviewReady({
   summary,
   hours,
-  onRange,
 }: {
   summary: MetricsSummary;
   hours: number;
-  onRange: (hours: number) => void;
 }) {
   const errorRate = fmtRate(summary.s5xx, summary.requests);
   return (
-    <div class="stack">
-      <div class="stat-grid">
+    <div class="flex min-w-0 flex-col gap-3">
+      <div class="stats stats-vertical bg-base-100 border border-base-300 min-w-0 xl:stats-horizontal">
         <StatCard
           icon={<MetricsIcon size={16} />}
           label="Requests"
@@ -594,40 +602,39 @@ function OverviewReady({
           sub="response headers"
         />
       </div>
-      <section class="card" aria-label="Requests chart">
-        <div class="card-head">
-          <h2>Requests</h2>
-          <div class="legend">
-            <span class="legend-item">
-              <span class="swatch swatch-dark" aria-hidden="true" />
-              This period
-            </span>
-            <span class="legend-item">
-              <span class="swatch swatch-light" aria-hidden="true" />
-              Errors (4xx + 5xx)
-            </span>
+      <section class="card card-border bg-base-100 min-w-0" aria-label="Requests chart">
+        <div class="card-body min-w-0">
+          <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+            <h2 class="card-title min-w-0 truncate" title="Requests">Requests</h2>
+            <div class="flex shrink-0 items-center gap-4 text-xs opacity-60">
+              <span class="flex min-w-0 items-center gap-1.5">
+                <span class="inline-block h-[3px] w-3.5 shrink-0 rounded bg-base-content" aria-hidden="true" />
+                This period
+              </span>
+              <span class="flex min-w-0 items-center gap-1.5">
+                <span class="inline-block h-[3px] w-3.5 shrink-0 rounded bg-base-content opacity-40" aria-hidden="true" />
+                Errors (4xx + 5xx)
+              </span>
+            </div>
           </div>
+          {summary.buckets.length === 0 ? (
+            <p class="m-0 min-w-0 opacity-60" role="status">
+              No traffic in this range.
+            </p>
+          ) : (
+            <RequestsLine buckets={summary.buckets} hours={hours} />
+          )}
         </div>
-        {summary.buckets.length === 0 ? (
-          <p class="muted" role="status">
-            No traffic in this range.
-          </p>
-        ) : (
-          <RequestsLine buckets={summary.buckets} hours={hours} />
-        )}
       </section>
     </div>
   );
 }
 
 // --- Metrics -------------------------------------------------------------------
-
 export function MetricsView({
   metrics,
-  onRange,
 }: {
   metrics: Panel<{ hours: number; summary: MetricsSummary }>;
-  onRange: (hours: number) => void;
 }) {
   if (metrics.kind === "loading") {
     return <Loading label="Loading metrics" />;
@@ -638,8 +645,8 @@ export function MetricsView({
   const { summary, hours } = metrics.value;
   const errorRate = fmtRate(summary.s5xx, summary.requests);
   return (
-    <div class="stack">
-      <div class="stat-grid">
+    <div class="flex min-w-0 flex-col gap-3">
+      <div class="stats stats-vertical bg-base-100 border border-base-300 min-w-0 xl:stats-horizontal">
         <StatCard
           icon={<MetricsIcon size={16} />}
           label="Requests"
@@ -668,50 +675,59 @@ export function MetricsView({
           sub="response headers"
         />
       </div>
-      <section class="card" aria-label={summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}>
-        <div class="card-head">
-          <h2>{summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}</h2>
-        </div>
-        {summary.buckets.length === 0 ? (
-          <p class="muted" role="status">
-            No traffic in this range.
-          </p>
-        ) : (
-          <Bars buckets={summary.buckets} hours={hours} />
-        )}
-      </section>
-      <section class="card" aria-label="Top paths">
-        <div class="card-head">
-          <h2>Top paths</h2>
-        </div>
-        {summary.top_paths.length === 0 ? (
-          <p class="muted" role="status">
-            No paths recorded in this range.
-          </p>
-        ) : (
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">Path</th>
-                  <th scope="col">Requests</th>
-                  <th scope="col">5xx</th>
-                </tr>
-              </thead>
-              <tbody>
-                {summary.top_paths.map((p) => (
-                  <tr key={p.path}>
-                    <td class="mono trim" title={p.path}>
-                      {p.path}
-                    </td>
-                    <td>{p.requests.toLocaleString()}</td>
-                    <td>{p.s5xx.toLocaleString()}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      <section class="card card-border bg-base-100 min-w-0" aria-label={summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}>
+        <div class="card-body min-w-0">
+          <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+            <h2 class="card-title min-w-0 truncate" title={summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}>{summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}</h2>
           </div>
-        )}
+          {summary.buckets.length === 0 ? (
+            <p class="m-0 min-w-0 opacity-60" role="status">
+              No traffic in this range.
+            </p>
+          ) : (
+            <Bars buckets={summary.buckets} hours={hours} />
+          )}
+        </div>
+      </section>
+      <section class="card card-border bg-base-100 min-w-0" aria-label="Top paths">
+        <div class="card-body min-w-0">
+          <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+            <h2 class="card-title min-w-0 truncate" title="Top paths">Top paths</h2>
+          </div>
+          {summary.top_paths.length === 0 ? (
+            <p class="m-0 min-w-0 opacity-60" role="status">
+              No paths recorded in this range.
+            </p>
+          ) : (
+            <div class="min-w-0 overflow-x-auto">
+              <table class="table table-fixed w-full">
+                <colgroup>
+                  <col />
+                  <col class="w-24" />
+                  <col class="w-20" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col">Path</th>
+                    <th scope="col">Requests</th>
+                    <th scope="col">5xx</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {summary.top_paths.map((p) => (
+                    <tr key={p.path}>
+                      <td class="truncate font-mono" title={p.path}>
+                        {p.path}
+                      </td>
+                      <td class="whitespace-nowrap">{p.requests.toLocaleString()}</td>
+                      <td class="whitespace-nowrap">{p.s5xx.toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </section>
     </div>
   );
@@ -738,78 +754,91 @@ export function ActionsView({
     return <Empty>No agent actions yet.</Empty>;
   }
   return (
-    <section class="card" aria-label="Agent actions">
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Time</th>
-              <th scope="col">Client</th>
-              <th scope="col">Tool</th>
-              <th scope="col">Summary</th>
-              <th scope="col">Outcome</th>
-              <th scope="col">Duration</th>
-            </tr>
-          </thead>
-          <tbody>
-            {actions.map((a) => (
-              <tr key={a.id}>
-                <td class="nowrap" title={when(a.at)}>
-                  {timeAgo(a.at)}
-                </td>
-                <td>{a.by}</td>
-                <td class="mono">{a.tool}</td>
-                <td class="mono wrap" title={a.summary}>
-                  {a.summary}
-                </td>
-                <td>
-                  <span class={`pill ${outcomeClass(a.outcome)}`}>
-                    {a.outcome}
-                  </span>
-                  {a.error_code && (
-                    <span class="mono muted"> {a.error_code}</span>
-                  )}
-                </td>
-                <td class="nowrap">{`${(a.duration_ms / 1000).toFixed(1)}s`}</td>
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Agent actions">
+      <div class="card-body min-w-0">
+        <div class="min-w-0 overflow-x-auto">
+          <table class="table table-fixed w-full">
+            <colgroup>
+              <col class="w-20" />
+              <col class="w-24" />
+              <col class="w-28" />
+              <col />
+              <col class="w-28" />
+              <col class="w-20" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Time</th>
+                <th scope="col">Client</th>
+                <th scope="col">Tool</th>
+                <th scope="col">Summary</th>
+                <th scope="col">Outcome</th>
+                <th scope="col">Duration</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {actions.map((a) => (
+                <tr key={a.id}>
+                  <td class="whitespace-nowrap" title={when(a.at)}>
+                    {timeAgo(a.at)}
+                  </td>
+                  <td class="truncate" title={a.by}>{a.by}</td>
+                  <td class="truncate font-mono" title={a.tool}>{a.tool}</td>
+                  <td class="truncate font-mono" title={a.summary}>
+                    {a.summary}
+                  </td>
+                  <td class="min-w-0">
+                    <span class={`badge badge-soft ${outcomeBadge(a.outcome)}`} title={a.outcome}>
+                      {a.outcome}
+                    </span>
+                    {a.error_code && (
+                      <span class="block truncate font-mono opacity-60" title={a.error_code}>
+                        {a.error_code}
+                      </span>
+                    )}
+                  </td>
+                  <td class="whitespace-nowrap">{`${(a.duration_ms / 1000).toFixed(1)}s`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {moreError && (
+          <p class="m-0 min-w-0 break-words opacity-60" role="alert">
+            Couldn't load more actions: {moreError}
+          </p>
+        )}
+        {next && (
+          <button
+            type="button"
+            class="btn mt-3"
+            disabled={loadingMore}
+            onclick={onMore}
+          >
+            {loadingMore && <span class="loading loading-spinner loading-sm" aria-hidden="true" />}
+            {loadingMore ? "Loading…" : "Load more"}
+          </button>
+        )}
       </div>
-      {moreError && (
-        <p class="muted" role="alert">
-          Couldn't load more actions: {moreError}
-        </p>
-      )}
-      {next && (
-        <button
-          type="button"
-          class="btn"
-          disabled={loadingMore}
-          onclick={onMore}
-        >
-          {loadingMore ? "Loading…" : "Load more"}
-        </button>
-      )}
     </section>
   );
 }
 
 // --- Deploys -------------------------------------------------------------------
-// Ported from Noite's deploys.tsx: status pill, sha + copy, expandable row.
+// Ported from Noite's deploys.tsx: status badge, sha + copy, expandable row.
 
 function DeployRow({ deploy }: { deploy: ConsoleDeploy }) {
   return (
-    <div class="deploy-row">
-      <span class={`pill ${statusClass(deploy.status)}`}>{deploy.status}</span>
-      <span class="mono" title={deploy.sha}>
+    <div class="flex min-w-0 items-center gap-2.5 text-[13px]">
+      <span class={`badge badge-soft ${statusBadge(deploy.status)} shrink-0`} title={deploy.status}>{deploy.status}</span>
+      <span class="shrink-0 truncate font-mono" title={deploy.sha}>
         {shortSha(deploy.sha)}
       </span>
       <CopyButton value={deploy.sha} label="Copy full SHA" />
-      <span class="muted nowrap" title={when(deploy.created_at)}>
+      <span class="shrink-0 whitespace-nowrap text-xs opacity-60" title={when(deploy.created_at)}>
         {timeAgo(deploy.created_at)}
       </span>
-      <span class="muted nowrap">
+      <span class="shrink-0 whitespace-nowrap text-xs opacity-60">
         {deploy.duration_ms == null
           ? ""
           : `${(deploy.duration_ms / 1000).toFixed(1)}s`}
@@ -831,64 +860,63 @@ export function DeploysView({
     return <Empty>No deploys yet.</Empty>;
   }
   return (
-    <div class="stack">
+    <div class="flex min-w-0 flex-col gap-3">
       {app.deploys.map((d) => {
         const open = expanded.includes(d.deploy_id);
         return (
-          <section class="card" key={d.deploy_id} aria-label={`Deploy ${shortSha(d.sha)}`}>
+          <section class={`collapse collapse-arrow border border-base-300 bg-base-100 min-w-0 ${open ? "collapse-open" : "collapse-close"}`} key={d.deploy_id} aria-label={`Deploy ${shortSha(d.sha)}`}>
             <button
               type="button"
-              class="deploy-head"
+              class="collapse-title flex min-w-0 items-center gap-2.5 text-left text-sm"
               aria-expanded={open}
               onclick={() => onToggle(d.deploy_id)}
             >
-              <span class={`pill ${statusClass(d.status)}`}>{d.status}</span>
-              <span class="mono" title={d.sha}>
+              <span class={`badge badge-soft ${statusBadge(d.status)} shrink-0`} title={d.status}>{d.status}</span>
+              <span class="min-w-0 flex-1 truncate font-mono" title={d.sha}>
                 {shortSha(d.sha)}
               </span>
-              <span class="muted nowrap" title={when(d.created_at)}>
+              <span class="shrink-0 whitespace-nowrap text-xs opacity-60" title={when(d.created_at)}>
                 {timeAgo(d.created_at)}
               </span>
-              <span class="muted nowrap">
+              <span class="shrink-0 whitespace-nowrap text-xs opacity-60">
                 {d.duration_ms == null
                   ? ""
                   : `${(d.duration_ms / 1000).toFixed(1)}s`}
               </span>
-              <span class="deploy-chevron" aria-hidden="true">
-                <ChevronDownIcon />
-              </span>
             </button>
             {open && (
-              <div class="deploy-detail">
-                <div class="detail-row">
-                  <span class="muted">Commit</span>
-                  <span>
-                    <span class="mono">{d.sha}</span>{" "}
-                    <CopyButton value={d.sha} label="Copy full SHA" />
-                  </span>
+              <div class="collapse-content min-w-0">
+                <div class="flex min-w-0 flex-col gap-2 text-[13px]">
+                  <div class="flex min-w-0 gap-3">
+                    <span class="w-[90px] shrink-0 opacity-60">Commit</span>
+                    <span class="flex min-w-0 items-center gap-2">
+                      <span class="min-w-0 flex-1 truncate font-mono" title={d.sha}>{d.sha}</span>
+                      <CopyButton value={d.sha} label="Copy full SHA" />
+                    </span>
+                  </div>
+                  <div class="flex min-w-0 gap-3">
+                    <span class="w-[90px] shrink-0 opacity-60">Created</span>
+                    <span class="min-w-0 flex-1 truncate" title={when(d.created_at)}>{when(d.created_at)}</span>
+                  </div>
+                  <div class="flex min-w-0 gap-3">
+                    <span class="w-[90px] shrink-0 opacity-60">Findings</span>
+                    <span class="min-w-0 flex-1 truncate">{d.findings_count}</span>
+                  </div>
+                  <div class="flex min-w-0 gap-3">
+                    <span class="w-[90px] shrink-0 opacity-60">URL</span>
+                    <span class="flex min-w-0 items-center gap-2">
+                      <a class="link min-w-0 flex-1 truncate" href={app.url} title={app.url}>
+                        {app.url}
+                      </a>
+                      <CopyButton value={app.url} label="Copy app URL" />
+                    </span>
+                  </div>
+                  {d.message && (
+                    <p class="alert alert-error alert-soft m-0 min-w-0" role="alert">
+                      <span class="min-w-0 break-all" title={d.message}>{d.message}</span>
+                    </p>
+                  )}
                 </div>
-                <div class="detail-row">
-                  <span class="muted">Created</span>
-                  <span title={when(d.created_at)}>{when(d.created_at)}</span>
-                </div>
-                <div class="detail-row">
-                  <span class="muted">Findings</span>
-                  <span>{d.findings_count}</span>
-                </div>
-                <div class="detail-row">
-                  <span class="muted">URL</span>
-                  <span>
-                    <a class="link" href={app.url}>
-                      {app.url}
-                    </a>{" "}
-                    <CopyButton value={app.url} label="Copy app URL" />
-                  </span>
-                </div>
-                {d.message && (
-                  <p class="deploy-message" role="alert">
-                    {d.message}
-                  </p>
-                )}
               </div>
             )}
           </section>
@@ -915,38 +943,40 @@ export function LogsView({
   }
   const lines = panel.value;
   return (
-    <section class="card" aria-label="Logs">
-      <div class="card-head">
-        <h2>
-          Recent logs{" "}
-          <span class="muted">
-            ({lines.length.toLocaleString()} lines)
-          </span>
-        </h2>
-        <button type="button" class="btn" onclick={onRefresh}>
-          Refresh
-        </button>
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Logs">
+      <div class="card-body min-w-0">
+        <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+          <h2 class="card-title min-w-0 truncate" title={`Recent logs (${lines.length.toLocaleString()} lines)`}>
+            Recent logs{" "}
+            <span class="opacity-60">
+              ({lines.length.toLocaleString()} lines)
+            </span>
+          </h2>
+          <button type="button" class="btn btn-sm shrink-0" onclick={onRefresh}>
+            Refresh
+          </button>
+        </div>
+        {lines.length === 0 ? (
+          <p class="m-0 min-w-0 opacity-60" role="status">
+            No log lines yet.
+          </p>
+        ) : (
+          <ol class="log-list">
+            {lines.map((entry) => (
+              <li
+                key={entry.seq}
+                class={`log-line is-${entry.stream}`}
+                title={when(entry.ts)}
+              >
+                <span class="log-stream" aria-hidden="true">
+                  {entry.stream === "stderr" ? "!" : ">"}
+                </span>
+                <code>{entry.line}</code>
+              </li>
+            ))}
+          </ol>
+        )}
       </div>
-      {lines.length === 0 ? (
-        <p class="muted" role="status">
-          No log lines yet.
-        </p>
-      ) : (
-        <ol class="log-list">
-          {lines.map((entry) => (
-            <li
-              key={entry.seq}
-              class={`log-line is-${entry.stream}`}
-              title={when(entry.ts)}
-            >
-              <span class="log-stream" aria-hidden="true">
-                {entry.stream === "stderr" ? "!" : ">"}
-              </span>
-              <code>{entry.line}</code>
-            </li>
-          ))}
-        </ol>
-      )}
     </section>
   );
 }
@@ -971,52 +1001,60 @@ export function ErrorsView({ panel }: { panel: Panel<ErrorsSummary> }) {
     );
   }
   return (
-    <section class="card" aria-label="Errors">
-      <div class="card-head">
-        <h2>Errors</h2>
-        <span class="muted">
-          {s5xx_last_hour.toLocaleString()} proxy 5xx in the last hour
-        </span>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Last seen</th>
-              <th scope="col">Error</th>
-              <th scope="col">Seen</th>
-              <th scope="col">First seen</th>
-              <th scope="col">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {issues.map((issue) => (
-              <tr key={issue.fingerprint}>
-                <td class="nowrap" title={when(issue.last_seen)}>
-                  {timeAgo(issue.last_seen)}
-                </td>
-                <td class="mono wrap">
-                  {issue.message}
-                  {issue.frame && (
-                    <span class="muted">
-                      <br />
-                      {issue.frame}
-                    </span>
-                  )}
-                </td>
-                <td class="nowrap">{issue.count.toLocaleString()}×</td>
-                <td class="nowrap" title={when(issue.first_seen)}>
-                  {timeAgo(issue.first_seen)}
-                </td>
-                <td>
-                  <span class={`pill ${outcomeClass(issue.status)}`}>
-                    {issue.status}
-                  </span>
-                </td>
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Errors">
+      <div class="card-body min-w-0">
+        <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+          <h2 class="card-title min-w-0 truncate" title="Errors">Errors</h2>
+          <span class="min-w-0 shrink-0 truncate text-xs opacity-60" title={`${s5xx_last_hour.toLocaleString()} proxy 5xx in the last hour`}>
+            {s5xx_last_hour.toLocaleString()} proxy 5xx in the last hour
+          </span>
+        </div>
+        <div class="min-w-0 overflow-x-auto">
+          <table class="table table-fixed w-full">
+            <colgroup>
+              <col class="w-24" />
+              <col />
+              <col class="w-20" />
+              <col class="w-24" />
+              <col class="w-24" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Last seen</th>
+                <th scope="col">Error</th>
+                <th scope="col">Seen</th>
+                <th scope="col">First seen</th>
+                <th scope="col">Status</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {issues.map((issue) => (
+                <tr key={issue.fingerprint}>
+                  <td class="whitespace-nowrap" title={when(issue.last_seen)}>
+                    {timeAgo(issue.last_seen)}
+                  </td>
+                  <td class="min-w-0 truncate font-mono" title={issue.frame ? `${issue.message}\n${issue.frame}` : issue.message}>
+                    {issue.message}
+                    {issue.frame && (
+                      <span class="block truncate opacity-60" title={issue.frame}>
+                        {issue.frame}
+                      </span>
+                    )}
+                  </td>
+                  <td class="whitespace-nowrap">{issue.count.toLocaleString()}×</td>
+                  <td class="whitespace-nowrap" title={when(issue.first_seen)}>
+                    {timeAgo(issue.first_seen)}
+                  </td>
+                  <td class="min-w-0">
+                    <span class={`badge badge-soft ${outcomeBadge(issue.status)}`} title={issue.status}>
+                      {issue.status}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
   );
@@ -1033,40 +1071,50 @@ export function SecretsView({ panel }: { panel: Panel<SecretsSummary> }) {
   }
   const secrets = panel.value.secrets;
   return (
-    <div class="stack">
-      <section class="card" aria-label="About secrets">
-        <p class="muted">
-          Names only — values never leave the server. Your agent manages them
-          over MCP (`list_secrets`, `set_secret`, `unset_secret`); they reach
-          the app as Worker env vars on the next deploy.
-        </p>
+    <div class="flex min-w-0 flex-col gap-3">
+      <section class="card card-border bg-base-100 min-w-0" aria-label="About secrets">
+        <div class="card-body min-w-0">
+          <p class="m-0 min-w-0 break-words opacity-60">
+            Names only — values never leave the server. Your agent manages them
+            over MCP (`list_secrets`, `set_secret`, `unset_secret`); they reach
+            the app as Worker env vars on the next deploy.
+          </p>
+        </div>
       </section>
       {secrets.length === 0 ? (
         <Empty>No secrets set.</Empty>
       ) : (
-        <section class="card" aria-label="Secrets">
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">Name</th>
-                  <th scope="col">Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                {secrets.map((s) => (
-                  <tr key={s.name}>
-                    <td>
-                      <span class="mono">{s.name}</span>{" "}
-                      <CopyButton value={s.name} label={`Copy ${s.name}`} />
-                    </td>
-                    <td class="nowrap" title={when(s.updated_at)}>
-                      {timeAgo(s.updated_at)}
-                    </td>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Secrets">
+          <div class="card-body min-w-0">
+            <div class="min-w-0 overflow-x-auto">
+              <table class="table table-fixed w-full">
+                <colgroup>
+                  <col />
+                  <col class="w-28" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col">Name</th>
+                    <th scope="col">Updated</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {secrets.map((s) => (
+                    <tr key={s.name}>
+                      <td class="min-w-0">
+                        <span class="flex min-w-0 items-center gap-2">
+                          <span class="min-w-0 flex-1 truncate font-mono" title={s.name}>{s.name}</span>
+                          <CopyButton value={s.name} label={`Copy ${s.name}`} />
+                        </span>
+                      </td>
+                      <td class="whitespace-nowrap" title={when(s.updated_at)}>
+                        {timeAgo(s.updated_at)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </section>
       )}
@@ -1078,51 +1126,53 @@ export function SecretsView({ panel }: { panel: Panel<SecretsSummary> }) {
 
 export function SettingsView({ app }: { app: AppDetail }) {
   return (
-    <div class="stack">
-      <section class="card" aria-label="Settings">
-        <p class="muted">
-          Read-only for now — your agent manages these over MCP.
-        </p>
-        <dl class="def-list">
-          <div class="detail-row">
-            <dt class="muted">App</dt>
-            <dd>
-              <span class="mono">{app.slug}</span>{" "}
-              <CopyButton value={app.slug} label="Copy app slug" />
-            </dd>
-          </div>
-          <div class="detail-row">
-            <dt class="muted">URL</dt>
-            <dd>
-              <a class="link" href={app.url}>
-                {app.url}
-              </a>{" "}
-              <CopyButton value={app.url} label="Copy app URL" />
-            </dd>
-          </div>
-          <div class="detail-row">
-            <dt class="muted">Visibility</dt>
-            <dd>{app.visibility}</dd>
-          </div>
-          <div class="detail-row">
-            <dt class="muted">Status</dt>
-            <dd>
-              <span class={`pill ${statusClass(app.status)}`}>
-                {app.status}
-              </span>
-            </dd>
-          </div>
-          <div class="detail-row">
-            <dt class="muted">Your role</dt>
-            <dd>{app.role}</dd>
-          </div>
-          <div class="detail-row">
-            <dt class="muted">Last request</dt>
-            <dd title={app.last_request_at ? when(app.last_request_at) : ""}>
-              {app.last_request_at ? timeAgo(app.last_request_at) : "never"}
-            </dd>
-          </div>
-        </dl>
+    <div class="flex min-w-0 flex-col gap-3">
+      <section class="card card-border bg-base-100 min-w-0" aria-label="Settings">
+        <div class="card-body min-w-0">
+          <p class="m-0 min-w-0 opacity-60">
+            Read-only for now — your agent manages these over MCP.
+          </p>
+          <dl class="m-0 mt-3 flex min-w-0 flex-col gap-2">
+            <div class="flex min-w-0 gap-3 text-[13px]">
+              <dt class="w-[90px] shrink-0 opacity-60">App</dt>
+              <dd class="m-0 flex min-w-0 items-center gap-2">
+                <span class="min-w-0 flex-1 truncate font-mono" title={app.slug}>{app.slug}</span>
+                <CopyButton value={app.slug} label="Copy app slug" />
+              </dd>
+            </div>
+            <div class="flex min-w-0 gap-3 text-[13px]">
+              <dt class="w-[90px] shrink-0 opacity-60">URL</dt>
+              <dd class="m-0 flex min-w-0 items-center gap-2">
+                <a class="link min-w-0 flex-1 truncate" href={app.url} title={app.url}>
+                  {app.url}
+                </a>
+                <CopyButton value={app.url} label="Copy app URL" />
+              </dd>
+            </div>
+            <div class="flex min-w-0 gap-3 text-[13px]">
+              <dt class="w-[90px] shrink-0 opacity-60">Visibility</dt>
+              <dd class="m-0 min-w-0 flex-1 truncate" title={app.visibility}>{app.visibility}</dd>
+            </div>
+            <div class="flex min-w-0 gap-3 text-[13px]">
+              <dt class="w-[90px] shrink-0 opacity-60">Status</dt>
+              <dd class="m-0 min-w-0 flex-1">
+                <span class={`badge badge-soft ${statusBadge(app.status)}`} title={app.status}>
+                  {app.status}
+                </span>
+              </dd>
+            </div>
+            <div class="flex min-w-0 gap-3 text-[13px]">
+              <dt class="w-[90px] shrink-0 opacity-60">Your role</dt>
+              <dd class="m-0 min-w-0 flex-1 truncate" title={app.role}>{app.role}</dd>
+            </div>
+            <div class="flex min-w-0 gap-3 text-[13px]">
+              <dt class="w-[90px] shrink-0 opacity-60">Last request</dt>
+              <dd class="m-0 min-w-0 flex-1 truncate" title={app.last_request_at ? when(app.last_request_at) : ""}>
+                {app.last_request_at ? timeAgo(app.last_request_at) : "never"}
+              </dd>
+            </div>
+          </dl>
+        </div>
       </section>
     </div>
   );
