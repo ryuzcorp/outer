@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request};
@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use crate::apps;
 use crate::fleet::manager::FleetManager;
 use crate::http::client_ip::{cf_connecting_ip, client_ip};
+use crate::observe::metrics::{MetricsAgg, RequestRecord};
 
 /// State the integration owner mounts as the fallback for every `Host`
 /// other than the platform host.
@@ -35,6 +36,9 @@ pub struct ProxyState {
     /// Last `touch_request` write per app: `touch_request` writes at most
     /// [`TOUCH_EVERY_MS`] often per app.
     pub last_touch_ms: Arc<Mutex<HashMap<String, i64>>>,
+    /// Per-app request metrics (spec §13): owned here, flushed to SQLite by
+    /// the sweep task. Cloning shares the same counters, never global.
+    pub metrics: MetricsAgg,
 }
 
 impl ProxyState {
@@ -45,6 +49,7 @@ impl ProxyState {
         fleets: FleetManager,
         apps_domain: String,
         origin_locked: bool,
+        metrics: MetricsAgg,
     ) -> Self {
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
         let client =
@@ -58,6 +63,7 @@ impl ProxyState {
             origin_locked,
             client,
             last_touch_ms: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         }
     }
 }
@@ -176,6 +182,15 @@ async fn touch_once(state: &ProxyState, app_id: &str) {
     }
 }
 
+/// Bytes the upstream claims in `Content-Length`, else 0. Chunked/streamed
+/// bodies are never buffered to count them (see `observe::metrics`).
+fn response_bytes(res: &hyper::Response<hyper::body::Incoming>) -> u64 {
+    res.headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse::<u64>().ok())
+        .unwrap_or(0)
+}
 /// Map an upstream response back onto the downstream connection: status,
 /// end-to-end headers, streaming body. Hop-by-hop headers go both ways,
 /// including any the upstream nominates through `Connection`;
@@ -279,6 +294,27 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
+    // Outer's own traffic is never app usage: the celld health gate the
+    // wake path probes directly is excluded even when it arrives here.
+    let raw_path = parts.uri.path();
+    let metered = raw_path != "/.well-known/celld/health";
+    // Recorded iff forwarded: only requests that reach the fleet's port
+    // (or fail connecting to it) count. Outer's synthetic answers above
+    // return before this closure can run.
+    let meter = |status: u16, latency_ms: u64, bytes_out: u64| {
+        if !metered {
+            return;
+        }
+        state.metrics.record(RequestRecord {
+            now_ms: apps::now_ms(),
+            app_id: &app.id,
+            path: raw_path,
+            status,
+            latency_ms,
+            bytes_out,
+            client_ip: client_ip.as_deref(),
+        });
+    };
     let uri = format!("http://127.0.0.1:{}{path}", app.port);
     let mut outbound = hyper::Request::builder()
         .method(parts.method)
@@ -311,7 +347,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // Fresh chain: client-supplied `x-forwarded-for` was dropped above, so
     // upstream sees exactly one value: the attested client IP when
     // origin-locked, else the real peer IP.
-    if let Some(ip) = client_ip {
+    if let Some(ip) = client_ip.as_deref() {
         outbound = outbound.header("x-forwarded-for", ip);
     }
     if state.origin_locked {
@@ -327,10 +363,18 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         Ok(req) => req,
         Err(_) => return text(StatusCode::BAD_GATEWAY, "app unavailable"),
     };
+    // Proxy-observed latency: time to response headers (or to the send
+    // failing), excluding the fleet wake above.
+    let upstream_start = Instant::now();
     let mut upstream = match state.client.request(outbound).await {
         Ok(res) => res,
         Err(err) => {
             tracing::warn!(slug = %app.slug, error = %err, "upstream connect failed");
+            meter(
+                StatusCode::BAD_GATEWAY.as_u16(),
+                upstream_start.elapsed().as_millis() as u64,
+                0,
+            );
             return text(StatusCode::BAD_GATEWAY, "app unavailable");
         }
     };
@@ -346,10 +390,20 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
                 let mut client = hyper_util::rt::TokioIo::new(client);
                 let _ = tokio::io::copy_bidirectional(&mut server, &mut client).await;
             });
+            meter(
+                StatusCode::SWITCHING_PROTOCOLS.as_u16(),
+                upstream_start.elapsed().as_millis() as u64,
+                0,
+            );
             return from_upstream(upstream, is_unlisted);
         }
     }
-    from_upstream(upstream, is_unlisted)
+    let status = upstream.status();
+    let bytes_out = response_bytes(&upstream);
+    let latency_ms = upstream_start.elapsed().as_millis() as u64;
+    let response = from_upstream(upstream, is_unlisted);
+    meter(status.as_u16(), latency_ms, bytes_out);
+    response
 }
 
 #[cfg(test)]
@@ -545,6 +599,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         for host in [
             "shop.other.com",
@@ -581,6 +636,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let req = Request::builder()
             .method("POST")
@@ -618,6 +674,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let before = fleet.hits.load(Ordering::SeqCst);
         let req = Request::builder()
@@ -654,6 +711,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let req = Request::builder()
             .uri("/robots.txt")
@@ -677,6 +735,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let req = Request::builder()
             .uri("/")
@@ -720,6 +779,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let (before,): (Option<i64>,) =
             sqlx::query_as("SELECT last_request_at FROM app WHERE id = 'app-touch'")
@@ -752,6 +812,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let req = Request::builder()
             .uri("/")
@@ -799,6 +860,7 @@ mod tests {
             }),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let req = Request::builder()
             .uri("/")
@@ -835,6 +897,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let req = Request::builder()
             .uri("/nominated")
@@ -862,6 +925,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let mut req = Request::builder()
             .uri("/")
@@ -899,6 +963,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             true,
+            MetricsAgg::new(),
         );
         let mut req = Request::builder()
             .uri("/")
@@ -926,6 +991,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             false,
+            MetricsAgg::new(),
         );
         let mut req = Request::builder()
             .uri("/")
@@ -959,6 +1025,7 @@ mod tests {
             manager(fix._dir.path()),
             "outer.test".to_string(),
             true,
+            MetricsAgg::new(),
         );
         let mut req = Request::builder()
             .uri("/")
@@ -976,5 +1043,85 @@ mod tests {
             got["headers"].get("cf-connecting-ip").is_none(),
             "an invalid cf-connecting-ip must not reach upstream"
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_requests_count_for_that_app_only() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(
+            &fix.pool,
+            "app-metered",
+            "metered",
+            fleet.addr.port(),
+            "public",
+        )
+        .await;
+        // Idle rows only (never requested, so nothing wakes them): they
+        // prove a flush attributes counts to exactly the hit app.
+        insert_app(
+            &fix.pool,
+            "app-other",
+            "other",
+            fleet.addr.port() + 1,
+            "public",
+        )
+        .await;
+        insert_app(
+            &fix.pool,
+            "app-quiet2",
+            "quiet2",
+            fleet.addr.port() + 2,
+            "unlisted",
+        )
+        .await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        async fn get(state: &ProxyState, host: &str, uri: &str) -> (StatusCode, String) {
+            let mut req = Request::builder()
+                .uri(uri)
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo("9.9.9.9:1234".parse::<SocketAddr>().unwrap()));
+            let (status, _, body) =
+                body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+            (status, body)
+        }
+        for _ in 0..3 {
+            let (status, _) = get(&state, "metered.outer.test", "/items/42").await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        // Excluded from metrics: the celld health gate, the unlisted
+        // robots override Outer serves itself, and unknown hosts.
+        let (status, _) = get(&state, "metered.outer.test", "/.well-known/celld/health").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&state, "quiet2.outer.test", "/robots.txt").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&state, "ghost.outer.test", "/").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        state.metrics.flush(&fix.pool).await.unwrap();
+        let minutes: Vec<(String, i64, i64)> =
+            sqlx::query_as("SELECT app_id, requests, visitors FROM metric_minute ORDER BY app_id")
+                .fetch_all(&fix.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            minutes,
+            [("app-metered".to_string(), 3, 1)],
+            "three hits from one peer IP: 3 requests, 1 visitor; nothing else counts"
+        );
+        let paths: Vec<(String, i64)> =
+            sqlx::query_as("SELECT path, requests FROM path_hour ORDER BY path")
+                .fetch_all(&fix.pool)
+                .await
+                .unwrap();
+        assert_eq!(paths, [("/items/:id".to_string(), 3)]);
     }
 }

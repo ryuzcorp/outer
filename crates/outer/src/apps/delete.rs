@@ -92,6 +92,7 @@ const CHILD_TABLES: &[&str] = &[
     "rollback_day",
     "metric_minute",
     "path_hour",
+    "visitor_day",
     "app_log",
     "error_issue",
     "agent_action",
