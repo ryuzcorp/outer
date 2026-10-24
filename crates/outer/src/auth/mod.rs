@@ -781,6 +781,7 @@ pub async fn resolve_bearer(
              FROM oauthAccessToken t JOIN oauthConsent c ON c.id = t.referenceId \
              JOIN user u ON u.id = c.userId \
              WHERE t.token = ? AND t.expiresAt > ? \
+               AND (t.revoked IS NULL OR t.revoked = 0) \
                AND c.revokedAt IS NULL AND u.banned = 0",
         )
         .bind(&hash)
@@ -811,9 +812,11 @@ pub async fn resolve_bearer(
     let row: Option<(String, String, String, Option<i64>)> = sqlx::query_as(
         "SELECT k.id, k.referenceId, u.email, k.lastRequest \
          FROM apikey k JOIN user u ON u.id = k.referenceId \
-         WHERE k.key = ? AND k.enabled != 0 AND u.banned = 0",
+         WHERE k.key = ? AND k.enabled != 0 AND u.banned = 0 \
+           AND (k.expiresAt IS NULL OR k.expiresAt > ?)",
     )
     .bind(&hash)
+    .bind(now)
     .fetch_optional(pool)
     .await?;
     let Some((key_id, account_id, email, last_used_at)) = row else {
