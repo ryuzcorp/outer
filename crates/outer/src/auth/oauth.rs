@@ -560,7 +560,9 @@ async fn authorize_post(
     }
 }
 
-/// Allow and deny redirects carry `iss` (RFC 9207) plus `state` when sent.
+/// Allow and deny hand the browser back to the client (see
+/// `pages::return_page` for why it isn't a 302). The URL carries `iss`
+/// (RFC 9207) plus `state` when sent.
 fn redirect(base: &str, params: &[(&str, &str)], state: Option<&str>, issuer: &str) -> Response {
     let mut url = match Url::parse(base) {
         Ok(url) => url,
@@ -582,7 +584,15 @@ fn redirect(base: &str, params: &[(&str, &str)], state: Option<&str>, issuer: &s
         }
         pairs.append_pair("iss", issuer);
     }
-    (StatusCode::FOUND, [("location", url.to_string())], "").into_response()
+    let host = match url.host_str() {
+        Some(host) => host.to_string(),
+        None => format!("{}:", url.scheme()),
+    };
+    html(
+        StatusCode::OK,
+        pages::return_page(url.as_str(), &host),
+        None,
+    )
 }
 
 /// `POST /oauth/register` (RFC 7591): public clients only, HTTPS or loopback
