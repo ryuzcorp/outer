@@ -784,7 +784,7 @@ export function Console() {
           <a class="rail-tile tooltip tooltip-right" data-tip="Docs" href="/" aria-label="Docs">
             <DocsIcon />
           </a>
-          <div class={`dropdown dropdown-right dropdown-top${ui().accountOpen ? " dropdown-open" : ""}`}>
+          <div class={`dropdown dropdown-right dropdown-end${ui().accountOpen ? " dropdown-open" : ""}`}>
             <button
               type="button"
               class="tooltip tooltip-right rounded-[14px]"
