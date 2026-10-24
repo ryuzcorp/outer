@@ -3063,14 +3063,18 @@ mod tests {
 
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().unwrap();
-        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
-            .await
-            .unwrap();
+        let pool = test_pool_in(dir.path()).await;
+        (dir, pool)
+    }
+    /// A pool whose database lives in `dir`; the caller keeps `dir` alive
+    /// for as long as the pool may open new connections.
+    async fn test_pool_in(dir: &Path) -> SqlitePool {
+        let pool = crate::db::open(&dir.join("outer.sqlite")).await.unwrap();
         sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('owner1', 'o@example.com', 0, 0, 0)")
             .execute(&pool)
             .await
             .unwrap();
-        (dir, pool)
+        pool
     }
     fn jev_client(base_url: &str) -> JevClient {
         let mut config = JevConfig::new(
@@ -3969,7 +3973,10 @@ exit 0
     ) {
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
-        let (_ddir, pool) = test_pool().await;
+        // The database lives in `data`, which the caller keeps: a TempDir
+        // dropped here would delete it while the pool can still open new
+        // connections ("unable to open database file", flaky in CI).
+        let pool = test_pool_in(data.path()).await;
         let app = test_app(10301);
         insert_test_app(&pool, &app).await;
         let key = crate::secrets::SecretsKey::test_key();
