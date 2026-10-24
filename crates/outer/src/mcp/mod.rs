@@ -7,6 +7,7 @@
 //! methods `−32601`, bad envelopes `−32600`, bad JSON `−32700` and bad
 //! params (including unknown tools) `−32602`.
 
+pub mod actions;
 pub mod docs;
 pub mod error;
 pub mod registry;
@@ -622,7 +623,24 @@ async fn handle_call(
         principal: caller,
         client_ip,
     };
-    match tools::dispatch(name, args, &ctx).await {
+    // The agent action log (spec §13.1): time the call, then record one row
+    // for app-targeting tools. Recording runs after the result is computed
+    // and never alters it: a failed insert only warns.
+    let started = std::time::Instant::now();
+    let outcome = tools::dispatch(name, args.clone(), &ctx).await;
+    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    if let Some(caller) = ctx.principal.as_ref() {
+        actions::record(
+            &state.pool,
+            caller,
+            name,
+            args.as_ref(),
+            &outcome,
+            duration_ms,
+        )
+        .await;
+    }
+    match outcome {
         Ok(result) => rpc_result(id, result),
         Err(tools::CallError::Rpc(code, message)) => rpc_error(Some(id), code, message),
         Err(tools::CallError::Tool(err)) => rpc_result(id, err.into_result()),

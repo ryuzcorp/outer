@@ -1718,3 +1718,326 @@ async fn delete_app_shows_as_destructive_in_tools_list() {
     assert_eq!(delete["annotations"]["destructiveHint"], true);
     assert_eq!(delete["annotations"]["readOnlyHint"], false);
 }
+
+async fn action_rows(state: &McpState, slug: &str) -> Vec<crate::mcp::actions::ActionRow> {
+    let id = app_id(state, slug).await;
+    crate::mcp::actions::list(&state.pool, &id, None, 50)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn agent_action_commit_logged_with_redacted_summary() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    let marker = "UNIQUE_BODY_MARKER_9Z8X7Y";
+    let body = format!("<h1>{marker}</h1>");
+    let (_, commit) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Add a header line",
+               "writes": [{"path": "pages/about.tsx", "content": body}]}),
+    )
+    .await;
+    assert_eq!(
+        result(&commit)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+
+    let rows = action_rows(&state, "groceries").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    // Newest first: the commit, then the create_app.
+    assert_eq!(rows[0].tool, "commit");
+    assert_eq!(rows[0].outcome, "success");
+    assert_eq!(rows[0].error_code, None);
+    assert!(
+        rows[0].summary.contains("pages/about.tsx"),
+        "{}",
+        rows[0].summary
+    );
+    assert!(
+        rows[0].summary.contains("Add a header line"),
+        "{}",
+        rows[0].summary
+    );
+    assert!(
+        rows[0].summary.contains("1 writes ("),
+        "{}",
+        rows[0].summary
+    );
+    assert!(
+        !rows[0].summary.contains(marker),
+        "file bodies never land in the log: {}",
+        rows[0].summary
+    );
+    assert_eq!(rows[1].tool, "create_app");
+    assert_eq!(rows[1].outcome, "success");
+    // API-key callers label with the key name (or its prefix when unnamed).
+    assert!(
+        rows[0].client_label.starts_with("API key"),
+        "{}",
+        rows[0].client_label
+    );
+    let key_ids: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT api_key_id FROM agent_action ORDER BY created_at")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(key_ids.len(), 2);
+    assert!(key_ids.iter().all(|id| id.is_some()), "{key_ids:?}");
+    let grants: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT grant_id FROM agent_action ORDER BY created_at")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+    assert!(grants.iter().all(|id| id.is_none()), "{grants:?}");
+}
+
+#[tokio::test]
+async fn agent_action_foreign_app_writes_nothing_and_failures_log_error() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+
+    // A stranger's slug answers not_found and writes nothing.
+    let (_, foreign) = call(&state, Some(&bob), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(is_error(&foreign)["error"], "not_found");
+    assert_eq!(action_rows(&state, "groceries").await.len(), 1);
+
+    // A failing call on the caller's own app logs outcome=error with the code.
+    let (_, bad) = call(
+        &state,
+        Some(&ana),
+        "set_visibility",
+        json!({"app": "groceries", "visibility": "everyone"}),
+    )
+    .await;
+    assert_eq!(is_error(&bad)["error"], "invalid_argument");
+    let rows = action_rows(&state, "groceries").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].tool, "set_visibility");
+    assert_eq!(rows[0].outcome, "error");
+    assert_eq!(rows[0].error_code.as_deref(), Some("invalid_argument"));
+    assert!(rows[0].summary.contains("everyone"), "{}", rows[0].summary);
+
+    // Arg-shape failures (JSON-RPC -32602) never reach a handler: no row.
+    let (_, shape) = call(&state, Some(&ana), "commit", json!({})).await;
+    assert_eq!(shape["error"]["code"], -32602);
+    assert_eq!(action_rows(&state, "groceries").await.len(), 2);
+
+    // A refused call's arguments were never length-checked: the stored
+    // summary is still bounded.
+    let huge = "p".repeat(100_000);
+    let (_, long) = call(
+        &state,
+        Some(&ana),
+        "read_file",
+        json!({"app": "groceries", "path": huge}),
+    )
+    .await;
+    assert_eq!(is_error(&long)["error"], "invalid_argument");
+    let rows = action_rows(&state, "groceries").await;
+    assert_eq!(rows[0].tool, "read_file");
+    assert!(
+        rows[0].summary.chars().count() <= 2003,
+        "{}",
+        rows[0].summary.len()
+    );
+
+    // Multi-byte input where the summary keeps a short prefix (sha, deploy
+    // id) must not panic the call: the caller still gets its result.
+    let (_, odd) = call(
+        &state,
+        Some(&ana),
+        "list_files",
+        json!({"app": "groceries", "sha": "aéééééééé"}),
+    )
+    .await;
+    assert!(odd.get("result").is_some(), "{odd}");
+    let (_, odd) = call(
+        &state,
+        Some(&ana),
+        "deploy_log",
+        json!({"app": "groceries", "deploy_id": "dééééé"}),
+    )
+    .await;
+    assert!(odd.get("result").is_some(), "{odd}");
+}
+
+#[tokio::test]
+async fn agent_action_oauth_caller_resolves_client_label() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let account_id: String =
+        sqlx::query_scalar("SELECT id FROM account WHERE email = 'ana@example.com'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+    let (access, hash) = crate::auth::tokens::new_access_token();
+    let now = crate::auth::now_ms();
+    sqlx::query(
+        "INSERT INTO oauth_client (client_id, kind, name, host, redirect_uris, created_at) \
+         VALUES ('cid-claude', 'dcr', 'Claude', 'claude.ai', '[\"https://claude.ai/cb\"]', ?1)",
+    )
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO oauth_grant (id, account_id, client_id, scope, resource, client_name, created_at) \
+         VALUES ('gid-1', ?1, 'cid-claude', 'apps', 'http://outer.localhost/mcp', 'Claude', ?2)",
+    )
+    .bind(&account_id)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO oauth_token (token_hash, grant_id, kind, expires_at) \
+         VALUES (?1, 'gid-1', 'access', ?2)",
+    )
+    .bind(&hash)
+    .bind(now + 3_600_000)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let (_, got) = call(
+        &state,
+        Some(&access),
+        "get_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(result(&got)["structuredContent"]["slug"], "groceries");
+
+    let rows = action_rows(&state, "groceries").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].tool, "get_app");
+    assert_eq!(rows[0].client_label, "Claude (claude.ai)");
+    let grant_id: Option<String> =
+        sqlx::query_scalar("SELECT grant_id FROM agent_action WHERE tool = 'get_app'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(grant_id.as_deref(), Some("gid-1"));
+}
+
+#[tokio::test]
+async fn agent_action_pagination_prune_and_delete_cascade() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let id = app_id(&state, "groceries").await;
+    let account_id: String =
+        sqlx::query_scalar("SELECT id FROM account WHERE email = 'ana@example.com'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    sqlx::query("DELETE FROM agent_action")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    for (row_id, tool, ts) in [
+        ("a", "get_app", 100),
+        ("b", "history", 200),
+        ("c", "commit", 300),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_action (id, app_id, account_id, tool, summary, outcome, duration_ms, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 's', 'ok', 1, ?5)",
+        )
+        .bind(row_id)
+        .bind(&id)
+        .bind(&account_id)
+        .bind(tool)
+        .bind(ts)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    // Newest first, cursor pages through the rest.
+    let page: Vec<crate::mcp::actions::ActionRow> =
+        crate::mcp::actions::list(&state.pool, &id, None, 2)
+            .await
+            .unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].tool, "commit");
+    assert_eq!(page[1].tool, "history");
+    let rest: Vec<crate::mcp::actions::ActionRow> = crate::mcp::actions::list(
+        &state.pool,
+        &id,
+        Some((page[1].created_at, page[1].id.clone())),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].tool, "get_app");
+
+    // Prune keeps rows inside the Free 7-day retention and drops older ones.
+    let now = 8 * 86_400_000i64;
+    sqlx::query("UPDATE agent_action SET created_at = ?1 WHERE id = 'a'")
+        .bind(now - 8 * 86_400_000)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_action SET created_at = ?1 WHERE id IN ('b', 'c')")
+        .bind(now - 86_400_000)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let removed = crate::mcp::actions::prune(&state.pool, now).await.unwrap();
+    assert_eq!(removed, 1);
+    let kept: Vec<String> = sqlx::query_scalar("SELECT id FROM agent_action ORDER BY id")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, vec!["b".to_string(), "c".to_string()]);
+
+    // Pro accounts keep 30 days: an 8-day-old row survives, a 31-day one goes.
+    sqlx::query("UPDATE account SET plan = 'pro' WHERE id = ?1")
+        .bind(&account_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_action SET created_at = ?1 WHERE id = 'b'")
+        .bind(now - 8 * 86_400_000)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_action SET created_at = ?1 WHERE id = 'c'")
+        .bind(now - 31 * 86_400_000)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let removed = crate::mcp::actions::prune(&state.pool, now).await.unwrap();
+    assert_eq!(removed, 1);
+    let kept: Vec<String> = sqlx::query_scalar("SELECT id FROM agent_action ORDER BY id")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, vec!["b".to_string()]);
+
+    // Deleting the app removes its log rows with everything else.
+    let (_, deleted) = call(
+        &state,
+        Some(&token),
+        "delete_app",
+        json!({"app": "groceries", "confirm": "groceries"}),
+    )
+    .await;
+    assert_eq!(result(&deleted)["structuredContent"]["deleted"], true);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_action")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}

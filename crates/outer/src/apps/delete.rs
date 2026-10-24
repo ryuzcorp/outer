@@ -94,6 +94,7 @@ const CHILD_TABLES: &[&str] = &[
     "path_hour",
     "app_log",
     "error_issue",
+    "agent_action",
 ];
 
 /// The live handles deletion touches: the row, the bucket, the repo mirror
