@@ -104,8 +104,8 @@ props without a reload. One `useForm` per form, with its own `intent`.
 ## Sources
 
 - The template's pages (loader, intent action, forms, daisyUI):
-  <https://github.com/ryuzcorp/outer-template/blob/8145efd51451abe1d819fffff2476d097e2c9dcd/pages/index.server.ts>,
-  <https://github.com/ryuzcorp/outer-template/blob/8145efd51451abe1d819fffff2476d097e2c9dcd/pages/index.tsx>
+  <https://github.com/ryuzcorp/outer-template/blob/60edb359d7698e527533b43dfac63ebb8d1d553a/pages/index.server.ts>,
+  <https://github.com/ryuzcorp/outer-template/blob/60edb359d7698e527533b43dfac63ebb8d1d553a/pages/index.tsx>
 - Island and command reference in the template's `AGENTS.md`:
-  <https://github.com/ryuzcorp/outer-template/blob/8145efd51451abe1d819fffff2476d097e2c9dcd/AGENTS.md>
+  <https://github.com/ryuzcorp/outer-template/blob/60edb359d7698e527533b43dfac63ebb8d1d553a/AGENTS.md>
 - The integration reference: <https://ilha.build/guide/void>
