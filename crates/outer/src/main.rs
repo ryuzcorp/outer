@@ -250,6 +250,17 @@ fn jev_client(config: &Config) -> anyhow::Result<Option<outer::moderation::JevCl
     )?))
 }
 
+/// What deploys, rollbacks and deletes purge from the edge cache: the zone
+/// plus the API token. `None` skips the purge at debug (localhost dev
+/// without `CLOUDFLARE_ZONE_ID`).
+fn cache_purge(config: &Config) -> Option<outer::cloudflare::CachePurge> {
+    config.cloudflare.as_ref().and_then(|cf| {
+        cf.zone_id
+            .clone()
+            .map(|zone_id| outer::cloudflare::CachePurge::new(zone_id, cf.api_token.clone()))
+    })
+}
+
 async fn platform(config: &Config) -> anyhow::Result<Platform> {
     std::fs::create_dir_all(&config.data_dir)?;
     let store = build_store(config)?;
@@ -265,6 +276,8 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
             storage: fleet_storage(config)?,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
+            apps_domain: rt.apps_domain.clone(),
+            cache_purge: cache_purge(config),
             jev,
         },
         rt.build_concurrency,
@@ -318,8 +331,8 @@ async fn app_create(config: Config, slug: String, rest: Vec<&str>) -> anyhow::Re
     };
     let p = platform(&config).await?;
     let (app, outcome) = ops::create_app(&p, owner, &slug, flag(&flags, "--name")).await?;
-    let reloaded = outcome.status == "success" && ops::reload_if_awake(&app).await;
-    print_outcome(&config, &app, &outcome, reloaded)?;
+    p.deployer.purges().drain().await;
+    print_outcome(&config, &app, &outcome, outcome.reloaded)?;
     end_outcome(&outcome)?;
     Ok(())
 }
@@ -330,8 +343,8 @@ async fn app_deploy(config: Config, slug: String) -> anyhow::Result<()> {
     let app = apps::get_by_slug(&p.pool, &slug)
         .await?
         .expect("deployed app exists");
-    let reloaded = outcome.status == "success" && ops::reload_if_awake(&app).await;
-    print_outcome(&config, &app, &outcome, reloaded)?;
+    p.deployer.purges().drain().await;
+    print_outcome(&config, &app, &outcome, outcome.reloaded)?;
     end_outcome(&outcome)?;
     Ok(())
 }
@@ -353,14 +366,7 @@ async fn app_delete(config: Config, slug: String) -> anyhow::Result<()> {
         data_dir: config.data_dir.clone(),
         cgroups: cgroups(),
         apps_domain: config.runtime.apps_domain.clone(),
-        cache_purge: config.cloudflare.as_ref().and_then(|cf| {
-            cf.zone_id
-                .clone()
-                .map(|zone_id| outer::apps::delete::CachePurge {
-                    zone_id,
-                    api_token: cf.api_token.clone(),
-                })
-        }),
+        cache_purge: cache_purge(&config),
     };
     let out = ops::delete_app(&p, &cfg, &slug, &slug, locks).await?;
     println!(
@@ -574,10 +580,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             storage,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
+            apps_domain: rt.apps_domain.clone(),
+            cache_purge: cache_purge(&config),
             jev: jev_client(&config)?,
         },
         rt.build_concurrency,
     );
+    let purges = deployer.purges();
     let auth = auth_state(&config, &pool)?;
     let mcp = outer::mcp::McpState {
         pool: pool.clone(),
@@ -601,14 +610,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             data_dir: config.data_dir.clone(),
             cgroups: cgroups(),
             apps_domain: rt.apps_domain.clone(),
-            cache_purge: config.cloudflare.as_ref().and_then(|cf| {
-                cf.zone_id
-                    .clone()
-                    .map(|zone_id| outer::apps::delete::CachePurge {
-                        zone_id,
-                        api_token: cf.api_token.clone(),
-                    })
-            }),
+            cache_purge: cache_purge(&config),
         },
     };
     let app = http::app(
@@ -663,6 +665,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
 
     tracing::info!("shutting down: stopping fleets, then writing the final state snapshot");
+    purges.drain().await;
     fleets.stop_all().await;
     store::snapshot::final_snapshot(&sync, &pool, &store, &snapshot_cfg).await;
     pool.close().await;

@@ -249,6 +249,7 @@ impl FakeDeploys {
             }],
             log_tail: "fake deploy ok".to_string(),
             version: None,
+            reloaded: false,
         })
     }
 }

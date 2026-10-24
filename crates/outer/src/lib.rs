@@ -5,6 +5,7 @@
 
 pub mod apps;
 pub mod auth;
+pub mod cloudflare;
 pub mod config;
 pub mod cron;
 pub mod db;

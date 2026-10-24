@@ -602,12 +602,7 @@ pub async fn run_deploy(
         }));
     }
     match tokio::time::timeout(state.tool_wait, handle).await {
-        Ok(Ok((finished_app, Ok(outcome)))) => {
-            if outcome.status == "success" {
-                crate::ops::reload_if_awake(&finished_app).await;
-            }
-            Ok(outcome_json(state, &finished_app, &outcome))
-        }
+        Ok(Ok((finished_app, Ok(outcome)))) => Ok(outcome_json(state, &finished_app, &outcome)),
         Ok(Ok((_, Err(e)))) => Err(internal(e)),
         Ok(Err(e)) => Err(internal(anyhow::Error::new(e))),
         Err(_) => Ok(json!({

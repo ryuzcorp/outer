@@ -46,6 +46,11 @@ pub struct DeploySettings {
     pub step_timeout: Duration,
     /// Cgroup anchor when containment is active, else `None` (dev).
     pub cgroups: Option<PathBuf>,
+    /// Apps live at `<slug>.<apps_domain>`; the purge targets that host.
+    pub apps_domain: String,
+    /// Edge cache purge after a successful deploy. `None` skips the purge
+    /// at debug (localhost dev without `CLOUDFLARE_ZONE_ID`).
+    pub cache_purge: Option<crate::cloudflare::CachePurge>,
     /// Jev classification for the pre-live gate. `None` only on localhost
     /// dev without the Cloudflare pair: the gate logs a warning and passes.
     /// Off localhost the config refuses to boot without the pair, so the
@@ -82,6 +87,10 @@ pub struct DeployOutcome {
     pub steps: Vec<Step>,
     pub log_tail: String,
     pub version: Option<String>,
+    /// An awake fleet acknowledged the reload (success only). A sleeping
+    /// fleet adopts the deploy when it wakes, so `false` is not a failure.
+    #[serde(skip)]
+    pub reloaded: bool,
 }
 
 /// Builds apps: the global semaphore plus per-app locks live here.
@@ -89,8 +98,46 @@ pub struct Deployer {
     settings: DeploySettings,
     semaphore: Arc<Semaphore>,
     app_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    purges: PurgeTasks,
 }
 
+/// Edge purges still in flight. Each runs detached so `deploy` never waits
+/// on Cloudflare, but the process owns them: the CLI and `serve`'s shutdown
+/// call [`PurgeTasks::drain`] before exiting, so a purge is never dropped
+/// with the runtime. Each purge is bounded by the client's 10 s timeout.
+#[derive(Clone, Default)]
+pub struct PurgeTasks(Arc<Mutex<tokio::task::JoinSet<()>>>);
+
+impl PurgeTasks {
+    fn spawn(&self, purge: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut set = self.0.lock().expect("purge set poisoned");
+        // Reap finished purges so a long-running `serve` doesn't accumulate them.
+        while set.try_join_next().is_some() {}
+        set.spawn(purge);
+    }
+
+    /// Wait for every purge spawned so far.
+    pub async fn drain(&self) {
+        let mut set = std::mem::take(&mut *self.0.lock().expect("purge set poisoned"));
+        while set.join_next().await.is_some() {}
+    }
+}
+
+/// Ask the app's fleet to adopt the new deploy now. A sleeping fleet isn't
+/// listening, which is fine: it adopts the deploy when it wakes, and an
+/// awake fleet would also pick it up on its own pointer poll.
+async fn reload_if_awake(app: &App) -> bool {
+    let url = format!("http://127.0.0.1:{}/reload", app.internal_port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build();
+    let Ok(client) = client else { return false };
+    client
+        .post(url)
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
+}
 /// Combined log kept per deploy, tail-capped before it hits the row.
 const LOG_TAIL_CAP: usize = 64 * 1024;
 /// Cap on one `error` line stored in the row.
@@ -150,7 +197,13 @@ impl Deployer {
             settings,
             semaphore: Arc::new(Semaphore::new(build_concurrency)),
             app_locks: Mutex::new(HashMap::new()),
+            purges: PurgeTasks::default(),
         }
+    }
+
+    /// The in-flight edge purges, for the owner of the process to drain.
+    pub fn purges(&self) -> PurgeTasks {
+        self.purges.clone()
     }
 
     /// Deploy `sha` of `app`: row `queued` → `building` → `reviewing` →
@@ -195,6 +248,11 @@ impl Deployer {
                 finish_success(pool, &deploy_id, &steps_json, &log_tail).await?;
                 apps::set_last_deploy(pool, &app.id, sha).await?;
                 cron::sync_app_crons(pool, &app.id, &crons, apps::now_ms()).await?;
+                // Switch an awake fleet first, then purge: purging while
+                // the old version still serves would let the edge re-cache
+                // its files. The purge runs off the critical path.
+                let reloaded = reload_if_awake(app).await;
+                self.spawn_edge_purge(&app.slug);
                 Ok(DeployOutcome {
                     deploy_id,
                     sha: sha.to_string(),
@@ -207,6 +265,7 @@ impl Deployer {
                     steps,
                     log_tail,
                     version,
+                    reloaded,
                 })
             }
             Err(StepEnd::Blocked(blocked)) => {
@@ -227,6 +286,7 @@ impl Deployer {
                     steps,
                     log_tail,
                     version: None,
+                    reloaded: false,
                 })
             }
             Err(StepEnd::Failed(failed)) => {
@@ -253,9 +313,24 @@ impl Deployer {
                     steps,
                     log_tail,
                     version: None,
+                    reloaded: false,
                 })
             }
         }
+    }
+
+    /// Purge `<slug>.<apps_domain>` from the edge cache after the new
+    /// version went live. Detached (no global state, just cloned handles)
+    /// so a slow Cloudflare never holds up the deploy response; `None`
+    /// skips at debug, failures warn. Only successful deploys purge: failed
+    /// and blocked deploys leave the previous version serving, and its
+    /// cached files are still the right ones.
+    fn spawn_edge_purge(&self, slug: &str) {
+        let purge = self.settings.cache_purge.clone();
+        let host = format!("{slug}.{}", self.settings.apps_domain);
+        self.purges.spawn(async move {
+            crate::cloudflare::purge_host_cache(purge.as_ref(), &host).await;
+        });
     }
 
     /// The per-app deploy mutex. `deploy` holds it across a whole pipeline
@@ -1440,6 +1515,8 @@ mod tests {
             },
             step_timeout: Duration::from_secs(120),
             cgroups: None,
+            apps_domain: "outer.localhost".to_string(),
+            cache_purge: None,
             jev: None,
         }
     }
@@ -1664,6 +1741,142 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(check, ("gate".to_string(), "pass".to_string()));
+    }
+
+    /// `DeploySettings` aimed at `fake`: the purge posts to the fake
+    /// Cloudflare instead of the real API.
+    fn purge_settings(
+        data: &tempfile::TempDir,
+        fake: &crate::cloudflare::fake::FakePurge,
+    ) -> DeploySettings {
+        let mut settings = test_settings(data.path().to_path_buf());
+        settings.cache_purge = Some(
+            crate::cloudflare::CachePurge::new("zone-1".to_string(), "token-1".to_string())
+                .with_api_base(fake.base_url.clone()),
+        );
+        settings
+    }
+
+    /// The CLI exits right after `deploy` returns: draining must not come
+    /// back before the detached purge reached Cloudflare.
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_purges() {
+        let data = tempfile::tempdir().unwrap();
+        let fake = crate::cloudflare::fake::FakePurge::start().await;
+        let deployer = Deployer::new(purge_settings(&data, &fake), 1);
+        deployer.spawn_edge_purge("grocery");
+        deployer.purges().drain().await;
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(
+            fake.requests.lock().unwrap()[0].body["hosts"][0],
+            format!("grocery.{}", deployer.settings.apps_domain)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_deploy_issues_no_purge() {
+        let (_mdir, cfg, _store, _sync, _sha_a, sha_b) = seed_mirror("grocery").await;
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10001);
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let purge = crate::cloudflare::fake::FakePurge::start().await;
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(purge_settings(&data, &purge), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        // No spawn happens on the failure path at all; the settle wait only
+        // guards against a stray detached task.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            purge.calls(),
+            0,
+            "a failed deploy leaves the old version serving: nothing to purge"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_deploy_issues_no_purge() {
+        // Same profane tree as `blocked_deploy_never_reaches_the_deploy_step`.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig {
+            repos_dir: dir.path().join("git"),
+        };
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "profane".to_string(),
+                base: None,
+                writes: vec![
+                    write(
+                        "package.json",
+                        r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
+                    ),
+                    write(
+                        "pages/index.tsx",
+                        "export default () => <h1>this list is fuck awesome</h1>;",
+                    ),
+                    write(
+                        "dist/wrangler.json",
+                        r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                    ),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10010);
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fake = FakeJev::start(block_responder()).await;
+        let purge = crate::cloudflare::fake::FakePurge::start().await;
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = purge_settings(&data, &purge);
+        settings.bun_bin = "/bin/true".to_string();
+        settings.celld_bin = "/nonexistent/celld-binary".to_string();
+        settings.jev = Some(jev_client(&fake.base_url));
+        let deployer = Deployer::new(settings, 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "blocked");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            purge.calls(),
+            0,
+            "a blocked deploy uploads nothing: the fleet is untouched, nothing to purge"
+        );
     }
     #[tokio::test]
     async fn blocked_deploy_never_reaches_the_deploy_step() {
@@ -2129,6 +2342,8 @@ mod tests {
             },
             step_timeout: Duration::from_secs(120),
             cgroups: None,
+            apps_domain: "outer.now".to_string(),
+            cache_purge: None,
             jev: None,
         };
         let deployer = Deployer::new(settings, 1);
