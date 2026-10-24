@@ -2199,6 +2199,7 @@ async fn set_visibility_purges_the_app_host() {
     let requests = fake.requests.lock().unwrap();
     let host = format!("groceries.{}", state.delete_cfg.apps_domain);
     assert_eq!(requests.last().unwrap().body["hosts"][0], host);
+}
 
 #[tokio::test]
 async fn secrets_set_list_unset_roundtrip_without_values() {
