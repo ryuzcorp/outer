@@ -15,16 +15,23 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Explicit base environment for sandboxed steps. Nothing is inherited:
 /// `run_sandboxed` starts from `env_clear()` plus these, then the caller's
-/// vars. Every cache lives under the app's own cache root: bun's in `bun/`
-/// and `HOME` in `home/`, so no two apps share a cache.
-pub fn base_env(work_tmp: &str, cache_root: &Path) -> Vec<(String, String)> {
+/// vars. Every cache lives under the app's own cache root: bun's in `bun/`,
+/// `HOME` in `home/`, and `TMPDIR` in `tmp/`, so no two apps share a cache —
+/// and so `git clean` (which wipes the worktree between deploys) cannot wipe
+/// them. In particular bun's node-compile-cache lives under `TMPDIR`: with
+/// a worktree TMPDIR every build paid a cold transpiler cache (~6 s on the
+/// template); with a persistent one warm builds reuse it.
+pub fn base_env(cache_root: &Path) -> Vec<(String, String)> {
     vec![
         ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
         (
             "HOME".into(),
             cache_root.join("home").to_string_lossy().into_owned(),
         ),
-        ("TMPDIR".into(), work_tmp.into()),
+        (
+            "TMPDIR".into(),
+            cache_root.join("tmp").to_string_lossy().into_owned(),
+        ),
         ("LANG".into(), "C.UTF-8".into()),
         ("CI".into(), "1".into()),
         // `CI` alone turns colors on in picocolors (Vite); the deploy log is
@@ -61,10 +68,12 @@ pub fn is_reserved_env_name(name: &str) -> bool {
 
 /// Sandboxed step: uid/gid drop plus explicit env.
 /// `uid: None` runs as the current user.
-/// `cache_root` is the app's persistent cache dir; `cgroup_leaf` moves the
-/// child into that leaf right after spawn. A leaf means cgroups are active:
-/// a refused move fails the step (the group is killed) instead of running
-/// uncapped. `None` is dev (no cgroups), where no move is attempted.
+/// `cache_root` is the app's persistent cache dir; `cgroup_leaf` contains
+/// the child in that leaf. The child moves itself there in pre_exec (before
+/// its first fork); the parent re-asserts right after spawn. A leaf means
+/// cgroups are active: a refused move fails the step (the group is killed)
+/// instead of running uncapped. `None` is dev (no cgroups), where no move is
+/// attempted.
 /// Each step needs its own leaf: cleanup kills the whole leaf (`cgroup.kill`
 /// plus the process group), so a shared leaf would kill sibling steps.
 ///
@@ -98,6 +107,80 @@ pub(crate) fn resolve_drop_id(want: u32) -> Option<u32> {
         );
     });
     None
+}
+
+/// The per-app cache subdirs `run_sandboxed` maintains (`bun/`, `home/`,
+/// `tmp/`, see [`base_env`]).
+#[cfg(unix)]
+const CACHE_SUBDIRS: [&str; 3] = ["bun", "home", "tmp"];
+
+/// Create the cache subdirs without following app-planted links: each is
+/// made with `mkdirat` relative to an `O_NOFOLLOW`-validated fd of the
+/// cache root. An entry that exists but is not a real dir (symlink, file)
+/// is removed with `unlinkat` (no follow) and recreated; anything else
+/// fails the step closed rather than running on an attacker-planted tree.
+#[cfg(unix)]
+fn ensure_cache_subdirs(cache_root: &Path) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::RawFd;
+    if std::fs::symlink_metadata(cache_root).is_err() {
+        // Fresh app: the parents (`<data>/cache`) are platform-owned, so
+        // creating the root itself is safe; what it contains afterwards is
+        // only ever touched through the fd below.
+        std::fs::create_dir_all(cache_root)?;
+    }
+    let root = CString::new(cache_root.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("cache root has an interior NUL"))?;
+    // SAFETY: `O_NOFOLLOW|O_DIRECTORY` fails rather than following a link;
+    // the fd pins the root for the `mkdirat` calls below.
+    let fd: RawFd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening cache root {}", cache_root.display()));
+    }
+    struct Close(RawFd);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            // SAFETY: ours until now; nothing else closes it.
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let _close = Close(fd);
+    for sub in CACHE_SUBDIRS {
+        let name = CString::new(sub).expect("subdir names have no NUL");
+        // SAFETY: `mkdirat` never follows the final component.
+        if unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) } == 0 {
+            continue;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("creating cache subdir {sub}"));
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fstatat` reports the entry itself; the buffer is ours.
+        let stat_ok =
+            unsafe { libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0;
+        if stat_ok && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            continue;
+        }
+        // A planted link or file: remove the name itself (no follow) and
+        // recreate the real dir. Anything else fails closed.
+        // SAFETY: `unlinkat` without flags never follows the final
+        // component; the retry only runs when the entry was not a dir.
+        if unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } != 0
+            || unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("replacing cache subdir {sub}"));
+        }
+    }
+    Ok(())
 }
 
 /// Hand one path that outer itself created to (uid, gid), without following
@@ -184,11 +267,80 @@ pub(crate) fn make_private_dir(path: &Path) -> bool {
 
 /// Move `pid` into a cgroup leaf: the child's whole tree is contained from
 /// here, since containment is inherited across fork and exec. Returns the
-/// refusal so the caller fails the step instead of running uncapped.
+/// refusal so the caller fails the step instead of running uncapped. This is
+/// the post-spawn re-assert; the child also moves itself in pre_exec (see
+/// `self_move_into_leaf`), which is what actually wins the race against the
+/// child's first fork.
 fn move_into_cgroup(leaf: &Path, pid: u32) -> anyhow::Result<()> {
     std::fs::write(leaf.join("cgroup.procs"), pid.to_string())
         .with_context(|| format!("move {pid} into {}", leaf.display()))?;
     Ok(())
+}
+
+/// The `cgroup.procs` file a child writes its own pid to, pre-built as a
+/// `CString` so the pre_exec hook (which may not allocate) can use it.
+/// `None` when the leaf path cannot be a C string (impossible for our
+/// generated leaf names); the caller then falls back to the post-spawn move.
+fn cgroup_procs_cstr(leaf: &Path) -> Option<std::ffi::CString> {
+    std::ffi::CString::new(leaf.join("cgroup.procs").as_os_str().as_encoded_bytes()).ok()
+}
+
+/// Decimal `pid` into `buf`, returning the used length. Manual (no
+/// allocation, no formatting machinery): the pre_exec hook may not allocate.
+fn format_pid(mut pid: u32, buf: &mut [u8; 20]) -> usize {
+    if pid == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut len = 0;
+    while pid > 0 {
+        buf[len] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        len += 1;
+    }
+    buf[..len].reverse();
+    len
+}
+
+/// The child moves ITSELF into `procs` (a leaf `cgroup.procs`) before
+/// dropping privilege or execing: nothing the child later forks can escape
+/// the leaf, because containment is inherited at fork and the move precedes
+/// the first fork by construction. (A post-spawn move from the parent races
+/// the child's first fork: `bun run` forks a runner process during startup,
+/// and on a loaded host the parent's write can land after it, leaving the
+/// whole build in the parent cgroup. Builds then ran uncapped — no memory
+/// or pids bound — while their empty leaves reported ~0 CPU.)
+///
+/// Only async-signal-safe calls (`open`, `write`, `close`, `getpid`): the
+/// hook runs between fork and exec. Must run while still root: an app uid
+/// cannot write a root-owned leaf's `cgroup.procs`.
+fn self_move_into_leaf(procs: &std::ffi::CStr) -> std::io::Result<()> {
+    // SAFETY: async-signal-safe libc calls only; the fd is closed on every
+    // path, and the buffer is a stack array filled by `format_pid`.
+    unsafe {
+        let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = [0u8; 20];
+        let len = format_pid(libc::getpid() as u32, &mut buf);
+        let mut written = 0;
+        while written < len {
+            let n = libc::write(
+                fd,
+                buf[written..len].as_ptr() as *const libc::c_void,
+                (len - written) as libc::size_t,
+            );
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(err);
+            }
+            written += n as usize;
+        }
+        libc::close(fd);
+        Ok(())
+    }
 }
 
 /// Whether `error` is the kernel reporting a gone process (ESRCH): a move
@@ -258,6 +410,31 @@ fn kill_leaf(leaf: &Path) {
     }
 }
 
+/// Remove the step's cgroup leaf after its processes are gone: per-step
+/// leaves are killed but never removed, and stale leaves pile up under the
+/// build parent. Best-effort: a leaf whose members are still reaping reports
+/// busy, which is retried briefly, then left with a debug log instead of
+/// failing the step.
+async fn remove_step_leaf(leaf: &Path) {
+    for _ in 0..10 {
+        match std::fs::remove_dir(leaf) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e)
+                if e.raw_os_error() == Some(libc::EBUSY)
+                    || e.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                tracing::debug!(leaf = %leaf.display(), error = %e, "step leaf left behind");
+                return;
+            }
+        }
+    }
+    tracing::debug!(leaf = %leaf.display(), "step leaf still busy; leaving it");
+}
+
 /// Sandboxed step: `env_clear`, base env plus caller vars, uid/gid drop, its
 /// own process group (the whole tree dies on timeout via killpg), rlimits
 /// (NPROC only without a leaf, FSIZE 4 GiB always), and capped output.
@@ -271,9 +448,17 @@ pub async fn run_sandboxed(
     timeout: Duration,
 ) -> anyhow::Result<String> {
     use std::os::unix::process::CommandExt;
-    let tmp = cwd.join(".tmp-sandbox");
-    let _ = std::fs::create_dir_all(&tmp);
-    for sub in ["bun", "home"] {
+    // `tmp` persists across deploys (bun's node-compile-cache lives under
+    // `TMPDIR`; a worktree TMPDIR was wiped by `git clean` every deploy and
+    // every build repaid a cold transpiler cache). It is per-app, 0700 and
+    // app-owned like `bun/` and `home/`, so no two apps share it.
+    // No-follow: `create_dir_all(cache_root.join(sub))` as root would
+    // create through an app-planted symlink. A planted non-dir is replaced
+    // with a real dir; anything else fails the step closed.
+    #[cfg(unix)]
+    ensure_cache_subdirs(sb.cache_root)?;
+    #[cfg(not(unix))]
+    for sub in ["bun", "home", "tmp"] {
         let _ = std::fs::create_dir_all(sb.cache_root.join(sub));
     }
     // Created by outer after the worktree was handed over: give them to the
@@ -284,10 +469,9 @@ pub async fn run_sandboxed(
     // other means stay root-owned (documented tradeoff).
     if let Some(uid) = sb.uid {
         let gid = sb.gid.unwrap_or(uid);
-        lchown_one(&tmp, uid, gid);
         lchown_one(sb.cache_root, uid, gid);
         make_private_dir(sb.cache_root);
-        for sub in ["bun", "home"] {
+        for sub in ["bun", "home", "tmp"] {
             lchown_one(&sb.cache_root.join(sub), uid, gid);
         }
     }
@@ -306,7 +490,7 @@ pub async fn run_sandboxed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for (key, value) in base_env(&tmp.to_string_lossy(), sb.cache_root) {
+    for (key, value) in base_env(sb.cache_root) {
         cmd.env(key, value);
     }
     for (key, value) in sb.platform_env {
@@ -323,6 +507,12 @@ pub async fn run_sandboxed(
     // groups, which it cannot change anyway.
     let privileged = unsafe { libc::geteuid() == 0 };
     let drops_priv = privileged && (uid.is_some() || gid.is_some());
+    // The child moves itself into its leaf in pre_exec (before any fork it
+    // can do): the post-spawn move below re-asserts, but only the self-move
+    // wins the race against the child's first fork. Pre-built here (no
+    // allocation is allowed in the hook); a missing C string falls back to
+    // the post-spawn move alone.
+    let self_move = sb.cgroup_leaf.and_then(cgroup_procs_cstr);
     {
         let std_cmd = cmd.as_std_mut();
         std_cmd.process_group(0);
@@ -334,6 +524,12 @@ pub async fn run_sandboxed(
         // no leaf bounds the step (with a leaf the pids.max cap applies).
         unsafe {
             std_cmd.pre_exec(move || {
+                if let Some(procs) = self_move.as_ref() {
+                    // While still root: an app uid cannot write the leaf's
+                    // `cgroup.procs`. A refusal fails the spawn, so the step
+                    // fails closed instead of running uncapped.
+                    self_move_into_leaf(procs)?;
+                }
                 if drops_priv {
                     if libc::setgroups(0, std::ptr::null()) != 0 {
                         return Err(std::io::Error::last_os_error());
@@ -400,10 +596,12 @@ pub async fn run_sandboxed(
         }
     }
     // A step that called `setsid`/`setpgid` escaped the group but not the
-    // leaf: kill the whole leaf so nothing outlives the step. Each step
+    // leaf: kill the whole leaf so nothing outlives the step, then remove
+    // the leaf itself so stale per-step leaves do not pile up. Each step
     // needs its own leaf — a shared leaf would kill sibling steps here.
     if let Some(leaf) = sb.cgroup_leaf {
         kill_leaf(leaf);
+        remove_step_leaf(leaf).await;
     }
     match result {
         Ok(Ok(output)) => {
@@ -462,16 +660,28 @@ mod tests {
     #[test]
     fn base_env_points_caches_at_the_app_root() {
         let cache = Path::new("/data/cache/grocery");
-        let env: std::collections::HashMap<_, _> =
-            base_env("/data/work/grocery/.tmp-sandbox", cache)
-                .into_iter()
-                .collect();
+        let env: std::collections::HashMap<_, _> = base_env(cache).into_iter().collect();
         assert_eq!(env["PATH"], "/usr/local/bin:/usr/bin:/bin");
         assert_eq!(env["HOME"], "/data/cache/grocery/home");
         assert_eq!(env["BUN_INSTALL_CACHE_DIR"], "/data/cache/grocery/bun");
-        assert_eq!(env["TMPDIR"], "/data/work/grocery/.tmp-sandbox");
+        assert_eq!(env["TMPDIR"], "/data/cache/grocery/tmp");
         assert_eq!(env["LANG"], "C.UTF-8");
         assert_eq!(env["NODE_ENV"], "production");
+    }
+
+    /// TMPDIR must survive deploys: `git clean` wipes the worktree (where
+    /// `.tmp-sandbox` used to live, taking bun's node-compile-cache with
+    /// it), but never the cache root.
+    #[test]
+    fn base_env_tmpdir_survives_a_worktree_wipe() {
+        let cache = Path::new("/data/cache/grocery");
+        let env: std::collections::HashMap<_, _> = base_env(cache).into_iter().collect();
+        assert!(
+            !env["TMPDIR"].starts_with("/data/work/"),
+            "TMPDIR must not live in the worktree: {}",
+            env["TMPDIR"]
+        );
+        assert_eq!(env["TMPDIR"], "/data/cache/grocery/tmp");
     }
 
     /// `env_clear` is honored: only the base env plus caller vars are
@@ -496,7 +706,7 @@ mod tests {
             .lines()
             .map(|line| line.split_once('=').unwrap())
             .collect();
-        let base = base_env("", Path::new(""));
+        let base = base_env(Path::new(""));
         let mut expected: std::collections::HashSet<&str> =
             base.iter().map(|(key, _)| key.as_str()).collect();
         expected.insert("GROCERY_LIST");
@@ -714,6 +924,38 @@ mod tests {
     }
 
     #[test]
+    fn format_pid_renders_decimal_without_alloc() {
+        let mut buf = [0u8; 20];
+        for (pid, want) in [
+            (0, "0"),
+            (7, "7"),
+            (42, "42"),
+            (2069, "2069"),
+            (u32::MAX, "4294967295"),
+        ] {
+            let len = format_pid(pid, &mut buf);
+            assert_eq!(&buf[..len], want.as_bytes(), "pid {pid}");
+        }
+    }
+
+    #[test]
+    fn cgroup_procs_cstr_joins_the_leaf() {
+        let leaf = Path::new("/sys/fs/cgroup/outer/builds/abc-build");
+        assert_eq!(
+            cgroup_procs_cstr(leaf).unwrap().as_bytes(),
+            b"/sys/fs/cgroup/outer/builds/abc-build/cgroup.procs"
+        );
+    }
+
+    /// A refused self-move fails closed (the spawn fails, so the step never
+    /// runs uncapped): a missing leaf surfaces `NotFound`, not success.
+    #[test]
+    fn self_move_into_a_missing_leaf_fails_closed() {
+        let err = self_move_into_leaf(c"/definitely/missing/cgroup.procs").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn kill_leaf_falls_back_to_procs() {
         let dir = tempfile::tempdir().unwrap();
         // A directory where the kill file would go: the write fails, so the
@@ -724,7 +966,6 @@ mod tests {
         // An unreadable leaf is success too: nothing is known to outlive.
         kill_leaf(&dir.path().join("missing"));
     }
-
     /// A step running in its own leaf is capped by the leaf's `pids.max`,
     /// not by the uid-wide RLIMIT_NPROC (which also counts the fleet's
     /// tasks sharing the app uid): the step's "Max processes" must not be
@@ -806,5 +1047,118 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// A symlinked `tmp` (an app-planted link to platform files) is replaced
+    /// with a real dir: `mkdirat` relative to the pinned cache root never
+    /// creates through the link, and the link's target is untouched.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_cache_subdirs_replaces_a_planted_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("platform.txt");
+        std::fs::write(&marker, "platform").unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink(outside.path(), cache.join("tmp")).unwrap();
+        ensure_cache_subdirs(&cache).unwrap();
+        for sub in ["bun", "home", "tmp"] {
+            assert!(
+                std::fs::symlink_metadata(cache.join(sub))
+                    .unwrap()
+                    .file_type()
+                    .is_dir(),
+                "{sub} is a real dir"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "platform");
+    }
+
+    /// A planted regular file and an intact dir: the file is replaced, the
+    /// dir (and its contents) is kept, and a missing root is created.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_cache_subdirs_keeps_real_dirs_replaces_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        ensure_cache_subdirs(&cache).unwrap();
+        std::fs::write(cache.join("keep.txt"), "keep").unwrap();
+        std::fs::remove_dir(cache.join("bun")).unwrap();
+        std::fs::write(cache.join("bun"), "planted").unwrap();
+        std::fs::write(cache.join("home").join("saved"), "saved").unwrap();
+        ensure_cache_subdirs(&cache).unwrap();
+        assert!(
+            std::fs::symlink_metadata(cache.join("bun"))
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "planted file replaced with a real dir"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join("home").join("saved")).unwrap(),
+            "saved",
+            "real dir contents are kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join("keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    /// A cache root that is itself a link fails closed instead of creating
+    /// through it.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_cache_subdirs_rejects_a_linked_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        ensure_cache_subdirs(&link).unwrap_err();
+        assert!(
+            std::fs::symlink_metadata(link.join("bun")).is_err(),
+            "nothing was created through the link"
+        );
+    }
+
+    /// A killed step leaf is removed: no stale per-step leaves pile up.
+    /// A plain dir stands in for the leaf (no cgroupfs needed). `kill_leaf`
+    /// is not in this loop: on a fake leaf its `cgroup.kill` write leaves a
+    /// real file behind which blocks `rmdir` (on cgroupfs interface files
+    /// do not block removing an empty group); `kill_leaf` has its own tests.
+    #[tokio::test]
+    async fn remove_step_leaf_removes_the_killed_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        remove_step_leaf(&leaf).await;
+        assert!(!leaf.exists(), "the step leaf is gone");
+        // A missing leaf is success too (already reaped, or dev).
+        remove_step_leaf(&leaf).await;
+    }
+
+    /// End to end on real cgroupfs: a step in its own leaf leaves no leaf
+    /// behind (killed and removed).
+    #[tokio::test]
+    #[ignore = "needs a writable cgroupfs mount plus cgroup delegation to make a real leaf"]
+    async fn step_in_a_real_leaf_leaves_no_leaf_behind() {
+        let root = Path::new("/sys/fs/cgroup");
+        let leaf = root.join(format!("outer-leaf-rm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&leaf).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let sb = Sandbox {
+            uid: None,
+            gid: None,
+            platform_env: &[],
+            env: &[],
+            cache_root: &cache,
+            cgroup_leaf: Some(&leaf),
+        };
+        let out = run_sandboxed("true", &[], dir.path(), &sb, Duration::from_secs(20)).await;
+        assert!(out.is_ok(), "step in a real leaf succeeds: {out:?}");
+        assert!(!leaf.exists(), "the step leaf was removed");
     }
 }
