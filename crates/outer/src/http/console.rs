@@ -545,6 +545,15 @@ async fn sign_in_post(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
+    // Same-origin gate on every step: the terms step acts on the session
+    // cookie, so a cross-site form must not be able to drive it.
+    if !fetch_ok(&headers) {
+        return page(
+            StatusCode::FORBIDDEN,
+            email_form(Some("Open the sign-in page on outer.now and try again.")),
+            None,
+        );
+    }
     let mcp = &state.mcp;
     let ip = request_ip(&headers, mcp.auth.config.origin_locked, Some(peer));
     match form.get("step").map(String::as_str) {
@@ -729,8 +738,10 @@ mod tests {
     }
 
     fn post_form(path: &str, body: &str, cookie: Option<&str>) -> Request<Body> {
-        let mut req =
-            Request::post(path).header("content-type", "application/x-www-form-urlencoded");
+        // Browsers send `Sec-Fetch-Site: same-origin` on the sign-in form.
+        let mut req = same_origin(
+            Request::post(path).header("content-type", "application/x-www-form-urlencoded"),
+        );
         if let Some(cookie) = cookie {
             req = req.header("cookie", cookie);
         }
@@ -983,6 +994,28 @@ mod tests {
             foreign.parse::<serde_json::Value>().unwrap()["error"],
             "not_found"
         );
+    }
+
+    /// The terms step acts on the session cookie: a cross-site form must not
+    /// drive any sign-in step.
+    #[tokio::test]
+    async fn sign_in_post_refuses_cross_site_forms() {
+        let (app, _, _, codes) = test_app().await;
+        let cookie = sign_in(&app, &codes, "ana@example.com").await;
+        let (status, _, _) = send(
+            &app,
+            Request::post("/console/sign-in")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", "cross-site")
+                .header("cookie", &cookie)
+                .body(Body::from(form(&[
+                    ("step", "terms"),
+                    ("accept_terms", "on"),
+                ])))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
