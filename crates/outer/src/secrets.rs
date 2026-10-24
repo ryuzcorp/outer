@@ -129,6 +129,9 @@ pub fn decrypt(key: &SecretsKey, app_id: &str, name: &str, blob: &[u8]) -> anyho
 /// (`^[A-Z_][A-Z0-9_]{0,63}$`), so it interpolates safely into `env.NAME`.
 /// Reserved platform names are refused separately ([`check_reserved`]).
 pub fn check_name(name: &str) -> Result<(), String> {
+    if !name.is_ascii() {
+        return Err(format!("secret name {name:?} must be ASCII"));
+    }
     if name.is_empty() || name.len() > 64 {
         return Err(format!(
             "secret name must be 1-64 chars, got {}",
@@ -138,23 +141,29 @@ pub fn check_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let first = chars.next().expect("nonempty checked above");
     let head_ok = first == '_' || first.is_ascii_uppercase();
-    if !head_ok || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+    // Exactly `^[A-Z_][A-Z0-9_]{0,63}$`: lowercase is refused, so a name
+    // can never smuggle shell case-folding surprises into `env.NAME`.
+    if !head_ok || !chars.all(|c| c == '_' || c.is_ascii_uppercase() || c.is_ascii_digit()) {
         return Err(format!(
             "secret name {name:?} must match ^[A-Z_][A-Z0-9_]{{0,63}}$"
         ));
     }
-    if !name.is_ascii() {
-        return Err(format!("secret name {name:?} must be ASCII"));
-    }
-    // `_` and digits pass the shape above but can never start a name;
-    // digits are covered by the first-char check, `_` is allowed.
     Ok(())
 }
-
 /// Refuse platform-reserved names (spec §12.4): `PORT`, `AWS_*`, `OUTER_*`
 /// and friends stay the platform's, so an app secret can never shadow or
 /// capture platform configuration at runtime.
+///
+/// All `BUN_*` names are refused for secrets, including
+/// `BUN_INSTALL_CACHE_DIR`: the sandbox lets that one through for builds,
+/// but secrets never reach builds — they only land in Worker `vars` — so
+/// there is no reason to let a secret claim any `BUN_*` name.
 pub fn check_reserved(name: &str) -> Result<(), String> {
+    if name.starts_with("BUN_") {
+        return Err(format!(
+            "secret name {name:?} is reserved for the platform and cannot be used for app secrets"
+        ));
+    }
     if crate::fleet::sandbox::is_reserved_env_name(name) {
         return Err(format!(
             "secret name {name:?} is reserved for the platform and cannot be used for app secrets"
@@ -332,6 +341,10 @@ mod tests {
         for bad in [
             "",
             "a",
+            "MyKey",
+            "Port",
+            "Aws_key",
+            "APIkey",
             "9LIVES",
             "API-KEY",
             "API KEY",
@@ -356,6 +369,10 @@ mod tests {
             assert!(err.contains("reserved"), "{reserved}: {err}");
         }
         assert!(check_reserved("RESEND_API_KEY").is_err());
+        // Secrets never reach builds, so every `BUN_*` name is refused for
+        // secrets — even the cache-dir override the sandbox allows builds.
+        assert!(check_reserved("BUN_FOO").is_err());
+        assert!(check_reserved("BUN_INSTALL_CACHE_DIR").is_err());
         assert!(check_reserved("MY_KEY").is_ok());
     }
 

@@ -21,7 +21,7 @@ pub struct ListSecretsInput {
     pub app: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct SetSecretInput {
     /// The app slug.
     pub app: String,
@@ -31,6 +31,16 @@ pub struct SetSecretInput {
     pub value: String,
 }
 
+/// Never formats the value: tool inputs can land in logs and error reports.
+impl std::fmt::Debug for SetSecretInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetSecretInput")
+            .field("app", &self.app)
+            .field("key", &self.key)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UnsetSecretInput {
     /// The app slug.
@@ -115,4 +125,22 @@ pub async fn unset_secret(input: UnsetSecretInput, ctx: &Ctx<'_>) -> Result<Valu
         ),
         json!({"ok": true, "applies": "next deploy"}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SetSecretInput;
+
+    #[test]
+    fn set_input_debug_redacts_the_value() {
+        let input = SetSecretInput {
+            app: "grocery".to_string(),
+            key: "API_KEY".to_string(),
+            value: "super-secret-value".to_string(),
+        };
+        let shown = format!("{input:?}");
+        assert!(shown.contains("grocery"), "keeps context: {shown}");
+        assert!(shown.contains("API_KEY"), "keeps the name: {shown}");
+        assert!(!shown.contains("super-secret-value"), "redacts: {shown}");
+    }
 }

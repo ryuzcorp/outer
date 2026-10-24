@@ -533,6 +533,16 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             "closed deploy rows a restart cut off (marked failed)"
         );
     }
+    // A crash mid-upload leaves injected plaintext in the worktree: put the
+    // stashed pre-inject bytes back and delete the sidecars (next boot
+    // retries whatever still fails the symlink check).
+    let scrubbed = outer::deploy::scrub_interrupted_injections(&config.data_dir)?;
+    if scrubbed > 0 {
+        tracing::warn!(
+            scrubbed,
+            "restored deploy configs a restart cut off mid secret-injection"
+        );
+    }
     // Bind before claiming the bucket: a second instance that can't listen
     // must not take ownership away from the one that's serving.
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
