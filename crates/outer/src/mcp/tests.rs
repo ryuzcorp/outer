@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 26);
+    assert_eq!(anon.len(), 27);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 24);
+    assert_eq!(authed.len(), 25);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -438,7 +438,8 @@ async fn registry_schemas_are_valid_json_schema() {
             "search_code",
             "show_commit",
             "deploy_log",
-            "app_logs"
+            "app_logs",
+            "app_errors"
         ]
     );
 }
@@ -1083,6 +1084,136 @@ async fn app_logs_empty_ring_and_method_not_allowed() {
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+#[tokio::test]
+async fn app_errors_groups_scope_and_shape() {
+    use crate::fleet::supervisor::{LogEntry, LogStream};
+    use crate::observe::logs as obs;
+
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    let app_id = app_id(&state, "groceries").await;
+
+    // Seed the log stream the way a fleet would write it, then flush the
+    // way the sweep does.
+    let lines = [
+        "serving on :8080",
+        "Error: kaboom user-1",
+        "    at handler (file:///app/index.js:10:5)",
+        "TypeError: bad id 42",
+    ];
+    let entries: Vec<LogEntry> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| LogEntry {
+            seq: i as u64,
+            ts: 1_700_000_000 + i as i64,
+            stream: LogStream::Stderr,
+            line: line.to_string(),
+        })
+        .collect();
+    obs::flush_fleet(&state.pool, &app_id, &entries)
+        .await
+        .unwrap();
+
+    // One proxy 5xx in the trailing hour.
+    let now = crate::apps::now_ms();
+    sqlx::query(
+        "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) \
+         VALUES (?1, ?2, 10, 0, 1, '', 0, 0)",
+    )
+    .bind(&app_id)
+    .bind(now / 60_000 * 60_000)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    // A stranger's slug answers not_found, exactly like a missing one.
+    let (_, bob_body) = call(
+        &state,
+        Some(&bob),
+        "app_errors",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&bob_body)["error"], "not_found");
+    // An unknown status is the caller's bug.
+    let (_, bad) = call(
+        &state,
+        Some(&ana),
+        "app_errors",
+        json!({"app": "groceries", "status": "bogus"}),
+    )
+    .await;
+    assert_eq!(is_error(&bad)["error"], "invalid_argument");
+
+    let (_, out) = call(
+        &state,
+        Some(&ana),
+        "app_errors",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let out = result(&out);
+    let structured = &out["structuredContent"];
+    assert_eq!(structured["s5xx_last_hour"], 1);
+    let found = structured["issues"].as_array().unwrap();
+    assert_eq!(found.len(), 2);
+    // Newest first.
+    assert!(found[0]["last_seen"].as_i64().unwrap() >= found[1]["last_seen"].as_i64().unwrap());
+    let kaboom = found
+        .iter()
+        .find(|item| item["message"].as_str().unwrap().contains("kaboom"))
+        .unwrap();
+    assert_eq!(kaboom["count"], 1);
+    assert_eq!(kaboom["status"], "open");
+    assert_eq!(kaboom["fingerprint"].as_str().unwrap().len(), 64);
+    assert!(kaboom["frame"].as_str().unwrap().contains("at handler"));
+    assert!(kaboom.get("last_deploy_sha").is_some());
+    // Untrusted: the payload rides behind the §8.4 notice as its own block.
+    let blocks = out["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks[1]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("The following was produced by your app and its visitors."));
+
+    // Status filter.
+    let (_, open) = call(
+        &state,
+        Some(&ana),
+        "app_errors",
+        json!({"app": "groceries", "status": "open"}),
+    )
+    .await;
+    assert_eq!(
+        result(&open)["structuredContent"]["issues"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (_, resolved) = call(
+        &state,
+        Some(&ana),
+        "app_errors",
+        json!({"app": "groceries", "status": "resolved"}),
+    )
+    .await;
+    assert!(result(&resolved)["structuredContent"]["issues"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // The call lands in the console action log.
+    let actions = crate::mcp::actions::list(&state.pool, &app_id, None, 10)
+        .await
+        .unwrap();
+    assert!(actions
+        .iter()
+        .any(|action| action.tool == "app_errors" && action.summary == "app_errors"));
 }
 
 #[tokio::test]

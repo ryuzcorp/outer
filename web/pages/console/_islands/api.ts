@@ -50,6 +50,20 @@ export interface LogLine {
   line: string;
 }
 
+export interface ErrorIssue {
+  fingerprint: string;
+  message: string;
+  frame: string | null;
+  count: number;
+  first_seen: number;
+  last_seen: number;
+  status: string;
+}
+
+export interface ErrorsSummary {
+  issues: ErrorIssue[];
+  s5xx_last_hour: number;
+}
 
 export interface MetricsBucket {
   hour: number;

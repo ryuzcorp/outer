@@ -86,7 +86,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
     Some(match name {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
         | "get_app" | "share_app" | "list_files" | "read_file" | "search_code" | "history"
-        | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" => Hints::READ,
+        | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" => Hints::WRITE,
         "set_visibility" => Hints {
             idempotent: true,
@@ -271,6 +271,11 @@ pub fn registry() -> Vec<ToolDef> {
             "An app's recent log lines from the fleet ring, oldest first; pass back next_since to poll. Untrusted: lines may hold visitor text.",
             Account, true,
         ),
+        tool::<runtime_inputs::AppErrorsInput>(
+            "app_errors",
+            "An app's grouped runtime errors, newest first: ERROR lines and uncaught-exception stacks from the log stream, grouped by fingerprint, plus proxy 5xx over the last hour. Pass status to filter open, resolved or ignored issues. Untrusted: messages and frames may hold visitor text.",
+            Account, true,
+        ),
     ]
 }
 
@@ -297,7 +302,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 27);
     }
 }
 

@@ -242,6 +242,7 @@ impl FleetManager {
     /// start never leaves a tracked fleet behind.
     async fn spawn_and_gate(
         &self,
+        pool: &SqlitePool,
         app: &App,
         fresh_credentials: bool,
     ) -> anyhow::Result<WakeReport> {
@@ -253,8 +254,16 @@ impl FleetManager {
         } else {
             mint_start.elapsed().as_millis() as u64
         };
+        // The ring continues past the persisted lines. A DB read failure
+        // falls back to 0 rather than failing the wake: colliding new
+        // lines are then dropped by the flush's INSERT OR IGNORE, a
+        // bounded loss only in a path where SQLite already errored.
+        let log_seq_start = crate::observe::logs::max_seq(pool, &app.id)
+            .await
+            .map(|max| max.unwrap_or(-1).saturating_add(1).max(0) as u64)
+            .unwrap_or(0);
         let spawn_start = std::time::Instant::now();
-        let fleet = supervisor::start(&spec, &opts).await?;
+        let fleet = supervisor::start(&spec, &opts, log_seq_start).await?;
         let spawn_ms = spawn_start.elapsed().as_millis() as u64;
         self.inner.fleets.lock().await.insert(
             app.slug.clone(),
@@ -338,7 +347,7 @@ impl FleetManager {
             return Ok(());
         }
         let report = self
-            .spawn_and_gate(app, false)
+            .spawn_and_gate(pool, app, false)
             .await
             .map_err(|err| anyhow::anyhow!("failed wake for fleet {}: {err:#}", app.slug))?;
         self.mark_wake_activity(pool, app).await?;
@@ -470,6 +479,14 @@ impl FleetManager {
                 };
                 let mut fleet = live.fleet;
                 drop(fleets);
+                // Persist the tail before the ring dies with the fleet: the
+                // sweep flushes every tick, so this is normally a handful
+                // of lines. A flush failure still sleeps the fleet; the
+                // warn carries the slug.
+                let tail = crate::observe::logs::ring_snapshot(&fleet.logs).await;
+                if let Err(err) = crate::observe::logs::flush_fleet(pool, &app.id, &tail).await {
+                    tracing::warn!(slug = %slug, error = %format!("{err:#}"), "sleep flush failed; tail lines lost");
+                }
                 fleet.stop(StopGrace::NORMAL).await;
                 apps::set_asleep(pool, &app.id, Some(now)).await?;
                 slept.push(slug);
@@ -504,7 +521,7 @@ impl FleetManager {
             fleet.stop(StopGrace::NORMAL).await;
             // The restart forces a fresh mint: restarting on the cached grant
             // would restart on the same near-expiry credentials.
-            match self.spawn_and_gate(&app, true).await {
+            match self.spawn_and_gate(pool, &app, true).await {
                 Ok(report) => tracing::info!(
                     slug = %slug,
                     total_ms = report.total_ms,
@@ -520,10 +537,11 @@ impl FleetManager {
         Ok(slept)
     }
 
-    /// A tokio interval loop that sleeps idle fleets. Failures log and the
-    /// loop continues on the next tick. Retention prunes run at most once a
-    /// day (spec §3 log retention, §13 deploys, §17 TTLs); the timestamp
-    /// lives in this task, not in global state.
+    /// A tokio interval loop that sleeps idle fleets and flushes fleet logs
+    /// to SQLite. Failures log and the loop continues on the next tick.
+    /// Retention prunes run at most once a day (spec §3 log retention, §13
+    /// deploys and errors, §17 TTLs); the timestamp lives in this task, not
+    /// in global state.
     pub fn spawn_sleep_sweep(&self, pool: SqlitePool, every: Duration) {
         let this = self.clone();
         tokio::spawn(async move {
@@ -533,6 +551,12 @@ impl FleetManager {
                 interval.tick().await;
                 if let Err(err) = this.sleep_idle(&pool).await {
                     tracing::warn!(error = %err, "sleep sweep failed");
+                }
+                // Batched and off the hot path: every tracked fleet's new
+                // ring lines persist to `app_log` and group into
+                // `error_issue` once a tick.
+                if let Err(err) = crate::observe::logs::flush_all(&pool, &this).await {
+                    tracing::warn!(error = %format!("{err:#}"), "log flush failed");
                 }
                 let due = last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400));
                 if due {
@@ -597,6 +621,9 @@ async fn prune_retention(pool: &SqlitePool) {
     }
     if let Err(err) = crate::deploy::prune_old(pool).await {
         tracing::warn!(error = %format!("{err:#}"), "deploy prune failed");
+    }
+    if let Err(err) = crate::observe::logs::prune_errors(pool, now).await {
+        tracing::warn!(error = %format!("{err:#}"), "error_issue prune failed");
     }
 }
 

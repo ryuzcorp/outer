@@ -691,6 +691,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::warn!(error = %err, "final metrics flush failed; counts stay in memory only");
     }
     purges.drain().await;
+    // Persist the rings before they die with the fleets: the next boot
+    // serves these lines from `app_log`. A failure still stops the fleets.
+    if let Err(err) = outer::observe::logs::flush_all(&pool, &fleets).await {
+        tracing::warn!(error = %format!("{err:#}"), "final log flush failed; unflushed lines are lost");
+    }
     fleets.stop_all().await;
     store::snapshot::final_snapshot(&sync, &pool, &store, &snapshot_cfg).await;
     pool.close().await;

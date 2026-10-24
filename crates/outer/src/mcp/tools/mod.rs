@@ -760,6 +760,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "app_logs" => runtime::app_logs(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
+        "app_errors" => runtime::app_errors(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
         _ => Err(CallError::Rpc(-32602, format!("unknown tool {tool:?}"))),
     }
 }

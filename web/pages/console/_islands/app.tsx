@@ -14,6 +14,7 @@ import {
   type ActionEntry,
   type ActionsPage,
   type AppDetail,
+  type ErrorsSummary,
   type LogLine,
   type MetricsSummary,
 } from "./api.ts";
@@ -22,7 +23,6 @@ type State =
   | { kind: "loading" }
   | { kind: "error"; message: string }
   | { kind: "ready"; app: AppDetail; logs: LogLine[]; logsError: string | null };
-
 type MetricsPanel =
   | { kind: "loading" }
   | { kind: "error"; message: string }
@@ -38,6 +38,11 @@ type ActionsPanel =
       loadingMore: boolean;
       moreError: string | null;
     };
+
+type ErrorsPanel =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; summary: ErrorsSummary };
 
 const METRICS_RANGES = [
   { hours: 24, label: "24 h" },
@@ -121,6 +126,12 @@ async function loadActions(slug: string, before: string | null): Promise<Actions
   const cursor = before === null ? "" : `&before=${encodeURIComponent(before)}`;
   return api<ActionsPage>(
     `/api/console/apps/${encodeURIComponent(slug)}/actions?limit=20${cursor}`,
+  );
+}
+
+async function loadErrors(slug: string): Promise<ErrorsSummary> {
+  return api<ErrorsSummary>(
+    `/api/console/apps/${encodeURIComponent(slug)}/errors`,
   );
 }
 
@@ -420,10 +431,76 @@ function ActionsSection({
   );
 }
 
+function ErrorsSection({ panel }: { panel: ErrorsPanel }) {
+  return (
+    <section class="flex flex-col gap-2">
+      <h3 class="text-lg font-semibold">Errors</h3>
+      {panel.kind === "loading" && (
+        <div class="flex justify-center py-6">
+          <span class="loading loading-spinner" aria-label="Loading errors" />
+        </div>
+      )}
+      {panel.kind === "error" && (
+        <div role="alert" class="alert alert-warning text-sm">
+          Couldn't load errors: {panel.message}
+        </div>
+      )}
+      {panel.kind === "ready" &&
+        (panel.summary.issues.length === 0 ? (
+          <div role="status" class="alert">
+            No errors recorded.
+            {panel.summary.s5xx_last_hour > 0 &&
+              ` ${panel.summary.s5xx_last_hour} proxy 5xx in the last hour, with no grouped issue.`}
+          </div>
+        ) : (
+          <div class="flex flex-col gap-2">
+            <p class="text-sm opacity-70">
+              {panel.summary.s5xx_last_hour.toLocaleString()} proxy 5xx in the
+              last hour.
+            </p>
+            <div class="overflow-x-auto">
+              <table class="table table-sm">
+                <thead>
+                  <tr>
+                    <th>Last seen</th>
+                    <th>Error</th>
+                    <th>Seen</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {panel.summary.issues.map((issue) => (
+                    <tr key={issue.fingerprint}>
+                      <td title={when(issue.last_seen)}>{timeAgo(issue.last_seen)}</td>
+                      <td class="font-mono text-xs whitespace-pre-wrap break-all">
+                        {issue.message}
+                        {issue.frame && (
+                          <>
+                            <br />
+                            <span class="opacity-70">{issue.frame}</span>
+                          </>
+                        )}
+                      </td>
+                      <td>{issue.count.toLocaleString()}×</td>
+                      <td>
+                        <span class={outcomeBadge(issue.status)}>{issue.status}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))}
+    </section>
+  );
+}
+
 export function AppView() {
   const state = atom<State>({ kind: "loading" });
   const metrics = atom<MetricsPanel>({ kind: "loading" });
   const actions = atom<ActionsPanel>({ kind: "loading" });
+  const errors = atom<ErrorsPanel>({ kind: "loading" });
   const slug =
     typeof window === "undefined"
       ? null
@@ -522,14 +599,21 @@ export function AppView() {
           .catch((err: unknown) => {
             actions.set({ kind: "error", message: String(err) });
           });
+        loadErrors(app.slug)
+          .then((summary) => {
+            errors.set({ kind: "ready", summary });
+          })
+          .catch((err: unknown) => {
+            errors.set({ kind: "error", message: String(err) });
+          });
       })
       .catch((err: unknown) => {
         state.set({ kind: "error", message: String(err) });
         metrics.set({ kind: "error", message: String(err) });
         actions.set({ kind: "error", message: String(err) });
+        errors.set({ kind: "error", message: String(err) });
       });
   });
-
   const current = state();
   if (current.kind === "loading") {
     if (typeof window !== "undefined" && !slug) {
@@ -675,6 +759,8 @@ export function AppView() {
           </pre>
         )}
       </section>
+
+      <ErrorsSection panel={errors()} />
     </div>
   );
 }

@@ -196,9 +196,16 @@ impl LogRing {
     pub const DEFAULT_CAP: usize = 2000;
 
     pub fn new(cap: usize) -> Self {
+        Self::new_with_next(cap, 0)
+    }
+
+    /// A ring whose first entry takes `next`: a fleet woken after sleep or
+    /// a restart continues past the persisted `MAX(seq)` for its app, so
+    /// persisted lines and live ring lines merge on one `since` cursor.
+    pub fn new_with_next(cap: usize, next: u64) -> Self {
         Self {
             cap: cap.max(1),
-            next: 0,
+            next,
             entries: VecDeque::new(),
         }
     }
@@ -245,7 +252,16 @@ impl LogRing {
 pub type SharedLogRing = Arc<tokio::sync::Mutex<LogRing>>;
 
 pub fn new_log_ring() -> SharedLogRing {
-    Arc::new(tokio::sync::Mutex::new(LogRing::new(LogRing::DEFAULT_CAP)))
+    new_log_ring_from(0)
+}
+
+/// A shared ring continuing past `next - 1`; see
+/// [`LogRing::new_with_next`].
+pub fn new_log_ring_from(next: u64) -> SharedLogRing {
+    Arc::new(tokio::sync::Mutex::new(LogRing::new_with_next(
+        LogRing::DEFAULT_CAP,
+        next,
+    )))
 }
 
 /// How long a fleet stop waits for graceful exit (SIGTERM) and then for the
@@ -357,7 +373,14 @@ where
 
 /// Start one celld fleet: state dir, uid drop, its own process group, its own
 /// cgroup leaf, and stdout/stderr captured line by line into a fresh ring.
-pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<RunningFleet> {
+/// `log_seq_start` is the ring's first sequence number: the caller passes
+/// the persisted `MAX(seq) + 1` for the app, so seqs stay global per app
+/// across sleep and restart.
+pub async fn start(
+    spec: &FleetSpec,
+    opts: &FleetOpts,
+    log_seq_start: u64,
+) -> anyhow::Result<RunningFleet> {
     use anyhow::Context;
     use std::os::unix::process::CommandExt;
     tokio::fs::create_dir_all(&opts.state_dir)
@@ -456,7 +479,7 @@ pub async fn start(spec: &FleetSpec, opts: &FleetOpts) -> anyhow::Result<Running
             tracing::warn!(fleet = %spec.slug, leaf = %spec.cgroup_leaf.display(), error = %e, "fleet cgroup move failed; running uncapped");
         }
     }
-    let logs = new_log_ring();
+    let logs = new_log_ring_from(log_seq_start);
     if let Some(out) = child.stdout.take() {
         spawn_capture(out, LogStream::Stdout, logs.clone());
     }
@@ -661,7 +684,7 @@ mod tests {
         let (mut spec, mut opts) = test_spec(dir.path());
         opts.celld_bin = bin.to_string_lossy().into_owned();
         spec.cgroup_leaf = dir.path().to_path_buf();
-        let mut fleet = start(&spec, &opts).await.unwrap();
+        let mut fleet = start(&spec, &opts, 0).await.unwrap();
         assert!(fleet.is_alive());
         // Captured output drains into the ring (the fake celld is silent).
         assert!(fleet.logs.lock().await.is_empty());
@@ -692,7 +715,7 @@ mod tests {
         // Nowhere to move into: the write is refused (ENOENT).
         spec.cgroup_leaf = dir.path().join("no-such-leaf");
         spec.cgroups_active = true;
-        let Err(err) = start(&spec, &opts).await else {
+        let Err(err) = start(&spec, &opts, 0).await else {
             panic!("an active refused move must fail");
         };
         let msg = format!("{err:#}");
@@ -710,7 +733,7 @@ mod tests {
         opts.celld_bin = fake_celld(&dir, "#!/bin/sh\nsleep 30\n");
         spec.cgroup_leaf = dir.path().join("no-such-leaf");
         spec.cgroups_active = false;
-        let mut fleet = start(&spec, &opts).await.unwrap();
+        let mut fleet = start(&spec, &opts, 0).await.unwrap();
         assert!(fleet.is_alive());
         fleet
             .stop(StopGrace {
@@ -733,7 +756,7 @@ mod tests {
             "#!/bin/sh\nhead -c 1048576 /dev/zero | tr '\\0' 'x'; echo; echo hello; sleep 30\n",
         );
         spec.cgroup_leaf = dir.path().to_path_buf();
-        let mut fleet = start(&spec, &opts).await.unwrap();
+        let mut fleet = start(&spec, &opts, 0).await.unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let tail = loop {
             let tail = fleet.logs.lock().await.tail(10);
@@ -813,7 +836,7 @@ mod tests {
         // The leader exits at once, leaving a group member behind.
         opts.celld_bin = fake_celld(&dir, &format!("#!/bin/sh\nsleep {marker} &\n"));
         spec.cgroup_leaf = dir.path().to_path_buf();
-        let mut fleet = start(&spec, &opts).await.unwrap();
+        let mut fleet = start(&spec, &opts, 0).await.unwrap();
         assert_eq!(fleet.pgid, fleet.child.id().unwrap_or(fleet.pgid));
         // Reap the exited leader, like a liveness poll would.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
