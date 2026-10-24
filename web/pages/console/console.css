@@ -157,6 +157,11 @@ body {
   border-radius: var(--radius-box);
   padding: 10px 0;
   min-height: calc(100dvh - 24px);
+  /* `sticky` makes the rail its own stacking context, so its dropdowns and
+     tooltips (daisyUI z-index 999/2) only stack inside it. Without a z-index
+     the later, positioned cards (`.card` is `position: relative`) paint over
+     them and the menus open invisibly behind the content. */
+  z-index: 20;
 }
 
 .rail-apps {
@@ -439,4 +444,11 @@ a.rail-tile:hover {
 .side .menu :where(li > .menu-active),
 .side .menu :where(li > a.menu-active) {
   @apply bg-base-200 text-base-content font-medium;
+}
+
+/* The mobile drawer still covers the rail (rail z-index 20 > daisyUI's 10). */
+@media (max-width: 767px) {
+  .drawer-side {
+    z-index: 30;
+  }
 }
