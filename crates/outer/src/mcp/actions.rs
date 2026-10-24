@@ -28,6 +28,7 @@
 //! - `show_commit`: `show_commit <sha>`
 //! - `deploy_status` / `deploy_log`: `<tool> [deploy <id-short>]`
 //! - `app_logs`: `app_logs [limit=<n>] [since=<seq>]`
+//! - `app_errors`: `app_errors [status=<s>]`
 
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -56,6 +57,7 @@ const LOGGED_TOOLS: &[&str] = &[
     "deploy_status",
     "deploy_log",
     "app_logs",
+    "app_errors",
 ];
 
 /// Truncate to `n` chars on a char boundary, marking the cut.
@@ -222,6 +224,13 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             }
             if let Some(since) = arg_u64(args, "since") {
                 s.push_str(&format!(" since={since}"));
+            }
+            s
+        }
+        "app_errors" => {
+            let mut s = "app_errors".to_string();
+            if let Some(status) = arg_str(args, "status") {
+                s.push_str(&format!(" status={status}"));
             }
             s
         }

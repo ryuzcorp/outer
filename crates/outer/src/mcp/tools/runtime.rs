@@ -1,10 +1,11 @@
-//! The deploy and runtime tools: `deploy_status`, `deploy_log`, `app_logs`.
+//! The deploy and runtime tools: `deploy_status`, `deploy_log`, `app_logs`,
+//! `app_errors`.
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{await_row, deploy_by, ok_untrusted, owned_app, Ctx};
+use super::{await_row, deploy_by, latest_deploy, ok_untrusted, owned_app, Ctx};
 use crate::mcp::error::ToolError;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -80,49 +81,35 @@ pub async fn deploy_log(input: DeployLogInput, ctx: &Ctx<'_>) -> Result<Value, T
         json!({"deploy_id": row.deploy_id, "sha": row.sha, "status": row.status, "log": log}),
     ))
 }
-
-/// Lines from a fleet's in-memory log ring: the newest `limit` tail, or —
-/// when `since` is set — the OLDEST `limit` after that sequence number, so
-/// the next poll from the last returned seq continues without a gap.
+/// Lines from the persisted `app_log` merged with the fleet's live ring on
+/// one `seq` cursor: the newest `limit` tail, or — when `since` is set —
+/// the OLDEST `limit` after that sequence number, so the next poll from the
+/// last returned seq continues without a gap. Persisted lines survive sleep
+/// and restart; the ring covers what the sweep has not flushed yet.
 /// Shared by the MCP `app_logs` tool and the console logs endpoint.
 pub async fn log_lines(
+    pool: &sqlx::SqlitePool,
     fleets: &crate::fleet::manager::FleetManager,
+    app_id: &str,
     slug: &str,
     since: Option<u64>,
     limit: usize,
 ) -> Vec<Value> {
-    let Some(ring) = fleets.logs(slug) else {
-        return Vec::new();
-    };
-    let ring = ring.lock().await;
-    let entries = match since {
-        Some(seq) => ring.since(seq),
-        None => ring.tail(limit),
-    };
-    // tail() returns the newest N in order; since() is unbounded and feeds
-    // a cursor: keep the OLDEST `limit` after `since`.
-    let entries = if since.is_some() {
-        cursor_page(entries, limit)
-    } else {
-        entries
-    };
-    entries
-        .iter()
-        .map(|e| {
-            json!({
-                "seq": e.seq,
-                "ts": e.ts,
-                "stream": format!("{:?}", e.stream).to_ascii_lowercase(),
-                "line": e.line,
-            })
-        })
-        .collect()
+    crate::observe::logs::read_merged(pool, fleets, app_id, slug, since, limit).await
 }
 
 pub async fn app_logs(input: AppLogsInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
     let limit = input.limit.unwrap_or(100).clamp(1, 500) as usize;
-    let lines: Vec<Value> = log_lines(&ctx.state.fleets, &app.slug, input.since, limit).await;
+    let lines: Vec<Value> = log_lines(
+        &ctx.state.pool,
+        &ctx.state.fleets,
+        &app.id,
+        &app.slug,
+        input.since,
+        limit,
+    )
+    .await;
     let next_since = lines.last().and_then(|l| l["seq"].as_u64());
     let data = lines
         .iter()
@@ -140,30 +127,80 @@ pub async fn app_logs(input: AppLogsInput, ctx: &Ctx<'_>) -> Result<Value, ToolE
     ))
 }
 
-/// One page of a `since` cursor: the OLDEST `limit` entries, so the next
-/// poll from the last returned seq continues without a gap.
-fn cursor_page<T>(mut entries: Vec<T>, limit: usize) -> Vec<T> {
-    entries.truncate(limit);
-    entries
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AppErrorsInput {
+    /// The app slug.
+    pub app: String,
+    /// Only issues with this status (`open`, `resolved` or `ignored`);
+    /// unset returns every status.
+    pub status: Option<String>,
 }
 
-#[cfg(test)]
-mod cursor_tests {
-    use super::cursor_page;
-
-    #[test]
-    fn polling_pages_through_every_line() {
-        let ring: Vec<u64> = (1..=7).collect();
-        let mut seen = Vec::new();
-        let mut since = 0;
-        loop {
-            let page = cursor_page(ring.iter().copied().filter(|seq| *seq > since).collect(), 3);
-            let Some(last) = page.last().copied() else {
-                break;
-            };
-            seen.extend(page);
-            since = last;
+/// The app's grouped runtime errors, newest first: `ERROR` lines and
+/// uncaught-exception stacks from the fleet log stream, grouped by
+/// fingerprint, plus the proxy 5xx count over the trailing hour (reused
+/// from `metric_minute`, never counted twice). Untrusted like `app_logs`:
+/// messages and frames can hold app or visitor text.
+pub async fn app_errors(input: AppErrorsInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let app = owned_app(ctx, &input.app).await?;
+    if let Some(status) = input.status.as_deref() {
+        if !matches!(status, "open" | "resolved" | "ignored") {
+            return Err(ToolError::invalid_argument(format!(
+                "unknown status {status:?}: expected open, resolved or ignored"
+            )));
         }
-        assert_eq!(seen, ring, "no line falls behind the cursor");
     }
+    let found = crate::observe::logs::issues(&ctx.state.pool, &app.id, input.status.as_deref())
+        .await
+        .map_err(super::internal)?;
+    let s5xx =
+        crate::observe::logs::s5xx_last_hour(&ctx.state.pool, &app.id, crate::apps::now_ms())
+            .await
+            .map_err(super::internal)?;
+    // The app's latest deploy, for "did my last deploy fix it"
+    // correlation. One value for the whole answer.
+    let last_deploy_sha = latest_deploy(&ctx.state.pool, &app.id)
+        .await
+        .map_err(super::internal)?
+        .map(|row| row.sha);
+    let items: Vec<Value> = found
+        .iter()
+        .map(|issue| {
+            json!({
+                "fingerprint": issue.fingerprint,
+                "message": issue.message,
+                "frame": issue.frame,
+                "count": issue.count,
+                "first_seen": issue.first_seen,
+                "last_seen": issue.last_seen,
+                "status": issue.status,
+                "last_deploy_sha": last_deploy_sha,
+            })
+        })
+        .collect();
+    let data = items
+        .iter()
+        .map(|item| {
+            format!(
+                "{} (x{}, {})",
+                item["message"].as_str().unwrap_or(""),
+                item["count"].as_i64().unwrap_or(0),
+                item["status"].as_str().unwrap_or(""),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ok_untrusted(
+        format!(
+            "{} error issue(s), {} proxy 5xx in the last hour.",
+            items.len(),
+            s5xx
+        ),
+        if data.is_empty() {
+            "(no issues)".to_string()
+        } else {
+            data
+        },
+        json!({"issues": items, "s5xx_last_hour": s5xx}),
+    ))
 }

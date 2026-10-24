@@ -17,7 +17,9 @@
 //!   4xx/5xx, latency p50/p95, hourly buckets and top paths (same rows as
 //!   `metrics::summary`; `hours` is 24, 168 or 720).
 //! - `GET /api/console/apps/:slug/logs?since=&limit=`: the fleet's
-//!   in-memory log ring (same lines as MCP `app_logs`).
+//!   in-memory log ring merged with persisted lines (same lines as MCP `app_logs`).
+//! - `GET /api/console/apps/:slug/errors?status=`: grouped runtime errors
+//!   plus the trailing-hour proxy 5xx (same rows as MCP `app_errors`).
 //! - `POST /api/console/sign-out`: deletes the session, clears the cookie.
 //!
 //! Rules: session cookie only (an `Authorization` header is ignored, never
@@ -55,6 +57,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/apps/{slug}/actions", get(api_actions))
         .route("/api/console/apps/{slug}/metrics", get(api_metrics))
         .route("/api/console/apps/{slug}/logs", get(api_logs))
+        .route("/api/console/apps/{slug}/errors", get(api_errors))
         .route("/api/console/sign-out", post(api_sign_out))
         .with_state(state)
 }
@@ -342,7 +345,15 @@ async fn api_logs(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100)
         .clamp(1, 500);
-    let lines = crate::mcp::tools::runtime::log_lines(&mcp.fleets, &app.slug, since, limit).await;
+    let lines = crate::mcp::tools::runtime::log_lines(
+        &mcp.pool,
+        &mcp.fleets,
+        &app.id,
+        &app.slug,
+        since,
+        limit,
+    )
+    .await;
     let next_since = lines
         .last()
         .and_then(|l| l.get("seq").and_then(|s| s.as_u64()));
@@ -357,6 +368,77 @@ async fn api_logs(
         .into_response()
 }
 
+/// `GET /api/console/apps/:slug/errors?status=`: the app's grouped runtime
+/// errors, newest first, plus the proxy 5xx count over the trailing hour
+/// (same rows as MCP `app_errors`). `status` is `open`, `resolved` or
+/// `ignored`; unset returns every status, anything else is a 400.
+async fn api_errors(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    let app = match owned_app(mcp, &account, &slug).await {
+        Ok(Some(app)) => app,
+        Ok(None) => return not_found(),
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load the app right now",
+            );
+        }
+    };
+    let status = query.get("status").map(String::as_str);
+    if let Some(status) = status {
+        if !matches!(status, "open" | "resolved" | "ignored") {
+            return nostore_json(
+                StatusCode::BAD_REQUEST,
+                "bad_status",
+                "status must be one of open, resolved, ignored",
+            );
+        }
+    }
+    let found = match crate::observe::logs::issues(&mcp.pool, &app.id, status).await {
+        Ok(found) => found,
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load errors right now",
+            );
+        }
+    };
+    let s5xx = match crate::observe::logs::s5xx_last_hour(&mcp.pool, &app.id, crate::apps::now_ms())
+        .await
+    {
+        Ok(s5xx) => s5xx,
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load errors right now",
+            );
+        }
+    };
+    ok_json(json!({
+        "issues": found.iter().map(|issue| json!({
+            "fingerprint": issue.fingerprint,
+            "message": issue.message,
+            "frame": issue.frame,
+            "count": issue.count,
+            "first_seen": issue.first_seen,
+            "last_seen": issue.last_seen,
+            "status": issue.status,
+        })).collect::<Vec<_>>(),
+        "s5xx_last_hour": s5xx,
+    }))
+}
 /// `GET /api/console/apps/:slug/actions`: the app's agent action log,
 /// newest first. `before` is the opaque `<created_at>:<id>` cursor of the
 /// last row on the previous page; `limit` defaults to 20 and clamps to
@@ -1312,6 +1394,7 @@ mod tests {
         let paths = [
             "/api/console/apps/groceries/actions".to_string(),
             "/api/console/apps/groceries/metrics?hours=24".to_string(),
+            "/api/console/apps/groceries/errors".to_string(),
         ];
         for path in &paths {
             let (status, headers, _) = send(
@@ -1343,7 +1426,7 @@ mod tests {
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         seed_app(&pool, "ben@example.com", "benblog", now).await;
         let session = login(&pool, "ana@example.com").await;
-        for prefix in ["actions", "metrics?hours=24"] {
+        for prefix in ["actions", "metrics?hours=24", "errors"] {
             let (status, _, foreign) = send(
                 &app,
                 authed(&format!("/api/console/apps/benblog/{prefix}"), &session),
@@ -1567,5 +1650,76 @@ mod tests {
         assert_eq!(paths[0]["path"], "/");
         assert_eq!(paths[0]["requests"], 10);
         assert_eq!(paths[0]["s5xx"], 1);
+    }
+
+    #[tokio::test]
+    async fn errors_shape_rejects_bad_status_and_counts_s5xx() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        sqlx::query(
+            "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status) \
+             VALUES ('app-groceries', 'fp1', 'Error: kaboom', 'at handler (x:1:2)', 3, ?1, ?2, 'open')",
+        )
+        .bind(now - 1_000)
+        .bind(now - 500)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let minute = now / 60_000 * 60_000;
+        sqlx::query(
+            "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) \
+             VALUES ('app-groceries', ?1, 10, 0, 2, '', 0, 0)",
+        )
+        .bind(minute)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session = login(&pool, "ana@example.com").await;
+        let (status, headers, body) =
+            send(&app, authed("/api/console/apps/groceries/errors", &session)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-store");
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["s5xx_last_hour"], 2);
+        let found = body["issues"].as_array().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["fingerprint"], "fp1");
+        assert_eq!(found[0]["message"], "Error: kaboom");
+        assert_eq!(found[0]["frame"], "at handler (x:1:2)");
+        assert_eq!(found[0]["count"], 3);
+        assert_eq!(found[0]["status"], "open");
+        let (open_status, _, open_body) = send(
+            &app,
+            authed("/api/console/apps/groceries/errors?status=open", &session),
+        )
+        .await;
+        assert_eq!(open_status, StatusCode::OK);
+        assert_eq!(
+            open_body.parse::<serde_json::Value>().unwrap()["issues"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (resolved_status, _, _) = send(
+            &app,
+            authed(
+                "/api/console/apps/groceries/errors?status=resolved",
+                &session,
+            ),
+        )
+        .await;
+        assert_eq!(resolved_status, StatusCode::OK);
+        let (bad_status, _, bad_body) = send(
+            &app,
+            authed("/api/console/apps/groceries/errors?status=bogus", &session),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            bad_body.parse::<serde_json::Value>().unwrap()["error"],
+            "bad_status"
+        );
     }
 }
