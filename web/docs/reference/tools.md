@@ -5,7 +5,7 @@ description: Every Outer MCP tool — access, input shape and untrusted-output m
 
 # Tool reference
 
-Every Outer tool in `tools/list` order, rendered from the registry. Generated — do not edit by hand; run `cargo run -- docs tools > docs/reference/tools.md`.
+Every Outer tool in `tools/list` order, rendered from the registry. Generated — do not edit by hand; run `cargo run -- docs tools > web/docs/reference/tools.md`.
 
 ## `about`
 

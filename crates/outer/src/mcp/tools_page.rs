@@ -1,7 +1,7 @@
-//! Render the tool registry as the `docs/reference/tools.md` page.
+//! Render the tool registry as the `web/docs/reference/tools.md` page.
 //!
 //! The page is generated, never hand-edited:
-//! `cargo run -- docs tools > docs/reference/tools.md`. A test below pins
+//! `cargo run -- docs tools > web/docs/reference/tools.md`. A test below pins
 //! the committed file to exactly what the registry renders.
 
 use serde_json::Value;
@@ -17,7 +17,7 @@ pub fn render(tools: &[ToolDef]) -> String {
     out.push_str("---\ntitle: Tool reference\ndescription: Every Outer MCP tool — access, input shape and untrusted-output markers.\n---\n\n");
     out.push_str("# Tool reference\n\n");
     out.push_str("Every Outer tool in `tools/list` order, rendered from the registry. ");
-    out.push_str("Generated — do not edit by hand; run `cargo run -- docs tools > docs/reference/tools.md`.\n\n");
+    out.push_str("Generated — do not edit by hand; run `cargo run -- docs tools > web/docs/reference/tools.md`.\n\n");
     for tool in tools {
         out.push_str(&format!("## `{}`\n\n", tool.name));
         let access = match tool.access {
@@ -149,10 +149,10 @@ mod tests {
     #[test]
     fn committed_reference_matches_registry() {
         let rendered = render(&registry());
-        let committed = include_str!("../../../../docs/reference/tools.md");
+        let committed = include_str!("../../../../web/docs/reference/tools.md");
         assert_eq!(
             rendered, committed,
-            "docs/reference/tools.md is stale: run cargo run -- docs tools > docs/reference/tools.md"
+            "web/docs/reference/tools.md is stale: run cargo run -- docs tools > web/docs/reference/tools.md"
         );
     }
 

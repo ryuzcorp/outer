@@ -1,5 +1,5 @@
 target/
 .git/
-node_modules/
-dist/
-.blume/
+web/node_modules/
+web/dist/
+web/.blume/

@@ -30,6 +30,9 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2

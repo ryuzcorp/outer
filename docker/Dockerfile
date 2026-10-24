@@ -13,15 +13,15 @@ ARG ESBUILD_VERSION=0.28.2
 
 FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 
-# --- docs site (Blume) ----------------------------------------------------------
+# --- web site (Blume) -----------------------------------------------------------
 # The platform host serves this static build for humans and agents; the MCP
-# `docs` tool serves the same Markdown from `docs/guides/`. Installed with
+# `docs` tool serves the same Markdown from `web/docs/guides/`. Installed with
 # bun: npm's resolver stalls on Astro's dependency tree (250k+ placements,
 # no lockfile after hours), while `bun install` finishes in seconds.
 FROM docker.io/oven/bun:1.4-slim AS site
-WORKDIR /site
-COPY package.json bun.lock blume.config.ts ./
-COPY docs ./docs
+WORKDIR /site/web
+COPY web/package.json web/bun.lock web/blume.config.ts ./
+COPY web/docs ./docs
 RUN bun install --frozen-lockfile \
  && bun ./node_modules/blume/bin/blume.mjs build
 
@@ -30,11 +30,11 @@ FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # The whole crates/ tree: sources pull files in with include_str!/sqlx
-# migrate! (docs, migrations), and listing subdirectories here broke the
-# image twice when a new one appeared. `docs/` rides along too: the MCP
+# migrate! (web/docs, migrations), and listing subdirectories here broke the
+# image twice when a new one appeared. `web/docs` rides along too: the MCP
 # `docs` tool and `outer docs tools` embed it with include_str!.
 COPY crates ./crates
-COPY docs ./docs
+COPY web ./web
 RUN --mount=type=cache,id=outer-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=outer-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=outer-target,target=/src/target,sharing=locked \
@@ -72,8 +72,8 @@ RUN for uid in $(seq 200000 201023); do \
   && mkdir -p /data
 COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
 COPY --from=build /out/outer /usr/local/bin/outer
-# The built docs site, served on the platform host from OUTER_SITE_DIR.
-COPY --from=site /site/dist /usr/share/outer/site
+# The built web site, served on the platform host from OUTER_SITE_DIR.
+COPY --from=site /site/web/dist /usr/share/outer/site
 # Apache-2.0 §4(a) and §4(d): the image carries the License and the NOTICE.
 COPY LICENSE NOTICE /licenses/
 WORKDIR /data

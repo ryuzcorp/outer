@@ -37,7 +37,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Platform-host fallback, in order: the built docs site (static files
+/// Platform-host fallback, in order: the built web site (static files
 /// from `OUTER_SITE_DIR`), then the auth router (OAuth, well-known
 /// discovery) with its own 404 for anything else.
 async fn platform_fallback(State(state): State<AppState>, req: axum::extract::Request) -> Response {

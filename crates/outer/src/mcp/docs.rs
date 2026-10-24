@@ -1,4 +1,4 @@
-//! The `docs` topics: Markdown embedded from `docs/guides/*.md`.
+//! The `docs` topics: Markdown embedded from `web/docs/guides/*.md`.
 //!
 //! The guides carry Blume frontmatter (`title`/`description`) for the
 //! website; the MCP tool serves them as plain Markdown with that block
@@ -8,20 +8,26 @@
 pub const TOPICS: &[(&str, &str)] = &[
     (
         "quickstart",
-        include_str!("../../../../docs/guides/quickstart.md"),
+        include_str!("../../../../web/docs/guides/quickstart.md"),
     ),
-    ("ilha", include_str!("../../../../docs/guides/ilha.md")),
-    ("void", include_str!("../../../../docs/guides/void.md")),
-    ("celld", include_str!("../../../../docs/guides/celld.md")),
-    ("d1", include_str!("../../../../docs/guides/d1.md")),
+    ("ilha", include_str!("../../../../web/docs/guides/ilha.md")),
+    ("void", include_str!("../../../../web/docs/guides/void.md")),
+    (
+        "celld",
+        include_str!("../../../../web/docs/guides/celld.md"),
+    ),
+    ("d1", include_str!("../../../../web/docs/guides/d1.md")),
     (
         "storage",
-        include_str!("../../../../docs/guides/storage.md"),
+        include_str!("../../../../web/docs/guides/storage.md"),
     ),
-    ("limits", include_str!("../../../../docs/guides/limits.md")),
+    (
+        "limits",
+        include_str!("../../../../web/docs/guides/limits.md"),
+    ),
     (
         "moderation",
-        include_str!("../../../../docs/guides/moderation.md"),
+        include_str!("../../../../web/docs/guides/moderation.md"),
     ),
 ];
 
