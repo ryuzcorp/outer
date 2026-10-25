@@ -139,7 +139,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `set_visibility`
 
 - **Access:** signed in
-- **Description:** Set an app unlisted (default, kept out of search engines) or public.
+- **Description:** Set an app unlisted (default, kept out of search engines) or public (public is a Pro feature).
 
 **Input:**
 

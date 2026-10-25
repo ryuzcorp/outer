@@ -553,6 +553,12 @@ async fn create_commit_read_history_roundtrip() {
     let (_, get) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
     assert_eq!(result(&get)["structuredContent"]["status"], "running");
 
+    // `public` is a Pro feature: upgrade before flipping visibility.
+    sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
     let (_, vis) = call(
         &state,
         Some(&token),
@@ -2184,6 +2190,10 @@ async fn set_visibility_purges_the_app_host() {
     );
     let ana = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &ana, "groceries").await;
+    sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
     let before = fake.calls();
     let (_, out) = call(
         &state,
@@ -2425,4 +2435,53 @@ async fn secrets_cap_counts_distinct_names_and_values_stay_out_of_logs() {
         .await
         .unwrap();
     assert!(tools.contains(&"set_secret".to_string()), "{tools:?}");
+}
+
+/// `public` is a Pro feature, gated in the shared domain function: a Free
+/// owner is refused with `payment_required` (and a user message pointing to
+/// Pro), `unlisted` is always allowed, and Pro flips the row.
+#[tokio::test]
+async fn set_visibility_public_is_pro_gated() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+
+    let (_, refused) = call(
+        &state,
+        Some(&ana),
+        "set_visibility",
+        json!({"app": "groceries", "visibility": "public"}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "payment_required");
+    assert!(
+        err["user_message"].as_str().unwrap().contains("Pro"),
+        "{err}"
+    );
+
+    let (_, unlisted) = call(
+        &state,
+        Some(&ana),
+        "set_visibility",
+        json!({"app": "groceries", "visibility": "unlisted"}),
+    )
+    .await;
+    assert_eq!(
+        result(&unlisted)["structuredContent"]["visibility"],
+        "unlisted"
+    );
+
+    sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, public) = call(
+        &state,
+        Some(&ana),
+        "set_visibility",
+        json!({"app": "groceries", "visibility": "public"}),
+    )
+    .await;
+    assert_eq!(result(&public)["structuredContent"]["visibility"], "public");
 }

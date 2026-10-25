@@ -439,18 +439,36 @@ pub async fn set_last_deploy(pool: &SqlitePool, app_id: &str, sha: &str) -> anyh
     Ok(())
 }
 
+/// Why [`set_visibility`] refused the change. `ProOnly` is decided here, in
+/// the shared domain function, so the MCP tool and the console endpoint gate
+/// identically: making an app `public` is a Pro feature, switching back to
+/// `unlisted` is always allowed.
+#[derive(Debug, thiserror::Error)]
+pub enum VisibilityError {
+    #[error("public apps are a Pro feature; upgrade to Pro to make the app public (unlisted is always free)")]
+    ProOnly,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
 /// Change who may discover the app: `unlisted` (default, kept out of search
 /// engines) or `public`. Owner-only; the MCP layer enforces the role.
+/// `plan` is the owner's plan (`"pro"` unlocks `public`).
 pub async fn set_visibility(
     pool: &SqlitePool,
     app_id: &str,
     visibility: Visibility,
-) -> anyhow::Result<()> {
+    plan: &str,
+) -> Result<(), VisibilityError> {
+    if visibility == Visibility::Public && plan != "pro" {
+        return Err(VisibilityError::ProOnly);
+    }
     sqlx::query("UPDATE app SET visibility = ?1 WHERE id = ?2")
         .bind(visibility.as_str())
         .bind(app_id)
         .execute(pool)
-        .await?;
+        .await
+        .map_err(|err| VisibilityError::Internal(err.into()))?;
     Ok(())
 }
 

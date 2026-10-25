@@ -214,7 +214,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<app_inputs::SetVisibilityInput>(
             "set_visibility",
-            "Set an app unlisted (default, kept out of search engines) or public.",
+            "Set an app unlisted (default, kept out of search engines) or public (public is a Pro feature).",
             Account, false,
         ),
         tool::<app_inputs::ShareAppInput>(
