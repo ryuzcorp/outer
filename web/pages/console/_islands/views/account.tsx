@@ -9,6 +9,7 @@ import {
   revokeApiKey,
   revokeConnection,
   signOutOthers,
+  updateAlertPrefs,
 } from "../actions/account.ts";
 import {
   timeAgo,
@@ -18,6 +19,7 @@ import {
 import {
   when,
   type AccountSummary,
+  type AlertPrefs,
   type ApiKeyEntry,
   type ApiKeysSummary,
   type ConnectionEntry,
@@ -703,6 +705,77 @@ export function UsageView({
   );
 }
 
+function EmailAlertsCard({
+  prefs,
+  onSaved,
+  onError,
+}: {
+  prefs: AlertPrefs;
+  onSaved: (prefs: AlertPrefs) => void;
+  onError: (message: string) => void;
+}) {
+  const busy = atom(false);
+  const rows: { key: keyof AlertPrefs; label: string; hint: string }[] = [
+    {
+      key: "deploy_failed",
+      label: "Deploy failures",
+      hint: "The app owner gets one email per app per hour when a deploy fails.",
+    },
+    {
+      key: "error_spike",
+      label: "Error spikes",
+      hint: "The app owner gets at most one email per app every 6 hours when errors spike.",
+    },
+    {
+      key: "quota",
+      label: "Quota thresholds",
+      hint: "One email per day when daily code changes hit 80% and 100%.",
+    },
+  ];
+
+  async function flip(key: keyof AlertPrefs, value: boolean): Promise<void> {
+    busy.set(true);
+    try {
+      onSaved(await updateAlertPrefs.run({ [key]: value }));
+    } catch (err: unknown) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Email alerts">
+      <div class="card-body min-w-0 gap-3">
+        <h2 class="card-title m-0 text-base">Email alerts</h2>
+        <p class="m-0 min-w-0 text-sm opacity-60">
+          Plain-text emails to your account address, one click to unsubscribe in every email.
+        </p>
+        {rows.map((row) => (
+          <label class="flex min-w-0 cursor-pointer items-start justify-between gap-3" key={row.key}>
+            <span class="min-w-0">
+              <span class="block min-w-0 truncate text-sm font-medium" title={row.label}>
+                {row.label}
+              </span>
+              <span class="block min-w-0 break-words text-xs opacity-60" title={row.hint}>
+                {row.hint}
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              class="toggle toggle-sm shrink-0"
+              checked={prefs[row.key]}
+              disabled={busy()}
+              aria-label={row.label}
+              onchange={(e: Event) => void flip(row.key, (e.target as HTMLInputElement).checked)}
+            />
+          </label>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 // --- Account -----------------------------------------------------------------
 
 export function AccountView({
@@ -803,6 +876,14 @@ export function AccountView({
           </div>
         </div>
       </section>
+      <EmailAlertsCard
+        prefs={summary.alerts}
+        onSaved={(prefs) => {
+          summary.alerts = prefs;
+          notice.set("Email alert settings saved.");
+        }}
+        onError={(message) => error.set(message)}
+      />
       <section
         class="card card-border border-error bg-base-100 min-w-0"
         aria-label="Danger zone"

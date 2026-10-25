@@ -6,6 +6,7 @@ import {
   api,
   apiPost,
   type AccountSummary,
+  type AlertPrefs,
   type ApiKeysSummary,
   type ConnectionsSummary,
   type CreatedKey,
@@ -195,6 +196,36 @@ export const deleteAccount: ConsoleAction<{ confirm: string }, DeletedAccount> =
   },
 };
 
+export const updateAlertPrefs: ConsoleAction<Partial<AlertPrefs>, AlertPrefs> = {
+  name: "update_alert_prefs",
+  title: "Update email alert prefs",
+  description:
+    "Flip this account's email alert toggles (deploy failures, error spikes, quota thresholds). Pass only the toggles to change; the rest stay as they are. Returns the effective toggles.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      deploy_failed: {
+        type: "boolean",
+        description: "Email the app owner when a deploy fails.",
+      },
+      error_spike: {
+        type: "boolean",
+        description: "Email the app owner when errors spike.",
+      },
+      quota: {
+        type: "boolean",
+        description: "Email the account when code-change quota hits 80% and 100%.",
+      },
+    },
+  },
+  readOnly: false,
+  consequential: true,
+  untrusted: false,
+  run(input: Partial<AlertPrefs>): Promise<AlertPrefs> {
+    return apiPost<AlertPrefs>("/api/console/alerts/prefs", input);
+  },
+};
+
 export const actions: ConsoleAction<unknown, unknown>[] = [
   listConnections as ConsoleAction<unknown, unknown>,
   revokeConnection as ConsoleAction<unknown, unknown>,
@@ -204,4 +235,5 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
   getAccount as ConsoleAction<unknown, unknown>,
   signOutOthers as ConsoleAction<unknown, unknown>,
   deleteAccount as ConsoleAction<unknown, unknown>,
+  updateAlertPrefs as ConsoleAction<unknown, unknown>,
 ];

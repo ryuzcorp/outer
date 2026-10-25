@@ -330,12 +330,19 @@ export interface AccountUsage {
   egress_bytes_month: number;
 }
 
+export interface AlertPrefs {
+  deploy_failed: boolean;
+  error_spike: boolean;
+  quota: boolean;
+}
+
 export interface AccountSummary {
   email: string;
   plan: string;
   plan_status: string | null;
   member_since: number;
   usage: AccountUsage;
+  alerts: AlertPrefs;
   resets_at: string;
 }
 
