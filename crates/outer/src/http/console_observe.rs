@@ -268,7 +268,7 @@ async fn triage(
                     format!("{tool} {} issues", fingerprints.len())
                 };
                 crate::mcp::actions::record_console(
-                    pool, app_id, account_id, tool, &summary, "ok", None,
+                    pool, app_id, account_id, tool, &summary, "ok", None, 0,
                 )
                 .await;
             }
