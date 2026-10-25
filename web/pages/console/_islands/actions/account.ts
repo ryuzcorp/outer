@@ -226,6 +226,42 @@ export const updateAlertPrefs: ConsoleAction<Partial<AlertPrefs>, AlertPrefs> = 
   },
 };
 
+export interface CheckoutSession {
+  checkout_url: string;
+}
+
+export interface PortalSession {
+  portal_url: string;
+}
+
+export const createCheckout: ConsoleAction<void, CheckoutSession> = {
+  name: "create_checkout",
+  title: "Upgrade to Pro",
+  description:
+    "Mint a Stripe Checkout link to upgrade this account to Outer Pro. Open the returned URL in a browser to pay; the plan lifts on the next call after payment.",
+  inputSchema: { type: "object", properties: {} },
+  readOnly: false,
+  consequential: true,
+  untrusted: false,
+  run(_input: void): Promise<CheckoutSession> {
+    return apiPost<CheckoutSession>("/api/console/billing/checkout", {});
+  },
+};
+
+export const createPortal: ConsoleAction<void, PortalSession> = {
+  name: "create_portal",
+  title: "Manage billing",
+  description:
+    "Mint a Stripe Customer Portal link to update the card or cancel Outer Pro. Needs an existing subscription — upgrade first.",
+  inputSchema: { type: "object", properties: {} },
+  readOnly: false,
+  consequential: false,
+  untrusted: false,
+  run(_input: void): Promise<PortalSession> {
+    return apiPost<PortalSession>("/api/console/billing/portal", {});
+  },
+};
+
 export const actions: ConsoleAction<unknown, unknown>[] = [
   listConnections as ConsoleAction<unknown, unknown>,
   revokeConnection as ConsoleAction<unknown, unknown>,
@@ -236,4 +272,6 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
   signOutOthers as ConsoleAction<unknown, unknown>,
   deleteAccount as ConsoleAction<unknown, unknown>,
   updateAlertPrefs as ConsoleAction<unknown, unknown>,
+  createCheckout as ConsoleAction<unknown, unknown>,
+  createPortal as ConsoleAction<unknown, unknown>,
 ];

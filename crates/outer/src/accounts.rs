@@ -133,6 +133,10 @@ pub struct AccountSummary {
     pub email: String,
     pub plan: String,
     pub plan_status: Option<String>,
+    /// Unix seconds the past-due grace ends (`user.graceUntil`).
+    pub grace_until: Option<i64>,
+    /// Whether Stripe knows this account (portal available).
+    pub has_customer: bool,
     pub member_since: i64,
     pub apps_owned: u64,
     pub apps_limit: u64,
@@ -157,12 +161,34 @@ pub async fn account_summary(
     pool: &SqlitePool,
     account_id: &str,
 ) -> Result<AccountSummary, AccountError> {
-    let row: Option<(String, String, Option<String>, i64)> =
-        sqlx::query_as("SELECT email, plan, planStatus, createdAt FROM user WHERE id = ?1")
-            .bind(account_id)
-            .fetch_optional(pool)
-            .await?;
-    let Some((email, plan, plan_status, member_since)) = row else {
+    #[derive(sqlx::FromRow)]
+    struct SummaryRow {
+        email: String,
+        plan: String,
+        #[sqlx(rename = "planStatus")]
+        plan_status: Option<String>,
+        #[sqlx(rename = "graceUntil")]
+        grace_until: Option<i64>,
+        #[sqlx(rename = "stripeCustomerId")]
+        stripe_customer: Option<String>,
+        #[sqlx(rename = "createdAt")]
+        member_since: i64,
+    }
+    let row: Option<SummaryRow> = sqlx::query_as(
+        "SELECT email, plan, planStatus, graceUntil, stripeCustomerId, createdAt FROM user WHERE id = ?1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(SummaryRow {
+        email,
+        plan,
+        plan_status,
+        grace_until,
+        stripe_customer,
+        member_since,
+    }) = row
+    else {
         return Err(AccountError::not_found("no such account".to_string()));
     };
     let apps_owned = tools::apps_owned(pool, account_id).await?;
@@ -217,6 +243,8 @@ pub async fn account_summary(
         resets_at: tools::resets_at_utc(),
         plan,
         plan_status,
+        grace_until,
+        has_customer: stripe_customer.is_some(),
         member_since,
     })
 }

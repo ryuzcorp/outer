@@ -94,6 +94,7 @@ async fn api_export(
     }
     let outcome = crate::mcp::tools::export::export_for_owner(
         &state.mcp.pool,
+        &state.mcp.billing,
         &state.mcp.store,
         &state.mcp.git,
         &state.mcp.sync,
@@ -400,6 +401,7 @@ mod tests {
         let bare = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let err = crate::mcp::tools::export::export_for_owner(
             &bare,
+            &mcp.billing,
             &mcp.store,
             &mcp.git,
             &mcp.sync,

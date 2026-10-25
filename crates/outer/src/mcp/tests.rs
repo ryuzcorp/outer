@@ -304,6 +304,8 @@ async fn tools_list_filters_per_caller() {
     assert_eq!(authed.len(), 47);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
+    assert!(authed.contains(&"upgrade".to_string()));
+    assert!(authed.contains(&"manage_billing".to_string()));
 
     // The test admin sees the same rows: M1 has no admin tools.
     let admin = api_key_for(&state, "owner@example.com").await;

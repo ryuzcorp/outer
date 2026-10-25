@@ -55,6 +55,7 @@ pub(crate) fn tool_error(app: &str, err: export::ExportError) -> ToolError {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn export_for_owner(
     pool: &sqlx::SqlitePool,
+    billing: &crate::billing::BillingState,
     store: &crate::store::Store,
     git: &crate::git::manifest::GitConfig,
     sync: &crate::git::manifest::GitSync,
@@ -69,9 +70,13 @@ pub(crate) async fn export_for_owner(
     }
     let plan = plan_of(pool, owner_id).await?;
     if plan != "pro" {
-        return Err(ToolError::payment_required(
-            format!("{slug} is on a Free account; code export is a Pro feature"),
-            "Code export is a Pro feature. Upgrade to Pro to download your app as a zip.",
+        return Err(super::with_upgrade(
+            ToolError::payment_required(
+                format!("{slug} is on a Free account; code export is a Pro feature"),
+                "Code export is a Pro feature. Upgrade to Pro to download your app as a zip.",
+            ),
+            billing,
+            owner_id,
         ));
     }
     export::export_app(
@@ -97,6 +102,7 @@ pub async fn export_code(input: ExportCodeInput, ctx: &Ctx<'_>) -> Result<Value,
     let app = owner_app(ctx, &input.app).await?;
     let outcome = export_for_owner(
         &ctx.state.pool,
+        &ctx.state.billing,
         &ctx.state.store,
         &ctx.state.git,
         &ctx.state.sync,

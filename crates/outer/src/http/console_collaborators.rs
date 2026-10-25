@@ -19,7 +19,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::console::{
-    fetch_ok, guard, nostore_json, nostore_json_user, not_found, ok_json, visible_app,
+    fetch_ok, guard, nostore_json, nostore_json_refusal, nostore_json_user, not_found, ok_json,
+    visible_app,
 };
 use crate::auth::AccountRow;
 use crate::collaborators::{self, AddError, Role};
@@ -187,13 +188,15 @@ async fn api_invite(
                 "collaborator": collaborator_json(&collaborator),
             }))
         }
-        Err(AddError::NotPro) => nostore_json_user(
+        Err(AddError::NotPro) => nostore_json_refusal(
             StatusCode::PAYMENT_REQUIRED,
             "payment_required",
             format!("collaborators on {} need a Pro owner", app.slug),
             "Collaborators are a Pro feature. Upgrade to Pro to invite people to your apps.",
+            mcp.billing
+                .upgrade_url(&app.owner_id, chrono::Utc::now().timestamp()),
         ),
-        Err(AddError::LimitReached) => nostore_json_user(
+        Err(AddError::LimitReached) => nostore_json_refusal(
             StatusCode::TOO_MANY_REQUESTS,
             "quota_exceeded",
             format!(
@@ -207,6 +210,8 @@ async fn api_invite(
                 app.slug,
                 collaborators::MAX_COLLABORATORS
             ),
+            mcp.billing
+                .upgrade_url(&app.owner_id, chrono::Utc::now().timestamp()),
         ),
         Err(AddError::InvalidEmail(_)) => nostore_json(
             StatusCode::BAD_REQUEST,

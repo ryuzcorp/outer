@@ -5,6 +5,8 @@ import { atom } from "ilha";
 
 import {
   createApiKey,
+  createCheckout,
+  createPortal,
   deleteAccount,
   revokeApiKey,
   revokeConnection,
@@ -571,6 +573,8 @@ export function UsageView({
   onRetry: () => void;
 }) {
   const upgradeOpen = atom(false);
+  const checkoutBusy = atom(false);
+  const checkoutError = atom<string | null>(null);
   if (panel.kind === "loading") {
     return <Loading label="Loading usage and plan" />;
   }
@@ -580,6 +584,33 @@ export function UsageView({
   const summary = panel.value;
   const usage = summary.usage;
   const isPro = summary.plan === "pro";
+  const pastDue = summary.plan_status === "past_due";
+  const canceled = summary.plan_status === "canceled";
+  async function openCheckout(): Promise<void> {
+    checkoutBusy.set(true);
+    checkoutError.set(null);
+    try {
+      const session = await createCheckout.run(undefined);
+      upgradeOpen.set(false);
+      globalThis.open(session.checkout_url, "_blank", "noopener");
+    } catch (err) {
+      checkoutError.set(err instanceof Error ? err.message : "checkout failed");
+    } finally {
+      checkoutBusy.set(false);
+    }
+  }
+  async function openPortal(): Promise<void> {
+    checkoutBusy.set(true);
+    checkoutError.set(null);
+    try {
+      const session = await createPortal.run(undefined);
+      globalThis.open(session.portal_url, "_blank", "noopener");
+    } catch (err) {
+      checkoutError.set(err instanceof Error ? err.message : "portal failed");
+    } finally {
+      checkoutBusy.set(false);
+    }
+  }
   return (
     <div class="flex min-w-0 flex-col gap-3">
       <section class="card card-border bg-base-100 min-w-0" aria-label="Plan">
@@ -601,15 +632,50 @@ export function UsageView({
               <button
                 type="button"
                 class="btn btn-sm btn-neutral shrink-0"
-                onclick={() => upgradeOpen.set(true)}
+                onclick={() => {
+                  checkoutError.set(null);
+                  upgradeOpen.set(true);
+                }}
               >
                 Upgrade
+              </button>
+            )}
+            {isPro && summary.has_customer && summary.billing_enabled && (
+              <button
+                type="button"
+                class="btn btn-sm shrink-0"
+                disabled={checkoutBusy()}
+                onclick={() => void openPortal()}
+              >
+                Manage billing
               </button>
             )}
           </div>
           <p class="m-0 min-w-0 truncate text-sm opacity-60" title={`Member since ${when(summary.member_since)}`}>
             Member since {when(summary.member_since)}
           </p>
+          {pastDue && summary.grace_until && (
+            <div class="alert alert-warning alert-soft min-w-0" role="alert">
+              <span class="min-w-0 break-words text-sm">
+                Payment failed — update payment details by {when(summary.grace_until)} to keep Pro, or the account returns to Free.
+              </span>
+            </div>
+          )}
+          {canceled && isPro && (
+            <p class="m-0 min-w-0 truncate text-sm opacity-60" title="Subscription canceled at period end">
+              Subscription canceled — Pro until the period ends.
+            </p>
+          )}
+          {canceled && !isPro && (
+            <p class="m-0 min-w-0 truncate text-sm opacity-60" title="Downgraded to Free">
+              Downgraded to Free — upgrade to restore Pro.
+            </p>
+          )}
+          {checkoutError() && (
+            <div class="alert alert-error alert-soft min-w-0" role="alert">
+              <span class="min-w-0 break-words text-sm">{checkoutError()}</span>
+            </div>
+          )}
         </div>
       </section>
       <section class="card card-border bg-base-100 min-w-0" aria-label="Today's usage">
@@ -686,19 +752,54 @@ export function UsageView({
             <li>Public visibility, collaborators and custom domains</li>
             <li>Code export, R2 file uploads, longer log retention</li>
           </ul>
-          <p class="m-0 min-w-0 break-words text-sm opacity-60">
-            Pro is $8/month. Billing isn't wired up yet — there is nothing
-            to pay today, and this button goes nowhere on purpose.
-          </p>
-          <div class="modal-action">
-            <button
-              type="button"
-              class="btn btn-neutral"
-              onclick={() => upgradeOpen.set(false)}
-            >
-              Got it
-            </button>
-          </div>
+          {summary.billing_enabled ? (
+            <div class="flex min-w-0 flex-col gap-2">
+              <p class="m-0 min-w-0 break-words text-sm opacity-60">
+                Pro is $8/month
+                {summary.plan === "free" && " ($4 launch price while the coupon lasts)"}
+                , tax calculated at checkout. The plan lifts on your agent's next call after payment.
+              </p>
+              {checkoutError() && (
+                <div class="alert alert-error alert-soft min-w-0" role="alert">
+                  <span class="min-w-0 break-words text-sm">{checkoutError()}</span>
+                </div>
+              )}
+              <div class="modal-action">
+                <button
+                  type="button"
+                  class="btn"
+                  disabled={checkoutBusy()}
+                  onclick={() => upgradeOpen.set(false)}
+                >
+                  Not now
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-neutral"
+                  disabled={checkoutBusy()}
+                  onclick={() => void openCheckout()}
+                >
+                  {checkoutBusy() ? "Opening…" : "Upgrade to Pro"}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div class="flex min-w-0 flex-col gap-2">
+              <p class="m-0 min-w-0 break-words text-sm opacity-60">
+                Pro is $8/month. Billing isn't wired up yet — there is nothing
+                to pay today, and this button goes nowhere on purpose.
+              </p>
+              <div class="modal-action">
+                <button
+                  type="button"
+                  class="btn btn-neutral"
+                  onclick={() => upgradeOpen.set(false)}
+                >
+                  Got it
+                </button>
+              </div>
+            </div>
+          )}
         </ShellModal>
       )}
     </div>

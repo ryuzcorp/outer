@@ -94,7 +94,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "list_backups" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
-        | "backup_database" | "promote_preview" => Hints::WRITE,
+        | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" => Hints::WRITE,
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -214,6 +214,16 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<account::DeleteAccountInput>(
             "delete_account",
             "Delete your account: pass confirm equal to your email. Deletes your apps, signs every session out.",
+            Account, false,
+        ),
+        tool::<NoArgs>(
+            "upgrade",
+            "Upgrade to Outer Pro: returns a Checkout link for the human to open ($4/month launch price with the coupon, $8/month after; tax calculated). The plan lifts on the next call after payment.",
+            Account, false,
+        ),
+        tool::<NoArgs>(
+            "manage_billing",
+            "Manage Outer Pro billing: returns the Customer Portal link to update the card or cancel. Needs an existing subscription — call upgrade first.",
             Account, false,
         ),
         tool::<app_inputs::CreateAppInput>(
