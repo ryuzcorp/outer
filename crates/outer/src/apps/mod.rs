@@ -9,6 +9,7 @@ use anyhow::Context as _;
 use sqlx::SqlitePool;
 
 pub mod delete;
+pub mod domains;
 pub(crate) mod local;
 pub mod rename;
 mod slug;

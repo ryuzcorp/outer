@@ -17,13 +17,13 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `docs`
 
 - **Access:** anyone (no token needed)
-- **Description:** Read an Outer guide: quickstart, ilha, void, celld, d1, storage, limits or moderation. Read the ilha guide before writing any code.
+- **Description:** Read an Outer guide: quickstart, ilha, void, celld, d1, storage, limits, moderation or custom-domains. Read the ilha guide before writing any code.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `topic` | string | yes | Which guide to read: quickstart, ilha, void, celld, d1, storage, limits or moderation. |
+| `topic` | string | yes | Which guide to read: quickstart, ilha, void, celld, d1, storage, limits, moderation or custom-domains. |
 
 ## `sign_in`
 
@@ -222,6 +222,41 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 
 - **Access:** signed in
 - **Description:** List your app's collaborators: email, joined or pending status, and when each was added. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+
+## `add_domain`
+
+- **Access:** signed in
+- **Description:** Give an app a custom domain (Pro, one per app): registers it as a Cloudflare custom hostname and returns the CNAME/TXT records to create at your DNS. The domain serves the app once its status turns active; poll list_domains.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `hostname` | string | yes | The full domain name, e.g. `groceries.silva.family`. |
+
+## `remove_domain`
+
+- **Access:** signed in
+- **Description:** Remove an app's custom domain: deletes the Cloudflare custom hostname and the local row, and purges its cached pages.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `hostname` | string | no | The hostname to remove. Optional: the app holds at most one, so it defaults to that; when given it must match or the call is refused. |
+
+## `list_domains`
+
+- **Access:** signed in
+- **Description:** An app's custom domain: hostname, live status (pending, active or failed with a reason), and the DNS records to create.
 
 **Input:**
 

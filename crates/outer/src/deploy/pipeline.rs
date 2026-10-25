@@ -650,7 +650,7 @@ impl Deployer {
                 // the old version still serves would let the edge re-cache
                 // its files. The purge runs off the critical path.
                 let reloaded = reload_if_awake(app).await;
-                self.spawn_edge_purge(&app.slug);
+                self.spawn_edge_purge(pool, &app.id, &app.slug);
                 Ok(DeployOutcome {
                     deploy_id,
                     sha: sha.to_string(),
@@ -717,17 +717,24 @@ impl Deployer {
         }
     }
 
-    /// Purge `<slug>.<apps_domain>` from the edge cache after the new
-    /// version went live. Detached (no global state, just cloned handles)
-    /// so a slow Cloudflare never holds up the deploy response; `None`
-    /// skips at debug, failures warn. Only successful deploys purge: failed
-    /// and blocked deploys leave the previous version serving, and its
-    /// cached files are still the right ones.
-    fn spawn_edge_purge(&self, slug: &str) {
+    /// Purge `<slug>.<apps_domain>` plus every `active` custom hostname from
+    /// the edge cache after the new version went live. Detached (no global
+    /// state, just cloned handles) so a slow Cloudflare never holds up the
+    /// deploy response; `None` skips at debug, failures warn. Only
+    /// successful deploys purge: failed and blocked deploys leave the
+    /// previous version serving, and its cached files are still the right
+    /// ones.
+    fn spawn_edge_purge(&self, pool: &SqlitePool, app_id: &str, slug: &str) {
         let purge = self.settings.cache_purge.clone();
-        let host = format!("{slug}.{}", self.settings.apps_domain);
+        let pool = pool.clone();
+        let app_id = app_id.to_string();
+        let hosts = vec![format!("{slug}.{}", self.settings.apps_domain)];
         self.purges.spawn(async move {
-            crate::cloudflare::purge_host_cache(purge.as_ref(), &host).await;
+            let mut hosts = hosts;
+            hosts.extend(crate::apps::domains::active_hosts(&pool, &app_id).await);
+            for host in hosts {
+                crate::cloudflare::purge_host_cache(purge.as_ref(), &host).await;
+            }
         });
     }
 
@@ -3218,12 +3225,36 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let fake = crate::cloudflare::fake::FakePurge::start().await;
         let deployer = Deployer::new(purge_settings(&data, &fake), 1);
-        deployer.spawn_edge_purge("grocery");
+        let (_ddir, pool) = test_pool().await;
+        // An `active` custom hostname purges alongside the app host.
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, visibility, last_activity_at, created_at) \
+             VALUES ('app1', 'grocery', 'owner1', 200001, 21001, 31001, 'unlisted', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_domain (hostname, app_id, cf_custom_hostname_id, status, created_at) \
+             VALUES ('shop.example.com', 'app1', 'cf-1', 'active', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        deployer.spawn_edge_purge(&pool, "app1", "grocery");
         deployer.purges().drain().await;
-        assert_eq!(fake.calls(), 1);
+        assert_eq!(fake.wait_for(2, std::time::Duration::from_secs(5)).await, 2);
+        let recorded = fake.requests.lock().unwrap();
+        let hosts: Vec<_> = recorded
+            .iter()
+            .map(|r| r.body["hosts"][0].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
-            fake.requests.lock().unwrap()[0].body["hosts"][0],
-            format!("grocery.{}", deployer.settings.apps_domain)
+            hosts,
+            vec![
+                format!("grocery.{}", deployer.settings.apps_domain),
+                "shop.example.com".to_string(),
+            ]
         );
     }
 

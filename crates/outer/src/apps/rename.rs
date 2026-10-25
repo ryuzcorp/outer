@@ -740,6 +740,11 @@ pub async fn rename_app_with_hooks(
     }
     crate::cloudflare::purge_host_cache(cache_purge, &format!("{old_slug}.{apps_domain}")).await;
     crate::cloudflare::purge_host_cache(cache_purge, &format!("{new_slug}.{apps_domain}")).await;
+    // Custom hosts ride on the app id, which the rename keeps — no row
+    // touch needed — but their cached pages are stale under either name.
+    for host in super::domains::active_hosts(pool, &app.id).await {
+        crate::cloudflare::purge_host_cache(cache_purge, &host).await;
+    }
 
     let app = super::get_by_id(pool, &app.id)
         .await

@@ -71,6 +71,9 @@ const LOGGED_TOOLS: &[&str] = &[
     "add_collaborator",
     "remove_collaborator",
     "list_collaborators",
+    "add_domain",
+    "remove_domain",
+    "list_domains",
 ];
 
 /// Ceiling on one stored summary, in chars.
@@ -181,7 +184,10 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             arg_str(args, "slug").unwrap_or("?")
         ),
         "share_app" | "get_app" => tool.to_string(),
-        "list_secrets" | "list_collaborators" => tool.to_string(),
+        "list_secrets" | "list_collaborators" | "list_domains" | "remove_domain" => {
+            tool.to_string()
+        }
+        "add_domain" => format!("add_domain {}", arg_str(args, "hostname").unwrap_or("?")),
         "add_collaborator" | "remove_collaborator" => {
             format!("{} {}", tool, arg_str(args, "email").unwrap_or("?"))
         }
