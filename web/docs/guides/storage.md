@@ -8,10 +8,11 @@ description: Bindings, file uploads, and what never to store.
 Extra state arrives as bindings in `void.config.ts`, validated from the
 built `dist/wrangler.json` at deploy time. Only keys celld accepts pass:
 
-- `kv_namespaces` and `durable_objects` for small state (sessions,
-  counters, rate flags). Anything relational belongs in [D1](/guides/d1).
-  Patterns: [KV](/guides/kv), [WebSockets](/guides/websockets) (rooms are
-  Durable Objects).
+- `kv_namespaces` and `durable_objects` for small state (sessions, flags,
+  low-write counters — a write-hot counter belongs in a Durable Object,
+  since KV writes to one namespace run one at a time). Anything relational
+  belongs in [D1](/guides/d1). Patterns: [KV](/guides/kv),
+  [WebSockets](/guides/websockets) (rooms are Durable Objects).
 - `r2_buckets` for file uploads. `queues` and `workflows` for background
   work ([Queues](/guides/queues)). Schedules are [Cron](/guides/cron).
   [Sandboxes](/guides/sandboxes) and native [Email](/guides/email) are not

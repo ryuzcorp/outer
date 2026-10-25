@@ -31,7 +31,9 @@ await kv.list({ prefix: "user:", limit: 100, cursor });
 const sessions = kv.map<Session>("sessions");
 ```
 
-Reads are eventually consistent across requests — never store the only copy
+Reads reach the cell that owns the namespace, so they never return a stale
+value — but writes to one namespace run one at a time, so a write-hot value
+like a busy counter belongs in a Durable Object. Never store the only copy
 of anything you can't rebuild, and never secrets (use
 [secret storage](/guides/celld) instead).
 

@@ -24,9 +24,10 @@ Paste a scoped first prompt — one screen, no login, no database yet:
 > No login, no sharing yet — just the list. Read the Outer quickstart and
 > Ilha guides first, then create the app and show me the live link.
 
-Your agent calls `create_app {slug: "grocery"}` and a live Ilha + Void app
-serves at `https://grocery.outer.now` in seconds. Unlisted by default: not
-indexed, reachable by link.
+Your agent calls `create_app` with a slug you pick — pass your own, since
+taken slugs are rejected and deleted names stay reserved for 30 days. A live
+Ilha + Void app serves at the returned `https://<your-slug>.outer.now` in
+seconds. Unlisted by default: not indexed, reachable by link.
 
 ## 3. Make one change
 

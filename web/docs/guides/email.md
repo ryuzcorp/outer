@@ -27,6 +27,9 @@ import { env } from "cloudflare:workers";
 
 export const action = defineHandler(async (c) => {
   const body = await c.req.json<{ to: string }>();
+  if (typeof body.to !== "string" || !body.to.includes("@")) {
+    return c.json({ errors: { to: "Enter a valid email address." } }, 422);
+  }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {

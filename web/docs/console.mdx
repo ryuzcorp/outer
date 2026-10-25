@@ -32,7 +32,7 @@ audit trail.
 
 Every deploy with its status badge, short SHA, and age. Expand one for the
 full SHA, findings, the live URL, and — for failures — the error message.
-**Rollback lives here**: any earlier deploy has a Roll back button behind
+**Rollback lives here**: any earlier successful deploy has a Roll back button behind
 a confirm modal. Rollbacks never count as code changes. A "what changed"
 link jumps to the [Code](#code) view's changes tab for that SHA.
 
@@ -78,7 +78,7 @@ Slug, URL, status, your role, and last request — then, owner-only:
 Owner-only browsers over the app's live bindings:
 
 - **D1** — pick a database, browse tables and rows. Owners can insert, edit
-  and delete rows; collaborators browse read-only.
+  and delete rows.
 - **R2** — browse folders, preview text and images, download, upload, and
   delete. Reads use the same scoped credentials as the app; writes go
   through celld and are recorded in the agent action log.

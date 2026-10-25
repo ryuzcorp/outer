@@ -14,9 +14,15 @@ Object — standard binding, declared for you:
 
 ```ts
 // routes/chat/[room].ws.ts
+import * as v from "valibot";
 import { defineRoom } from "void/ws";
 
+// Validation schemas — install with `bun add valibot` if not present.
+const ClientMessage = v.object({ type: v.literal("chat.message"), text: v.string() });
+const ServerMessage = v.object({ type: v.literal("chat.message"), text: v.string() });
+
 export default defineRoom({
+  messages: { client: ClientMessage, server: ServerMessage },
   async onBeforeConnect(ctx) {
     if (!ctx.user) return new Response("Unauthorized", { status: 401 });
   },
@@ -48,7 +54,11 @@ sockets survive short idles but never a move — code for the disconnect.
 
 Nothing to declare: the route file is the config. Rebuild and commit; the
 room serves at the same host as the app. One room per file keeps failure
-domains small; moving a route preserves state with `name:`.
+domains small. Moving a route keeps its state only when you carry its
+identity: run `void info` first for the `name:` to add to `defineRoom`,
+keep the parameter names, and use `key:` to preserve the old key when a
+parameter is renamed — otherwise the moved route selects a new Durable
+Object and looks empty.
 
 ## Sources
 

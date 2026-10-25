@@ -69,7 +69,8 @@ one.
 ## Notes
 
 - Rate limits are Better Auth's defaults (roughly 3 sign-ins per 10 s per
-  IP) — enough for families, not for brute force.
+  IP), tracked per Worker instance — and everyone behind one proxy IP
+  shares that IP's count. Enough for families, not for brute force.
 - Test sign-in on the live link, not only locally: OAuth callbacks must
   match the app's public host.
 

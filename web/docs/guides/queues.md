@@ -51,8 +51,8 @@ deploy key (`crates/outer/src/deploy/pipeline.rs`), so the queue deploys on
 every account — plan gating for bindings arrives with billing. Rebuild after
 editing queue files; consumers deploy with the app and scale with it.
 
-Test locally via the dev server's `POST /__void/queue` trigger; schedules
-for local dispatch never fire on their own.
+Trigger local dispatch manually with the dev server's `POST /__void/queue`
+endpoint — queued messages don't run on their own.
 
 ## Sources
 
