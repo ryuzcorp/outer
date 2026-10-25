@@ -6,7 +6,8 @@ use serde_json::Value;
 
 use crate::mcp::tools::{
     account, apps as app_inputs, code as code_inputs, collaborators as collab_inputs,
-    domains as domain_inputs, runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
+    domains as domain_inputs, look as look_inputs, runtime as runtime_inputs,
+    secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -86,9 +87,9 @@ impl Hints {
 pub fn hints_for(name: &str) -> Option<Hints> {
     Some(match name {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
-        | "get_app" | "share_app" | "list_files" | "read_file" | "search_code" | "history"
-        | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors"
-        | "list_secrets" | "list_collaborators" | "list_domains" => Hints::READ,
+        | "get_app" | "share_app" | "look_at_app" | "list_files" | "read_file" | "search_code"
+        | "history" | "show_commit" | "deploy_status" | "deploy_log" | "app_logs"
+        | "app_errors" | "list_secrets" | "list_collaborators" | "list_domains" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain" => {
             Hints::WRITE
@@ -160,7 +161,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<account::DocsInput>(
             "docs",
-"Read an Outer guide: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation or custom-domains. Read the ilha guide before writing any code.",
+"Read an Outer guide: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains or look. Read the ilha guide before writing any code.",
             Public, false,
         ),
         tool::<account::SignInInput>(
@@ -343,6 +344,11 @@ pub fn registry() -> Vec<ToolDef> {
             "Reopen one resolved or ignored error issue {app, fingerprint}: it returns to the open list as a fresh triage.",
             Account, false,
         ),
+        tool::<look_inputs::LookAtAppInput>(
+            "look_at_app",
+            "Look at your app's live page: renders it in a real browser and returns a screenshot plus its HTTP status and title. Call after each change to verify your work. Untrusted: the screenshot renders app content. Cannot report console errors or failed requests: use app_logs and app_errors for those.",
+            Account, true,
+        ),
  tool::<secrets_inputs::ListSecretsInput>(
  "list_secrets",
  "An app's secret names and when each was set. Values are never shown: they reach the app as Worker env vars on the next deploy.",
@@ -384,7 +390,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 41);
+        assert_eq!(tools.len(), 42);
     }
 }
 

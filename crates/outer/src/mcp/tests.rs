@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 41);
+    assert_eq!(anon.len(), 42);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 39);
+    assert_eq!(authed.len(), 40);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -439,7 +439,8 @@ async fn registry_schemas_are_valid_json_schema() {
             "show_commit",
             "deploy_log",
             "app_logs",
-            "app_errors"
+            "app_errors",
+            "look_at_app"
         ]
     );
 }
@@ -3965,4 +3966,217 @@ mod slug_check_tests {
             "rename outage is retryable: {body}"
         );
     }
+}
+
+/// Point one test state's renderer at the fake Cloudflare endpoint.
+fn with_fake_browser(state: &mut McpState, fake: &crate::browser::fake::FakeRender) {
+    state.browser = Some(fake.render());
+}
+
+fn snapshot_body(screenshot_b64: &str, status: i64, title: &str) -> Value {
+    json!({
+        "success": true,
+        "result": {"screenshot": screenshot_b64, "content": "<html></html>"},
+        "meta": {"status": status, "title": title},
+    })
+}
+
+fn jpeg_b64() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(crate::browser::test_jpeg_bytes())
+}
+
+#[tokio::test]
+async fn look_at_app_renders_screenshot_and_status() {
+    let (mut state, _) = setup().await;
+    let fake = crate::browser::fake::FakeRender::start().await;
+    with_fake_browser(&mut state, &fake);
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    fake.program(200, snapshot_body(&jpeg_b64(), 200, "Groceries"));
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "look_at_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let out = result(&body);
+    assert!(out.get("isError").is_none(), "render succeeds: {body}");
+    let content = out["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert!(content[0]["text"].as_str().unwrap().contains("HTTP 200"));
+    assert!(content[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains(super::tools::UNTRUSTED_NOTICE));
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["mimeType"], "image/jpeg");
+    use base64::Engine as _;
+    let image = base64::engine::general_purpose::STANDARD
+        .decode(content[1]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(image, crate::browser::test_jpeg_bytes());
+    let structured = &out["structuredContent"];
+    assert_eq!(structured["url"], "http://groceries.outer.localhost/");
+    assert_eq!(structured["http_status"], 200);
+    assert_eq!(structured["title"], "Groceries");
+    assert_eq!(structured["width"], 1280);
+    // The request carries the render knobs: JPEG, viewport width, goto budget.
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["url"], "http://groceries.outer.localhost/");
+    assert_eq!(calls[0]["screenshotOptions"]["type"], "jpeg");
+}
+
+#[tokio::test]
+async fn look_at_app_validates_before_touching_the_network() {
+    let (mut state, _) = setup().await;
+    let fake = crate::browser::fake::FakeRender::start().await;
+    with_fake_browser(&mut state, &fake);
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    fake.program(200, snapshot_body(&jpeg_b64(), 200, "Groceries"));
+
+    for args in [
+        json!({"app": "groceries", "width": 800}),
+        json!({"app": "groceries", "path": "https://evil.example/"}),
+        json!({"app": "groceries", "path": "/a\nb"}),
+        json!({"app": "no-such-app"}),
+    ] {
+        let (_, body) = call(&state, Some(&token), "look_at_app", args).await;
+        let err = is_error(&body);
+        assert!(
+            err["error"] == "invalid_argument" || err["error"] == "not_found",
+            "bad input refuses: {body}"
+        );
+    }
+    assert!(fake.calls().is_empty(), "no render runs before validation");
+}
+
+#[tokio::test]
+async fn look_at_app_uses_the_active_custom_domain() {
+    let (mut state, _) = setup().await;
+    let fake = crate::browser::fake::FakeRender::start().await;
+    with_fake_browser(&mut state, &fake);
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let app = crate::apps::get_by_slug(&state.pool, "groceries")
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO app_domain (hostname, app_id, cf_custom_hostname_id, status, created_at) \
+         VALUES (?1, ?2, ?3, 'active', ?4)",
+    )
+    .bind("shop.example.com")
+    .bind(&app.id)
+    .bind("cf-host-1")
+    .bind(crate::auth::now_ms())
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    fake.program(200, snapshot_body(&jpeg_b64(), 200, "Shop"));
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "look_at_app",
+        json!({"app": "groceries", "path": "/about", "width": 390, "full_page": true}),
+    )
+    .await;
+    let out = result(&body);
+    assert_eq!(
+        out["structuredContent"]["url"],
+        "http://shop.example.com/about"
+    );
+    assert_eq!(fake.calls()[0]["url"], "http://shop.example.com/about");
+    assert_eq!(fake.calls()[0]["viewport"]["width"], 390);
+    assert_eq!(fake.calls()[0]["screenshotOptions"]["fullPage"], true);
+}
+
+#[tokio::test]
+async fn look_at_app_counts_hourly_quota_then_rate_limits() {
+    let (mut state, _) = setup().await;
+    let fake = crate::browser::fake::FakeRender::start().await;
+    with_fake_browser(&mut state, &fake);
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    fake.program(200, snapshot_body(&jpeg_b64(), 200, "Groceries"));
+
+    for _ in 0..crate::browser::LOOKS_PER_HOUR {
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "look_at_app",
+            json!({"app": "groceries"}),
+        )
+        .await;
+        assert!(result(&body).get("isError").is_none(), "looks pass: {body}");
+    }
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "look_at_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "rate_limited");
+    assert!(err["retry_after_s"].as_u64().unwrap() >= 1, "{err}");
+    assert_eq!(fake.calls().len(), crate::browser::LOOKS_PER_HOUR as usize);
+}
+
+#[tokio::test]
+async fn look_at_app_refuses_without_browser_and_on_render_failure() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // No Cloudflare pair (localhost dev): the tool refuses, no panic.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "look_at_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "internal");
+    assert!(
+        err["message"].as_str().unwrap().contains("not configured"),
+        "{err}"
+    );
+
+    // Cloudflare refuses the render: internal, and the quota claim stands
+    // (the browser session still ran).
+    let (mut state, _) = setup().await;
+    let fake = crate::browser::fake::FakeRender::start().await;
+    state.browser = Some(fake.render());
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    fake.program(400, json!({"success": false, "errors": ["bad page"]}));
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "look_at_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "internal");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("try again in a minute"),
+        "{err}"
+    );
+    let used: i64 =
+        sqlx::query_scalar("SELECT looks FROM look_hour WHERE userId = (SELECT id FROM user WHERE email = 'ana@example.com')")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(used, 1);
 }

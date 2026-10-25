@@ -6,6 +6,7 @@
 pub mod accounts;
 pub mod apps;
 pub mod auth;
+pub mod browser;
 pub mod cloudflare;
 pub mod collaborators;
 pub mod config;

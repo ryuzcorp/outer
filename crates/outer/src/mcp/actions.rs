@@ -29,6 +29,7 @@
 //! - `deploy_status` / `deploy_log`: `<tool> [deploy <id-short>]`
 //! - `app_logs`: `app_logs [limit=<n>] [since=<seq>]`
 //! - `app_errors`: `app_errors [status=<s>]`
+//! - `look_at_app`: `look_at_app [path=<p>] [width=<w>] [full]`
 //! - `resolve_error` / `ignore_error` / `reopen_error`: `<tool> <fp-short>`
 //! - `list_secrets`: `list_secrets`
 //! - `set_secret` / `unset_secret`: `<tool> <name>` (never the value)
@@ -74,6 +75,7 @@ const LOGGED_TOOLS: &[&str] = &[
     "add_domain",
     "remove_domain",
     "list_domains",
+    "look_at_app",
 ];
 
 /// Ceiling on one stored summary, in chars.
@@ -261,6 +263,19 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             let mut s = "app_errors".to_string();
             if let Some(status) = arg_str(args, "status") {
                 s.push_str(&format!(" status={status}"));
+            }
+            s
+        }
+        "look_at_app" => {
+            let mut s = "look_at_app".to_string();
+            if let Some(path) = arg_str(args, "path") {
+                s.push_str(&format!(" path={}", truncate(path, 120)));
+            }
+            if let Some(width) = arg_u64(args, "width") {
+                s.push_str(&format!(" width={width}"));
+            }
+            if args.get("full_page").and_then(Value::as_bool) == Some(true) {
+                s.push_str(" full");
             }
             s
         }

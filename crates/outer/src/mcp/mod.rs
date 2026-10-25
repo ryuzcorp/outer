@@ -342,6 +342,10 @@ pub struct McpState {
     pub jev: Option<crate::moderation::JevClient>,
     /// Awaited calls return the in-progress status after this long (§10.3).
     pub tool_wait: Duration,
+    /// Cloudflare browser rendering for `look_at_app`. `None` on localhost
+    /// dev without the Cloudflare pair: the tool refuses, exactly like the
+    /// Jev gate when the pair is missing.
+    pub browser: Option<crate::browser::BrowserRender>,
     /// At most one rollback runs per app (fails fast otherwise).
     pub rollback_locks: RollbackLocks,
     /// What `delete_app` wipes and purges: dirs, edge host, zone.
@@ -447,6 +451,7 @@ impl McpState {
             app_port_suffix: String::new(),
             jev: None,
             tool_wait: Duration::from_millis(200),
+            browser: None,
             rollback_locks: RollbackLocks::default(),
             delete_cfg: crate::apps::delete::DeleteConfig {
                 data_dir: data_dir.clone(),

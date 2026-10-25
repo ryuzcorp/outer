@@ -15,6 +15,7 @@ export default defineMeta({
     "sse",
     "email",
     "sandboxes",
+    "look",
     "custom-domains",
     "ilha",
     "void",

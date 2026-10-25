@@ -10,6 +10,7 @@ pub(crate) mod apps;
 pub(crate) mod code;
 pub(crate) mod collaborators;
 pub(crate) mod domains;
+pub(crate) mod look;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
 
@@ -827,6 +828,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "reopen_error" => runtime::reopen_error(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "look_at_app" => look::look_at_app(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "list_secrets" => secrets::list_secrets(parse_args(args)?, ctx)

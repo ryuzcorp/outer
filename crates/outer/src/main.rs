@@ -259,6 +259,16 @@ fn cache_purge(config: &Config) -> Option<outer::cloudflare::CachePurge> {
     })
 }
 
+/// What `look_at_app` renders through: the account plus the API token
+/// (needs `Browser Rendering Write`). `None` skips the tool at debug
+/// (localhost dev without the Cloudflare pair).
+fn browser_render(config: &Config) -> Option<outer::browser::BrowserRender> {
+    config
+        .cloudflare
+        .as_ref()
+        .map(|cf| outer::browser::BrowserRender::new(cf.account_id.clone(), cf.api_token.clone()))
+}
+
 async fn platform(config: &Config) -> anyhow::Result<Platform> {
     std::fs::create_dir_all(&config.data_dir)?;
     let store = build_store(config)?;
@@ -657,6 +667,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tool_wait: config.tool_wait,
         jev,
         rollback_locks: outer::mcp::RollbackLocks::default(),
+        browser: browser_render(&config),
         delete_cfg: outer::apps::delete::DeleteConfig {
             data_dir: config.data_dir.clone(),
             cgroups: cgroups(),
