@@ -4,6 +4,7 @@
 pub mod client_ip;
 pub mod console;
 pub mod console_actions;
+pub mod console_code;
 pub mod proxy;
 pub mod site;
 pub mod tls;
