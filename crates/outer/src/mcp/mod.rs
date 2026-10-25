@@ -101,6 +101,18 @@ impl Deploys {
         }
     }
 
+    /// The live pipeline's settings, for the console data panels (scoped
+    /// storage reads, celld calls, work-dir config reads). `None` for the
+    /// test fake, which has no pipeline — those endpoints answer
+    /// "unavailable" there.
+    pub(crate) fn deploy_settings(&self) -> Option<&crate::deploy::pipeline::DeploySettings> {
+        match &*self.inner {
+            DeploysInner::Live(deployer) => Some(deployer.settings()),
+            #[cfg(test)]
+            DeploysInner::Fake(_) => None,
+        }
+    }
+
     pub async fn deploy(
         &self,
         pool: &SqlitePool,

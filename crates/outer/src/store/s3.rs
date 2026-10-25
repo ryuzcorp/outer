@@ -8,7 +8,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use hmac::{Hmac, KeyInit, Mac};
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
+use sha2::{Digest, Sha256};
 
 use super::S3Config;
 
@@ -68,11 +70,41 @@ impl std::fmt::Display for S3NotFound {
 
 impl std::error::Error for S3NotFound {}
 
+/// One object a delimited LIST page names, with the fields a browser shows.
+#[derive(Debug, Clone)]
+pub struct S3Object {
+    pub key: String,
+    pub last_modified: String,
+    pub size: u64,
+    pub etag: String,
+}
+
+/// One delimited LIST page: the objects in this folder, the folders below
+/// it, and the token that continues the page (`None` when complete).
+#[derive(Debug, Clone, Default)]
+pub struct S3Page {
+    pub objects: Vec<S3Object>,
+    pub prefixes: Vec<String>,
+    pub next: Option<String>,
+}
+
+/// One object's record as a HEAD reports it: the size (a listing carries it
+/// too, but a single-key lookup has no listing) and the real `content-type`
+/// header the writer stored for the object.
+#[derive(Debug, Clone)]
+pub struct S3Head {
+    pub size: i64,
+    pub content_type: Option<String>,
+}
+
 /// S3/R2 backend: rusty-s3 signs presigned URLs, one pooled reqwest client
 /// sends them. Region `auto` and [`UrlStyle::Path`] are what R2 expects;
 /// a session token (R2 temporary credentials) is signed into every
-/// presigned URL as the `X-Amz-Security-Token` query parameter by
-/// [`Credentials::new_with_token`].
+/// presigned object URL as the `X-Amz-Security-Token` query parameter by
+/// [`Credentials::new_with_token`]. LIST is the exception: R2 rejects the
+/// token as a presigned query parameter (501 on `ListObjectsV2`), so both
+/// list paths sign a SigV4 `Authorization` header instead and send the
+/// token as the signed `x-amz-security-token` header (see `list_request`).
 #[derive(Debug, Clone)]
 pub struct S3Backend {
     bucket: Bucket,
@@ -339,6 +371,141 @@ impl S3Backend {
         Err(s3_err("delete", key, resp, Duration::from_secs(20)).await)
     }
 
+    /// SHA-256 of the empty body, sent as `x-amz-content-sha256` on every
+    /// LIST GET and covered by the signature: a list has no payload to hash.
+    const EMPTY_BODY_SHA256: &'static str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// One header-signed `ListObjectsV2` GET for `params` (the full
+    /// `list-type=2` parameter set: prefix, delimiter, page size, …).
+    ///
+    /// R2 answers 501 `NotImplemented` when the session token rides the
+    /// presigned *query* string on LIST, while GET/HEAD object presigns with
+    /// the same parameter work — so LIST never uses the presigned
+    /// `ListObjectsV2::sign`. The token travels as the
+    /// `x-amz-security-token` *header* instead, covered by the SigV4
+    /// `Authorization` header this builds. Object GET/HEAD/PUT/DELETE stay
+    /// presigned: they work, and presigns need no clock.
+    fn list_request(&self, params: &[(&str, &str)]) -> reqwest::RequestBuilder {
+        let now = chrono::Utc::now();
+        let (url, authorization, amz_date) = Self::signed_list_request(
+            self.bucket.base_url(),
+            self.bucket.region(),
+            &self.creds,
+            params,
+            &now.format("%Y%m%dT%H%M%SZ").to_string(),
+            &now.format("%Y%m%d").to_string(),
+        );
+        let mut request = self
+            .client
+            .get(url)
+            .header("authorization", authorization)
+            .header("x-amz-date", amz_date)
+            .header("x-amz-content-sha256", Self::EMPTY_BODY_SHA256);
+        if let Some(token) = self.creds.token() {
+            request = request.header("x-amz-security-token", token);
+        }
+        request
+    }
+
+    /// Pure SigV4 header signing for one LIST GET: the URL (token-free
+    /// query), the `Authorization` value, and the `x-amz-date` value. Pure
+    /// so tests pin the shape without a clock or a network.
+    fn signed_list_request(
+        base_url: &url::Url,
+        region: &str,
+        creds: &Credentials,
+        params: &[(&str, &str)],
+        amz_date: &str,
+        date_stamp: &str,
+    ) -> (url::Url, String, String) {
+        let mut sorted: Vec<(&str, &str)> = params.to_vec();
+        sorted.sort();
+        let query = sorted
+            .iter()
+            .map(|(key, value)| format!("{}={}", Self::amz_encode(key), Self::amz_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut headers: Vec<(&str, String)> = vec![
+            ("host", base_url.host_str().unwrap_or_default().to_string()),
+            ("x-amz-content-sha256", Self::EMPTY_BODY_SHA256.to_string()),
+            ("x-amz-date", amz_date.to_string()),
+        ];
+        if let Some(token) = creds.token() {
+            headers.push(("x-amz-security-token", token.to_string()));
+        }
+        // Already ascending (`host < x-amz-content-sha256 < x-amz-date <
+        // x-amz-security-token`), as the canonical form requires.
+        let signed_headers = headers
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>()
+            .join(";");
+        let mut canonical_headers = String::new();
+        for (key, value) in &headers {
+            canonical_headers.push_str(key);
+            canonical_headers.push(':');
+            canonical_headers.push_str(value.trim());
+            canonical_headers.push('\n');
+        }
+        let canonical = format!(
+            "GET\n{}\n{query}\n{canonical_headers}\n{signed_headers}\n{}",
+            base_url.path(),
+            Self::EMPTY_BODY_SHA256
+        );
+        let scope = format!("{date_stamp}/{region}/s3/aws4_request");
+        let canonical_hash = hex::encode(Sha256::digest(canonical.as_bytes()));
+        let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{canonical_hash}");
+        let signature = Self::sigv4_signature(creds.secret(), date_stamp, region, &string_to_sign);
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            creds.key()
+        );
+        let mut url = base_url.clone();
+        url.set_query(Some(&query));
+        (url, authorization, amz_date.to_string())
+    }
+
+    /// The `kDate/kRegion/kService/kSigning` HMAC-SHA256 chain.
+    fn sigv4_signature(
+        secret: &str,
+        date_stamp: &str,
+        region: &str,
+        string_to_sign: &str,
+    ) -> String {
+        fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }
+        let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
+        let region_key = hmac_sha256(&date_key, region.as_bytes());
+        let service_key = hmac_sha256(&region_key, b"s3");
+        let signing_key = hmac_sha256(&service_key, b"aws4_request");
+        hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()))
+    }
+
+    /// RFC 3986 percent-encoding for SigV4: unreserved bytes
+    /// (`A-Z a-z 0-9 - _ . ~`) pass through, everything else — including `/`
+    /// and `%` — becomes uppercase `%XX`. The same rule rusty-s3 signs
+    /// presigned URLs with, so a LIST prefix encodes identically both ways.
+    fn amz_encode(input: &str) -> String {
+        const UNRESERVED: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(input.len());
+        for byte in input.bytes() {
+            if UNRESERVED.contains(&byte) {
+                out.push(byte as char);
+            } else {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+        out
+    }
+
     /// All keys under `prefix`, paginated internally. A retry restarts from
     /// the first page — pages are small and a partial merge could otherwise
     /// duplicate keys.
@@ -350,15 +517,19 @@ impl S3Backend {
         let mut keys = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
-            let mut action = self.bucket.list_objects_v2(Some(&self.creds));
-            action.with_prefix(prefix.to_string());
-            if let Some(t) = continuation.take() {
-                action.with_continuation_token(t);
+            // Header-signed (see `list_request`): R2 rejects the session
+            // token as a presigned LIST query parameter.
+            let token = continuation.take();
+            let mut params = vec![
+                ("encoding-type", "url"),
+                ("list-type", "2"),
+                ("prefix", prefix),
+            ];
+            if let Some(token) = token.as_deref() {
+                params.push(("continuation-token", token));
             }
-            let url = action.sign(Duration::from_secs(300));
             let resp = match self
-                .client
-                .get(url)
+                .list_request(&params)
                 .timeout(Duration::from_secs(20))
                 .send()
                 .await
@@ -386,6 +557,119 @@ impl S3Backend {
             }
         }
         Ok(keys)
+    }
+
+    /// One bounded LIST request with a delimiter: `prefixes` are the folders
+    /// below `prefix` and `objects` the files in it. The caller pages with
+    /// the returned token; `max_keys` is clamped to 1–1000.
+    pub async fn list_delimited_page(
+        &self,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: usize,
+        continuation: Option<&str>,
+    ) -> anyhow::Result<S3Page> {
+        with_s3_retry("list", prefix, || {
+            self.list_delimited_once(prefix, delimiter, max_keys, continuation)
+        })
+        .await
+    }
+
+    async fn list_delimited_once(
+        &self,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: usize,
+        continuation: Option<&str>,
+    ) -> Result<S3Page, S3Fail> {
+        // Header-signed (see `list_request`): R2 rejects the session token
+        // as a presigned LIST query parameter.
+        let max_keys = max_keys.clamp(1, 1000).to_string();
+        let mut params = vec![
+            ("delimiter", delimiter),
+            ("encoding-type", "url"),
+            ("list-type", "2"),
+            ("max-keys", max_keys.as_str()),
+            ("prefix", prefix),
+        ];
+        if let Some(token) = continuation {
+            params.push(("continuation-token", token));
+        }
+        let resp = match self
+            .list_request(&params)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(S3Fail::Retryable(anyhow::anyhow!(
+                    "s3 list {prefix} transport: {e:#}"
+                )));
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
+            return Err(classify_status("list", prefix, status, &body));
+        }
+        let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
+            .await
+            .map_err(S3Fail::Final)?;
+        let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
+            .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST XML parse: {e:#}")))?;
+        Ok(S3Page {
+            objects: parsed
+                .contents
+                .into_iter()
+                .map(|o| S3Object {
+                    key: o.key,
+                    last_modified: o.last_modified,
+                    size: o.size,
+                    etag: o.etag,
+                })
+                .collect(),
+            prefixes: parsed
+                .common_prefixes
+                .into_iter()
+                .map(|p| p.prefix)
+                .collect(),
+            next: parsed.next_continuation_token,
+        })
+    }
+
+    /// `HEAD` one object: `None` when it does not exist. Any other failure
+    /// is an error, so a refused credential never reads as "missing".
+    pub async fn head(&self, key: &str) -> anyhow::Result<Option<S3Head>> {
+        let url = self
+            .bucket
+            .head_object(Some(&self.creds), key)
+            .sign(Duration::from_secs(300));
+        let resp = self
+            .client
+            .head(url)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .with_context(|| format!("s3 HEAD {key}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(s3_err("head", key, resp, Duration::from_secs(20)).await);
+        }
+        let size = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        Ok(Some(S3Head { size, content_type }))
     }
 
     /// Recursive delete of one prefix, which must be a whole slug scope
@@ -679,14 +963,110 @@ mod tests {
                 "token missing: {url}"
             );
         }
-        let listed = backend.bucket.list_objects_v2(Some(&backend.creds));
-        let listed = listed.sign(Duration::from_secs(300));
+    }
+
+    /// LIST carries the session token as the signed `x-amz-security-token`
+    /// header, never as a query parameter: R2 answers 501 when the token
+    /// rides the presigned LIST query string. No network: the built request
+    /// is inspected before sending.
+    #[test]
+    fn list_signs_the_token_as_a_header_not_a_query_param() {
+        let backend = S3Backend::new(&test_cfg(Some("session-token-abc"))).expect("backend");
+        let request = backend
+            .list_request(&[
+                ("delimiter", "/"),
+                ("encoding-type", "url"),
+                ("list-type", "2"),
+                ("max-keys", "100"),
+                ("prefix", "fleets/demo/r2/files/"),
+            ])
+            .build()
+            .expect("request builds");
+        let url = request.url().as_str().to_string();
         assert!(
-            listed
-                .as_str()
-                .contains("X-Amz-Security-Token=session-token-abc"),
-            "list must sign the token too: {listed}"
+            url.starts_with("https://account.eu.r2.cloudflarestorage.com/outer-state/?"),
+            "not path style: {url}"
         );
+        for param in [
+            "list-type=2",
+            "encoding-type=url",
+            "prefix=fleets%2Fdemo%2Fr2%2Ffiles%2F",
+            "delimiter=%2F",
+            "max-keys=100",
+        ] {
+            assert!(url.contains(param), "param {param} missing: {url}");
+        }
+        assert!(
+            !url.contains("Security-Token"),
+            "token must not ride the query: {url}"
+        );
+        let headers = request.headers();
+        assert_eq!(
+            headers
+                .get("x-amz-security-token")
+                .map(|v| v.to_str().expect("ascii")),
+            Some("session-token-abc"),
+        );
+        let auth = headers
+            .get("authorization")
+            .map(|v| v.to_str().expect("ascii"))
+            .expect("authorization header");
+        // The key, date, region and service scope ride the credential; the
+        // token header is covered by the signature.
+        assert!(
+            auth.starts_with("AWS4-HMAC-SHA256 Credential=key/"),
+            "credential scope missing: {auth}"
+        );
+        assert!(
+            auth.contains(
+                "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+            ),
+            "token header not signed: {auth}"
+        );
+        assert!(auth.contains("Signature="), "no signature: {auth}");
+    }
+
+    /// Without scoped credentials there is no token header and the signed
+    /// headers shrink to match — a `None` token must not sign an empty one.
+    #[test]
+    fn list_without_a_token_signs_no_token_header() {
+        let backend = S3Backend::new(&test_cfg(None)).expect("backend");
+        let request = backend
+            .list_request(&[
+                ("encoding-type", "url"),
+                ("list-type", "2"),
+                ("prefix", "fleets/demo/"),
+            ])
+            .build()
+            .expect("request builds");
+        assert!(
+            !request.url().as_str().contains("Security-Token"),
+            "unexpected token: {}",
+            request.url()
+        );
+        let headers = request.headers();
+        assert!(!headers.contains_key("x-amz-security-token"));
+        let auth = headers
+            .get("authorization")
+            .map(|v| v.to_str().expect("ascii"))
+            .expect("authorization header");
+        assert!(
+            auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date,"),
+            "signed headers must omit the token: {auth}"
+        );
+    }
+
+    /// SigV4 query encoding: unreserved bytes pass through, `/` and `%` in
+    /// a prefix become `%2F` / `%25` — the same rule the presigned object
+    /// URLs use, so LIST asks for the same bytes it stored.
+    #[test]
+    fn list_query_encoding_matches_presigned_objects() {
+        assert_eq!(
+            S3Backend::amz_encode("fleets/demo/r2/files/"),
+            "fleets%2Fdemo%2Fr2%2Ffiles%2F"
+        );
+        assert_eq!(S3Backend::amz_encode("caf%C3%A9/"), "caf%25C3%25A9%2F");
+        assert_eq!(S3Backend::amz_encode("a-z_A-Z.0~"), "a-z_A-Z.0~");
     }
 
     #[test]

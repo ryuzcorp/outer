@@ -24,9 +24,17 @@ export const ACCOUNT_VIEWS = [
   { id: "admin", label: "Admin" },
 ] as const;
 
+export const DATA_VIEWS = [
+  { id: "r2", label: "R2" },
+  { id: "do", label: "Durable Objects" },
+] as const;
+
 export type AccountViewId = (typeof ACCOUNT_VIEWS)[number]["id"];
 
-export type ViewId = (typeof VIEWS)[number]["id"] | AccountViewId;
+export type ViewId =
+  | (typeof VIEWS)[number]["id"]
+  | AccountViewId
+  | (typeof DATA_VIEWS)[number]["id"];
 
 export const RANGES = [
   { hours: 24, label: "24h", title: "Last 24 hours" },
@@ -67,7 +75,7 @@ const D1_DEFAULTS: Pick<Route, "db" | "table" | "page" | "size" | "sort" | "f" |
 };
 
 export function toViewId(raw: string | null): ViewId {
-  if (VIEWS.some((v) => v.id === raw) || ACCOUNT_VIEWS.some((v) => v.id === raw)) {
+  if (VIEWS.some((v) => v.id === raw) || ACCOUNT_VIEWS.some((v) => v.id === raw) || DATA_VIEWS.some((v) => v.id === raw)) {
     return raw as ViewId;
   }
   return "overview";

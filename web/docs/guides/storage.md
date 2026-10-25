@@ -22,7 +22,27 @@ Uploaded images and video are **not** profanity-classified — keep uploads
 behind your own checks, and never serve user uploads as executable
 content.
 
-## What never to store
+## Browse your data in the console
+
+Console → your app → **Data → R2** shows every `r2_buckets` binding: browse
+folders, preview text (up to 256 KiB) and images inline, download (up to 64
+MiB), upload (up to 64 MiB), create folders, and delete with confirmation.
+Reads use the same scoped credentials as your app; writes go through celld
+and are recorded in the agent action log. The binding list comes from the
+deployed manifest in your bucket, not the local build directory.
+
+Console → your app → **Data → Durable Objects** lists every
+`durable_objects` binding's instances (read-only — celld exposes no generic
+storage API for an instance). Selecting an instance shows what the app's own
+`?read=1` handler returns for it. To preview state, implement that
+read-only branch without side effects, e.g.:
+
+```js
+if (new URL(request.url).searchParams.has("read")) {
+  return Response.json({ n: this.state.n ?? 0 });
+}
+```
+
 
 Secrets go in secret storage (set outside code), never in the repo, the
 database or KV. API keys, tokens and connection strings in committed code

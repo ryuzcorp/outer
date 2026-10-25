@@ -23,9 +23,13 @@ import {
   ChevronRight,
   Copy,
   Database,
+  Download,
   Eye,
   EyeOff,
+  File,
   Filter,
+  Folder,
+  Image,
   KeyRound,
   LayoutGrid,
   Lock,
@@ -42,8 +46,10 @@ import {
   Table,
   Terminal,
   Ticket,
+  Trash2,
   TriangleAlert,
   UserRound,
+  Upload,
   Users,
   X,
   type IconNode,
@@ -53,10 +59,13 @@ function Lucide({
   node,
   size = 18,
   label,
+  cls,
 }: {
   node: IconNode;
   size?: number;
   label?: string;
+  /** Extra classes (sizes, opacity) on the svg. */
+  cls?: string;
 }) {
   return (
     <svg
@@ -69,7 +78,7 @@ function Lucide({
       stroke-linecap="round"
       stroke-linejoin="round"
       role={label ? "img" : "presentation"}
-      aria-label={label}
+      class={cls}
       aria-hidden={label ? undefined : "true"}
     >
       {node.map(([tag, attrs], i) => h(tag, { ...attrs, key: i }))}
@@ -230,6 +239,29 @@ export function KeyIcon({ size = 14 }: { size?: number }) {
 
 export function AccountIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={UserRound} size={size} />;
+}
+export function FolderIcon({ cls }: { cls?: string }) {
+  return <Lucide node={Folder} size={16} cls={cls ?? "shrink-0 opacity-60"} />;
+}
+
+export function FileIcon({ cls }: { cls?: string }) {
+  return <Lucide node={File} size={16} cls={cls ?? "shrink-0 opacity-60"} />;
+}
+
+export function ImageIcon({ cls }: { cls?: string }) {
+  return <Lucide node={Image} size={16} cls={cls ?? "shrink-0 opacity-60"} />;
+}
+
+export function UploadIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Upload} size={size} />;
+}
+
+export function DownloadIcon({ size = 16 }: { size?: number }) {
+  return <Lucide node={Download} size={size} />;
+}
+
+export function TrashIcon({ size = 16 }: { size?: number }) {
+  return <Lucide node={Trash2} size={size} />;
 }
 
 export function UsersIcon({ size = 18 }: { size?: number }) {
