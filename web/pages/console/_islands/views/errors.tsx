@@ -6,7 +6,6 @@ import { atom } from "ilha";
 
 import {
   action,
-  consumeJumpToIssue,
   type BulkTriageInput,
   type BulkTriageResult,
   type ErrorDetailInput,
@@ -65,10 +64,15 @@ export function ErrorsView({
   slug,
   panel,
   onRetry,
+  jump,
+  onJumpConsumed,
 }: {
   slug: string;
   panel: Panel<ErrorsSummary>;
   onRetry: () => void;
+  /** A Logs "View issue" fingerprint to fetch and expand, then consume. */
+  jump: string | null;
+  onJumpConsumed: () => void;
 }) {
   const ready = panel.kind === "ready" ? panel.value : null;
   const tab = atom<Tab>("open");
@@ -115,9 +119,9 @@ export function ErrorsView({
 
   // A "View issue" jump from Logs: fetch the issue wherever it lives,
   // switch to its tab, and expand it.
-  const jump = consumeJumpToIssue();
   if (jump !== null && !jumpBusy()) {
     jumpBusy.set(true);
+    onJumpConsumed();
     void (async () => {
       try {
         const found = await action<ErrorDetailInput, IssueDetail>("error_detail").run({

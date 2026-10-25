@@ -53,7 +53,7 @@ const listSecrets: ConsoleAction<ListSecretsInput, ListSecretsOutput> = {
   readOnly: true,
   consequential: false,
   untrusted: false,
-  run(input, signal) {
+  run(input, _ctx, signal) {
     return request<ListSecretsOutput>(
       "GET",
       `/api/console/apps/${encodeURIComponent(input.slug)}/secrets`,
@@ -80,7 +80,7 @@ const setSecret: ConsoleAction<SetSecretInput, SetSecretOutput> = {
   readOnly: false,
   consequential: false,
   untrusted: false,
-  run(input, signal) {
+  run(input, _ctx, signal) {
     return request<SetSecretOutput>(
       "PUT",
       `/api/console/apps/${encodeURIComponent(input.slug)}/secrets/${encodeURIComponent(input.name)}`,
@@ -106,7 +106,7 @@ const unsetSecret: ConsoleAction<UnsetSecretInput, UnsetSecretOutput> = {
   readOnly: false,
   consequential: true,
   untrusted: false,
-  run(input, signal) {
+  run(input, _ctx, signal) {
     return request<UnsetSecretOutput>(
       "DELETE",
       `/api/console/apps/${encodeURIComponent(input.slug)}/secrets/${encodeURIComponent(input.name)}`,

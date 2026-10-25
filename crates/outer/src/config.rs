@@ -134,6 +134,11 @@ pub struct Config {
     pub outer_secret: String,
     /// `OUTER_EMAIL_FROM` (default `Outer <hello@outer.now>`).
     pub email_from: String,
+    /// WebMCP origin-trial token (`OUTER_WEBMCP_ORIGIN_TRIAL`, absent =
+    /// none): when set, `/console*` responses carry it as an `Origin-Trial`
+    /// header so Chrome enables WebMCP. The console's strict CSP is
+    /// untouched.
+    pub webmcp_origin_trial: Option<String>,
     /// `OUTER_OAUTH_ACCESS_TTL_S` (default 3600).
     pub oauth_access_ttl: Duration,
     /// `OUTER_OAUTH_REFRESH_TTL_D` (default 90).
@@ -316,6 +321,7 @@ impl Config {
         let email_from = get("OUTER_EMAIL_FROM")
             .unwrap_or("Outer <hello@outer.now>")
             .to_string();
+        let webmcp_origin_trial = get("OUTER_WEBMCP_ORIGIN_TRIAL").map(str::to_string);
         let oauth_access_ttl = Duration::from_secs(parse_num(
             get("OUTER_OAUTH_ACCESS_TTL_S"),
             "OUTER_OAUTH_ACCESS_TTL_S",
@@ -415,6 +421,7 @@ impl Config {
             terms_version: terms_version.unwrap_or_else(|| "dev".to_string()),
             outer_secret,
             email_from,
+            webmcp_origin_trial,
             oauth_access_ttl,
             oauth_refresh_ttl,
             tool_wait,
@@ -472,6 +479,15 @@ impl Config {
         if let StoreKind::R2(r2) = &self.store {
             if !r2.endpoint.is_empty() && !r2.endpoint.starts_with("https://") && !self.is_local() {
                 problems.push(format!("OUTER_R2_ENDPOINT={:?} must be https", r2.endpoint));
+            }
+        }
+        // `file_response` silently drops an unparseable token, which would
+        // leave WebMCP unavailable despite a passing config check.
+        if let Some(token) = &self.webmcp_origin_trial {
+            if token.parse::<axum::http::HeaderValue>().is_err() {
+                problems.push(format!(
+                    "OUTER_WEBMCP_ORIGIN_TRIAL={token:?} is not a valid HTTP header value"
+                ));
             }
         }
         if !self.is_local() && self.terms_version == "dev" {
@@ -696,6 +712,24 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.ai_gateway, "staging");
+    }
+    #[test]
+    fn webmcp_origin_trial_must_parse_as_a_header_value() {
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_WEBMCP_ORIGIN_TRIAL", "token-abc"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.webmcp_origin_trial.as_deref(), Some("token-abc"));
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_WEBMCP_ORIGIN_TRIAL", "abc\ndef"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter().any(|p| p.contains("OUTER_WEBMCP_ORIGIN_TRIAL")),
+            "{err:?}"
+        );
     }
 
     #[test]

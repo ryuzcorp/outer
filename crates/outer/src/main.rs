@@ -671,7 +671,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             sync: sync.clone(),
             auth,
             mcp,
-            site: http::site::SiteDir::new(&config.site_dir),
+            site: match &config.webmcp_origin_trial {
+                Some(token) => {
+                    http::site::SiteDir::new(&config.site_dir).with_origin_trial(token.clone())
+                }
+                None => http::site::SiteDir::new(&config.site_dir),
+            },
         },
         http::proxy::ProxyState::new(
             pool.clone(),

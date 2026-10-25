@@ -44,6 +44,7 @@ import {
   OuterMark,
   OverviewIcon,
   PlusIcon,
+  SearchIcon,
   SecretsIcon,
   SettingsIcon,
   ShieldIcon,
@@ -64,11 +65,18 @@ import {
 import { CodeView } from "./views/code.tsx";
 import { D1Nav, D1View } from "./views/d1.tsx";
 
+import type { ConsoleBridge } from "./actions/settings.ts";
 import { domainActions } from "./actions/domains.ts";
+import { Palette } from "./palette.tsx";
+import {
+  createConfirmHandler,
+  syncWebMcp,
+  type ConfirmEntry,
+  type ExecuteContext,
+} from "./webmcp.ts";
 import { secretsActions } from "./actions/secrets.ts";
 import { ErrorsView } from "./views/errors.tsx";
 import { LogsView } from "./views/logs.tsx";
-import { setJumpToIssue } from "./actions/observe.ts";
 import {
   AccountView,
   ConnectionsView,
@@ -185,6 +193,19 @@ interface Ui {
   createOpen: boolean;
   accountOpen: boolean;
   expanded: string[];
+  paletteOpen: boolean;
+}
+
+/** The modal names the target, not just the action: first concrete input wins. */
+function confirmTargetOf(input: Record<string, unknown>): string {
+  const keys = ["slug", "app", "email", "name", "prefix", "id", "fingerprint", "sha", "bucket", "table"];
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "string" && value !== "") {
+      return value;
+    }
+  }
+  return "the current app";
 }
 
 export function Console() {
@@ -215,7 +236,29 @@ export function Console() {
     createOpen: false,
     accountOpen: false,
     expanded: [],
+    paletteOpen: false,
   });
+  const pendingConfirm = atom<ConfirmEntry | null>(null);
+  // A fingerprint picked in Logs ("View issue"): the Errors view consumes
+  // it on mount and expands it. Owned here, passed down as props.
+  const pendingJump = atom<string | null>(null);
+  const bridge: ConsoleBridge = {
+    getEmail: () => email(),
+    getRoute: () => route(),
+    getApps: () => {
+      const panel = apps();
+      return panel.kind === "ready" ? panel.value : [];
+    },
+    navigate,
+  };
+  const webmcpCtx: ExecuteContext = {
+    getSlug: () => route().app,
+    bridge,
+    confirm: createConfirmHandler(
+      () => pendingConfirm(),
+      (next) => pendingConfirm.set(next),
+    ),
+  };
 
   // One generation per navigation: late responses from the previous app
   // never repaint the new one (Noite keys its cards per app id instead).
@@ -646,6 +689,16 @@ export function Console() {
       });
   }
 
+  // patchUi lives above `watch.once`: the watcher's first pass runs
+  // while the boot skeleton early-returns below, and its keydown listener
+  // closes over this scope — a later definition would stay unassigned.
+  const patchUi = (patch: Partial<Ui>) => {
+    if (patch.collapsed !== undefined && typeof window !== "undefined") {
+      window.localStorage.setItem(COLLAPSED_KEY, patch.collapsed ? "1" : "0");
+    }
+    ui.set({ ...ui(), ...patch });
+  };
+
   watch.once(() => {
     if (typeof window === "undefined") {
       return;
@@ -663,10 +716,12 @@ export function Console() {
           email.set(me.email);
           plan.set(me.plan ?? "free");
           isAdmin.set(me.is_admin ?? false);
+          syncWebMcp(me.email || null, webmcpCtx);
         } catch {
           email.set("");
           plan.set("free");
           isAdmin.set(false);
+          syncWebMcp(null, webmcpCtx);
         }
         const r = route();
         if (isAccountView(r.view)) {
@@ -710,10 +765,25 @@ export function Console() {
         }
         detail.set({ kind: "error", message: String(err) });
       });
+    // ⌘K + WebMCP wiring: `webmcpCtx` already carries the bridge for the
+    // navigation actions and the daisyUI confirm gate; here only the
+    // identity-keyed registration stays (re-register on identity change,
+    // abort on unload).
+    syncWebMcp(email() || null, webmcpCtx);
+    window.addEventListener("pagehide", () => {
+      syncWebMcp(null, webmcpCtx);
+    });
     window.addEventListener("keydown", (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        patchUi({ paletteOpen: !ui().paletteOpen });
+        return;
+      }
       if (e.key === "Escape") {
         const current = ui();
-        if (current.createOpen || current.accountOpen || current.drawer) {
+        if (current.paletteOpen) {
+          ui.set({ ...current, paletteOpen: false });
+        } else if (current.createOpen || current.accountOpen || current.drawer) {
           ui.set({ ...current, createOpen: false, accountOpen: false, drawer: false });
         }
       }
@@ -838,12 +908,7 @@ export function Console() {
       ? errorsPanel.value.issues.filter((i) => i.status === "open").length
       : 0;
 
-  const patchUi = (patch: Partial<Ui>) => {
-    if (patch.collapsed !== undefined && typeof window !== "undefined") {
-      window.localStorage.setItem(COLLAPSED_KEY, patch.collapsed ? "1" : "0");
-    }
-    ui.set({ ...ui(), ...patch });
-  };
+  // (patchUi moved above `watch.once`; see the note there.)
 
   // Reload the visible view's data (error Retry buttons reuse it).
   function reload(): void {
@@ -987,6 +1052,16 @@ export function Console() {
             </div>
           )}
         </div>
+        <button
+          type="button"
+          class="rail-tile tooltip tooltip-right"
+          data-tip="Search ⌘K"
+          aria-label="Search (⌘K)"
+          title="Search (⌘K)"
+          onclick={() => patchUi({ paletteOpen: true })}
+        >
+          <SearchIcon />
+        </button>
         <div class="rail-foot">
           <a class="rail-tile tooltip tooltip-right" data-tip="Docs" href="/" aria-label="Docs">
             <DocsIcon />
@@ -1230,9 +1305,11 @@ export function Console() {
                         });
                     }}
                     onJumpToIssue={(fingerprint) => {
-                      setJumpToIssue(fingerprint);
+                      pendingJump.set(fingerprint);
                       navigate({ view: "errors" });
                     }}
+                    jumpToIssue={pendingJump()}
+                    onJumpConsumed={() => pendingJump.set(null)}
                     onRetry={reload}
                     onRefreshDetail={refreshDetail}
                     onRenamed={afterRename}
@@ -1389,6 +1466,58 @@ export function Console() {
           </div>
         </div>
       )}
+      {ui().paletteOpen && (
+        <Palette
+          apps={list}
+          slug={r.app}
+          view={r.view}
+          isAdmin={isAdmin()}
+          onNavigate={(next) => navigate(next)}
+          execCtx={webmcpCtx}
+          onMutated={() => {
+            void reloadApps();
+            refreshDetail();
+          }}
+          onClose={() => patchUi({ paletteOpen: false })}
+        />
+      )}
+      {pendingConfirm() && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={`Confirm ${pendingConfirm()?.action.title ?? "action"}`}>
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 min-w-0 truncate text-base font-semibold" title={pendingConfirm()?.action.title}>
+              Run "{pendingConfirm()?.action.title}"?
+            </h3>
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              An in-browser agent asked to run this consequential action as
+              you. Target: <code class="font-mono">{confirmTargetOf(pendingConfirm()?.input ?? {})}</code>.
+              Confirm only if you asked for this.
+            </p>
+            <details class="mt-2 min-w-0 text-sm">
+              <summary class="cursor-pointer opacity-70">Input</summary>
+              <pre class="mockup-code mt-1 max-h-40 overflow-auto text-xs">{JSON.stringify(pendingConfirm()?.input, null, 2)}</pre>
+            </details>
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                onclick={() => pendingConfirm()?.reject(new Error(`"${pendingConfirm()?.action.name}" was cancelled — nothing ran.`))}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-error"
+                onclick={() => pendingConfirm()?.resolve()}
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => pendingConfirm()?.reject(new Error(`"${pendingConfirm()?.action.name}" was cancelled — nothing ran.`))}>
+            Close
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1451,6 +1580,9 @@ function ViewBody(props: {
   onShowChanges: (sha: string) => void;
   onSwitchCodeTab: (tab: "files" | "changes") => void;
   onJumpToIssue: (fingerprint: string) => void;
+  /** A Logs "View issue" pick for the Errors view to expand, then consume. */
+  jumpToIssue: string | null;
+  onJumpConsumed: () => void;
   onCollaboratorsChanged: () => void;
   onAddDomain: (hostname: string) => Promise<void>;
   onRefreshDomains: () => Promise<void>;
@@ -1518,7 +1650,15 @@ function ViewBody(props: {
         />
       );
     case "errors":
-      return <ErrorsView slug={props.slug} panel={props.errors} onRetry={props.onRetry} />;
+      return (
+        <ErrorsView
+          slug={props.slug}
+          panel={props.errors}
+          onRetry={props.onRetry}
+          jump={props.jumpToIssue}
+          onJumpConsumed={props.onJumpConsumed}
+        />
+      );
     case "secrets":
       return (
         <SecretsView

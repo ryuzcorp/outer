@@ -11,6 +11,7 @@ import {
   type CreatedKey,
 } from "../api.ts";
 
+import type { ActionContext } from "./settings.ts";
 export interface ConsoleAction<I, O> {
   name: string;
   title: string;
@@ -19,7 +20,7 @@ export interface ConsoleAction<I, O> {
   readOnly: boolean;
   consequential: boolean;
   untrusted: boolean;
-  run(input: I, signal?: AbortSignal): Promise<O>;
+  run(input: I, ctx?: ActionContext, signal?: AbortSignal): Promise<O>;
 }
 
 export interface Revoked {

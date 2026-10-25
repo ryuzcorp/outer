@@ -3,7 +3,7 @@
 // one exported entry here, so the later ⌘K and WebMCP layer can import
 // `actions/*.ts` wholesale. The Settings UI calls `run`.
 import { request } from "./http.ts";
-import type { ConsoleAction } from "./settings.ts";
+import type { ActionContext, ConsoleAction } from "./settings.ts";
 import type { DomainEntry, DomainResult, DomainsSummary } from "../api.ts";
 
 function domainPath(slug: string, rest = ""): string {
@@ -42,7 +42,7 @@ const listDomains: ConsoleAction<ListDomainsInput, DomainsSummary> = {
   readOnly: true,
   consequential: false,
   untrusted: false,
-  run(input, signal?: AbortSignal): Promise<DomainsSummary> {
+  run(input, _ctx?: ActionContext, signal?: AbortSignal): Promise<DomainsSummary> {
     return request<DomainsSummary>("GET", domainPath(input.app), undefined, signal);
   },
 };
@@ -56,7 +56,7 @@ const refreshDomains: ConsoleAction<ListDomainsInput, DomainResult> = {
   readOnly: false,
   consequential: false,
   untrusted: false,
-  run(input, signal?: AbortSignal): Promise<DomainResult> {
+  run(input, _ctx?: ActionContext, signal?: AbortSignal): Promise<DomainResult> {
     return request<DomainResult>("POST", domainPath(input.app, "/refresh"), {}, signal);
   },
 };
@@ -77,7 +77,7 @@ const addDomain: ConsoleAction<AddDomainInput, AddDomainOutput> = {
   readOnly: false,
   consequential: false,
   untrusted: false,
-  run(input, signal?: AbortSignal): Promise<AddDomainOutput> {
+  run(input, _ctx?: ActionContext, signal?: AbortSignal): Promise<AddDomainOutput> {
     return request<AddDomainOutput>(
       "POST",
       domainPath(input.app),
@@ -96,7 +96,7 @@ const removeDomain: ConsoleAction<ListDomainsInput, RemoveDomainOutput> = {
   readOnly: false,
   consequential: true,
   untrusted: false,
-  run(input, signal?: AbortSignal): Promise<RemoveDomainOutput> {
+  run(input, _ctx?: ActionContext, signal?: AbortSignal): Promise<RemoveDomainOutput> {
     return request<RemoveDomainOutput>("DELETE", domainPath(input.app), undefined, signal);
   },
 };

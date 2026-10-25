@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug)]
 pub struct SiteDir {
     root: Option<PathBuf>,
+    origin_trial: Option<String>,
 }
 
 impl SiteDir {
@@ -26,7 +27,15 @@ impl SiteDir {
     pub fn new(dir: &Path) -> Self {
         Self {
             root: std::fs::canonicalize(dir).ok(),
+            origin_trial: None,
         }
+    }
+
+    /// Carry a WebMCP origin-trial token on `/console*` responses (the
+    /// token comes from `OUTER_WEBMCP_ORIGIN_TRIAL` via `Config`).
+    pub fn with_origin_trial(mut self, token: String) -> Self {
+        self.origin_trial = Some(token);
+        self
     }
 
     /// Answer a platform-host request that Outer's own routes didn't claim.
@@ -72,6 +81,7 @@ impl SiteDir {
                         "text/markdown; charset=utf-8",
                         true,
                         &md,
+                        self.origin_trial.as_deref(),
                     ));
                 }
             }
@@ -84,12 +94,19 @@ impl SiteDir {
                     content_type(&candidate),
                     false,
                     &candidate,
+                    self.origin_trial.as_deref(),
                 ));
             }
         }
         if let Some(file) = read_within(root, "404.html").await {
-            let mut res =
-                file_response(method, file, "text/html; charset=utf-8", false, "404.html");
+            let mut res = file_response(
+                method,
+                file,
+                "text/html; charset=utf-8",
+                false,
+                "404.html",
+                self.origin_trial.as_deref(),
+            );
             *res.status_mut() = StatusCode::NOT_FOUND;
             return Some(res);
         }
@@ -252,10 +269,11 @@ fn file_response(
     content_type: &'static str,
     negotiated: bool,
     relative: &str,
+    origin_trial: Option<&str>,
 ) -> Response {
     // The console CSP hashes the page's own inline blocks, so hash the
     // bytes before they move into the body.
-    let console_csp = if relative == "console" || relative.starts_with("console/") {
+    let console_csp = if is_console(relative) {
         Some(console_csp(&bytes))
     } else {
         None
@@ -294,7 +312,17 @@ fn file_response(
             "same-origin".parse().expect("static header parses"),
         );
     }
+    if let Some(token) = origin_trial.filter(|_| is_console(relative)) {
+        if let Ok(value) = token.parse() {
+            headers.insert("origin-trial", value);
+        }
+    }
     res
+}
+
+/// The console shells: `console` itself and everything beneath it.
+fn is_console(relative: &str) -> bool {
+    relative == "console" || relative.starts_with("console/")
 }
 
 /// The `/console/*` content security policy (spec §13.1): strict
@@ -670,6 +698,41 @@ mod tests {
         )
         .await;
         assert!(!hdrs.contains_key("content-security-policy"));
+    }
+
+    /// The WebMCP origin trial rides an `Origin-Trial` response header on
+    /// `/console*` only; docs pages stay untouched, and an absent token
+    /// sends nothing.
+    #[tokio::test]
+    async fn origin_trial_header_only_on_console() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("console")).unwrap();
+        std::fs::write(dir.path().join("console/index.html"), "<h1>Console</h1>").unwrap();
+        std::fs::write(dir.path().join("index.html"), "<h1>Outer</h1>").unwrap();
+        let site = SiteDir::new(dir.path()).with_origin_trial("token-abc".to_string());
+        let (_, hdrs, _) = body_text(
+            site.serve_request("GET", "/console", None, &headers(None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(hdrs["origin-trial"], "token-abc");
+        let (_, hdrs, _) = body_text(
+            site.serve_request("GET", "/", None, &headers(None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!hdrs.contains_key("origin-trial"));
+        let plain = SiteDir::new(dir.path());
+        let (_, hdrs, _) = body_text(
+            plain
+                .serve_request("GET", "/console", None, &headers(None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!hdrs.contains_key("origin-trial"));
     }
 
     #[test]

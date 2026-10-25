@@ -8,6 +8,7 @@
 // data and audit to the action log). Row content is app/user data, so reads
 // are `untrusted`.
 
+import type { ActionContext } from "./settings.ts";
 import type {
   D1Database,
   D1Filter,
@@ -31,11 +32,11 @@ export interface ConsoleAction<I, O> {
   inputSchema: object;
   /** WebMCP readOnlyHint. */
   readOnly: boolean;
-  /** WebMCP consequentialHint (destructive/irreversible). */
-  consequential: boolean;
-  /** WebMCP untrustedContentHint (output includes app/user-generated text). */
-  untrusted: boolean;
-  run(input: I, signal?: AbortSignal): Promise<O>;
+   /** WebMCP consequentialHint (destructive/irreversible). */
+   consequential: boolean;
+   /** WebMCP untrustedContentHint (output includes app/user-generated text). */
+   untrusted: boolean;
+  run(input: I, ctx?: ActionContext, signal?: AbortSignal): Promise<O>;
 }
 
 const base = (slug: string, binding: string, rest: string): string =>
@@ -47,6 +48,7 @@ const base = (slug: string, binding: string, rest: string): string =>
 export function d1run<I, O>(
   name: string,
   input: I,
+  ctx?: ActionContext,
   signal?: AbortSignal,
 ): Promise<O> {
   const action = actions.find((candidate) => candidate.name === name) as
@@ -55,7 +57,7 @@ export function d1run<I, O>(
   if (action === undefined) {
     throw new Error(`unknown action ${name}`);
   }
-  return action.run(input, signal);
+  return action.run(input, ctx, signal);
 }
 /** GET with the console's 401 handling (missing/expired session signs the
  * human through the Rust sign-in flow) and the D1 error envelope
@@ -187,7 +189,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     readOnly: true,
     consequential: false,
     untrusted: false,
-    run(input: D1DatabasesInput, signal?: AbortSignal): Promise<D1DatabasesOutput> {
+    run(input: D1DatabasesInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<D1DatabasesOutput> {
       return d1get<D1DatabasesOutput>(
         `/api/console/apps/${encodeURIComponent(input.slug)}/data/d1/databases`,
         signal,
@@ -207,7 +209,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     readOnly: true,
     consequential: false,
     untrusted: false,
-    run(input: D1TablesInput, signal?: AbortSignal): Promise<D1TablesOutput> {
+    run(input: D1TablesInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<D1TablesOutput> {
       return d1get<D1TablesOutput>(`${base(input.slug, input.binding, "/tables")}`, signal);
     },
   },
@@ -224,7 +226,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     readOnly: true,
     consequential: false,
     untrusted: false,
-    run(input: D1SchemaInput, signal?: AbortSignal): Promise<D1TableSchema> {
+    run(input: D1SchemaInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<D1TableSchema> {
       return d1get<D1TableSchema>(
         `${base(input.slug, input.binding, `/tables/${encodeURIComponent(input.table)}/schema`)}`,
         signal,
@@ -260,7 +262,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     readOnly: true,
     consequential: false,
     untrusted: true,
-    run(input: D1RowsInput, signal?: AbortSignal): Promise<D1Rows> {
+    run(input: D1RowsInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<D1Rows> {
       const { slug, binding, table, ...query } = input;
       return d1post<D1Rows>(
         `${base(slug, binding, `/tables/${encodeURIComponent(table)}/rows`)}`,
@@ -291,6 +293,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     untrusted: false,
     run(
       input: D1WriteInput,
+      _ctx?: ActionContext,
       signal?: AbortSignal,
     ): Promise<{ ok: true }> {
       const { slug, binding, table, ...body } = input;
@@ -321,6 +324,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     untrusted: false,
     run(
       input: D1DeleteRowsInput,
+      _ctx?: ActionContext,
       signal?: AbortSignal,
     ): Promise<{ deleted: number }> {
       const { slug, binding, table, ...body } = input;

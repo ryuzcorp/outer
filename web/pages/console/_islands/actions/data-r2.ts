@@ -4,7 +4,7 @@
 // and are audited (client "Console").
 
 import { request } from "./http.ts";
-import type { ConsoleAction } from "./settings.ts";
+import type { ActionContext, ConsoleAction } from "./settings.ts";
 
 export interface R2Bucket {
   binding: string;
@@ -77,7 +77,7 @@ const r2ListBuckets: ConsoleAction<{ slug: string }, BucketsResult> = {
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run: ({ slug }, signal) =>
+  run: ({ slug }, _ctx: ActionContext | undefined, signal) =>
     request<BucketsResult>(
       "GET",
       `/api/console/apps/${encodeURIComponent(slug)}/data/r2/buckets`,
@@ -107,7 +107,7 @@ const r2List: ConsoleAction<
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run: ({ slug, bucket, prefix, cursor }, signal) =>
+  run: ({ slug, bucket, prefix, cursor }, _ctx: ActionContext | undefined, signal) =>
     request<R2Preview>(
       "GET",
       `/api/console/apps/${encodeURIComponent(slug)}/data/r2/list${qs({ bucket, prefix, cursor })}`,
@@ -133,7 +133,7 @@ const r2File: ConsoleAction<{ slug: string; bucket: string; key: string }, R2Fil
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run: ({ slug, bucket, key }, signal) =>
+  run: ({ slug, bucket, key }, _ctx: ActionContext | undefined, signal) =>
     request<R2File>(
       "GET",
       `/api/console/apps/${encodeURIComponent(slug)}/data/r2/file${qs({ bucket, key })}`,
@@ -159,7 +159,7 @@ const r2Delete: ConsoleAction<{ slug: string; bucket: string; keys: string[] }, 
   readOnly: false,
   consequential: true,
   untrusted: false,
-  run: ({ slug, bucket, keys }, signal) =>
+  run: ({ slug, bucket, keys }, _ctx: ActionContext | undefined, signal) =>
     request<{ deleted: number }>(
       "POST",
       `/api/console/apps/${encodeURIComponent(slug)}/data/r2/delete`,
@@ -195,7 +195,7 @@ const r2Upload: ConsoleAction<R2UploadInput, { key: string; size: number }> = {
   readOnly: false,
   consequential: true,
   untrusted: false,
-  run: async ({ slug, bucket, key, file, contentType }, signal) => {
+  run: async ({ slug, bucket, key, file, contentType }, _ctx: ActionContext | undefined, signal) => {
     const res = await fetch(
       `/api/console/apps/${encodeURIComponent(slug)}/data/r2/object${qs({ bucket, key })}`,
       {

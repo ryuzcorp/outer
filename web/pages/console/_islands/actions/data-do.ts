@@ -5,7 +5,7 @@
 // read handler.
 
 import { request } from "./http.ts";
-import type { ConsoleAction } from "./settings.ts";
+import type { ActionContext, ConsoleAction } from "./settings.ts";
 
 export interface DoBinding {
   name: string;
@@ -58,7 +58,7 @@ const doListClasses: ConsoleAction<{ slug: string }, DoClassesResult> = {
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run: ({ slug }, signal) =>
+  run: ({ slug }, _ctx: ActionContext | undefined, signal) =>
     request<DoClassesResult>(
       "GET",
       `/api/console/apps/${encodeURIComponent(slug)}/data/do/classes`,
@@ -83,7 +83,7 @@ const doListInstances: ConsoleAction<{ slug: string; class: string }, DoInstance
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run: ({ slug, class: className }, signal) =>
+  run: ({ slug, class: className }, _ctx: ActionContext | undefined, signal) =>
     request<DoInstancesResult>(
       "GET",
       `/api/console/apps/${encodeURIComponent(slug)}/data/do/instances${qs({ class: className })}`,
@@ -108,7 +108,7 @@ const doProbe: ConsoleAction<{ slug: string; scope: string }, DoProbeResult> = {
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run: ({ slug, scope }, signal) =>
+  run: ({ slug, scope }, _ctx: ActionContext | undefined, signal) =>
     request<DoProbeResult>(
       "GET",
       `/api/console/apps/${encodeURIComponent(slug)}/data/do/probe${qs({ scope })}`,

@@ -2,6 +2,25 @@
 // `run`; the later ⌘K and WebMCP layer imports every `actions/*.ts`
 // registry.
 import { ConsoleApiError, request } from "./http.ts";
+import type { ConsoleApp } from "../api.ts";
+import type { Route } from "../common.tsx";
+
+/** Live console state the navigation actions drive: the Console island
+ * builds it on mount and hands it down through the execute context, so no
+ * action module keeps its own copy. */
+export interface ConsoleBridge {
+  getEmail: () => string;
+  getRoute: () => Route;
+  getApps: () => ConsoleApp[];
+  navigate: (next: Partial<Route>) => void;
+}
+
+/** Explicit per-run dependencies, threaded through `executeAction` into
+ * `run`. Actions that need nothing (slug comes from the caller or the
+ * current-app default) ignore it. */
+export interface ActionContext {
+  bridge?: ConsoleBridge;
+}
 
 export interface ConsoleAction<I, O> {
   name: string;
@@ -11,7 +30,7 @@ export interface ConsoleAction<I, O> {
   readOnly: boolean;
   consequential: boolean;
   untrusted: boolean;
-  run(input: I, signal?: AbortSignal): Promise<O>;
+  run(input: I, ctx?: ActionContext, signal?: AbortSignal): Promise<O>;
 }
 
 export interface SetVisibilityInput {
@@ -61,7 +80,7 @@ const setVisibility: ConsoleAction<SetVisibilityInput, SetVisibilityOutput> = {
   readOnly: false,
   consequential: false,
   untrusted: false,
-  run(input, signal) {
+  run(input, _ctx, signal) {
     return request<SetVisibilityOutput>(
       "POST",
       `/api/console/apps/${encodeURIComponent(input.slug)}/visibility`,
@@ -87,7 +106,7 @@ const renameApp: ConsoleAction<RenameAppInput, RenameAppOutput> = {
   readOnly: false,
   consequential: true,
   untrusted: false,
-  async run(input, signal) {
+  async run(input, _ctx, signal) {
     try {
       return await request<RenameAppOutput>(
         "POST",
@@ -124,7 +143,7 @@ const deleteApp: ConsoleAction<DeleteAppInput, DeleteAppOutput> = {
   readOnly: false,
   consequential: true,
   untrusted: false,
-  run(input, signal) {
+  run(input, _ctx, signal) {
     return request<DeleteAppOutput>(
       "POST",
       `/api/console/apps/${encodeURIComponent(input.slug)}/delete`,
