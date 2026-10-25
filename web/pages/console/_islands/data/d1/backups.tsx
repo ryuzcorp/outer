@@ -197,7 +197,7 @@ export const BackupsPanel = ({
             <thead>
               <tr>
                 <th scope="col">Taken</th>
-                <th scope="col">Size</th>
+                <th scope="col" class="hidden sm:table-cell">Size</th>
                 <th scope="col">
                   <span class="sr-only">Actions</span>
                 </th>
@@ -207,14 +207,15 @@ export const BackupsPanel = ({
               {current.value.map((backup) => (
                 <tr key={backup.id}>
                   <td
-                    class="whitespace-nowrap tabular-nums"
+                    class="tabular-nums sm:whitespace-nowrap"
                     title={new Date(backup.created_at).toISOString()}
                   >
                     {formatDateTime(new Date(backup.created_at))}
+                    <span class="block text-xs opacity-60 sm:hidden">{formatBytes(backup.size_bytes)}</span>
                   </td>
-                  <td class="whitespace-nowrap tabular-nums">{formatBytes(backup.size_bytes)}</td>
+                  <td class="hidden whitespace-nowrap tabular-nums sm:table-cell">{formatBytes(backup.size_bytes)}</td>
                   <td class="whitespace-nowrap">
-                    <div class="flex justify-end gap-2">
+                    <div class="flex justify-end gap-1 sm:gap-2">
                       <a
                         class="btn btn-sm btn-ghost"
                         href={downloadUrl(slug, binding, backup.id)}
