@@ -678,7 +678,7 @@ export function Console() {
         isAdmin={isAdmin()}
         onGenerate={(count, note) => generateCodes(count, note)}
         onRevoke={(code) => revokeCode(code)}
-        onMore={() => void loadMoreAdminCodes()}
+        onMoreCodes={() => void loadMoreAdminCodes()}
         onRetry={() => {
           epoch += 1;
           void loadAccountView("admin", epoch);
