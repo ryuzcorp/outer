@@ -56,6 +56,8 @@ import {
   SettingsView,
 } from "./views.tsx";
 
+import { secretsActions } from "./actions/secrets.ts";
+
 import {
   CopyButton,
   RANGES,
@@ -149,10 +151,20 @@ const VIEW_TITLES: Record<ViewId, string> = {
   admin: "Admin",
 };
 
+/** Shell UI state: sidebar collapse, mobile drawer, popovers, expanded deploy rows. */
+interface Ui {
+  collapsed: boolean;
+  drawer: boolean;
+  createOpen: boolean;
+  accountOpen: boolean;
+  expanded: string[];
+}
+
 export function Console() {
   const route = atom<Route>(readRoute());
   const apps = atom<Panel<ConsoleApp[]>>({ kind: "loading" });
   const email = atom("");
+  const plan = atom("free");
   const isAdmin = atom(false);
   const invites = atom<Panel<InvitesSummary>>({ kind: "loading" });
   const adminInvites = atom<Panel<AdminInvitesPage>>({ kind: "loading" });
@@ -308,9 +320,8 @@ export function Console() {
         secrets.set({ kind: "loading" });
       }
       jobs.push(
-        api<SecretsSummary>(
-          `/api/console/apps/${encodeURIComponent(slug)}/secrets`,
-        )
+        secretsActions.listSecrets
+          .run({ slug })
           .then((summary) => {
             put(secrets, { kind: "ready", value: summary });
           })
@@ -526,11 +537,15 @@ export function Console() {
       .then(async (data) => {
         apps.set({ kind: "ready", value: data.apps });
         try {
-          const me = await api<{ email: string; is_admin?: boolean }>("/api/console/me");
+          const me = await api<{ email: string; plan?: string; is_admin?: boolean }>(
+            "/api/console/me",
+          );
           email.set(me.email);
+          plan.set(me.plan ?? "free");
           isAdmin.set(me.is_admin ?? false);
         } catch {
           email.set("");
+          plan.set("free");
           isAdmin.set(false);
         }
         const r = route();
@@ -693,6 +708,45 @@ export function Console() {
       void loadAccountView(r.view, epoch);
     }
   }
+
+  // Re-read the app detail (and the rail) after a mutation: visibility and
+  // rollback change what the detail carries, rename changes the slug, and
+  // delete changes the rail.
+  function refreshDetail(): void {
+    const r = route();
+    if (r.app && !isAccountView(r.view)) {
+      epoch += 1;
+      void enter(r, epoch);
+    }
+  }
+
+  async function reloadApps(): Promise<ConsoleApp[]> {
+    try {
+      const data = await api<{ apps: ConsoleApp[] }>("/api/console/apps");
+      apps.set({ kind: "ready", value: data.apps });
+      return data.apps;
+    } catch {
+      return [];
+    }
+  }
+
+  // After a rename: refresh the rail, then move to the new slug.
+  function afterRename(newSlug: string): void {
+    void reloadApps().then(() => {
+      navigate({ app: newSlug, view: "settings" });
+    });
+  }
+
+  // After a delete: refresh the rail, then move to the next app (or clear
+  // the app, which renders the no-apps state).
+  function afterDelete(): void {
+    const gone = route().app;
+    void reloadApps().then((list) => {
+      const next = list.find((a) => a.slug !== gone) ?? null;
+      navigate({ app: next?.slug ?? null, view: "overview" });
+    });
+  }
+
 
   return (
     <div class="console">
@@ -952,6 +1006,7 @@ export function Console() {
                 {!accountView && detailPanel.kind === "ready" && (
                   <ViewBody
                     route={r}
+                    onView={(view) => navigate({ view })}
                     app={detailPanel.value}
                     metrics={metrics()}
                     actions={actions()}
@@ -985,6 +1040,10 @@ export function Console() {
                         });
                     }}
                     onRetry={reload}
+                    onRefreshDetail={refreshDetail}
+                    onRenamed={afterRename}
+                    onDeleted={afterDelete}
+                    plan={plan()}
                   />
                 )}
               </div>
@@ -1104,6 +1163,7 @@ function ViewIcon({ id }: { id: ViewId }) {
 function ViewBody(props: {
   route: Route;
   app: AppDetail;
+  plan: string;
   metrics: Panel<{ hours: number; summary: MetricsSummary }>;
   actions: ActionsPanel;
   errors: Panel<ErrorsSummary>;
@@ -1114,6 +1174,11 @@ function ViewBody(props: {
   onLoadMore: () => void;
   onRefreshLogs: () => void;
   onRetry: () => void;
+  onRefreshDetail: () => void;
+  onRenamed: (slug: string) => void;
+  onDeleted: () => void;
+  /** Switch the current app's view (ViewBody is outside `navigate`'s scope). */
+  onView: (view: ViewId) => void;
 }) {
   switch (props.route.view) {
     case "overview":
@@ -1123,7 +1188,7 @@ function ViewBody(props: {
           metrics={props.metrics}
           actions={props.actions}
           errors={props.errors}
-          onView={(view) => navigate({ view })}
+          onView={props.onView}
           onRetry={props.onRetry}
         />
       );
@@ -1143,6 +1208,7 @@ function ViewBody(props: {
           app={props.app}
           expanded={props.expanded}
           onToggle={props.onToggleExpand}
+          onRolledBack={props.onRefreshDetail}
         />
       );
     case "logs":
@@ -1156,8 +1222,23 @@ function ViewBody(props: {
     case "errors":
       return <ErrorsView panel={props.errors} onRetry={props.onRetry} />;
     case "secrets":
-      return <SecretsView panel={props.secrets} onRetry={props.onRetry} />;
+      return (
+        <SecretsView
+          slug={props.app.slug}
+          panel={props.secrets}
+          onRetry={props.onRetry}
+          onChanged={props.onRetry}
+        />
+      );
     case "settings":
-      return <SettingsView app={props.app} />;
+      return (
+        <SettingsView
+          app={props.app}
+          plan={props.plan}
+          onRefresh={props.onRefreshDetail}
+          onRenamed={props.onRenamed}
+          onDeleted={props.onDeleted}
+        />
+      );
   }
 }

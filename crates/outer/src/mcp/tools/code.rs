@@ -9,8 +9,10 @@ use super::{
     authed, check_rev, claim_change, internal, ok, ok_deploy, ok_untrusted, owned_app,
     refund_change, run_deploy, Ctx,
 };
+use crate::apps::App;
 use crate::git::{self, CommitError};
 use crate::mcp::error::ToolError;
+use crate::mcp::McpState;
 use crate::ops::noreply_author;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -477,10 +479,34 @@ pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value,
 pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owned_app(ctx, &input.app).await?;
     let caller = authed(ctx)?;
-    check_rev("sha", &input.sha)?;
+    rollback_to(
+        ctx.state,
+        &app,
+        &caller.account_id,
+        &caller.email,
+        &input.sha,
+        input.wait.unwrap_or(true),
+    )
+    .await
+}
+
+/// The shared rollback path: the MCP tool and the console endpoint both run
+/// here, so the target checks, the daily quota and the
+/// new-commit-then-deploy shape are identical. `app` must already be
+/// ownership-checked by the caller (MCP's `owned_app` refuses foreign slugs
+/// as `not_found`; the console answers 404 the same way).
+pub async fn rollback_to(
+    state: &McpState,
+    app: &App,
+    account_id: &str,
+    email: &str,
+    sha: &str,
+    wait: bool,
+) -> Result<Value, ToolError> {
+    check_rev("sha", sha)?;
     // At most one rollback runs per app: a second one fails fast instead of
     // queueing another full build behind the first.
-    let _guard = ctx.state.rollback_locks.try_lock(&app.id).ok_or_else(|| {
+    let _guard = state.rollback_locks.try_lock(&app.id).ok_or_else(|| {
         ToolError::rate_limited(
             "another rollback is already running for this app; wait for it to finish",
             30,
@@ -488,15 +514,9 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
     })?;
     // Coalesce: a deploy already queued or running for this app wins over a
     // new rollback commit. Report it (awaited or not) instead of building.
-    if let Some(row) = super::latest_deploy(&ctx.state.pool, &app.id).await? {
+    if let Some(row) = super::latest_deploy(&state.pool, &app.id).await? {
         if !super::is_terminal(&row.status) {
-            let deploy = super::await_row(
-                ctx.state,
-                &app,
-                Some(&row.deploy_id),
-                input.wait.unwrap_or(true),
-            )
-            .await?;
+            let deploy = super::await_row(state, app, Some(&row.deploy_id), wait).await?;
             let structured = json!({"commit": {"sha": row.sha}, "deploy": deploy});
             let summary = format!(
                 "A deploy is already running; reporting it instead of a new rollback ({}).",
@@ -519,34 +539,34 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
          WHERE app_id = ?1 AND status = 'success' AND sha LIKE ?2 || '%' LIMIT 2",
     )
     .bind(&app.id)
-    .bind(input.sha.to_ascii_lowercase())
-    .fetch_all(&ctx.state.pool)
+    .bind(sha.to_ascii_lowercase())
+    .fetch_all(&state.pool)
     .await
     .map_err(internal)?;
     let target = match matches.as_slice() {
         [one] => one.clone(),
         [] => {
             return Err(ToolError::invalid_argument(format!(
-                "{:?} is not a successfully deployed commit of {:?}; pick a sha from history whose deploy succeeded",
-                input.sha, input.app
+                "{sha:?} is not a successfully deployed commit of {:?}; pick a sha from history whose deploy succeeded",
+                app.slug
             )))
         }
         _ => {
             return Err(ToolError::invalid_argument(format!(
-                "{:?} matches more than one deployed commit of {:?}; give more of the sha",
-                input.sha, input.app
+                "{sha:?} matches more than one deployed commit of {:?}; give more of the sha",
+                app.slug
             )))
         }
     };
     // The daily budget is claimed after the cheap checks and before the git
     // work: a refused or redundant rollback costs nothing, and a rollback
     // whose commit never happens gives the claim back.
-    super::claim_rollback(&ctx.state.pool, &app.id).await?;
-    let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
+    super::claim_rollback(&state.pool, &app.id).await?;
+    let author = noreply_author(account_id, email, &state.domain);
     let sha = match git::commit::rollback(
-        &ctx.state.store,
-        &ctx.state.git,
-        &ctx.state.sync,
+        &state.store,
+        &state.git,
+        &state.sync,
         &app.slug,
         &target,
         &author,
@@ -555,7 +575,7 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
     {
         Ok(sha) => sha,
         Err(e) => {
-            if let Err(refund) = super::refund_rollback(&ctx.state.pool, &app.id).await {
+            if let Err(refund) = super::refund_rollback(&state.pool, &app.id).await {
                 tracing::warn!("rollback refund failed: {refund:#}");
             }
             return Err(match e {
@@ -567,7 +587,7 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
         }
     };
     // Rollbacks don't count as code changes (spec §14.1).
-    let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
+    let deploy = run_deploy(state, app, &sha, wait).await?;
     let summary = format!(
         "Rolled back to {} ({}).",
         &target[..12.min(target.len())],

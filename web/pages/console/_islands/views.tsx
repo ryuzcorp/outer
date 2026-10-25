@@ -28,6 +28,9 @@ import {
   type SecretsSummary,
   type WaitlistSummary,
 } from "./api.ts";
+import { deploysActions } from "./actions/deploys.ts";
+import { secretsActions } from "./actions/secrets.ts";
+import { settingsActions } from "./actions/settings.ts";
 import {
   CopyButton,
   timeAgo,
@@ -39,6 +42,8 @@ import {
   ActionsIcon,
   DeploysIcon,
   ErrorsIcon,
+  EyeIcon,
+  EyeOffIcon,
   LogsIcon,
   MetricsIcon,
   OverviewIcon,
@@ -942,11 +947,41 @@ export function DeploysView({
   app,
   expanded,
   onToggle,
+  onRolledBack,
 }: {
   app: AppDetail;
   expanded: string[];
   onToggle: (id: string) => void;
+  onRolledBack: () => void;
 }) {
+  // The live version is the newest successful deploy (the list is newest
+  // first; /apps/{slug} has no last_deploy field).
+  const liveSha = app.deploys.find((d) => d.status === "success")?.sha ?? null;
+  const confirmTarget = atom<ConsoleDeploy | null>(null);
+  const busy = atom(false);
+  const error = atom<string | null>(null);
+  const notice = atom<string | null>(null);
+
+  async function rollback(target: ConsoleDeploy): Promise<void> {
+    if (busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      const out = await deploysActions.rollbackApp.run({ slug: app.slug, sha: target.sha });
+      notice.set(
+        `Rolled back to ${shortSha(target.sha)}: deploy ${out.deploy?.status ?? "building"}.`,
+      );
+      confirmTarget.set(null);
+      onRolledBack();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
   if (app.deploys.length === 0) {
     return (
       <EmptyState icon={<DeploysIcon />} title="No deploys yet">
@@ -954,10 +989,17 @@ export function DeploysView({
       </EmptyState>
     );
   }
+  const target = confirmTarget();
   return (
     <div class="flex min-w-0 flex-col gap-3">
+      {notice() && (
+        <div class="alert alert-success alert-soft min-w-0" role="status">
+          <span class="min-w-0 break-words">{notice()}</span>
+        </div>
+      )}
       {app.deploys.map((d) => {
         const open = expanded.includes(d.deploy_id);
+        const canRollback = d.status === "success" && d.sha !== liveSha;
         return (
           <section class={`collapse collapse-arrow border border-base-300 bg-base-100 min-w-0 ${open ? "collapse-open" : "collapse-close"}`} key={d.deploy_id} aria-label={`Deploy ${shortSha(d.sha)}`}>
             <button
@@ -1011,12 +1053,70 @@ export function DeploysView({
                       <span class="min-w-0 break-all" title={d.message}>{d.message}</span>
                     </p>
                   )}
+                  {canRollback && (
+                    <div class="flex min-w-0 gap-3">
+                      <span class="w-[90px] shrink-0 opacity-60">Rollback</span>
+                      <span class="flex min-w-0 flex-1">
+                        <button
+                          type="button"
+                          class="btn btn-sm btn-outline min-w-0 shrink-0"
+                          onclick={() => confirmTarget.set(d)}
+                        >
+                          <span class="truncate">Roll back to this version</span>
+                        </button>
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
           </section>
         );
       })}
+      {target && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Confirm rollback">
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 min-w-0 truncate text-base font-semibold" title={target.sha}>
+              Roll back to {shortSha(target.sha)}?
+            </h3>
+            {target.message && (
+              <p class="mb-2 min-w-0 truncate text-sm opacity-70" title={target.message}>
+                {target.message}
+              </p>
+            )}
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              Makes a new commit restoring this version's files, then deploys
+              it. Counts against today's rollback budget.
+            </p>
+            {error() && (
+              <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                <span class="min-w-0 break-words">{error()}</span>
+              </div>
+            )}
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                disabled={busy()}
+                onclick={() => confirmTarget.set(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-error"
+                disabled={busy()}
+                onclick={() => void rollback(target)}
+              >
+                {busy() ? "Rolling back…" : "Roll back"}
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => confirmTarget.set(null)}>
+            Close
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1159,7 +1259,89 @@ export function ErrorsView({ panel, onRetry }: { panel: Panel<ErrorsSummary>; on
 
 // --- Secrets -------------------------------------------------------------------
 
-export function SecretsView({ panel, onRetry }: { panel: Panel<SecretsSummary>; onRetry: () => void }) {
+export function SecretsView({
+  slug,
+  panel,
+  onRetry,
+  onChanged,
+}: {
+  slug: string;
+  panel: Panel<SecretsSummary>;
+  onRetry: () => void;
+  onChanged: () => void;
+}) {
+  const name = atom("");
+  const value = atom("");
+  const showValue = atom(false);
+  const busy = atom(false);
+  const error = atom<string | null>(null);
+  const notice = atom<string | null>(null);
+  const replaceTarget = atom<string | null>(null);
+  const replaceValue = atom("");
+  const showReplace = atom(false);
+  const removeTarget = atom<string | null>(null);
+
+  async function addSecret(): Promise<void> {
+    const key = name().trim();
+    if (!key || !value() || busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await secretsActions.setSecret.run({ slug, name: key, value: value() });
+      notice.set(`Set ${key}. Takes effect on the next deploy.`);
+      name.set("");
+      value.set("");
+      showValue.set(false);
+      onChanged();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  async function replaceSecret(): Promise<void> {
+    const key = replaceTarget();
+    if (!key || !replaceValue() || busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await secretsActions.setSecret.run({ slug, name: key, value: replaceValue() });
+      notice.set(`Replaced ${key}. Takes effect on the next deploy.`);
+      replaceTarget.set(null);
+      replaceValue.set("");
+      showReplace.set(false);
+      onChanged();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  async function removeSecret(): Promise<void> {
+    const key = removeTarget();
+    if (!key || busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await secretsActions.unsetSecret.run({ slug, name: key });
+      notice.set(`Removed ${key}. Takes effect on the next deploy.`);
+      removeTarget.set(null);
+      onChanged();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
   if (panel.kind === "loading") {
     return <Loading label="Loading secrets" />;
   }
@@ -1167,20 +1349,89 @@ export function SecretsView({ panel, onRetry }: { panel: Panel<SecretsSummary>; 
     return <Err message={panel.message} onRetry={onRetry} />;
   }
   const secrets = panel.value.secrets;
+  const replacing = replaceTarget();
+  const removing = removeTarget();
   return (
     <div class="flex min-w-0 flex-col gap-3">
       <section class="card card-border bg-base-100 min-w-0" aria-label="About secrets">
         <div class="card-body min-w-0">
           <p class="m-0 min-w-0 break-words opacity-60">
-            Names only — values never leave the server. Your agent manages them
-            over MCP (`list_secrets`, `set_secret`, `unset_secret`); they reach
-            the app as Worker env vars on the next deploy.
+            Add them here or have your agent set them over MCP. Values are
+            write-only: they're encrypted on the server, never shown again, and
+            reach the app as Worker env vars when it redeploys.
           </p>
+        </div>
+      </section>
+      {notice() && (
+        <div class="alert alert-success alert-soft min-w-0" role="status">
+          <span class="min-w-0 break-words">{notice()}</span>
+        </div>
+      )}
+      {error() && !replacing && !removing && (
+        <div class="alert alert-error alert-soft min-w-0" role="alert">
+          <span class="min-w-0 break-words">{error()}</span>
+        </div>
+      )}
+      <section class="card card-border bg-base-100 min-w-0" aria-label="Add secret">
+        <div class="card-body min-w-0">
+          <h2 class="card-title min-w-0 truncate" title="Add secret">Add secret</h2>
+          <div class="mt-1 flex min-w-0 flex-col gap-2 sm:flex-row">
+            <label class="form-control min-w-0 flex-1">
+              <span class="label"><span class="label-text">Name</span></span>
+              <input
+                type="text"
+                class="input input-bordered w-full min-w-0 font-mono"
+                placeholder="API_KEY"
+                autocomplete="off"
+                spellcheck={false}
+                value={name()}
+                disabled={busy()}
+                oninput={(e: Event) => name.set((e.target as HTMLInputElement).value.toUpperCase())}
+              />
+            </label>
+            <label class="form-control min-w-0 flex-1">
+              <span class="label"><span class="label-text">Value</span></span>
+              <span class="join w-full min-w-0">
+                <input
+                  type={showValue() ? "text" : "password"}
+                  class="input input-bordered join-item min-w-0 flex-1 font-mono"
+                  placeholder="Write-only, never shown again"
+                  autocomplete="new-password"
+                  value={value()}
+                  disabled={busy()}
+                  oninput={(e: Event) => value.set((e.target as HTMLInputElement).value)}
+                />
+                <button
+                  type="button"
+                  class="btn btn-square join-item shrink-0"
+                  aria-label={showValue() ? "Hide value" : "Show value"}
+                  aria-pressed={showValue()}
+                  disabled={busy()}
+                  onclick={() => showValue.set(!showValue())}
+                >
+                  {showValue() ? <EyeOffIcon size={16} /> : <EyeIcon size={16} />}
+                </button>
+              </span>
+            </label>
+          </div>
+          <p class="m-0 min-w-0 truncate text-xs opacity-60" title="Names match ^[A-Z_][A-Z0-9_]{0,63}$; values are at most 4 KiB.">
+            Names match ^[A-Z_][A-Z0-9_]&#123;0,63&#125;$, values at most 4 KiB.
+          </p>
+          <div class="mt-2 min-w-0">
+            <button
+              type="button"
+              class="btn btn-primary btn-sm shrink-0"
+              disabled={!name().trim() || !value() || busy()}
+              onclick={() => void addSecret()}
+            >
+              {busy() ? "Setting…" : "Add secret"}
+            </button>
+          </div>
         </div>
       </section>
       {secrets.length === 0 ? (
         <EmptyState icon={<SecretsIcon />} title="No secrets set">
-          Your agent manages secret names over MCP; values never leave the server.
+          Add an API key or token above, or ask your agent to set one.
         </EmptyState>
       ) : (
         <section class="card card-border bg-base-100 min-w-0" aria-label="Secrets">
@@ -1190,11 +1441,13 @@ export function SecretsView({ panel, onRetry }: { panel: Panel<SecretsSummary>; 
                 <colgroup>
                   <col />
                   <col class="w-28" />
+                  <col class="w-36" />
                 </colgroup>
                 <thead>
                   <tr>
                     <th scope="col">Name</th>
                     <th scope="col">Updated</th>
+                    <th scope="col"><span class="sr-only">Actions</span></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1209,6 +1462,34 @@ export function SecretsView({ panel, onRetry }: { panel: Panel<SecretsSummary>; 
                       <td class="whitespace-nowrap" title={when(s.updated_at)}>
                         {timeAgo(s.updated_at)}
                       </td>
+                      <td class="whitespace-nowrap">
+                        <span class="flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            class="btn btn-ghost btn-xs shrink-0"
+                            disabled={busy()}
+                            onclick={() => {
+                              error.set(null);
+                              replaceValue.set("");
+                              showReplace.set(false);
+                              replaceTarget.set(s.name);
+                            }}
+                          >
+                            Replace
+                          </button>
+                          <button
+                            type="button"
+                            class="btn btn-ghost btn-xs shrink-0 text-error"
+                            disabled={busy()}
+                            onclick={() => {
+                              error.set(null);
+                              removeTarget.set(s.name);
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </span>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1217,21 +1498,131 @@ export function SecretsView({ panel, onRetry }: { panel: Panel<SecretsSummary>; 
           </div>
         </section>
       )}
+      {replacing && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={`Replace ${replacing}`}>
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 min-w-0 truncate font-mono text-base font-semibold" title={replacing}>
+              Replace {replacing}
+            </h3>
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              The old value stops working on the next deploy. The new value is
+              write-only and never shown again.
+            </p>
+            <label class="form-control mt-3 min-w-0">
+              <span class="label"><span class="label-text">New value</span></span>
+              <span class="join w-full min-w-0">
+                <input
+                  type={showReplace() ? "text" : "password"}
+                  class="input input-bordered join-item min-w-0 flex-1 font-mono"
+                  placeholder="New value"
+                  autocomplete="new-password"
+                  value={replaceValue()}
+                  disabled={busy()}
+                  oninput={(e: Event) => replaceValue.set((e.target as HTMLInputElement).value)}
+                />
+                <button
+                  type="button"
+                  class="btn btn-square join-item shrink-0"
+                  aria-label={showReplace() ? "Hide value" : "Show value"}
+                  aria-pressed={showReplace()}
+                  disabled={busy()}
+                  onclick={() => showReplace.set(!showReplace())}
+                >
+                  {showReplace() ? <EyeOffIcon size={16} /> : <EyeIcon size={16} />}
+                </button>
+              </span>
+            </label>
+            {error() && (
+              <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                <span class="min-w-0 break-words">{error()}</span>
+              </div>
+            )}
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                disabled={busy()}
+                onclick={() => replaceTarget.set(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-primary"
+                disabled={!replaceValue() || busy()}
+                onclick={() => void replaceSecret()}
+              >
+                {busy() ? "Replacing…" : "Replace secret"}
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => replaceTarget.set(null)}>
+            Close
+          </button>
+        </div>
+      )}
+      {removing && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={`Remove ${removing}`}>
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 min-w-0 truncate font-mono text-base font-semibold" title={removing}>
+              Remove {removing}?
+            </h3>
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              The app loses this secret on the next deploy. This cannot be undone.
+            </p>
+            {error() && (
+              <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                <span class="min-w-0 break-words">{error()}</span>
+              </div>
+            )}
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                disabled={busy()}
+                onclick={() => removeTarget.set(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-error"
+                disabled={busy()}
+                onclick={() => void removeSecret()}
+              >
+                {busy() ? "Removing…" : "Remove secret"}
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => removeTarget.set(null)}>
+            Close
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
 // --- Settings --------------------------------------------------------------------
 
-export function SettingsView({ app }: { app: AppDetail }) {
+export function SettingsView({
+  app,
+  plan,
+  onRefresh,
+  onRenamed,
+  onDeleted,
+}: {
+  app: AppDetail;
+  plan: string;
+  onRefresh: () => void;
+  onRenamed: (slug: string) => void;
+  onDeleted: () => void;
+}) {
   return (
     <div class="flex min-w-0 flex-col gap-3">
       <section class="card card-border bg-base-100 min-w-0" aria-label="Settings">
         <div class="card-body min-w-0">
-          <p class="m-0 min-w-0 opacity-60">
-            Read-only for now — your agent manages these over MCP.
-          </p>
-          <dl class="m-0 mt-3 flex min-w-0 flex-col gap-2">
+          <dl class="m-0 flex min-w-0 flex-col gap-2">
             <div class="flex min-w-0 gap-3 text-[13px]">
               <dt class="w-[90px] shrink-0 opacity-60">App</dt>
               <dd class="m-0 flex min-w-0 items-center gap-2">
@@ -1247,10 +1638,6 @@ export function SettingsView({ app }: { app: AppDetail }) {
                 </a>
                 <CopyButton value={app.url} label="Copy app URL" />
               </dd>
-            </div>
-            <div class="flex min-w-0 gap-3 text-[13px]">
-              <dt class="w-[90px] shrink-0 opacity-60">Visibility</dt>
-              <dd class="m-0 min-w-0 flex-1 truncate" title={app.visibility}>{app.visibility}</dd>
             </div>
             <div class="flex min-w-0 gap-3 text-[13px]">
               <dt class="w-[90px] shrink-0 opacity-60">Status</dt>
@@ -1273,7 +1660,312 @@ export function SettingsView({ app }: { app: AppDetail }) {
           </dl>
         </div>
       </section>
+      <VisibilityCard app={app} plan={plan} onRefresh={onRefresh} />
+      <DangerZone app={app} onRenamed={onRenamed} onDeleted={onDeleted} />
     </div>
+  );
+}
+
+// Server slug rule (spec §7.1): lowercase letters, digits, hyphens neither
+// first nor last, at most 48 chars. The server re-validates; this only
+// enables the button early.
+const SLUG_RE = /^[a-z0-9]([a-z0-9-]{0,46}[a-z0-9])?$/;
+
+function VisibilityCard({
+  app,
+  plan,
+  onRefresh,
+}: {
+  app: AppDetail;
+  plan: string;
+  onRefresh: () => void;
+}) {
+  const pending = atom<"unlisted" | "public" | null>(null);
+  const error = atom<string | null>(null);
+  const isPro = plan === "pro";
+
+  async function change(visibility: "unlisted" | "public"): Promise<void> {
+    if (visibility === app.visibility || pending() !== null) {
+      return;
+    }
+    pending.set(visibility);
+    error.set(null);
+    try {
+      await settingsActions.setVisibility.run({ slug: app.slug, visibility });
+      onRefresh();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      pending.set(null);
+    }
+  }
+
+  function option(
+    value: "unlisted" | "public",
+    title: string,
+    explainer: string,
+    disabled: boolean,
+    badge: string | null,
+  ) {
+    return (
+      <label
+        class={`flex min-w-0 cursor-pointer items-start gap-3 rounded-box border border-base-300 p-3${disabled ? " opacity-60" : ""}`}
+      >
+        <input
+          type="radio"
+          name={`visibility-${app.slug}`}
+          class="radio mt-0.5 shrink-0"
+          checked={app.visibility === value}
+          disabled={disabled || pending() !== null}
+          onchange={() => void change(value)}
+        />
+        <span class="min-w-0 flex-1">
+          <span class="flex min-w-0 flex-wrap items-center gap-2">
+            <strong class="min-w-0 truncate">{title}</strong>
+            {badge && (
+              <span class="badge badge-soft badge-info badge-sm shrink-0" title={badge}>
+                {badge}
+              </span>
+            )}
+          </span>
+          <span class="mt-0.5 block min-w-0 break-words text-[13px] opacity-60">
+            {explainer}
+          </span>
+        </span>
+      </label>
+    );
+  }
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Visibility">
+      <div class="card-body min-w-0">
+        <h2 class="card-title min-w-0 truncate" title="Visibility">
+          Visibility
+          {pending() && <span class="loading loading-spinner loading-xs shrink-0" aria-label="Saving" />}
+        </h2>
+        <div class="flex min-w-0 flex-col gap-2" role="radiogroup" aria-label="Visibility">
+          {option(
+            "unlisted",
+            "Unlisted",
+            "Anyone with the link can open it; search engines are kept out. Always free.",
+            false,
+            null,
+          )}
+          {option(
+            "public",
+            "Public",
+            "Anyone can open it; search engines may index it. Public apps are a Pro feature.",
+            !isPro,
+            isPro ? null : "Pro",
+          )}
+        </div>
+        {error() && (
+          <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
+            <span class="min-w-0 break-words">{error()}</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function DangerZone({
+  app,
+  onRenamed,
+  onDeleted,
+}: {
+  app: AppDetail;
+  onRenamed: (slug: string) => void;
+  onDeleted: () => void;
+}) {
+  const renameOpen = atom(false);
+  const deleteOpen = atom(false);
+  const newSlug = atom("");
+  const confirm = atom("");
+  const busy = atom(false);
+  const error = atom<string | null>(null);
+
+  const slugValid = SLUG_RE.test(newSlug()) && newSlug().length <= 48;
+
+  async function rename(): Promise<void> {
+    const target = newSlug().trim();
+    if (!SLUG_RE.test(target) || target === app.slug || busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      const out = await settingsActions.renameApp.run({ slug: app.slug, newSlug: target });
+      renameOpen.set(false);
+      newSlug.set("");
+      onRenamed(out.slug);
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  async function remove(): Promise<void> {
+    if (confirm() !== app.slug || busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await settingsActions.deleteApp.run({ slug: app.slug, confirm: confirm() });
+      deleteOpen.set(false);
+      confirm.set("");
+      onDeleted();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  return (
+    <section class="card card-border border-error/30 bg-base-100 min-w-0" aria-label="Danger zone">
+      <div class="card-body min-w-0">
+        <h2 class="card-title min-w-0 truncate text-error" title="Danger zone">Danger zone</h2>
+        <div class="flex min-w-0 flex-col gap-2 sm:flex-row">
+          <button
+            type="button"
+            class="btn btn-outline btn-sm min-w-0 shrink-0"
+            onclick={() => {
+              error.set(null);
+              newSlug.set("");
+              renameOpen.set(true);
+            }}
+          >
+            <span class="truncate">Change name…</span>
+          </button>
+          <button
+            type="button"
+            class="btn btn-error btn-sm min-w-0 shrink-0"
+            onclick={() => {
+              error.set(null);
+              confirm.set("");
+              deleteOpen.set(true);
+            }}
+          >
+            <span class="truncate">Delete app…</span>
+          </button>
+        </div>
+      </div>
+      {renameOpen() && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Change name">
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 text-base font-semibold">Change name</h3>
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              The app moves to the new name; the old name becomes free for
+              others once the rename lands.
+            </p>
+            <label class="form-control mt-3 min-w-0">
+              <span class="label"><span class="label-text">New slug</span></span>
+              <input
+                type="text"
+                class="input input-bordered w-full min-w-0 font-mono"
+                placeholder={app.slug}
+                autocomplete="off"
+                spellcheck={false}
+                value={newSlug()}
+                disabled={busy()}
+                oninput={(e: Event) => newSlug.set((e.target as HTMLInputElement).value)}
+              />
+            </label>
+            {newSlug() && !slugValid && (
+              <p class="mt-2 min-w-0 break-words text-sm text-error" role="alert">
+                Slugs are lowercase letters, digits and hyphens (not first or
+                last), at most 48 characters.
+              </p>
+            )}
+            {error() && (
+              <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                <span class="min-w-0 break-words">{error()}</span>
+              </div>
+            )}
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                disabled={busy()}
+                onclick={() => renameOpen.set(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-primary"
+                disabled={!slugValid || newSlug().trim() === app.slug || busy()}
+                onclick={() => void rename()}
+              >
+                {busy() ? "Renaming…" : "Rename"}
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => renameOpen.set(false)}>
+            Close
+          </button>
+        </div>
+      )}
+      {deleteOpen() && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Delete app">
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 min-w-0 truncate text-base font-semibold" title={`Delete ${app.slug}?`}>
+              Delete {app.slug}?
+            </h3>
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              Deletes the app, its code, data and files. The name stays
+              reserved for 30 days.
+            </p>
+            <label class="form-control mt-3 min-w-0">
+              <span class="label">
+                <span class="label-text">
+                  Type <code class="font-mono">{app.slug}</code> to confirm
+                </span>
+              </span>
+              <input
+                type="text"
+                class="input input-bordered w-full min-w-0 font-mono"
+                placeholder={app.slug}
+                autocomplete="off"
+                spellcheck={false}
+                value={confirm()}
+                disabled={busy()}
+                oninput={(e: Event) => confirm.set((e.target as HTMLInputElement).value)}
+              />
+            </label>
+            {error() && (
+              <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                <span class="min-w-0 break-words">{error()}</span>
+              </div>
+            )}
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                disabled={busy()}
+                onclick={() => deleteOpen.set(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-error"
+                disabled={confirm() !== app.slug || busy()}
+                onclick={() => void remove()}
+              >
+                {busy() ? "Deleting…" : "Delete app"}
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => deleteOpen.set(false)}>
+            Close
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 

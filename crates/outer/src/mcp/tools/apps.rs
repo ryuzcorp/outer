@@ -204,9 +204,12 @@ pub async fn set_visibility(input: SetVisibilityInput, ctx: &Ctx<'_>) -> Result<
             )));
         }
     };
-    apps::set_visibility(&ctx.state.pool, &app.id, visibility)
+    // The Pro gate lives in the shared domain function, so the console
+    // endpoint gating on the same function refuses identically.
+    let plan = super::plan_of(&ctx.state.pool, &app.owner_id).await?;
+    apps::set_visibility(&ctx.state.pool, &app.id, visibility, &plan)
         .await
-        .map_err(internal)?;
+        .map_err(|err| visibility_tool_error(&app.slug, err))?;
     // Visibility changes `X-Robots-Tag` and `/robots.txt`, which the edge
     // caches (robots.txt for hours): purge the host so the new answer is
     // what crawlers see. Best-effort, like the deploy and delete purges.
@@ -216,6 +219,23 @@ pub async fn set_visibility(input: SetVisibilityInput, ctx: &Ctx<'_>) -> Result<
         format!("{} is now {}.", app.slug, visibility.as_str()),
         json!({"visibility": visibility.as_str()}),
     ))
+}
+
+/// Map the shared visibility refusal to the error both surfaces return: the
+/// MCP `isError` and the console HTTP body carry the same code and user
+/// message. Free owners get `payment_required` with a user message pointing
+/// to Pro; switching back to `unlisted` never reaches this gate.
+pub fn visibility_tool_error(slug: &str, err: crate::apps::VisibilityError) -> ToolError {
+    match err {
+        crate::apps::VisibilityError::ProOnly => ToolError::new(
+            "payment_required",
+            format!("{slug} is on a Free account; public apps are a Pro feature"),
+        )
+        .with_user(format!(
+            "Public apps are Pro. Upgrade to Pro to make {slug} public; switching back to unlisted is always free.",
+        )),
+        crate::apps::VisibilityError::Internal(err) => internal(err),
+    }
 }
 
 pub async fn share_app(input: ShareAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {

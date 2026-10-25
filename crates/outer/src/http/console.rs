@@ -1,4 +1,4 @@
-//! Console: the read-mostly web UI under `/console` (spec §13.1).
+//! Console: the web UI under `/console` (spec §13.1).
 //!
 //! Routes (platform host only; explicit Axum routes, so they win over the
 //! site fallback in [`super::platform_fallback`]):
@@ -23,6 +23,15 @@
 //! - `GET /api/console/apps/:slug/secrets`: the app's secret names plus
 //!   `updated_at` (same rows as MCP `list_secrets`; values never leave the
 //!   server — they are injected as Worker env vars at deploy time).
+//! - `POST /api/console/apps/:slug/visibility {visibility}`: the MCP
+//!   `set_visibility` path, including the shared Pro gate.
+//! - `POST /api/console/apps/:slug/delete {confirm}`: the MCP `delete_app`
+//!   path; `confirm` must equal the slug.
+//! - `PUT /api/console/apps/:slug/secrets/:name {value}` and
+//!   `DELETE /api/console/apps/:slug/secrets/:name`: the MCP `set_secret` /
+//!   `unset_secret` paths; values never leave the client again.
+//! - `POST /api/console/apps/:slug/rollback {sha}`: the MCP `rollback`
+//!   path, without waiting for the new deploy.
 //! - `POST /api/console/sign-out`: deletes the session, clears the cookie.
 //!
 //! Rules: session cookie only (an `Authorization` header is ignored, never
@@ -73,11 +82,12 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/apps/{slug}/logs", get(api_logs))
         .route("/api/console/apps/{slug}/errors", get(api_errors))
         .route("/api/console/apps/{slug}/secrets", get(api_secrets))
+        .merge(super::console_actions::routes())
         .route("/api/console/sign-out", post(api_sign_out))
         .with_state(state)
 }
 
-fn nostore_json(status: StatusCode, error: &str, message: &str) -> Response {
+pub(crate) fn nostore_json(status: StatusCode, error: &str, message: &str) -> Response {
     (
         status,
         [
@@ -90,7 +100,7 @@ fn nostore_json(status: StatusCode, error: &str, message: &str) -> Response {
         .into_response()
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     nostore_json(StatusCode::NOT_FOUND, "not_found", "no such app")
 }
 
@@ -101,7 +111,10 @@ fn fetch_ok(headers: &HeaderMap) -> bool {
     headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("same-origin")
 }
 
-async fn guard(auth: &AuthState, headers: &HeaderMap) -> Result<AccountRow, Box<Response>> {
+pub(crate) async fn guard(
+    auth: &AuthState,
+    headers: &HeaderMap,
+) -> Result<AccountRow, Box<Response>> {
     let Some(session) = crate::auth::session_from_headers(headers) else {
         return Err(nostore_json(
             StatusCode::UNAUTHORIZED,
@@ -140,7 +153,7 @@ async fn guard(auth: &AuthState, headers: &HeaderMap) -> Result<AccountRow, Box<
 
 /// The app `slug` names, owned by `account`. Anything else — missing, or
 /// owned by someone else — is `None`, and the caller answers 404 (spec §8.2).
-async fn owned_app(
+pub(crate) async fn owned_app(
     mcp: &McpState,
     account: &AccountRow,
     slug: &str,
@@ -847,7 +860,7 @@ async fn api_metrics(
 }
 
 /// A 200 JSON answer with the same `no-store` rules as the error shape.
-fn ok_json(body: serde_json::Value) -> Response {
+pub(crate) fn ok_json(body: serde_json::Value) -> Response {
     (
         StatusCode::OK,
         [
@@ -1830,7 +1843,7 @@ mod tests {
         assert_eq!(first["outcome"], "failed");
         assert!(first["error_code"].is_null());
         assert_eq!(first["duration_ms"], 120);
-        assert_eq!(first["by"], "API key");
+        assert_eq!(first["by"], "Console");
         let next = body["next"]
             .as_str()
             .expect("full page carries next")
@@ -2334,5 +2347,323 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["email"], "late@example.com", "newest first");
         assert_eq!(entries[1]["attempts"], 2);
+    }
+
+    fn put_json(path: &str, cookie: &str, body: serde_json::Value) -> Request<Body> {
+        same_origin(Request::put(path).header("content-type", "application/json"))
+            .header("cookie", cookie)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn delete_authed(path: &str, cookie: &str) -> Request<Body> {
+        same_origin(Request::delete(path))
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn action_rows(pool: &SqlitePool) -> Vec<(String, String, Option<String>)> {
+        sqlx::query_as("SELECT tool, outcome, error_code FROM agent_action ORDER BY created_at")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn console_visibility_pro_gate() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let session = login(&pool, "ana@example.com").await;
+        let path = "/api/console/apps/groceries/visibility";
+
+        // Free owner: `public` is refused with the MCP code and a user
+        // message pointing to Pro.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &session, serde_json::json!({"visibility": "public"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["error"], "payment_required");
+        assert!(
+            body["user_message"].as_str().unwrap().contains("Pro"),
+            "{body}"
+        );
+
+        // `unlisted` is always allowed, on any plan.
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                path,
+                &session,
+                serde_json::json!({"visibility": "unlisted"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["visibility"],
+            "unlisted"
+        );
+
+        // Pro owner: `public` flips the row.
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE id = 'acct-ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &session, serde_json::json!({"visibility": "public"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["visibility"],
+            "public"
+        );
+        let visibility: Option<String> =
+            sqlx::query_scalar("SELECT visibility FROM app WHERE slug = 'groceries'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(visibility.as_deref(), Some("public"));
+
+        // Every attempt audited under the MCP tool name, with no grant or
+        // key ids — the log labels the client "Console".
+        let rows = action_rows(&pool).await;
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows.iter().all(|(tool, _, _)| tool == "set_visibility"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|(_, outcome, _)| outcome == "ok"));
+        assert!(rows.iter().any(|(_, outcome, code)| outcome == "error"
+            && *code == Some("payment_required".to_string())));
+        let ids: Vec<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT consent_id, apikey_id FROM agent_action")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            ids.iter().all(|(c, k)| c.is_none() && k.is_none()),
+            "{ids:?}"
+        );
+        let listed = crate::mcp::actions::list(&pool, "app-groceries", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(
+            listed.iter().all(|row| row.client_label == "Console"),
+            "{listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_visibility_rejects_bad_value_foreign_slugs_and_cross_site() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "bob@example.com", "bobshop", now).await;
+        let ana = login(&pool, "ana@example.com").await;
+        let bob = login(&pool, "bob@example.com").await;
+        let path = "/api/console/apps/groceries/visibility";
+
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &ana, serde_json::json!({"visibility": "everyone"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["error"],
+            "invalid_argument"
+        );
+
+        // Another owner's slug answers 404, exactly like a missing one.
+        let (status, _, _) = send(
+            &app,
+            post_json(path, &bob, serde_json::json!({"visibility": "unlisted"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Same-origin required, like every other /api/console route.
+        let (status, _, _) = send(
+            &app,
+            Request::post(path)
+                .header("content-type", "application/json")
+                .header("cookie", ana)
+                .body(Body::from(r#"{"visibility":"unlisted"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn console_delete_requires_confirm_and_is_owner_scoped() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "bob@example.com", "bobshop", now).await;
+        let ana = login(&pool, "ana@example.com").await;
+        let bob = login(&pool, "bob@example.com").await;
+        let path = "/api/console/apps/groceries/delete";
+
+        // A wrong confirm refuses and deletes nothing.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &ana, serde_json::json!({"confirm": "grocerie"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["error"],
+            "invalid_argument"
+        );
+        let (status, _, body) = send(&app, authed("/api/console/apps", &ana)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("groceries"), "{body}");
+
+        // Another owner's slug answers 404, exactly like a missing one.
+        let (status, _, _) = send(
+            &app,
+            post_json(path, &bob, serde_json::json!({"confirm": "groceries"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The exact slug deletes: the rail drops the app and the slug
+        // quarantines.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &ana, serde_json::json!({"confirm": "groceries"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["deleted"], true);
+        let (status, _, body) = send(&app, authed("/api/console/apps", &ana)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("groceries"), "{body}");
+        let quarantined: Option<i64> =
+            sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = 'groceries'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(quarantined.is_some_and(|until| until > now));
+    }
+
+    #[tokio::test]
+    async fn console_secrets_round_trip_never_returns_values() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "bob@example.com", "bobshop", now).await;
+        let ana = login(&pool, "ana@example.com").await;
+        let bob = login(&pool, "bob@example.com").await;
+        let put_path = "/api/console/apps/groceries/secrets/API_KEY";
+
+        let (status, _, body) = send(
+            &app,
+            put_json(put_path, &ana, serde_json::json!({"value": "s3cr3t-value"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["name"], "API_KEY");
+        assert_eq!(body["applies"], "next deploy");
+        assert!(body["updated_at"].as_i64().is_some_and(|at| at >= now));
+
+        // Neither the write nor the read ever carries the value.
+        let (status, _, body) =
+            send(&app, authed("/api/console/apps/groceries/secrets", &ana)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("s3cr3t-value"), "{body}");
+        let list: serde_json::Value = body.parse().unwrap();
+        assert_eq!(list["secrets"].as_array().unwrap().len(), 1);
+        assert_eq!(list["secrets"][0]["name"], "API_KEY");
+
+        // Replace re-validates: lowercase and oversize values refuse.
+        let (status, _, _) = send(
+            &app,
+            put_json(
+                "/api/console/apps/groceries/secrets/lower",
+                &ana,
+                serde_json::json!({"value": "x"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let big = "v".repeat(crate::secrets::MAX_VALUE_BYTES + 1);
+        let (status, _, _) = send(
+            &app,
+            put_json(put_path, &ana, serde_json::json!({"value": big})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Another owner sees 404 on the write.
+        let (status, _, _) = send(
+            &app,
+            put_json(put_path, &bob, serde_json::json!({"value": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Remove, then removing again is 404.
+        let (status, _, body) = send(&app, delete_authed(put_path, &ana)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["name"],
+            "API_KEY"
+        );
+        let (status, _, _) = send(&app, delete_authed(put_path, &ana)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The secret mutations audited under the MCP tool names.
+        let rows = action_rows(&pool).await;
+        let tools: Vec<&str> = rows.iter().map(|(tool, _, _)| tool.as_str()).collect();
+        assert!(tools.contains(&"set_secret"), "{tools:?}");
+        assert!(tools.contains(&"unset_secret"), "{tools:?}");
+    }
+
+    #[tokio::test]
+    async fn console_rollback_refuses_unknown_sha_without_spending_quota() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let ana = login(&pool, "ana@example.com").await;
+
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/rollback",
+                &ana,
+                serde_json::json!({"sha": "0123456789abcdef0123456789abcdef01234567"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["error"], "invalid_argument");
+
+        // Refused before the claim: the daily rollback budget is untouched.
+        let spent: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rollback_day WHERE app_id = 'app-groceries'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(spent, 0);
+        let rows = action_rows(&pool).await;
+        assert!(
+            rows.iter().any(|(tool, outcome, code)| tool == "rollback"
+                && outcome == "error"
+                && *code == Some("invalid_argument".to_string())),
+            "{rows:?}"
+        );
     }
 }

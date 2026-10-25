@@ -18,6 +18,8 @@ import {
   ChevronDown,
   Copy,
   Database,
+  Eye,
+  EyeOff,
   KeyRound,
   LayoutGrid,
   LogOut,
@@ -161,4 +163,12 @@ export function TicketIcon({ size = 18 }: { size?: number }) {
 
 export function ShieldIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={ShieldCheck} size={size} />;
+}
+
+export function EyeIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Eye} size={size} label="Show" />;
+}
+
+export function EyeOffIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={EyeOff} size={size} label="Hide" />;
 }

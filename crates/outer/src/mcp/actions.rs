@@ -340,6 +340,42 @@ pub async fn record(
     }
 }
 
+/// Write one `agent_action` row for a console mutation, under the equivalent
+/// MCP tool name (`set_visibility`, `set_secret`, `unset_secret`, `rollback`,
+/// …). Both `consent_id` and `apikey_id` stay NULL — the console signs its
+/// own session cookie — so [`list`] labels the row's client "Console".
+/// `delete_app` has no row: its app row cascades, taking the entry with it
+/// (the MCP tool is unlogged for the same reason).
+pub async fn record_console(
+    pool: &SqlitePool,
+    app_id: &str,
+    user_id: &str,
+    tool: &str,
+    summary: &str,
+    outcome: &str,
+    error_code: Option<&str>,
+) {
+    let summary = truncate(summary, MAX_SUMMARY_CHARS);
+    if let Err(err) = sqlx::query(
+        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
+         tool, summary, outcome, error_code, duration_ms, created_at) \
+         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, 0, ?8)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(app_id)
+    .bind(user_id)
+    .bind(tool)
+    .bind(&summary)
+    .bind(outcome)
+    .bind(error_code)
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(tool, error = %format!("{err:#}"), "console action insert failed");
+    }
+}
+
 /// Delete rows older than the owning account's plan retention (spec §3).
 /// Returns the rows removed.
 pub async fn prune(pool: &SqlitePool, now: i64) -> anyhow::Result<u64> {
@@ -379,6 +415,10 @@ pub struct ActionRow {
     pub client_label: String,
 }
 
+/// Who made the call: the OAuth client name + domain, or the API key name.
+/// Both ids NULL means the row came from the console UI, which signs its
+/// own session cookie rather than an OAuth grant or an API key: label that
+/// client "Console".
 fn client_label(
     grant_name: Option<String>,
     client_name: Option<String>,
@@ -398,7 +438,7 @@ fn client_label(
     match (key_name, key_prefix) {
         (Some(name), _) => name,
         (None, Some(prefix)) => format!("API key {prefix}"),
-        (None, None) => "API key".to_string(),
+        (None, None) => "Console".to_string(),
     }
 }
 
@@ -536,5 +576,15 @@ mod tests {
         let summary = summary_for("search_code", &args).unwrap();
         assert!(!summary.contains(&"x".repeat(300)), "{summary}");
         assert!(summary.contains("..."), "{summary}");
+    }
+
+    #[test]
+    fn console_rows_label_without_grant_or_key() {
+        assert_eq!(client_label(None, None, None, None, None), "Console");
+        // Named keys and OAuth clients still win over the fallback.
+        assert_eq!(
+            client_label(None, None, None, Some("deploy".to_string()), None),
+            "deploy"
+        );
     }
 }
