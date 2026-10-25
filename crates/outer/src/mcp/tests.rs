@@ -2562,6 +2562,8 @@ async fn set_visibility_public_is_pro_gated() {
     )
     .await;
     assert_eq!(result(&public)["structuredContent"]["visibility"], "public");
+}
+
 #[tokio::test]
 async fn error_triage_tools_move_issues() {
     let (state, _) = setup().await;

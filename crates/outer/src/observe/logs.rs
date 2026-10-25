@@ -668,6 +668,11 @@ fn cursor_page<T>(mut entries: Vec<T>, limit: usize) -> Vec<T> {
 /// One log line with its sequence cursor, plus the error-issue
 /// fingerprint when the line opens (or continues) a grouped error event:
 /// the console links those lines to their issue.
+///
+/// `ts` is unix seconds in storage (the ring's unit). [`LogLine::to_json`]
+/// is the console API boundary and emits milliseconds, matching every
+/// other console timestamp (`when`/`timeAgo` take ms); the MCP
+/// `app_logs` shape (`read_merged`) still carries seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
     pub seq: u64,
@@ -679,8 +684,7 @@ pub struct LogLine {
 
 impl LogLine {
     pub fn to_json(&self) -> Value {
-        let mut out =
-            json!({"seq": self.seq, "ts": self.ts, "stream": self.stream, "line": self.line});
+        let mut out = json!({"seq": self.seq, "ts": self.ts.saturating_mul(1000), "stream": self.stream, "line": self.line});
         if let Some(fp) = &self.fingerprint {
             out["fingerprint"] = json!(fp);
         }

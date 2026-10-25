@@ -61,6 +61,7 @@ export interface AppDetail extends ConsoleApp {
 
 export interface LogLine {
   seq: number;
+  /** Unix milliseconds (the console API converts the stored seconds). */
   ts: number;
   stream: string;
   line: string;

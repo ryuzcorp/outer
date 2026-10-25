@@ -363,36 +363,6 @@ pub async fn record(
         tracing::warn!(app = %app_id, tool, error = %format!("{err:#}"), "agent_action insert failed");
     }
 }
-/// Write one `agent_action` row for a console mutation: same shape as an
-/// MCP call, but with the MCP tool's name and NULL consent + NULL key, so
-/// the action log labels the client **Console**. Failures warn and the
-/// caller's response is returned anyway, like [`record`].
-pub async fn record_console(
-    pool: &SqlitePool,
-    account_id: &str,
-    app_id: &str,
-    tool: &str,
-    summary: &str,
-    outcome: &str,
-) {
-    if let Err(err) = sqlx::query(
-        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
-         tool, summary, outcome, error_code, duration_ms, created_at) \
-         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, NULL, 0, ?7)",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(app_id)
-    .bind(account_id)
-    .bind(tool)
-    .bind(truncate(summary, MAX_SUMMARY_CHARS))
-    .bind(outcome)
-    .bind(now_ms())
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(app = %app_id, tool, error = %format!("{err:#}"), "console agent_action insert failed");
-    }
-}
 
 /// Write one `agent_action` row for a console mutation, under the equivalent
 /// MCP tool name (`set_visibility`, `set_secret`, `unset_secret`, `rollback`,

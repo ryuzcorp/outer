@@ -2478,6 +2478,11 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(tail[1]["line"].as_str().unwrap(), "WARN retrying fetch");
+        assert_eq!(
+            tail[1]["ts"].as_i64().unwrap(),
+            ts * 1000,
+            "console log timestamps are unix ms, like every other console time"
+        );
         let before = tail[0]["seq"].as_u64().unwrap();
         let (_, _, body) = send(&app, get(&format!("?limit=2&before={before}"))).await;
         let older = body.parse::<serde_json::Value>().unwrap()["lines"]

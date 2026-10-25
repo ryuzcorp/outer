@@ -330,7 +330,7 @@ export function LogsView({
                 <li
                   key={entry.seq}
                   class={`log-line is-${entry.stream}`}
-                  title={when(entry.ts * 1000)}
+                  title={when(entry.ts)}
                 >
                   <span class="log-stream" aria-hidden="true">
                     {entry.stream === "stderr" ? "!" : ">"}
