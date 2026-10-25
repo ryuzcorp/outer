@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 42);
+    assert_eq!(anon.len(), 43);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 40);
+    assert_eq!(authed.len(), 41);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -4295,4 +4295,312 @@ async fn look_at_app_reports_precise_capture_notes() {
             "{capture}"
         );
     }
+}
+
+async fn export_call(state: &McpState, token: &str, slug: &str, sha: Option<&str>) -> Value {
+    let mut args = json!({"app": slug});
+    if let Some(sha) = sha {
+        args["sha"] = json!(sha);
+    }
+    let (_, body) = call(state, Some(token), "export_code", args).await;
+    body
+}
+
+/// Read a stored zip into `name -> bytes`, for export assertions.
+fn zip_map(bytes: Vec<u8>) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut buf).unwrap();
+        out.insert(file.name().to_string(), buf);
+    }
+    out
+}
+
+/// Raw blob bytes straight from the mirror: the exact-bytes oracle for
+/// export assertions.
+fn blob_bytes(state: &McpState, sha: &str, path: &str) -> Vec<u8> {
+    let bare = crate::git::manifest::mirror_path(&state.git, "groceries");
+    let out = std::process::Command::new("git")
+        .arg(format!("--git-dir={}", bare.display()))
+        .args(["cat-file", "blob", &format!("{sha}:{path}")])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "cat-file {sha}:{path}");
+    out.stdout
+}
+
+#[tokio::test]
+async fn export_code_needs_a_pro_owner() {
+    let (state, _) = setup().await;
+    let owner = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &owner, "groceries").await;
+
+    // A Free owner is refused with payment_required, pointing at Pro.
+    let body = export_call(&state, &owner, "groceries", None).await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "payment_required");
+    assert!(
+        err["user_message"].as_str().unwrap().contains("Pro"),
+        "{err}"
+    );
+
+    set_plan(&state, "ana@example.com", "pro").await;
+    let body = export_call(&state, &owner, "groceries", None).await;
+    let content = result(&body)["structuredContent"].clone();
+    let url = content["url"].as_str().expect("download url");
+    assert!(url.contains("response-content-disposition="), "{url}");
+    assert!(url.contains("attachment"), "{url}");
+    let sha = content["sha"].as_str().expect("sha");
+    assert_eq!(sha.len(), 40, "{content}");
+    assert!(content["bytes"].as_u64().unwrap() > 0, "{content}");
+    let expires =
+        chrono::DateTime::parse_from_rfc3339(content["expires_at"].as_str().unwrap()).unwrap();
+    let delta = expires
+        .signed_duration_since(chrono::Utc::now())
+        .num_seconds();
+    assert!((3500..=3700).contains(&delta), "{delta}");
+
+    // The object and its row exist under the spec key shape.
+    let keys = state.store.list("outer/exports/groceries/").await.unwrap();
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    assert!(
+        keys[0].starts_with(&format!("outer/exports/groceries/{}-", &sha[..7])),
+        "{keys:?}"
+    );
+    assert!(keys[0].ends_with(".zip"), "{keys:?}");
+    let row: Option<String> = sqlx::query_scalar("SELECT sha FROM app_export WHERE key = ?1")
+        .bind(&keys[0])
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(row.as_deref(), Some(sha));
+}
+
+#[tokio::test]
+async fn export_code_zip_matches_the_tree_at_sha() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    let (_, commit) = call(
+        &state,
+        Some(&owner),
+        "commit",
+        json!({"app": "groceries", "message": "add note",
+               "writes": [{"path": "note.txt", "content": "hi\n"}]}),
+    )
+    .await;
+    assert!(result(&commit).get("isError").is_none(), "{commit}");
+    let (_, hist) = call(&state, Some(&owner), "history", json!({"app": "groceries"})).await;
+    let commits = result(&hist)["structuredContent"]["commits"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(commits.len() >= 2, "{commits:?}");
+    let head = commits[0]["sha"].as_str().unwrap().to_string();
+    let first = commits[1]["sha"].as_str().unwrap().to_string();
+
+    // The oracle is the same git read paths the Code view uses: every blob
+    // `list_files` names at the sha lands in the zip under the top folder
+    // with identical bytes, and nothing else does.
+    for sha in [&head, &first] {
+        let body = export_call(&state, &owner, "groceries", Some(sha)).await;
+        let content = result(&body)["structuredContent"].clone();
+        assert_eq!(content["sha"], json!(sha), "{body}");
+        let (_, listed) = call(
+            &state,
+            Some(&owner),
+            "list_files",
+            json!({"app": "groceries", "sha": sha}),
+        )
+        .await;
+        let files = result(&listed)["structuredContent"]["files"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let short = &sha[..7];
+        let mut expected = std::collections::BTreeMap::new();
+        for file in &files {
+            let path = file["path"].as_str().unwrap();
+            // Ground truth is the blob itself: `read_file` trims a trailing
+            // newline for display, so it cannot serve as the oracle here.
+            expected.insert(
+                format!("groceries-{short}/{path}"),
+                blob_bytes(&state, sha, path),
+            );
+        }
+        let key: String = sqlx::query_scalar("SELECT key FROM app_export WHERE sha = ?1")
+            .bind(sha)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let bytes = state.store.get(&key).await.unwrap().expect("zip stored");
+        assert_eq!(zip_map(bytes), expected, "zip of {sha}");
+    }
+    // The earlier commit predates the note: its zip lacks the file.
+    let old_key: String = sqlx::query_scalar("SELECT key FROM app_export WHERE sha = ?1")
+        .bind(&first)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    let old_bytes = state.store.get(&old_key).await.unwrap().unwrap();
+    assert!(
+        !zip_map(old_bytes)
+            .keys()
+            .any(|name| name.ends_with("note.txt")),
+        "old tree carries the new file"
+    );
+}
+
+#[tokio::test]
+async fn export_code_is_owner_only() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let stranger = api_key_for(&state, "stranger@example.com").await;
+
+    // A collaborator reads forbidden; a slug with no role reads not_found.
+    let body = export_call(&state, &bruno, "groceries", None).await;
+    assert_eq!(is_error(&body)["error"], "forbidden");
+    let body = export_call(&state, &stranger, "groceries", None).await;
+    assert_eq!(is_error(&body)["error"], "not_found");
+
+    // Bad shapes and unknown commits are the caller's bug.
+    let body = export_call(&state, &owner, "groceries", Some("!!!")).await;
+    assert_eq!(is_error(&body)["error"], "invalid_argument");
+    let body = export_call(&state, &owner, "groceries", Some("deadbeef")).await;
+    assert_eq!(is_error(&body)["error"], "invalid_argument");
+}
+
+#[tokio::test]
+async fn export_caps_refuse_oversized_trees() {
+    use crate::git::export::{export_app, ExportCaps, ExportDeps, ExportError, ExportParams};
+    let (state, _) = setup().await;
+    pro_app(&state, "ana@example.com", "groceries").await;
+    let app_id = app_id(&state, "groceries").await;
+    let now = chrono::Utc::now();
+    let deps = ExportDeps {
+        pool: &state.pool,
+        store: &state.store,
+        git: &state.git,
+        sync: &state.sync,
+    };
+    let tiny = ExportCaps {
+        max_total_bytes: 10,
+        ..ExportCaps::default()
+    };
+    let err = export_app(
+        &deps,
+        ExportParams {
+            slug: "groceries",
+            app_id: &app_id,
+            rev: None,
+            caps: &tiny,
+            now,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ExportError::TooLarge { .. }), "{err:?}");
+    let few = ExportCaps {
+        max_total_bytes: u64::MAX,
+        max_file_bytes: u64::MAX,
+        max_files: 0,
+    };
+    let err = export_app(
+        &deps,
+        ExportParams {
+            slug: "groceries",
+            app_id: &app_id,
+            rev: None,
+            caps: &few,
+            now,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ExportError::TooManyFiles(_)), "{err:?}");
+    let small = ExportCaps {
+        max_total_bytes: u64::MAX,
+        max_file_bytes: 1,
+        max_files: 100_000,
+    };
+    let err = export_app(
+        &deps,
+        ExportParams {
+            slug: "groceries",
+            app_id: &app_id,
+            rev: None,
+            caps: &small,
+            now,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ExportError::FileTooLarge { .. }), "{err:?}");
+    let full = ExportCaps::default();
+    let ok = export_app(
+        &deps,
+        ExportParams {
+            slug: "groceries",
+            app_id: &app_id,
+            rev: None,
+            caps: &full,
+            now,
+        },
+    )
+    .await;
+    assert!(ok.is_ok(), "default caps fit the test tree");
+}
+
+#[tokio::test]
+async fn export_prune_deletes_only_exports_older_than_a_day() {
+    use crate::git::export::prune_exports;
+    let (state, _) = setup().await;
+    pro_app(&state, "ana@example.com", "groceries").await;
+    let app_id = app_id(&state, "groceries").await;
+    let now = crate::apps::now_ms();
+    for (key, age_ms) in [
+        ("outer/exports/groceries/abc1234-aaaa.zip", 25 * 3_600_000),
+        ("outer/exports/groceries/abc1234-bbbb.zip", 3_600_000),
+    ] {
+        state.store.put(key, b"zip".to_vec()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO app_export (key, app_id, sha, bytes, created_at) VALUES (?1, ?2, 'abc', 3, ?3)",
+        )
+        .bind(key)
+        .bind(&app_id)
+        .bind(now - age_ms)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+    let pruned = prune_exports(&state.pool, &state.store, now).await.unwrap();
+    assert_eq!(pruned, 1);
+    assert!(
+        state
+            .store
+            .get("outer/exports/groceries/abc1234-aaaa.zip")
+            .await
+            .unwrap()
+            .is_none(),
+        "old export survives the sweep"
+    );
+    assert!(
+        state
+            .store
+            .get("outer/exports/groceries/abc1234-bbbb.zip")
+            .await
+            .unwrap()
+            .is_some(),
+        "fresh export pruned too early"
+    );
+    let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM app_export ORDER BY key")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(keys, vec!["outer/exports/groceries/abc1234-bbbb.zip"]);
 }

@@ -264,6 +264,18 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
 
+## `export_code`
+
+- **Access:** signed in
+- **Description:** Download your app's whole code as a zip (Pro, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `sha` | string | no | A commit sha (full or short). Defaults to `main`. |
+
 ## `list_files`
 
 - **Access:** signed in

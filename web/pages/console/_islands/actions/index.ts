@@ -17,6 +17,7 @@ import { actions as observeActions } from "./observe.ts";
 import { actions as secretsActions } from "./secrets.ts";
 import { actions as settingsActions } from "./settings.ts";
 import { actions as domainActions } from "./domains.ts";
+import { actions as exportActions } from "./export.ts";
 
 export type { ConsoleAction };
 export type AnyAction = ConsoleAction<any, any>;
@@ -34,6 +35,7 @@ const registries: ConsoleAction<any, any>[][] = [
   accountActions as ConsoleAction<any, any>[],
   collaboratorActions as ConsoleAction<any, any>[],
   domainActions as ConsoleAction<any, any>[],
+  exportActions as ConsoleAction<any, any>[],
 ];
 
 function combine(): AnyAction[] {

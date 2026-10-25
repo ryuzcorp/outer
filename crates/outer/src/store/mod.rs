@@ -143,6 +143,28 @@ impl Store {
             }
         }
     }
+    /// A presigned GET for `key` that downloads as `filename`, valid `ttl`.
+    /// R2 signs the disposition into the URL; the in-memory backend (tests
+    /// and local dev, with no HTTP front) answers a synthetic `memory:` URL
+    /// carrying the same filename and expiry, so callers keep one shape.
+    pub fn presign_get(
+        &self,
+        key: &str,
+        filename: &str,
+        ttl: std::time::Duration,
+    ) -> anyhow::Result<String> {
+        match &self.inner {
+            StoreInner::S3(backend) => Ok(backend.presigned_get(key, filename, ttl).to_string()),
+            StoreInner::Memory(_) => {
+                // Export filenames are `<slug>-<shortsha>.zip`: the slug rule
+                // keeps them URL-safe, so no encoding is needed.
+                Ok(format!(
+                    "memory://{key}?response-content-disposition=attachment%3B+filename%3D%22{filename}%22&expires_in={}",
+                    ttl.as_secs(),
+                ))
+            }
+        }
+    }
 
     /// All keys under `prefix`, in sort order.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
