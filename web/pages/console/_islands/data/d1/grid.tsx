@@ -10,10 +10,7 @@ import { atom } from "ilha";
 import type { View } from "ilha";
 
 import { d1run } from "../../actions/data-d1.ts";
-import type {
-  D1DeleteRowsInput,
-  D1RowsInput,
-} from "../../actions/data-d1.ts";
+import type { D1DeleteRowsInput } from "../../actions/data-d1.ts";
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -28,13 +25,6 @@ import type {
 } from "./types.ts";
 import { CellValue } from "./cells.tsx";
 import { DEFAULT_PAGE_SIZE, PAGE_SIZES, pageCount } from "./state.ts";
-
-/** Loading state for one mounted query. The panel remounts this component
- * per query key, so the fetch fires once per mount. */
-type RowsState =
-  | { kind: "loading" }
-  | { kind: "error"; message: string }
-  | { kind: "ready"; value: D1Rows };
 
 const Pager = ({
   onPage,
@@ -117,6 +107,7 @@ const Pager = ({
 export const RowsGrid = ({
   binding,
   canWrite,
+  data,
   onChanged,
   onOpenRow,
   onPage,
@@ -131,6 +122,8 @@ export const RowsGrid = ({
   binding: string;
   /** False for collaborators: rows render read-only, no selection. */
   canWrite: boolean;
+  /** The panel fetches rows in parallel with the schema and hands them in. */
+  data: D1Rows;
   onChanged: () => void;
   onOpenRow: (row: Record<string, D1Cell>) => void;
   onPage: (page: number) => void;
@@ -142,69 +135,10 @@ export const RowsGrid = ({
   slug: string;
   viewSlot: View;
 }) => {
-  const state = atom<RowsState>({ kind: "loading" });
   const selected = atom<Record<string, true>>({});
   const confirming = atom(false);
   const busy = atom(false);
   const failure = atom("");
-  const started = atom(false);
-
-  if (!started()) {
-    started.set(true);
-    const input: D1RowsInput = {
-      slug,
-      binding,
-      table: query.table,
-      filters: query.filters,
-      page: query.page,
-      page_size: query.page_size,
-      search: query.search,
-      sort: query.sort,
-    };
-    d1run<D1RowsInput, D1Rows>("d1_rows", input).then(
-      (value) => {
-        state.set({ kind: "ready", value });
-      },
-      (error: unknown) => {
-        state.set({
-          kind: "error",
-          message: error instanceof Error ? error.message : String(error),
-        });
-      },
-    );
-  }
-
-  const current = state();
-
-  if (current.kind === "error") {
-    return (
-      <div class="flex flex-col items-start gap-2 p-4">
-        <p class="text-error m-0 text-sm">{current.message}</p>
-        <button
-          type="button"
-          class="btn btn-sm"
-          onclick={() => {
-            state.set({ kind: "loading" });
-            started.set(false);
-          }}
-        >
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  if (current.kind === "loading") {
-    return (
-      <div class="flex flex-col gap-2 p-4">
-        <span class="skeleton h-8 w-full" />
-        <span class="skeleton h-6 w-full" />
-        <span class="skeleton h-6 w-full" />
-      </div>
-    );
-  }
-
-  const data = current.value;
 
   const schemaColumn = (name: string) =>
     schema.columns.find((column) => column.name === name);

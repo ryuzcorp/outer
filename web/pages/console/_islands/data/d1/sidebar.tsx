@@ -29,7 +29,7 @@ export const TableSidebar = ({
       : tables.filter((table) => table.name.toLowerCase().includes(needle));
 
   return (
-    <aside class="bg-base-100 border-base-300 hidden w-64 shrink-0 flex-col border-r md:flex">
+    <aside class="d1-rail bg-base-100 border-base-300 hidden w-64 shrink-0 flex-col border-r md:flex">
       <div class="border-base-300 flex flex-col gap-1 border-b p-3">
         <div class="flex items-center gap-2">
           <span class="truncate font-semibold" title={binding}>

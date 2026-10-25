@@ -1020,6 +1020,22 @@ export function DeploysView({
               <span class="shrink-0 whitespace-nowrap text-xs opacity-60" title={when(d.created_at)}>
                 {timeAgo(d.created_at)}
               </span>
+              {canRollback && (
+                <span class="shrink-0" onclick={(event) => event.stopPropagation()}>
+                  <button
+                    type="button"
+                    class="btn btn-xs btn-outline"
+                    title={`Roll back to ${shortSha(d.sha)}`}
+                    aria-label={`Roll back to ${shortSha(d.sha)}`}
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      confirmTarget.set(d);
+                    }}
+                  >
+                    Roll back
+                  </button>
+                </span>
+              )}
               <span class="shrink-0 whitespace-nowrap text-xs opacity-60">
                 {d.duration_ms == null
                   ? ""
@@ -2279,6 +2295,14 @@ function DangerZone({
                 last), at most 48 characters.
               </p>
             )}
+            {busy() && (
+              <div class="alert alert-info alert-soft mt-3 min-w-0" role="status">
+                <span class="loading loading-spinner loading-sm shrink-0" aria-hidden="true" />
+                <span class="min-w-0 break-words">
+                  Renaming… this can take a minute (copying data and redeploying).
+                </span>
+              </div>
+            )}
             {error() && (
               <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
                 <span class="min-w-0 break-words">{error()}</span>
@@ -2303,7 +2327,7 @@ function DangerZone({
               </button>
             </div>
           </div>
-          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => renameOpen.set(false)}>
+          <button type="button" class="modal-backdrop" aria-label="Close" disabled={busy()} onclick={() => { if (!busy()) renameOpen.set(false); }}>
             Close
           </button>
         </div>

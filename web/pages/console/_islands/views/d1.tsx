@@ -15,29 +15,56 @@ type DatabasesState =
   | { kind: "error"; message: string }
   | { kind: "ready"; value: D1DatabasesOutput };
 
-/** The app's declared D1 bindings, fetched once per mount. */
+/** One in-flight (or finished) fetch per app, shared by every mounted hook
+ * instance: the sidebar nav and the view body mount separately, and without
+ * this each mount fires its own `d1_databases`. Failures evict the entry so
+ * a retry fetches again. */
+const databasesCache = new Map<string, Promise<D1DatabasesOutput>>();
+
+const fetchDatabases = (slug: string): Promise<D1DatabasesOutput> => {
+  const cached = databasesCache.get(slug);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const pending = d1run<D1DatabasesInput, D1DatabasesOutput>("d1_databases", {
+    slug,
+  });
+  databasesCache.set(slug, pending);
+  pending.catch(() => {
+    if (databasesCache.get(slug) === pending) {
+      databasesCache.delete(slug);
+    }
+  });
+  return pending;
+};
+
+/** The app's declared D1 bindings, fetched once per app (not per mount). */
 const useDatabases = (slug: string): DatabasesState & { retry: () => void } => {
   const state = atom<DatabasesState>({ kind: "loading" });
-  const started = atom(false);
+  const started = atom("");
 
   const load = () => {
-    started.set(true);
+    const key = slug;
+    started.set(key);
     state.set({ kind: "loading" });
-    const input: D1DatabasesInput = { slug };
-    d1run<D1DatabasesInput, D1DatabasesOutput>("d1_databases", input).then(
+    fetchDatabases(slug).then(
       (value) => {
-        state.set({ kind: "ready", value });
+        if (started() === key) {
+          state.set({ kind: "ready", value });
+        }
       },
       (error: unknown) => {
-        state.set({
-          kind: "error",
-          message: error instanceof Error ? error.message : String(error),
-        });
+        if (started() === key) {
+          state.set({
+            kind: "error",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
       },
     );
   };
 
-  if (!started()) {
+  if (started() !== slug) {
     load();
   }
 
@@ -45,7 +72,8 @@ const useDatabases = (slug: string): DatabasesState & { retry: () => void } => {
   return {
     ...current,
     retry: () => {
-      started.set(false);
+      databasesCache.delete(slug);
+      started.set("");
     },
   };
 };
