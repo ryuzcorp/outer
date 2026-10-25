@@ -648,6 +648,15 @@ export function Console() {
       })
       .catch((err: unknown) => {
         apps.set({ kind: "error", message: String(err) });
+        const r = route();
+        if (isAccountView(r.view)) {
+          // Account views never need the app list: a failing
+          // `/api/console/apps` still shows them instead of the fatal
+          // error screen.
+          epoch += 1;
+          void enter(r, epoch);
+          return;
+        }
         detail.set({ kind: "error", message: String(err) });
       });
     window.addEventListener("keydown", (e: KeyboardEvent) => {
@@ -701,7 +710,11 @@ export function Console() {
       </div>
     );
   }
-  if (appsPanel.kind === "error") {
+  // A failing `/api/console/apps` is fatal for app views only: account
+  // views (`?t=connections`, `?t=usage`, ...) stand alone on an empty rail.
+  const list = appsPanel.kind === "ready" ? appsPanel.value : [];
+  const accountView = isAccountView(r.view);
+  if (appsPanel.kind === "error" && !accountView) {
     return (
       <div class="console-error" role="alert">
         <div class="alert alert-error alert-soft max-w-md">
@@ -711,8 +724,7 @@ export function Console() {
       </div>
     );
   }
-  const list = appsPanel.value;
-  const accountView = isAccountView(r.view);
+
   if (list.length === 0 && !accountView) {
     return (
       <div class="console-empty" role="status">

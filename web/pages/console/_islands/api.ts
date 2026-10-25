@@ -6,9 +6,16 @@ export class ApiError extends Error {
   status: number;
   body: unknown;
   constructor(status: number, body: unknown) {
+    // Older endpoints answer `{error, message}` with no `user_message`;
+    // prefer the server's sentence either way over the bare status text.
     let message = `request failed: ${status}`;
-    if (body !== null && typeof body === "object" && "user_message" in body) {
-      message = String(body.user_message);
+    if (body !== null && typeof body === "object") {
+      const human =
+        (body as Record<string, unknown>).user_message ??
+        (body as Record<string, unknown>).message;
+      if (typeof human === "string" && human.length > 0) {
+        message = human;
+      }
     }
     super(message);
     this.name = "ApiError";

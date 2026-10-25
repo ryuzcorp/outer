@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::console::{guard, nostore_json, ok_json};
+use super::console_actions::tool_response;
 use crate::accounts::{self, AccountError};
 use crate::auth::{self, now_ms};
 
@@ -46,20 +47,10 @@ pub fn routes() -> Router<super::AppState> {
         .route("/api/console/account/delete", post(api_delete_account))
 }
 
-/// `{error, message, user_message}` with the console's `no-store` rules.
+/// Account errors through the shared console envelope ([`tool_response`]):
+/// `{error, message, user_message?}` with the console's `no-store` rules.
 fn err_json(err: AccountError) -> Response {
-    let status = StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        status,
-        [
-            ("cache-control", "no-store"),
-            ("pragma", "no-cache"),
-            ("content-type", "application/json"),
-        ],
-        json!({"error": err.code, "message": err.message, "user_message": err.user_message})
-            .to_string(),
-    )
-        .into_response()
+    tool_response(&err.into())
 }
 
 /// The audit outcome for a finished mutation: `ok`, or `error:<code>`.

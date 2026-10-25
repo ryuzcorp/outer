@@ -14,31 +14,31 @@ use crate::auth::{normalize_email, now_ms};
 use crate::mcp::{error::ToolError, tools};
 
 /// Console-facing domain error: the §8.3 code plus the human message the
-/// UI shows, plus the HTTP status for the console handler.
+/// UI shows. HTTP status derives from the code in
+/// [`crate::http::console_actions::tool_response`], the same envelope every
+/// console mutation answers with.
 #[derive(Debug)]
 pub struct AccountError {
     pub code: &'static str,
     pub message: String,
     pub user_message: String,
-    pub status: u16,
 }
 
 impl AccountError {
-    fn new(code: &'static str, message: String, user_message: String, status: u16) -> Self {
+    fn new(code: &'static str, message: String, user_message: String) -> Self {
         Self {
             code,
             message,
             user_message,
-            status,
         }
     }
 
     pub fn not_found(message: String) -> Self {
-        Self::new("not_found", message.clone(), message, 404)
+        Self::new("not_found", message.clone(), message)
     }
 
     pub fn invalid_argument(message: String, user_message: String) -> Self {
-        Self::new("invalid_argument", message, user_message, 400)
+        Self::new("invalid_argument", message, user_message)
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
@@ -48,29 +48,23 @@ impl AccountError {
             "internal",
             message,
             "Something broke on our side; try again in a minute.".to_string(),
-            500,
         )
     }
 }
 
 impl From<ToolError> for AccountError {
     fn from(err: ToolError) -> Self {
-        let status = match err.code {
-            "not_found" => 404,
-            "invalid_argument" | "terms_required" => 400,
-            "forbidden" => 403,
-            "conflict" => 409,
-            "quota_exceeded" => 429,
-            "rate_limited" => 429,
-            "payment_required" => 402,
-            "suspended" => 403,
-            _ => 500,
-        };
         let user_message = err
             .user_message
             .clone()
             .unwrap_or_else(|| err.message.clone());
-        Self::new(err.code, err.message, user_message, status)
+        Self::new(err.code, err.message, user_message)
+    }
+}
+
+impl From<AccountError> for ToolError {
+    fn from(err: AccountError) -> Self {
+        Self::new(err.code, err.message).with_user(err.user_message)
     }
 }
 
@@ -86,7 +80,7 @@ impl From<sqlx::Error> for AccountError {
     }
 }
 
-/// One `account_action` row (migration 0003): the account-level equivalent
+/// One `account_action` row (migration 0005): the account-level equivalent
 /// of an `agent_action` row, with the MCP tool name and client "Console".
 /// A failed insert warns and the mutation result stands, like
 /// [`crate::mcp::actions::record`].
