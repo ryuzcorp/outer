@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 const USAGE: &str = "usage:
   outer serve
   outer check-config
-  outer templates sync [--template app|website] [--sha SHA] [--url URL]
+  outer templates sync [--template app|website [--sha SHA] [--url URL]]
   outer app create SLUG --owner EMAIL [--name NAME] [--template app|website]
   outer app deploy SLUG
   outer app delete SLUG

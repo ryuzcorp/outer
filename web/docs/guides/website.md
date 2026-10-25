@@ -33,19 +33,20 @@ it. Island props are JSON only — never forward an Astro `<slot />` into an
 island. Until hydration, handlers don't exist: keep controls usable or
 disabled, never silently dead.
 
-## One server route
+## Server routes
 
 Pages prerender by default — no server runs for them. A route that needs
-bindings opts out:
+bindings opts out. The starter's `src/pages/api/newsletter.ts` validates and
+saves signups; a read-only route looks like this:
 
 ```ts
-// src/pages/api/newsletter.ts
+// src/pages/api/subscribers.ts
 import type { APIRoute } from "astro";
 import { env } from "cloudflare:workers";
 
 export const prerender = false;
 
-export const POST: APIRoute = async () => {
+export const GET: APIRoute = async () => {
   const { DB } = env;
   const { results } = await DB.prepare("SELECT id FROM newsletter").all();
   return Response.json({ count: results.length });
