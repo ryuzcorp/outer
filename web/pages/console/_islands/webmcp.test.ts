@@ -9,7 +9,7 @@ import { consoleActions } from "./actions/console.ts";
 import type { ActionContext, ConsoleBridge } from "./actions/settings.ts";
 import type { ConsoleApp } from "./api.ts";
 import type { Route } from "./common.tsx";
-import { actionView, emptyQueryEntries, isRunnable, matchScore, searchEntries, type ItemGroup } from "./palette.tsx";
+import { actionView, buildGroups, emptyQueryEntries, isRunnable, matchScore, searchEntries, type ItemGroup } from "./palette.tsx";
 import {
   applyDefaults,
   createConfirmHandler,
@@ -317,6 +317,27 @@ describe("registration", () => {
     expect(calls[0].signal?.aborted).toBe(true);
   });
 
+  test("admin actions register only for admins; unknown keeps everything", () => {
+    const adminNames = allActions.filter((a) => a.adminOnly).map((a) => a.name);
+    expect(adminNames.length).toBeGreaterThan(0);
+    for (const known of [true, false] as const) {
+      const seen: string[] = [];
+      stubDocument({ registerTool: (tool: Record<string, unknown>) => {
+        seen.push(String(tool["name"]));
+      } });
+      const ctx: ExecuteContext = { getSlug: () => null, isAdmin: () => known };
+      expect(registerAllWebMcp(ctx)).not.toBeNull();
+      const want = known ? allActions : allActions.filter((a) => !a.adminOnly);
+      expect(seen.sort()).toEqual(want.map((a) => a.name).sort());
+    }
+    const seen: string[] = [];
+    stubDocument({ registerTool: (tool: Record<string, unknown>) => {
+      seen.push(String(tool["name"]));
+    } });
+    expect(registerAllWebMcp({ getSlug: () => null })).not.toBeNull();
+    expect(seen.sort()).toEqual(allActions.map((a) => a.name).sort());
+  });
+
   test("navigator.modelContext is the fallback; absent means null", () => {
     expect(registerAllWebMcp({ getSlug: () => null })).toBeNull();
     testScope["navigator"] = {
@@ -454,6 +475,30 @@ describe("palette", () => {
     expect(actionView(findAction("set_secret")!)).toBe("secrets");
     expect(actionView(findAction("rename_app")!)).toBe("settings");
     expect(actionView(findAction("d1_rows")!)).toBe("d1");
+  });
+  test("admin actions list for admins only and navigate to admin", () => {
+    expect(actionView(findAction("admin_review")!)).toBe("admin");
+    expect(actionView(findAction("moderation_queue")!)).toBe("admin");
+    const adminNames = allActions.filter((a) => a.adminOnly).map((a) => a.name);
+    expect(adminNames).toContain("admin_review");
+    const base = {
+      apps: [],
+      slug: null,
+      view: "overview",
+      onNavigate: () => {},
+      execCtx: { getSlug: () => null },
+      onMutated: () => {},
+      onClose: () => {},
+    } as const;
+    const actionKeys = (isAdmin: boolean): string[] =>
+      buildGroups({ ...base, isAdmin }).flatMap((g) =>
+        g.items.filter((i) => i.kind === "action").map((i) => i.key),
+      );
+    for (const name of adminNames) {
+      expect(actionKeys(true)).toContain(`action:${name}`);
+      expect(actionKeys(false)).not.toContain(`action:${name}`);
+    }
+    expect(actionKeys(false)).toContain("action:rollback");
   });
 
   test("domains: refresh is runnable, add navigates to settings", () => {

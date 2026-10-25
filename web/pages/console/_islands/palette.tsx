@@ -97,9 +97,13 @@ const ACTION_VIEWS: Record<string, ViewId> = {
   do_probe: "do",
   code_list_files: "code",
   code_read_file: "code",
-  code_history: "code",
-  code_diff: "code",
   code_compare: "code",
+  moderation_queue: "admin",
+  admin_stats: "admin",
+  admin_review: "admin",
+  admin_suspend_app: "admin",
+  admin_restore_app: "admin",
+  admin_ban_account: "admin",
 };
 
 export function actionView(action: AnyAction): ViewId {
@@ -187,7 +191,7 @@ export function buildGroups(props: PaletteProps): ItemGroup[] {
     view: v.id as ViewId,
   }));
   const actionItems: PaletteItem[] = allActions
-    .filter((a) => !EXCLUDED_FROM_PALETTE[a.name])
+    .filter((a) => !EXCLUDED_FROM_PALETTE[a.name] && (!a.adminOnly || props.isAdmin))
     .map((action) => {
       const runnable = isRunnable(action);
       return {

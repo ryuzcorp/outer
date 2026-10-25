@@ -6,6 +6,7 @@
 import type { ConsoleAction } from "./settings.ts";
 
 import { actions as accountActions } from "./account.ts";
+import { actions as adminModerationActions } from "./admin-moderation.ts";
 import { actions as codeActions } from "./code.ts";
 import { actions as collaboratorActions } from "./collaborators.ts";
 import { actions as consoleActions } from "./console.ts";
@@ -34,6 +35,7 @@ const registries: ConsoleAction<any, any>[][] = [
   codeActions as ConsoleAction<any, any>[],
   accountActions as ConsoleAction<any, any>[],
   collaboratorActions as ConsoleAction<any, any>[],
+  adminModerationActions as ConsoleAction<any, any>[],
   domainActions as ConsoleAction<any, any>[],
   exportActions as ConsoleAction<any, any>[],
 ];

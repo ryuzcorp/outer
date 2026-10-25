@@ -246,8 +246,10 @@ export interface ExecuteContext extends ActionContext {
   getSlug: () => string | null;
   /** The console modal gate for consequential runs; absent outside the island. */
   confirm?: ConfirmFn | null;
+  /** Admin actions register only while this returns true. Absent (tests,
+   * outside the island) means unknown: register everything, like before. */
+  isAdmin?: () => boolean;
 }
-
 /**
  * Run one action the WebMCP way: defaults, confirm gate, then `run`.
  * Shared with the ⌘K palette so both surfaces behave identically.
@@ -302,7 +304,11 @@ export function registerAllWebMcp(ctx: ExecuteContext): (() => void) | null {
     return null;
   }
   const controller = new AbortController();
-  for (const action of allActions) {
+  // Admin-only actions register for admins alone. An unknown identity
+  // (tests, no isAdmin yet) keeps the old behavior: register everything.
+  const visible =
+    ctx.isAdmin && !ctx.isAdmin() ? allActions.filter((a) => !a.adminOnly) : allActions;
+  for (const action of visible) {
     const current = action;
     try {
       const registered = mc.registerTool(

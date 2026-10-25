@@ -27,6 +27,7 @@ import {
   type SecretsSummary,
   type WaitlistSummary,
 } from "./api.ts";
+import type { AdminStats, ModerationQueue } from "./actions/admin-moderation.ts";
 import {
   AccountIcon,
   ActionsIcon,
@@ -217,6 +218,8 @@ export function Console() {
   const invites = atom<Panel<InvitesSummary>>({ kind: "loading" });
   const adminInvites = atom<Panel<AdminInvitesPage>>({ kind: "loading" });
   const waitlist = atom<Panel<WaitlistSummary>>({ kind: "loading" });
+  const moderationQueue = atom<Panel<ModerationQueue>>({ kind: "loading" });
+  const adminStats = atom<Panel<AdminStats>>({ kind: "loading" });
   const detail = atom<Panel<AppDetail>>({ kind: "loading" });
   const metrics = atom<Panel<{ hours: number; summary: MetricsSummary }>>({
     kind: "loading",
@@ -254,6 +257,7 @@ export function Console() {
   const webmcpCtx: ExecuteContext = {
     getSlug: () => route().app,
     bridge,
+    isAdmin: () => isAdmin(),
     confirm: createConfirmHandler(
       () => pendingConfirm(),
       (next) => pendingConfirm.set(next),
@@ -520,14 +524,20 @@ export function Console() {
     if (view === "admin") {
       adminInvites.set({ kind: "loading" });
       waitlist.set({ kind: "loading" });
+      moderationQueue.set({ kind: "loading" });
+      adminStats.set({ kind: "loading" });
       try {
-        const [page, list] = await Promise.all([
+        const [page, list, queue, stats] = await Promise.all([
           api<AdminInvitesPage>("/api/console/admin/invites?limit=50"),
           api<WaitlistSummary>("/api/console/admin/waitlist?limit=100"),
+          api<ModerationQueue>("/api/console/admin/moderation/queue"),
+          api<AdminStats>("/api/console/admin/stats"),
         ]);
         if (fresh()) {
           adminInvites.set({ kind: "ready", value: page });
           waitlist.set({ kind: "ready", value: list });
+          moderationQueue.set({ kind: "ready", value: queue });
+          adminStats.set({ kind: "ready", value: stats });
           setTitle(route(), null);
         }
       } catch (err: unknown) {
@@ -535,6 +545,8 @@ export function Console() {
           const message = String(err);
           adminInvites.set({ kind: "error", message });
           waitlist.set({ kind: "error", message });
+          moderationQueue.set({ kind: "error", message });
+          adminStats.set({ kind: "error", message });
         }
       }
     }
@@ -888,6 +900,8 @@ export function Console() {
       <AdminView
         codes={adminInvites()}
         waitlist={waitlist()}
+        queue={moderationQueue()}
+        stats={adminStats()}
         isAdmin={isAdmin()}
         onGenerate={(count, note) => generateCodes(count, note)}
         onRevoke={(code) => revokeCode(code)}
@@ -896,6 +910,11 @@ export function Console() {
           epoch += 1;
           void loadAccountView("admin", epoch);
         }}
+        onMutated={() => {
+          epoch += 1;
+          void loadAccountView("admin", epoch);
+        }}
+        onOpenCode={(slug) => navigate({ app: slug, view: "code" })}
       />
     )
   ) : null;

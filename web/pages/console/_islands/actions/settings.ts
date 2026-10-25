@@ -30,6 +30,8 @@ export interface ConsoleAction<I, O> {
   readOnly: boolean;
   consequential: boolean;
   untrusted: boolean;
+  /** Admin-only actions register in ⌘K/WebMCP for admins alone. */
+  adminOnly?: boolean;
   run(input: I, ctx?: ActionContext, signal?: AbortSignal): Promise<O>;
 }
 

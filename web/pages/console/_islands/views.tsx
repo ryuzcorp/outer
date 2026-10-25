@@ -31,6 +31,12 @@ import {
   type WaitlistSummary,
 } from "./api.ts";
 import { deploysActions } from "./actions/deploys.ts";
+import {
+  adminModerationActions,
+  type AdminStats,
+  type ModerationQueue,
+  type ModerationQueueItem,
+} from "./actions/admin-moderation.ts";
 import { exportActions } from "./actions/export.ts";
 import { secretsActions } from "./actions/secrets.ts";
 import { settingsActions } from "./actions/settings.ts";
@@ -2695,19 +2701,27 @@ export function InvitesView({
 export function AdminView({
   codes,
   waitlist,
+  queue,
+  stats,
   isAdmin,
   onGenerate,
   onRevoke,
   onMoreCodes,
   onRetry,
+  onMutated,
+  onOpenCode,
 }: {
   codes: Panel<AdminInvitesPage>;
   waitlist: Panel<WaitlistSummary>;
+  queue: Panel<ModerationQueue>;
+  stats: Panel<AdminStats>;
   isAdmin: boolean;
   onGenerate: (count: number, note: string) => Promise<void>;
   onRevoke: (code: string) => Promise<void>;
   onMoreCodes: () => void;
   onRetry: () => void;
+  onMutated: () => void;
+  onOpenCode: (slug: string) => void;
 }) {
   if (!isAdmin) {
     return (
@@ -2720,6 +2734,13 @@ export function AdminView({
   }
   return (
     <div class="flex min-w-0 flex-col gap-3">
+      <ModerationStatsCard panel={stats} onRetry={onRetry} />
+      <ModerationQueueCard
+        panel={queue}
+        onRetry={onRetry}
+        onMutated={onMutated}
+        onOpenCode={onOpenCode}
+      />
       <GenerateCard onGenerate={onGenerate} />
       <AdminCodesCard
         panel={codes}
@@ -3011,6 +3032,455 @@ function WaitlistCard({
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// --- Admin moderation (spec §15.3, §13 admin_stats) ------------------------------
+
+function StatCell({ label, value, title }: { label: string; value: string; title?: string }) {
+  return (
+    <div class="min-w-0">
+      <div class="truncate text-xs opacity-60" title={label}>
+        {label}
+      </div>
+      <div class="min-w-0 truncate text-lg font-semibold" title={title ?? value}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function ModerationStatsCard({
+  panel,
+  onRetry,
+}: {
+  panel: Panel<AdminStats>;
+  onRetry: () => void;
+}) {
+  if (panel.kind === "loading") {
+    return <Loading label="Loading admin stats" />;
+  }
+  if (panel.kind === "error") {
+    return (
+      <section class="card card-border bg-base-100 min-w-0" aria-label="Overview">
+        <div class="card-body min-w-0">
+          <h2 class="card-title m-0 min-w-0 text-base">Overview</h2>
+          <Err message={panel.message} onRetry={onRetry} />
+        </div>
+      </section>
+    );
+  }
+  const s = panel.value;
+  const plans = s.accounts_by_plan.map((p) => `${p.plan}: ${p.accounts}`).join(", ");
+  const failurePct = `${(s.deploy_failure_rate_7d * 100).toFixed(1)}%`;
+  const secs = (ms: number | null): string =>
+    ms === null ? "—" : `${(ms / 1000).toFixed(1)}s`;
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Overview">
+      <div class="card-body min-w-0">
+        <h2 class="card-title m-0 min-w-0 text-base">Overview</h2>
+        <div class="grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          <StatCell label="Accounts" value={String(s.accounts_total)} title={plans || "no accounts"} />
+          <StatCell label="Waitlist" value={String(s.waitlist_size)} />
+          <StatCell
+            label="Apps awake / asleep"
+            value={`${s.apps_awake} / ${s.apps_asleep}`}
+            title={`${s.apps_total} total`}
+          />
+          <StatCell
+            label="Held / suspended"
+            value={`${s.apps_held} / ${s.apps_suspended}`}
+          />
+          <StatCell label="Blocked deploys" value={String(s.blocked_deploys)} />
+          <StatCell label="Unreviewed checks" value={String(s.unreviewed_checks)} />
+          <StatCell
+            label="Deploys / 7d"
+            value={String(s.deploys_7d)}
+            title={`failure rate ${failurePct}`}
+          />
+          <StatCell label="Fail rate / 7d" value={failurePct} />
+          <StatCell label="Deploy p50 / 7d" value={secs(s.deploy_p50_ms_7d)} />
+          <StatCell label="Deploy p95 / 7d" value={secs(s.deploy_p95_ms_7d)} />
+        </div>
+        {plans && (
+          <p class="m-0 min-w-0 truncate text-xs opacity-60" title={plans}>
+            {plans}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+interface ModerationConfirm {
+  title: string;
+  detail: string;
+  confirmLabel: string;
+  needsReason: boolean;
+  run: (reason: string) => Promise<unknown>;
+  done: string;
+}
+
+function findingRows(findings: unknown): { path: string; line: string; category: string; score: string }[] {
+  if (!Array.isArray(findings)) {
+    return [];
+  }
+  return findings.slice(0, 8).map((raw) => {
+    const f = (raw ?? {}) as Record<string, unknown>;
+    const path = typeof f["path"] === "string" ? (f["path"] as string) : "—";
+    const line = typeof f["line"] === "number" ? `line ${f["line"] as number}` : "";
+    const category = typeof f["category"] === "string" ? (f["category"] as string) : "flagged";
+    const score = typeof f["score"] === "number" ? (f["score"] as number).toFixed(2) : "";
+    return { path, line, category, score };
+  });
+}
+
+function scoreText(scores: unknown): string | null {
+  if (!scores || typeof scores !== "object" || Array.isArray(scores)) {
+    return null;
+  }
+  const entries = Object.entries(scores as Record<string, unknown>)
+    .filter(([, v]) => typeof v === "number")
+    .map(([k, v]) => `${k}: ${(v as number).toFixed(2)}`);
+  return entries.length > 0 ? entries.join(", ") : null;
+}
+
+const KIND_LABEL: Record<string, string> = {
+  blocked_deploy: "blocked deploy",
+  held_app: "held app",
+  suspended_app: "suspended app",
+  flagged_check: "flagged check",
+};
+
+function ModerationQueueCard({
+  panel,
+  onRetry,
+  onMutated,
+  onOpenCode,
+}: {
+  panel: Panel<ModerationQueue>;
+  onRetry: () => void;
+  onMutated: () => void;
+  onOpenCode: (slug: string) => void;
+}) {
+  const pending = atom<ModerationConfirm | null>(null);
+  const reason = atom("");
+  const busy = atom(false);
+  const error = atom<string | null>(null);
+  const notice = atom<string | null>(null);
+
+  async function confirm(): Promise<void> {
+    const target = pending();
+    if (!target || busy()) {
+      return;
+    }
+    if (target.needsReason && reason().trim() === "") {
+      error.set("A reason is required.");
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await target.run(reason().trim());
+      notice.set(target.done);
+      pending.set(null);
+      reason.set("");
+      onMutated();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  function askReview(item: ModerationQueueItem, verdict: "allow" | "deny"): void {
+    const kind = item.kind === "blocked_deploy" ? "deploy" : "app";
+    const id = item.kind === "blocked_deploy" ? item.id : item.app_slug;
+    pending.set({
+      title: `${verdict === "allow" ? "Approve" : "Reject"} ${KIND_LABEL[item.kind] ?? item.kind}?`,
+      detail:
+        verdict === "allow"
+          ? kind === "deploy"
+            ? `Clears the content-check hashes for ${item.app_slug} and redeploys the blocked commit.`
+            : `Lifts the hold on ${item.app_slug}.`
+          : "Records the decision and keeps the block in place.",
+      confirmLabel: verdict === "allow" ? "Approve" : "Reject",
+      needsReason: false,
+      run: () => adminModerationActions.adminReview.run({ kind, id, verdict }),
+      done: verdict === "allow" ? "Approved." : "Rejection recorded.",
+    });
+  }
+
+  function askSuspend(slug: string): void {
+    pending.set({
+      title: `Suspend ${slug}?`,
+      detail: "Stops its fleet and purges its cached pages until restored.",
+      confirmLabel: "Suspend",
+      needsReason: false,
+      run: () => adminModerationActions.adminSuspendApp.run({ slug }),
+      done: `Suspended ${slug}.`,
+    });
+  }
+
+  function askRestore(slug: string): void {
+    pending.set({
+      title: `Restore ${slug}?`,
+      detail: "Puts the app back to normal; the wake sweep picks it up on demand.",
+      confirmLabel: "Restore",
+      needsReason: false,
+      run: () => adminModerationActions.adminRestoreApp.run({ slug }),
+      done: `Restored ${slug}.`,
+    });
+  }
+
+  function askBan(item: ModerationQueueItem): void {
+    reason.set("");
+    pending.set({
+      title: `Ban ${item.owner_email ?? item.app_slug}?`,
+      detail: `Refuses sign-in for ${item.owner_email ?? "the owner"} and parks every owned app as stopped.`,
+      confirmLabel: "Ban account",
+      needsReason: true,
+      run: (text) =>
+        adminModerationActions.adminBanAccount.run({
+          email: item.owner_email ?? "",
+          reason: text,
+        }),
+      done: "Account banned.",
+    });
+  }
+
+  if (panel.kind === "loading") {
+    return <Loading label="Loading moderation queue" />;
+  }
+  if (panel.kind === "error") {
+    return (
+      <section class="card card-border bg-base-100 min-w-0" aria-label="Moderation queue">
+        <div class="card-body min-w-0">
+          <h2 class="card-title m-0 min-w-0 text-base">Moderation queue</h2>
+          <Err message={panel.message} onRetry={onRetry} />
+        </div>
+      </section>
+    );
+  }
+  const items = panel.value.items;
+  const target = pending();
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Moderation queue">
+      <div class="card-body min-w-0">
+        <h2 class="card-title m-0 min-w-0 text-base">Moderation queue</h2>
+        {notice() && (
+          <div class="alert alert-success alert-soft min-w-0" role="status">
+            <span class="min-w-0 break-words">{notice()}</span>
+          </div>
+        )}
+        {items.length === 0 ? (
+          <EmptyState plain title="Queue clear">
+            Blocked deploys and held apps land here with the gate's findings.
+          </EmptyState>
+        ) : (
+          <div class="flex min-w-0 flex-col gap-3">
+            {items.map((item) => {
+              const rows = findingRows(item.findings);
+              const scores = scoreText(item.scores);
+              return (
+                <section
+                  class="border border-base-300 rounded-box min-w-0"
+                  key={`${item.kind}:${item.id}`}
+                  aria-label={`${KIND_LABEL[item.kind] ?? item.kind} ${item.app_slug}`}
+                >
+                  <div class="flex min-w-0 flex-col gap-2 p-3">
+                    <div class="flex min-w-0 flex-wrap items-center gap-2">
+                      <span class="badge badge-soft badge-warning shrink-0">
+                        {KIND_LABEL[item.kind] ?? item.kind}
+                      </span>
+                      <span class="min-w-0 flex-1 truncate font-mono" title={item.app_slug}>
+                        {item.app_slug}
+                      </span>
+                      {item.sha && (
+                        <span class="shrink-0 font-mono text-xs opacity-60" title={item.sha}>
+                          {shortSha(item.sha)}
+                        </span>
+                      )}
+                      <span class="shrink-0 text-xs opacity-60" title={when(item.created_at)}>
+                        {timeAgo(item.created_at)}
+                      </span>
+                    </div>
+                    {item.owner_email && (
+                      <p class="m-0 min-w-0 truncate text-xs opacity-60" title={item.owner_email}>
+                        {item.owner_email}
+                      </p>
+                    )}
+                    {rows.length > 0 && (
+                      <div class="min-w-0 overflow-x-auto">
+                        <table class="table table-fixed table-xs w-full">
+                          <colgroup>
+                            <col />
+                            <col class="w-24" />
+                            <col class="w-16" />
+                          </colgroup>
+                          <thead>
+                            <tr>
+                              <th scope="col">Chunk</th>
+                              <th scope="col">Category</th>
+                              <th scope="col">Score</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rows.map((row, i) => (
+                              <tr key={i}>
+                                <td class="min-w-0 truncate font-mono" title={`${row.path}${row.line ? `, ${row.line}` : ""}`}>
+                                  {row.path}
+                                  {row.line ? `, ${row.line}` : ""}
+                                </td>
+                                <td class="truncate" title={row.category}>
+                                  {row.category}
+                                </td>
+                                <td class="whitespace-nowrap">{row.score}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                    {scores && (
+                      <p class="m-0 min-w-0 truncate font-mono text-xs opacity-60" title={scores}>
+                        {scores}
+                      </p>
+                    )}
+                    {item.reviewed_by && (
+                      <p class="m-0 min-w-0 truncate text-xs opacity-60" title={item.reviewed_by}>
+                        Reviewed by {item.reviewed_by}
+                      </p>
+                    )}
+                    <div class="flex min-w-0 flex-wrap gap-2">
+                      <button
+                        type="button"
+                        class="btn btn-xs btn-outline"
+                        onclick={() => onOpenCode(item.app_slug)}
+                      >
+                        Code view
+                      </button>
+                      {(item.kind === "blocked_deploy" || item.kind === "flagged_check") && (
+                        <span class="contents">
+                          <button
+                            type="button"
+                            class="btn btn-xs btn-success"
+                            onclick={() => askReview(item, "allow")}
+                          >
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            class="btn btn-xs btn-error btn-soft"
+                            onclick={() => askReview(item, "deny")}
+                          >
+                            Reject
+                          </button>
+                        </span>
+                      )}
+                      {item.kind === "held_app" && (
+                        <button
+                          type="button"
+                          class="btn btn-xs btn-warning btn-soft"
+                          title="Escalate to suspended"
+                          onclick={() => askSuspend(item.app_slug)}
+                        >
+                          Suspend
+                        </button>
+                      )}
+                      {item.kind !== "blocked_deploy" && item.kind !== "flagged_check" && (
+                        <button
+                          type="button"
+                          class="btn btn-xs btn-outline"
+                          onclick={() => askRestore(item.app_slug)}
+                        >
+                          Restore
+                        </button>
+                      )}
+                      {item.owner_email && (
+                        <button
+                          type="button"
+                          class="btn btn-xs btn-error"
+                          onclick={() => askBan(item)}
+                        >
+                          Ban account
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </section>
+              );
+            })}
+          </div>
+        )}
+        {target && (
+          <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={target.title}>
+            <div class="modal-box min-w-0">
+              <h3 class="mb-2 min-w-0 truncate text-base font-semibold" title={target.title}>
+                {target.title}
+              </h3>
+              <p class="m-0 min-w-0 break-words text-sm opacity-70">{target.detail}</p>
+              {target.needsReason && (
+                <label class="form-control mt-3 min-w-0" for="moderation-ban-reason">
+                  <span class="label min-w-0">
+                    <span class="label-text truncate" title="Why this account is banned">
+                      Reason (required)
+                    </span>
+                  </span>
+                  <input
+                    type="text"
+                    id="moderation-ban-reason"
+                    class="input input-bordered w-full min-w-0"
+                    maxlength="500"
+                    placeholder="e.g. phishing kit"
+                    value={reason()}
+                    oninput={(event) =>
+                      reason.set((event.target as HTMLInputElement).value)}
+                  />
+                </label>
+              )}
+              {error() && (
+                <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                  <span class="min-w-0 break-words">{error()}</span>
+                </div>
+              )}
+              <div class="modal-action">
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  disabled={busy()}
+                  onclick={() => {
+                    pending.set(null);
+                    error.set(null);
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-error"
+                  disabled={busy()}
+                  onclick={() => void confirm()}
+                >
+                  {busy() ? "Working…" : target.confirmLabel}
+                </button>
+              </div>
+            </div>
+            <button
+              type="button"
+              class="modal-backdrop"
+              aria-label="Close"
+              onclick={() => {
+                pending.set(null);
+                error.set(null);
+              }}
+            >
+              Close
+            </button>
           </div>
         )}
       </div>
