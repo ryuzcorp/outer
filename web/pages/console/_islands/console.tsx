@@ -1002,7 +1002,6 @@ export function Console() {
                     {active.url.replace(/^https?:\/\//, "")}
                   </p>
                 </div>
-                <span class={`status ${statusDot(active.status)} mt-1.5 shrink-0`} title={active.status} aria-label={active.status} />
                 <span class={`badge badge-soft ${statusBadge(active.status)} shrink-0`} title={active.status}>{active.status}</span>
                 <button
                   type="button"
@@ -1015,7 +1014,7 @@ export function Console() {
                 </button>
               </div>
               <ul class="menu w-full min-w-0 gap-0.5 p-0">
-                <li class="menu-title">App</li>
+                <li class="menu-title text-xs font-medium uppercase tracking-wider">App</li>
                 {VIEWS.map((v) => (
                   <li key={v.id} class="min-w-0">
                     <button
@@ -1034,7 +1033,7 @@ export function Console() {
                     </button>
                   </li>
                 ))}
-                <li class="menu-title">Data</li>
+                <li class="menu-title text-xs font-medium uppercase tracking-wider">Data</li>
                 {(["D1", "R2", "Durable Objects"] as const).map((name) => (
                   <li key={name} class="menu-disabled min-w-0" title="Coming later">
                     <span class="min-w-0">
