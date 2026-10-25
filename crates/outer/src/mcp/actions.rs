@@ -438,6 +438,8 @@ fn client_label(
     match (key_name, key_prefix) {
         (Some(name), _) => name,
         (None, Some(prefix)) => format!("API key {prefix}"),
+        // No grant, client or key: a console write (the console-actions
+        // contract records those with NULL consent and API key IDs).
         (None, None) => "Console".to_string(),
     }
 }

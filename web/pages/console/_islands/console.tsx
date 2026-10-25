@@ -57,6 +57,7 @@ import {
   SettingsView,
 } from "./views.tsx";
 import { CodeView } from "./views/code.tsx";
+import { D1Nav, D1View } from "./views/d1.tsx";
 
 import { secretsActions } from "./actions/secrets.ts";
 
@@ -150,6 +151,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   errors: "Errors",
   secrets: "Secrets",
   settings: "Settings",
+  d1: "D1",
   invites: "Invite codes",
   admin: "Admin",
 };
@@ -211,6 +213,7 @@ export function Console() {
         return ["actions"];
       case "deploys":
       case "code":
+      case "d1":
         return [];
       case "logs":
         return ["logs"];
@@ -971,7 +974,7 @@ export function Console() {
                 )}
               </div>
               <div class="tabs tabs-box tabs-sm mb-3 w-full min-w-0 overflow-x-auto md:hidden" role="tablist" aria-label="Views">
-                {VIEWS.map((v) => (
+                {VIEWS.filter((v) => v.id !== "d1").map((v) => (
                   <button
                     key={v.id}
                     type="button"
@@ -1011,6 +1014,7 @@ export function Console() {
                   <ViewBody
                     route={r}
                     onView={(view) => navigate({ view })}
+                    onRoute={(next) => navigate(next)}
                     app={detailPanel.value}
                     metrics={metrics()}
                     actions={actions()}
@@ -1081,7 +1085,7 @@ export function Console() {
               </div>
               <ul class="menu w-full min-w-0 gap-0.5 p-0">
                 <li class="menu-title text-xs font-medium uppercase tracking-wider">App</li>
-                {VIEWS.map((v) => (
+                {VIEWS.filter((v) => v.id !== "d1").map((v) => (
                   <li key={v.id} class="min-w-0">
                     <button
                       type="button"
@@ -1100,7 +1104,13 @@ export function Console() {
                   </li>
                 ))}
                 <li class="menu-title text-xs font-medium uppercase tracking-wider">Data</li>
-                {(["D1", "R2", "Durable Objects"] as const).map((name) => (
+                <D1Nav
+                  active={r.view === "d1"}
+                  route={r}
+                  setRoute={(next) => navigate(next)}
+                  slug={active.slug}
+                />
+                {(["R2", "Durable Objects"] as const).map((name) => (
                   <li key={name} class="menu-disabled min-w-0" title="Coming later">
                     <span class="min-w-0">
                       <DatabaseIcon />
@@ -1162,6 +1172,8 @@ function ViewIcon({ id }: { id: ViewId }) {
       return <SecretsIcon />;
     case "settings":
       return <SettingsIcon />;
+    case "d1":
+      return <DatabaseIcon />;
     case "invites":
       return <TicketIcon />;
     case "admin":
@@ -1191,6 +1203,8 @@ function ViewBody(props: {
   onDeleted: () => void;
   /** Switch the current app's view (ViewBody is outside `navigate`'s scope). */
   onView: (view: ViewId) => void;
+  /** Patch the route (views with their own URL state, e.g. D1). */
+  onRoute: (next: Partial<Route>) => void;
 }) {
   switch (props.route.view) {
     case "overview":
@@ -1263,6 +1277,14 @@ function ViewBody(props: {
           onRefresh={props.onRefreshDetail}
           onRenamed={props.onRenamed}
           onDeleted={props.onDeleted}
+        />
+      );
+    case "d1":
+      return (
+        <D1View
+          route={props.route}
+          setRoute={props.onRoute}
+          slug={props.app.slug}
         />
       );
   }
