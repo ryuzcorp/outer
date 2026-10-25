@@ -573,9 +573,9 @@ export function R2View({ slug }: { slug: string }) {
           </span>
           <h3 class="m-0 text-base font-semibold">No R2 buckets yet</h3>
           <p class="m-0 max-w-md text-sm opacity-60">
-            Declare an `r2_buckets` binding in `void.config.ts` and deploy —
-            this browser lists, previews, uploads and deletes the objects
-            your app stores there.
+            Declare an <code>r2_buckets</code> binding in{" "}
+            <code>void.config.ts</code> and deploy. Then browse, preview,
+            upload and delete the files your app stores there.
           </p>
           <a class="btn btn-sm btn-neutral" href="/guides/storage">
             Read the storage guide
