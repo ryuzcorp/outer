@@ -41,21 +41,26 @@ bindings opts out:
 ```ts
 // src/pages/api/newsletter.ts
 import type { APIRoute } from "astro";
+import { env } from "cloudflare:workers";
 
 export const prerender = false;
 
-export const POST: APIRoute = async ({ locals, request }) => {
-  const { DB } = locals.runtime.env;
+export const POST: APIRoute = async () => {
+  const { DB } = env;
   const { results } = await DB.prepare("SELECT id FROM newsletter").all();
   return Response.json({ count: results.length });
 };
 ```
 
-`export const prerender = false` is the whole switch: without it,
-`locals.runtime` doesn't exist. Read bindings only through
-`Astro.locals.runtime.env` (raw D1/KV/R2 access — no `void/*` helpers, so
-nothing needs AsyncLocalStorage). Keep server routes few and small: one D1
-database, one R2 bucket per site.
+`export const prerender = false` is the whole switch: without it, the route
+renders once at build time, where bindings don't exist. Read bindings only
+through `import { env } from "cloudflare:workers"` — Astro 6 removed
+`Astro.locals.runtime.env`, which now throws at runtime. Keep server routes
+few and small: one D1 database, one R2 bucket per site.
+
+Pages build as files (`blog.html`, `blog/hello.html`) and links use the
+no-slash spelling (`/blog`, `/blog/hello`); the template sets
+`build.format: "file"` and `trailingSlash: "never"` for that.
 
 ## Database
 
