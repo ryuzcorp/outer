@@ -1,8 +1,10 @@
-//! The vendored Ilha + Void template (spec §16).
+//! The vendored starter templates (spec §16): the interactive `app` (Ilha +
+//! Void) and the content-site `website` (Astro + Ilha islands).
 //!
-//! `outer templates sync` pins the template repo at a sha into the store as a
-//! git bundle plus a `current.json` pointer; app creation [`materialize`]s
-//! that bundle into a fresh directory. No network is needed past the sync.
+//! `outer templates sync` pins each template repo at a sha into the store as
+//! a git bundle plus a per-template `current.json` pointer; app creation
+//! [`materialize`]s one bundle into a fresh directory. No network is needed
+//! past the sync.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -13,21 +15,90 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
 
-/// Where the template lives upstream.
+/// Where the app template lives upstream.
 pub const ILHA_VOID_URL: &str = "https://github.com/ryuzcorp/outer-template";
-/// The pinned commit `outer templates sync` vendors.
+/// The pinned commit `outer templates sync` vendors for the app template.
 pub const ILHA_VOID_SHA: &str = "32d413655a4f050485c14d04e9476325619f2b32";
+/// Where the website template lives upstream.
+pub const WEBSITE_URL: &str = "https://github.com/ryuzcorp/outer-template-website";
+/// The pinned commit `outer templates sync` vendors for the website
+/// template. Placeholder until the integrator pushes
+/// `outer-template-website` and pins its first commit here — one line to
+/// change, then `outer templates sync --template website` vendors it.
+pub const WEBSITE_SHA: &str = "7899d776017013fb77cae545286badd30c4cbd9e";
 
-/// Pointer to the vendored bundle in the store.
-const CURRENT_KEY: &str = "outer/templates/ilha-void/current.json";
+/// Which starter template an app is created from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Template {
+    /// Interactive Ilha + Void app (`outer-template`).
+    App,
+    /// Astro + Ilha-islands content site (`outer-template-website`).
+    Website,
+}
+
+impl Template {
+    /// Every template `outer templates sync` vendors.
+    pub const ALL: [Template; 2] = [Template::App, Template::Website];
+
+    /// The `create_app`/`--template` id.
+    pub fn id(self) -> &'static str {
+        match self {
+            Template::App => "app",
+            Template::Website => "website",
+        }
+    }
+
+    /// Parse a `create_app`/`--template` id, else `None`.
+    pub fn from_id(id: &str) -> Option<Template> {
+        match id {
+            "app" => Some(Template::App),
+            "website" => Some(Template::Website),
+            _ => None,
+        }
+    }
+
+    /// Where this template lives upstream.
+    pub fn url(self) -> &'static str {
+        match self {
+            Template::App => ILHA_VOID_URL,
+            Template::Website => WEBSITE_URL,
+        }
+    }
+
+    /// The pinned commit `outer templates sync` vendors for this template.
+    /// Each arm reads one const, so repinning is a one-line change.
+    pub fn sha(self) -> &'static str {
+        match self {
+            Template::App => ILHA_VOID_SHA,
+            Template::Website => WEBSITE_SHA,
+        }
+    }
+
+    /// The `Start from …` seed commit message for this template.
+    pub fn seed_message(self, sha: &str) -> String {
+        let short = &sha[..12.min(sha.len())];
+        match self {
+            Template::App => format!("Start from the Ilha + Void template ({short})"),
+            Template::Website => format!("Start from the Astro website template ({short})"),
+        }
+    }
+
+    /// Pointer to this template's vendored bundle in the store.
+    fn current_key(self) -> &'static str {
+        match self {
+            Template::App => "outer/templates/app/current.json",
+            Template::Website => "outer/templates/website/current.json",
+        }
+    }
+
+    /// Key of this template's vendored bundle in the store.
+    fn bundle_key(self, sha: &str) -> String {
+        format!("outer/templates/{}/{sha}.bundle", self.id())
+    }
+}
 
 /// Per-step git timeout: a full clone of the small template repo takes seconds.
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Key of a vendored template bundle in the store.
-fn bundle_key(sha: &str) -> String {
-    format!("outer/templates/ilha-void/{sha}.bundle")
-}
 
 /// What [`sync`] vendors and [`materialize`] reads back. On the wire the
 /// bundle key travels as `bundle` (see `current.json`).
@@ -71,9 +142,15 @@ async fn run_git(
 }
 
 /// Clone `url`, check out exactly `sha` (failing when it is missing), bundle
-/// that commit, and upload the bundle plus the `current.json` pointer.
-/// Re-running for the same sha overwrites the same keys: idempotent.
-pub async fn sync(store: &Store, url: &str, sha: &str) -> anyhow::Result<TemplateRef> {
+/// that commit, and upload the bundle plus `template`'s `current.json`
+/// pointer. Re-running for the same sha overwrites the same keys:
+/// idempotent.
+pub async fn sync(
+    store: &Store,
+    template: Template,
+    url: &str,
+    sha: &str,
+) -> anyhow::Result<TemplateRef> {
     // Full lowercase commit sha only: an abbreviated sha or branch name would
     // pass `cat-file` and be stored, but `materialize` checks out and compares
     // `rev-parse HEAD` (always full length), so every later create would fail.
@@ -126,17 +203,28 @@ pub async fn sync(store: &Store, url: &str, sha: &str) -> anyhow::Result<Templat
         &[],
     )
     .await?;
-    let key = bundle_key(sha);
+    let key = template.bundle_key(sha);
     store.put_file(&key, &bundle_path).await?;
-    let template = TemplateRef {
+    let reference = TemplateRef {
         sha: sha.to_string(),
         bundle_key: key,
         source: url.to_string(),
     };
     store
-        .put(CURRENT_KEY, serde_json::to_vec(&template)?)
+        .put(template.current_key(), serde_json::to_vec(&reference)?)
         .await?;
-    Ok(template)
+    Ok(reference)
+}
+
+/// Vendor every pinned template at its const sha: the `--template`-less
+/// `outer templates sync` path.
+pub async fn sync_pinned(store: &Store) -> anyhow::Result<Vec<(Template, TemplateRef)>> {
+    let mut out = Vec::with_capacity(Template::ALL.len());
+    for template in Template::ALL {
+        let reference = sync(store, template, template.url(), template.sha()).await?;
+        out.push((template, reference));
+    }
+    Ok(out)
 }
 
 /// Copy a directory tree to `dest`, skipping a top-level `.git`.
@@ -182,13 +270,21 @@ fn copy_tree_contents(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read the `current.json` pointer, download its bundle, clone it, and copy
-/// the tree (without `.git`) into `dest_dir`, creating it when missing.
-pub async fn materialize(store: &Store, dest_dir: &Path) -> anyhow::Result<TemplateRef> {
-    let bytes = store.get(CURRENT_KEY).await?.ok_or_else(|| {
+/// Read `template`'s `current.json` pointer, download its bundle, clone it,
+/// and copy the tree (without `.git`) into `dest_dir`, creating it when
+/// missing.
+pub async fn materialize(
+    store: &Store,
+    template: Template,
+    dest_dir: &Path,
+) -> anyhow::Result<TemplateRef> {
+    let current = template.current_key();
+    let bytes = store.get(current).await?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no vendored template in the store; run `outer templates sync` \
-             to vendor {ILHA_VOID_URL} first"
+            "no vendored {} template in the store; run `outer templates sync` \
+             to vendor {} first",
+            template.id(),
+            template.url(),
         )
     })?;
     let template: TemplateRef = serde_json::from_slice(&bytes)?;
@@ -242,20 +338,21 @@ pub async fn materialize(store: &Store, dest_dir: &Path) -> anyhow::Result<Templ
 #[cfg(test)]
 pub(crate) async fn put_test_template(
     store: &Store,
+    template: Template,
     sha: &str,
     bundle: &Path,
 ) -> anyhow::Result<TemplateRef> {
-    let key = bundle_key(sha);
+    let key = template.bundle_key(sha);
     store.put_file(&key, bundle).await?;
-    let template = TemplateRef {
+    let reference = TemplateRef {
         sha: sha.to_string(),
         bundle_key: key,
         source: "test".to_string(),
     };
     store
-        .put(CURRENT_KEY, serde_json::to_vec(&template)?)
+        .put(template.current_key(), serde_json::to_vec(&reference)?)
         .await?;
-    Ok(template)
+    Ok(reference)
 }
 /// `dest_dir` joined with `rel`, for tests.
 #[cfg(test)]
@@ -308,23 +405,29 @@ mod tests {
     async fn sync_then_materialize_round_trips() {
         let (_repo, url, sha) = make_source_repo().await;
         let store = Store::memory();
-        let first = sync(&store, &url, &sha).await.unwrap();
+        let first = sync(&store, Template::App, &url, &sha).await.unwrap();
         assert_eq!(first.sha, sha);
         assert_eq!(
             first.bundle_key,
-            format!("outer/templates/ilha-void/{sha}.bundle")
+            format!("outer/templates/app/{sha}.bundle")
         );
         assert_eq!(first.source, url);
         assert!(store.get(&first.bundle_key).await.unwrap().is_some());
-        let pointer: serde_json::Value =
-            serde_json::from_slice(&store.get(CURRENT_KEY).await.unwrap().unwrap()).unwrap();
+        let pointer: serde_json::Value = serde_json::from_slice(
+            &store
+                .get(Template::App.current_key())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(pointer["sha"], serde_json::Value::String(sha.clone()));
         // Idempotent: a second sync vendors the same pointer.
-        let second = sync(&store, &url, &sha).await.unwrap();
+        let second = sync(&store, Template::App, &url, &sha).await.unwrap();
         assert_eq!(first, second);
         let dest = tempfile::tempdir().unwrap();
         let out = dest.path().join("app");
-        let back = materialize(&store, &out).await.unwrap();
+        let back = materialize(&store, Template::App, &out).await.unwrap();
         assert_eq!(back, first);
         assert_eq!(
             std::fs::read_to_string(dest_path(&out, "README.md")).unwrap(),
@@ -338,10 +441,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_templates_sync_and_materialize_independently() {
+        let (_repo, url, sha) = make_source_repo().await;
+        let store = Store::memory();
+        for template in Template::ALL {
+            sync(&store, template, &url, &sha).await.unwrap();
+        }
+        assert_ne!(
+            Template::App.current_key(),
+            Template::Website.current_key(),
+            "each template owns its pointer"
+        );
+        for template in Template::ALL {
+            let dest = tempfile::tempdir().unwrap();
+            let back = materialize(&store, template, dest.path()).await.unwrap();
+            assert_eq!(back.sha, sha);
+            assert_eq!(
+                std::fs::read_to_string(dest_path(dest.path(), "README.md")).unwrap(),
+                "# ilha-void\n"
+            );
+        }
+        // Syncing one template again leaves the other's pointer alone.
+        sync(&store, Template::Website, &url, &sha).await.unwrap();
+        let back = materialize(&store, Template::App, tempfile::tempdir().unwrap().path())
+            .await
+            .unwrap();
+        assert_eq!(back.sha, sha);
+    }
+
+    #[tokio::test]
+    async fn template_ids_round_trip() {
+        assert_eq!(Template::from_id("app"), Some(Template::App));
+        assert_eq!(Template::from_id("website"), Some(Template::Website));
+        assert_eq!(Template::from_id("blog"), None);
+        assert_eq!(Template::from_id(""), None);
+    }
+
+    #[tokio::test]
     async fn sync_refuses_a_missing_sha() {
         let (_repo, url, _sha) = make_source_repo().await;
         let store = Store::memory();
-        let err = sync(&store, &url, &"0".repeat(40)).await.unwrap_err();
+        let err = sync(&store, Template::Website, &url, &"0".repeat(40))
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("not found"),
             "unexpected error: {err:#}"
@@ -352,10 +494,17 @@ mod tests {
     async fn materialize_without_a_sync_names_the_command() {
         let store = Store::memory();
         let dest = tempfile::tempdir().unwrap();
-        let err = materialize(&store, dest.path()).await.unwrap_err();
+        let err = materialize(&store, Template::Website, dest.path())
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
         assert!(
-            err.to_string().contains("outer templates sync"),
-            "operator-facing error must name the fix, got: {err:#}"
+            message.contains("outer templates sync"),
+            "operator-facing error must name the fix, got: {message}"
+        );
+        assert!(
+            message.contains("website"),
+            "the error names the missing template, got: {message}"
         );
     }
 
@@ -370,7 +519,7 @@ mod tests {
             "main".to_string(),
             "HEAD".to_string(),
         ] {
-            let err = sync(&store, &url, &bad).await.unwrap_err();
+            let err = sync(&store, Template::App, &url, &bad).await.unwrap_err();
             assert!(
                 err.to_string()
                     .contains("full 40-character lowercase commit sha"),
@@ -378,7 +527,11 @@ mod tests {
             );
         }
         assert!(
-            store.get(CURRENT_KEY).await.unwrap().is_none(),
+            store
+                .get(Template::App.current_key())
+                .await
+                .unwrap()
+                .is_none(),
             "a refused sync stores no pointer"
         );
     }

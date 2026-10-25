@@ -5,8 +5,8 @@ export default defineMeta({
   title: "Guides",
   pages: [
     "quickstart",
+    "templates",
     "d1",
-    "storage",
     "kv",
     "auth",
     "cron",
@@ -19,6 +19,7 @@ export default defineMeta({
     "custom-domains",
     "ilha",
     "void",
+    "website",
     "celld",
     "moderation",
     "limits",

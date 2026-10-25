@@ -27,7 +27,10 @@ Paste a scoped first prompt — one screen, no login, no database yet:
 Your agent calls `create_app` with a slug you pick — pass your own, since
 taken slugs are rejected and deleted names stay reserved for 30 days. A live
 Ilha + Void app serves at the returned `https://<your-slug>.outer.now` in
-seconds. Unlisted by default: not indexed, reachable by link.
+seconds. Unlisted by default: not indexed, reachable by link. Building a
+landing page, portfolio, or blog instead? Say so in the prompt — the agent
+passes `template: "website"` for the content-site starter. See
+[Templates](/guides/templates).
 
 ## 3. Make one change
 
