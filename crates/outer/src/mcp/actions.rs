@@ -359,6 +359,7 @@ pub async fn record(
 /// own session cookie — so [`list`] labels the row's client "Console".
 /// `delete_app` has no row: its app row cascades, taking the entry with it
 /// (the MCP tool is unlogged for the same reason).
+#[allow(clippy::too_many_arguments)]
 pub async fn record_console(
     pool: &SqlitePool,
     app_id: &str,
@@ -367,12 +368,13 @@ pub async fn record_console(
     summary: &str,
     outcome: &str,
     error_code: Option<&str>,
+    duration_ms: i64,
 ) {
     let summary = truncate(summary, MAX_SUMMARY_CHARS);
     if let Err(err) = sqlx::query(
         "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
          tool, summary, outcome, error_code, duration_ms, created_at) \
-         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, 0, ?8)",
+         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(app_id)
@@ -381,6 +383,7 @@ pub async fn record_console(
     .bind(&summary)
     .bind(outcome)
     .bind(error_code)
+    .bind(duration_ms)
     .bind(now_ms())
     .execute(pool)
     .await
