@@ -625,8 +625,31 @@ pub async fn run_deploy(
     let git = state.git.clone();
     let app_owned = app.clone();
     let sha_owned = sha.to_string();
+    let sender = state.auth.config.email.clone();
+    let issuer = state.auth.config.issuer.clone();
+    let unsub_key = state.unsub_key.clone();
     let handle = tokio::spawn(async move {
         let outcome = deploys.deploy(&pool, &git, &app_owned, &sha_owned).await;
+        // Email the app owner on failure (alerts #2): the spawned task
+        // always runs to a terminal row, so this fires for background
+        // deploys too. Never raises: a dead mailer must not fail deploys.
+        if let Ok(done) = &outcome {
+            if done.status == "failed" {
+                crate::alerts::notify_deploy_failed(
+                    &crate::alerts::Ctx {
+                        pool: &pool,
+                        sender: &sender,
+                        issuer: &issuer,
+                        key: &unsub_key,
+                    },
+                    &app_owned,
+                    done.failed_step.as_deref(),
+                    done.error.as_deref(),
+                    crate::auth::now_ms(),
+                )
+                .await;
+            }
+        }
         (app_owned, outcome)
     });
     if !wait {

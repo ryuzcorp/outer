@@ -146,7 +146,7 @@ impl EmailSender {
             "Your Outer sign-in code is {code}. It expires in 10 minutes.\n\nIf you didn't ask for this, ignore this email."
         );
         match self {
-            Self::Cloudflare { .. } => self.post(to, &subject, &text).await,
+            Self::Cloudflare { .. } => self.post(to, &subject, &text, &[]).await,
             Self::Log => {
                 tracing::info!(email = %to, code = %code, "sign-in code (localhost log sender)");
                 Ok(())
@@ -165,26 +165,50 @@ impl EmailSender {
     /// Send one free-form message (collaborator invites). Same transport,
     /// same failure contract as [`send_code`].
     pub async fn send_text(&self, to: &str, subject: &str, text: &str) -> Result<(), EmailError> {
+        self.send_text_with_headers(to, subject, text, &[]).await
+    }
+
+    /// [`send_text`] plus extra RFC headers. The Cloudflare Email Sending
+    /// REST API accepts them as a `headers` object (used for
+    /// `List-Unsubscribe` / `List-Unsubscribe-Post` on alert emails); the
+    /// test capture and localhost log senders record them in the stored
+    /// text.
+    pub async fn send_text_with_headers(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        headers: &[(&str, String)],
+    ) -> Result<(), EmailError> {
         match self {
-            Self::Cloudflare { .. } => self.post(to, subject, text).await,
+            Self::Cloudflare { .. } => self.post(to, subject, text, headers).await,
             Self::Log => {
                 tracing::info!(email = %to, subject = %subject, "outbound email (localhost log sender)");
                 Ok(())
             }
             #[cfg(test)]
             Self::Capture { codes } => {
-                codes
-                    .lock()
-                    .unwrap()
-                    .insert(to.to_string(), format!("{subject}\n\n{text}"));
+                let mut stored = format!("{subject}\n\n{text}");
+                for (name, value) in headers {
+                    stored.push_str(&format!("\n{name}: {value}"));
+                }
+                codes.lock().unwrap().insert(to.to_string(), stored);
                 Ok(())
             }
         }
     }
 
     /// The Cloudflare Email Sending POST behind [`send_code`] and
-    /// [`send_text`].
-    async fn post(&self, to: &str, subject: &str, text: &str) -> Result<(), EmailError> {
+    /// [`send_text`]. Extra headers travel as the `headers` object the
+    /// REST API documents for list management (`List-Unsubscribe`,
+    /// `List-Unsubscribe-Post`); the object is omitted when empty.
+    async fn post(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        headers: &[(&str, String)],
+    ) -> Result<(), EmailError> {
         let Self::Cloudflare {
             client,
             api_base,
@@ -196,15 +220,23 @@ impl EmailSender {
             unreachable!("post is only called on the Cloudflare sender");
         };
         let url = format!("{api_base}/client/v4/accounts/{account_id}/email/sending/send");
+        let mut payload = serde_json::json!({
+            "to": to,
+            "from": { "address": from.address, "name": from.name },
+            "subject": subject,
+            "text": text,
+        });
+        if !headers.is_empty() {
+            payload["headers"] = headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), serde_json::Value::String(value.clone())))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+        }
         let response = client
             .post(&url)
             .bearer_auth(api_token)
-            .json(&serde_json::json!({
-                "to": to,
-                "from": { "address": from.address, "name": from.name },
-                "subject": subject,
-                "text": text,
-            }))
+            .json(&payload)
             .send()
             .await
             .map_err(|err| EmailError::Retryable(scrubbed(&err.to_string())))?;
