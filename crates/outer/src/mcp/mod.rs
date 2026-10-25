@@ -437,6 +437,7 @@ impl McpState {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(30),
             wake_concurrency: 4,
+            always_on_max: 10,
         });
         Self {
             pool,

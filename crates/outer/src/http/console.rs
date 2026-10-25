@@ -25,6 +25,8 @@
 //!   server — they are injected as Worker env vars at deploy time).
 //! - `POST /api/console/apps/:slug/visibility {visibility}`: the MCP
 //!   `set_visibility` path, including the shared Pro gate.
+//! - `POST /api/console/apps/:slug/always-on {on}`: the MCP `set_always_on`
+//!   path (Pro keep-warm), including the shared Pro gate.
 //! - `POST /api/console/apps/:slug/delete {confirm}`: the MCP `delete_app`
 //!   path; `confirm` must equal the slug.
 //! - `PUT /api/console/apps/:slug/secrets/:name {value}` and
@@ -493,6 +495,7 @@ async fn api_apps(State(state): State<super::AppState>, headers: HeaderMap) -> R
                 crate::collaborators::Role::Collaborator => "collaborator",
             },
             "visibility": app.visibility.as_str(),
+            "always_on": app.always_on,
             "status": status,
             "last_request_at": app.last_request_at,
         });
@@ -612,6 +615,7 @@ async fn api_app(
                 crate::collaborators::Role::Collaborator => "collaborator",
             },
             "visibility": app.visibility.as_str(),
+            "always_on": app.always_on,
             "status": status,
             "last_request_at": app.last_request_at,
             "deploys": deploys,
@@ -3040,6 +3044,74 @@ mod tests {
             listed.iter().all(|row| row.client_label == "Console"),
             "{listed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn console_always_on_pro_gate() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let session = login(&pool, "ana@example.com").await;
+        let path = "/api/console/apps/groceries/always-on";
+
+        // Free owner: `on` is refused with the MCP code and a user
+        // message pointing to Pro.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &session, serde_json::json!({"on": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["error"], "payment_required");
+        assert!(
+            body["user_message"].as_str().unwrap().contains("Pro"),
+            "{body}"
+        );
+
+        // `off` is always allowed, on any plan.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &session, serde_json::json!({"on": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["always_on"],
+            false
+        );
+
+        // Pro owner: `on` flips the row.
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE id = 'acct-ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &session, serde_json::json!({"on": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["always_on"],
+            true
+        );
+        let flag: i64 = sqlx::query_scalar("SELECT always_on FROM app WHERE slug = 'groceries'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(flag, 1);
+
+        // Every attempt audited under the MCP tool name.
+        let rows = action_rows(&pool).await;
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows.iter().all(|(tool, _, _)| tool == "set_always_on"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|(_, outcome, _)| outcome == "ok"));
+        assert!(rows.iter().any(|(_, outcome, code)| outcome == "error"
+            && *code == Some("payment_required".to_string())));
     }
 
     #[tokio::test]

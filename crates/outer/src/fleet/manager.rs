@@ -5,7 +5,7 @@
 //! fleets whose app has gone quiet, and the proxy records activity through
 //! `crate::apps::touch_request`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +46,11 @@ pub struct ManagerSettings {
     pub wake_timeout: Duration,
     /// How many fleets may start at once.
     pub wake_concurrency: usize,
+    /// At most this many Pro always-on fleets stay awake at once (from
+    /// `OUTER_ALWAYS_ON_MAX`). Past the cap the oldest-idle flagged apps
+    /// may still sleep, and the warm-up stops waking. 0 disables the
+    /// keep-warm protection entirely.
+    pub always_on_max: usize,
 }
 
 /// Bucket and credentials a fleet pulls its deploys from. The credentials
@@ -83,6 +88,7 @@ struct Inner {
     sleep_after: Duration,
     credential_refresh_after: Duration,
     wake_timeout: Duration,
+    always_on_max: usize,
     wake_permits: tokio::sync::Semaphore,
     fleets: tokio::sync::Mutex<HashMap<String /* slug */, LiveFleet>>,
     wakes: tokio::sync::Mutex<HashMap<String /* slug */, Arc<tokio::sync::Mutex<()>>>>,
@@ -147,6 +153,7 @@ impl FleetManager {
             sleep_after: settings.sleep_after,
             credential_refresh_after: settings.credential_refresh_after,
             wake_timeout: settings.wake_timeout,
+            always_on_max: settings.always_on_max,
             wake_permits: tokio::sync::Semaphore::new(settings.wake_concurrency.max(1)),
             fleets: tokio::sync::Mutex::new(HashMap::new()),
             wakes: tokio::sync::Mutex::new(HashMap::new()),
@@ -457,9 +464,141 @@ impl FleetManager {
     /// read fresh from the DB per fleet. The sleep check comes first:
     /// refresh applies only to fleets that are not being put to sleep this
     /// tick.
+    /// Slugs the sleep sweep must skip this tick: flagged always-on apps
+    /// whose owner is still Pro, minus the oldest-idle excess past
+    /// `always_on_max` ([`over_cap_victims`]). A downgraded (Free) owner
+    /// keeps the flag stored but unprotected, so the sweep treats the app
+    /// as ordinary. Read without locks — the per-slug loop re-checks the
+    /// row under its wake lock — so a flag flipped mid-tick converges on
+    /// the next tick at worst.
+    async fn keep_warm_exempt(&self, pool: &SqlitePool) -> anyhow::Result<HashSet<String>> {
+        let max = self.inner.always_on_max;
+        if max == 0 {
+            return Ok(HashSet::new());
+        }
+        let slugs: Vec<String> = self.inner.fleets.lock().await.keys().cloned().collect();
+        let mut idle: Vec<(String, i64)> = Vec::new();
+        for slug in slugs {
+            let Some(app) = apps::get_by_slug(pool, &slug).await? else {
+                continue;
+            };
+            if !app.always_on {
+                continue;
+            }
+            if crate::apps::always_on::owner_plan(pool, &app.owner_id).await? != "pro" {
+                continue;
+            }
+            // Dead fleets leave the map through the sweep's own path; only
+            // live ones count toward the cap.
+            if !Self::alive(&self.inner.fleets, &slug).await {
+                continue;
+            }
+            let newest = app
+                .last_request_at
+                .unwrap_or(app.created_at)
+                .max(app.created_at);
+            idle.push((slug, newest));
+        }
+        let victims: HashSet<String> = over_cap_victims(idle.clone(), max).into_iter().collect();
+        Ok(idle
+            .into_iter()
+            .map(|(slug, _)| slug)
+            .filter(|slug| !victims.contains(slug))
+            .collect())
+    }
+
+    /// How many Pro always-on fleets are awake (tracked and live) right
+    /// now. The warm-up stops waking at `always_on_max`.
+    async fn always_on_awake(&self, pool: &SqlitePool) -> anyhow::Result<usize> {
+        let slugs: Vec<String> = self.inner.fleets.lock().await.keys().cloned().collect();
+        let mut awake = 0;
+        for slug in slugs {
+            if !Self::alive(&self.inner.fleets, &slug).await {
+                continue;
+            }
+            let Some(app) = apps::get_by_slug(pool, &slug).await? else {
+                continue;
+            };
+            if !app.always_on {
+                continue;
+            }
+            if crate::apps::always_on::owner_plan(pool, &app.owner_id).await? != "pro" {
+                continue;
+            }
+            awake += 1;
+        }
+        Ok(awake)
+    }
+
+    /// Wake stopped always-on apps (Pro owner, `desired_state` running,
+    /// moderation ok, neither paused nor expired, deployed at least once):
+    /// after a restart or crash nothing is tracked, and without this they
+    /// would sit asleep until a request. Most-recently-active first, stopping
+    /// at `always_on_max` awake, and bounded across slugs by the wake
+    /// semaphore inside [`Self::ensure_awake`]. Failures warn and the next
+    /// tick retries. Apps that never deployed are skipped: there is nothing
+    /// to serve yet, and waking them would fail the health gate every tick.
+    pub async fn warm_always_on(&self, pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
+        let max = self.inner.always_on_max;
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        // Eligibility mirrors cron's `due` filters: only apps that would
+        // otherwise serve requests.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT a.id AS id, a.slug AS slug FROM app AS a JOIN user AS u ON u.id = a.owner_id \
+             WHERE a.always_on = 1 AND u.plan = 'pro' \
+               AND a.desired_state = 'running' AND a.moderation_state = 'ok' \
+               AND a.paused_reason IS NULL AND a.expired_at IS NULL \
+               AND a.last_deploy_sha IS NOT NULL \
+             ORDER BY COALESCE(a.last_request_at, a.created_at) DESC",
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut awake = self.always_on_awake(pool).await?;
+        let mut woken = Vec::new();
+        for (id, slug) in rows {
+            if Self::alive(&self.inner.fleets, &slug).await {
+                continue;
+            }
+            if awake >= max {
+                break;
+            }
+            let Some(app) = apps::get_by_id(pool, &id).await? else {
+                continue;
+            };
+            if self.wake_in_progress(&slug) {
+                continue;
+            }
+            match self.ensure_awake(pool, &app).await {
+                Ok(()) => {
+                    awake += 1;
+                    woken.push(slug);
+                }
+                Err(err) => tracing::warn!(
+                    slug = %slug,
+                    error = %format!("{err:#}"),
+                    "keep-warm wake failed; next tick retries"
+                ),
+            }
+        }
+        Ok(woken)
+    }
+
+    /// Stop every fleet whose app has been quieter than `sleep_after`, drop
+    /// dead fleets from the map, restart the fleet before ITS credentials
+    /// expire (credential age, not process uptime) with freshly minted
+    /// credentials, and return the slugs put to sleep. Always-on Pro apps
+    /// are exempt up to `always_on_max` (oldest-idle sleep past the cap).
+    /// The app's activity is read fresh from the DB per fleet. The sleep
+    /// check comes first: refresh applies only to fleets that are not
+    /// being put to sleep this tick.
     pub async fn sleep_idle(&self, pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
         let now = apps::now_ms();
         let slugs: Vec<String> = self.inner.fleets.lock().await.keys().cloned().collect();
+        // Keep-warm skips, computed once per tick (the loop re-checks the
+        // row under each slug's wake lock).
+        let exempt = self.keep_warm_exempt(pool).await?;
         let mut slept = Vec::new();
         for slug in slugs {
             // A wake holds this slug's wake lock from its first liveness
@@ -500,13 +639,18 @@ impl FleetManager {
                 fleets.remove(&slug);
                 continue;
             }
-            if should_sleep(
-                app.last_request_at,
-                app.created_at,
-                now,
-                live.started.elapsed(),
-                self.inner.sleep_after,
-            ) {
+            // Always-on Pro apps (up to the cap) skip the sleep below and
+            // fall through to the credential refresh: their flag only buys
+            // freedom from idleness, not from expiring credentials.
+            if !exempt.contains(&slug)
+                && should_sleep(
+                    app.last_request_at,
+                    app.created_at,
+                    now,
+                    live.started.elapsed(),
+                    self.inner.sleep_after,
+                )
+            {
                 let Some(live) = fleets.remove(&slug) else {
                     continue;
                 };
@@ -583,6 +727,19 @@ impl FleetManager {
                 interval.tick().await;
                 if let Err(err) = this.sleep_idle(&pool).await {
                     tracing::warn!(error = %err, "sleep sweep failed");
+                }
+                // Keep-warm: restart stopped always-on fleets (after a
+                // process restart or crash nothing is tracked). The
+                // interval's first tick fires at once, so a rebooted host
+                // warms its Pro apps on boot, then every tick after.
+                match this.warm_always_on(&pool).await {
+                    Ok(woken) if !woken.is_empty() => {
+                        tracing::info!(slugs = ?woken, "keep-warm wake complete");
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %format!("{err:#}"), "keep-warm wake failed");
+                    }
+                    Ok(_) => {}
                 }
                 // Batched and off the hot path: every tracked fleet's new
                 // ring lines persist to `app_log` and group into
@@ -691,6 +848,19 @@ pub fn should_sleep(
     now_ms.saturating_sub(activity) as i128 > sleep_after.as_millis() as i128
 }
 
+/// The excess past `max` keep-warm fleets that may still sleep: the
+/// oldest-idle first. `idle` is `(slug, newest_activity_ms)`; the sort
+/// breaks activity ties by slug so the victims are deterministic. Pure
+/// for tests; the sweep feeds it the live protected set.
+pub fn over_cap_victims(mut idle: Vec<(String, i64)>, max: usize) -> Vec<String> {
+    idle.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let victims = idle.len().saturating_sub(max);
+    idle.into_iter()
+        .take(victims)
+        .map(|(slug, _)| slug)
+        .collect()
+}
+
 /// Whether the fleet should restart with freshly minted credentials: its
 /// credentials' age has reached `refresh_after` (TTL minus a day in
 /// production, so the restart lands before they expire). Unlike
@@ -776,6 +946,7 @@ mod tests {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
+            always_on_max: 10,
         });
         assert!(!manager.wake_in_progress("ghost"));
         // Peeking must not create a map entry either.
@@ -854,6 +1025,7 @@ mod tests {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
+            always_on_max: 10,
         });
         let app = apps::get_by_slug(&pool, "wake").await.unwrap().unwrap();
         manager.ensure_awake(&pool, &app).await.unwrap();
@@ -999,10 +1171,422 @@ mod tests {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(60),
             wake_concurrency: 2,
+            always_on_max: 10,
         });
         let app = apps::get_by_slug(&pool, "real").await.unwrap().unwrap();
         manager.ensure_awake(&pool, &app).await.unwrap();
         assert!(manager.logs("real").is_some());
         manager.stop_all().await;
+    }
+
+    /// Keep-warm rig: a fake celld (a script that sleeps) plus a fake
+    /// healthy port, so `ensure_awake` tracks a live fleet with no real
+    /// celld and no network.
+    struct WarmRig {
+        _dir: tempfile::TempDir,
+        pool: SqlitePool,
+        manager: FleetManager,
+        listeners: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl WarmRig {
+        async fn new(always_on_max: usize) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+                .await
+                .unwrap();
+            // A fleet binary that stays alive and ignores its argv: the
+            // health gate is answered by the fake listener below.
+            let celld = dir.path().join("celld");
+            std::fs::write(&celld, "#!/bin/sh\nexec sleep 120\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&celld, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let manager = FleetManager::new(ManagerSettings {
+                data_dir: dir.path().to_path_buf(),
+                celld_bin: celld.to_string_lossy().into_owned(),
+                storage: FleetStorage {
+                    endpoint: "https://example.com".to_string(),
+                    region: "auto".to_string(),
+                    bucket: "outer-dev".to_string(),
+                    credentials: crate::store::credentials::CredentialSource::Static {
+                        access_key_id: "key".to_string(),
+                        secret_access_key: "secret".to_string(),
+                    },
+                },
+                cgroups: None,
+                memory_max_bytes: 0,
+                cpu_max: "50000 100000".to_string(),
+                // Zero: every stale app is sleepable, so an awake fleet at
+                // the end of the test proves the keep-warm skip, not the
+                // uptime guard.
+                sleep_after: Duration::ZERO,
+                credential_refresh_after: Duration::from_secs(6 * 86400),
+                wake_timeout: Duration::from_secs(10),
+                wake_concurrency: 4,
+                always_on_max,
+            });
+            Self {
+                _dir: dir,
+                pool,
+                manager,
+                listeners: Vec::new(),
+            }
+        }
+
+        /// A listener that answers 200 to anything: the manager's health
+        /// gate treats the port as a healthy fleet. Used for warm-up tests,
+        /// where adoption (no spawn) is exactly the path under test.
+        async fn healthy_port(&mut self) -> u16 {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            self.listeners.push(tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                    });
+                }
+            }));
+            port
+        }
+
+        /// An unused port number, for seeding an app whose health gate the
+        /// test answers itself (see `wake_then_idle`).
+        async fn free_port() -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        }
+
+        async fn seed_user(&self, id: &str, email: &str, plan: &str) {
+            sqlx::query(
+                "INSERT INTO user (id, email, plan, lastActiveAt, createdAt, updatedAt) \
+                 VALUES (?1, ?2, ?3, 0, 0, 0)",
+            )
+            .bind(id)
+            .bind(email)
+            .bind(plan)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn seed_app(
+            &self,
+            id: &str,
+            slug: &str,
+            owner: &str,
+            uid: i64,
+            port: i64,
+            always_on: bool,
+            last_request_at: Option<i64>,
+            deploy: Option<&str>,
+            asleep: Option<i64>,
+        ) {
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, visibility, \
+                 always_on, last_request_at, last_deploy_sha, asleep_since, \
+                 last_activity_at, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'unlisted', ?6, ?7, ?8, ?9, 0, 0)",
+            )
+            .bind(id)
+            .bind(slug)
+            .bind(owner)
+            .bind(uid)
+            .bind(port)
+            .bind(i64::from(always_on))
+            .bind(last_request_at)
+            .bind(deploy)
+            .bind(asleep)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// Start and health-gate the app's fleet, then backdate its
+        /// activity so the sweep sees it as idle. The port answers 503
+        /// until the wake is in flight: the zero-timeout probe can never
+        /// mistake it for an already-healthy fleet, so `ensure_awake`
+        /// always spawns (and tracks) the fake celld.
+        async fn wake_then_idle(&self, slug: &str, last_request_at: i64) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let port: i64 = sqlx::query_scalar("SELECT port FROM app WHERE slug = ?1")
+                .bind(slug)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port as u16))
+                .await
+                .unwrap();
+            let ready = Arc::new(AtomicBool::new(false));
+            let gate = ready.clone();
+            let serving = tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let gate = gate.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let body = if gate.load(Ordering::SeqCst) {
+                            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                                [..]
+                        } else {
+                            &b"HTTP/1.1 503 Busy\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbusy!"[..]
+                        };
+                        let _ = sock.write_all(body).await;
+                    });
+                }
+            });
+            let app = apps::get_by_slug(&self.pool, slug).await.unwrap().unwrap();
+            let manager = self.manager.clone();
+            let pool = self.pool.clone();
+            let wake = tokio::spawn(async move { manager.ensure_awake(&pool, &app).await });
+            // Let the spawn land (the fake celld starts instantly), then
+            // answer the health gate.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            ready.store(true, Ordering::SeqCst);
+            wake.await.unwrap().unwrap();
+            serving.abort();
+            sqlx::query("UPDATE app SET last_request_at = ?1 WHERE slug = ?2")
+                .bind(last_request_at)
+                .bind(slug)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn over_cap_victims_picks_the_oldest_idle() {
+        let s = |slug: &str, at: i64| (slug.to_string(), at);
+        assert!(over_cap_victims(vec![], 2).is_empty());
+        assert!(over_cap_victims(vec![s("b", 5), s("a", 3)], 2).is_empty());
+        assert_eq!(over_cap_victims(vec![s("b", 5), s("a", 3)], 1), vec!["a"]);
+        // Activity ties break by slug, so the victims are deterministic.
+        assert_eq!(over_cap_victims(vec![s("b", 5), s("a", 5)], 1), vec!["a"]);
+        assert_eq!(
+            over_cap_victims(vec![s("a", 1), s("b", 2), s("c", 3)], 1),
+            vec!["a", "b"]
+        );
+        // Zero disables the protection: everything may sleep.
+        assert_eq!(over_cap_victims(vec![s("a", 1)], 0), vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn sleep_sweep_skips_protected_always_on() {
+        let rig = WarmRig::new(10).await;
+        rig.seed_user("a1", "a@example.com", "pro").await;
+        let port = WarmRig::free_port().await as i64;
+        rig.seed_app(
+            "app1",
+            "warm",
+            "a1",
+            220101,
+            port,
+            true,
+            None,
+            Some("sha"),
+            None,
+        )
+        .await;
+        rig.wake_then_idle("warm", 0).await;
+        let slept = rig.manager.sleep_idle(&rig.pool).await.unwrap();
+        assert!(slept.is_empty(), "protected fleet sleeps: {slept:?}");
+        assert!(rig.manager.logs("warm").is_some());
+        let asleep: Option<i64> =
+            sqlx::query_scalar("SELECT asleep_since FROM app WHERE slug = 'warm'")
+                .fetch_one(&rig.pool)
+                .await
+                .unwrap();
+        assert!(asleep.is_none());
+        rig.manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn sleep_sweep_sleeps_free_always_on() {
+        let rig = WarmRig::new(10).await;
+        rig.seed_user("a1", "a@example.com", "free").await;
+        let port = WarmRig::free_port().await as i64;
+        rig.seed_app(
+            "app1",
+            "cold",
+            "a1",
+            220101,
+            port,
+            true,
+            None,
+            Some("sha"),
+            None,
+        )
+        .await;
+        // The sweep ignores the flag on Free: the fleet sleeps normally.
+        rig.wake_then_idle("cold", 0).await;
+        let slept = rig.manager.sleep_idle(&rig.pool).await.unwrap();
+        assert_eq!(slept, vec!["cold"]);
+        assert!(rig.manager.logs("cold").is_none());
+        let asleep: Option<i64> =
+            sqlx::query_scalar("SELECT asleep_since FROM app WHERE slug = 'cold'")
+                .fetch_one(&rig.pool)
+                .await
+                .unwrap();
+        assert!(asleep.is_some());
+        rig.manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn sleep_sweep_cap_sleeps_the_oldest_idle() {
+        let rig = WarmRig::new(1).await;
+        rig.seed_user("a1", "a@example.com", "pro").await;
+        let old_port = WarmRig::free_port().await as i64;
+        let new_port = WarmRig::free_port().await as i64;
+        rig.seed_app(
+            "app1",
+            "old",
+            "a1",
+            220101,
+            old_port,
+            true,
+            None,
+            Some("sha"),
+            None,
+        )
+        .await;
+        rig.seed_app(
+            "app2",
+            "new",
+            "a1",
+            220102,
+            new_port,
+            true,
+            None,
+            Some("sha"),
+            None,
+        )
+        .await;
+        rig.wake_then_idle("old", 0).await;
+        // Stale too (so it would sleep unprotected), but newer than `old`.
+        rig.wake_then_idle("new", 1_000).await;
+        let slept = rig.manager.sleep_idle(&rig.pool).await.unwrap();
+        assert_eq!(slept, vec!["old"], "cap victim is the oldest idle");
+        assert!(rig.manager.logs("new").is_some());
+        assert!(rig.manager.logs("old").is_none());
+        rig.manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn warm_always_on_restarts_stopped_pro_fleets() {
+        let mut rig = WarmRig::new(10).await;
+        rig.seed_user("a1", "a@example.com", "pro").await;
+        rig.seed_user("b1", "b@example.com", "free").await;
+        let warm_port = rig.healthy_port().await as i64;
+        let cold_port = rig.healthy_port().await as i64;
+        let now = apps::now_ms();
+        rig.seed_app(
+            "app1",
+            "warm",
+            "a1",
+            220101,
+            warm_port,
+            true,
+            Some(now),
+            Some("sha"),
+            Some(now),
+        )
+        .await;
+        // Free flag is stored but never warmed.
+        rig.seed_app(
+            "app2",
+            "cold",
+            "b1",
+            220102,
+            cold_port,
+            true,
+            Some(now),
+            Some("sha"),
+            Some(now),
+        )
+        .await;
+        let woken = rig.manager.warm_always_on(&rig.pool).await.unwrap();
+        assert_eq!(woken, vec!["warm"]);
+        for slug in ["warm", "cold"] {
+            let asleep: Option<i64> =
+                sqlx::query_scalar("SELECT asleep_since FROM app WHERE slug = ?1")
+                    .bind(slug)
+                    .fetch_one(&rig.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(asleep.is_none(), slug == "warm", "{slug}");
+        }
+        rig.manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn warm_skips_undeployed_apps_and_stops_at_the_cap() {
+        let mut rig = WarmRig::new(1).await;
+        rig.seed_user("a1", "a@example.com", "pro").await;
+        let p1 = rig.healthy_port().await as i64;
+        let p2 = rig.healthy_port().await as i64;
+        let p3 = rig.healthy_port().await as i64;
+        let now = apps::now_ms();
+        // Never deployed: nothing to serve yet, so no wake (and no
+        // per-minute health-gate failure loop).
+        rig.seed_app(
+            "app1",
+            "nodeploy",
+            "a1",
+            220101,
+            p1,
+            true,
+            Some(now),
+            None,
+            Some(now),
+        )
+        .await;
+        // Most-recently-active first: `first` wins the single cap slot.
+        rig.seed_app(
+            "app2",
+            "first",
+            "a1",
+            220102,
+            p2,
+            true,
+            Some(now),
+            Some("sha"),
+            Some(now),
+        )
+        .await;
+        rig.seed_app(
+            "app3",
+            "second",
+            "a1",
+            220103,
+            p3,
+            true,
+            Some(now - 60_000),
+            Some("sha"),
+            Some(now),
+        )
+        .await;
+        let woken = rig.manager.warm_always_on(&rig.pool).await.unwrap();
+        assert_eq!(woken, vec!["first"]);
+        let asleep: Option<i64> =
+            sqlx::query_scalar("SELECT asleep_since FROM app WHERE slug = 'second'")
+                .fetch_one(&rig.pool)
+                .await
+                .unwrap();
+        assert!(asleep.is_some(), "over-cap app stays asleep");
+        rig.manager.stop_all().await;
     }
 }

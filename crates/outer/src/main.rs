@@ -601,6 +601,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         credential_refresh_after,
         wake_timeout: Duration::from_secs(30),
         wake_concurrency: rt.wake_concurrency,
+        always_on_max: rt.always_on_max,
     });
     // A previous process may have died between a rename's commit and its
     // post-commit deletes: drain pending prefix cleanups before serving, so

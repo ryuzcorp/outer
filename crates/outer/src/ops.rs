@@ -61,15 +61,20 @@ pub async fn create_app(
     let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM user WHERE id = ?1")
         .fetch_optional(&p.pool)
         .await?;
-    let app = apps::create(
+    let mut app = apps::create(
         &p.pool,
         &owner_id,
         slug,
         name,
         &p.alloc,
-        apps::app_limit_for_plan(&plan.unwrap_or_default()),
+        apps::app_limit_for_plan(&plan.clone().unwrap_or_default()),
     )
     .await?;
+    // Same Pro default as the MCP path: new Pro apps keep warm.
+    if plan.as_deref() == Some("pro") {
+        apps::always_on::set_always_on(&p.pool, &app.id, true, "pro").await?;
+        app.always_on = true;
+    }
     let author = noreply_author(&owner_id, owner_email, &p.domain);
     let seeded = async {
         // Claim-point wipe: a crashed delete can leave local orphans behind

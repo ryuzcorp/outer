@@ -38,6 +38,9 @@ IP (`crates/outer/src/auth/limits.rs`).
 One deployment-wide setting each (operator config, not per plan): fleets
 stop after 30 minutes idle (`OUTER_SLEEP_AFTER_S`), and each fleet is
 capped at 512 MiB (`OUTER_FLEET_MEMORY_MB`) with CPU `50000 100000`.
+Pro apps can skip the idle sleep with `set_always_on` (Console → Settings
+→ Keep warm): flagged fleets stay awake and restart after restarts, up to
+`OUTER_ALWAYS_ON_MAX` awake at once (oldest-idle sleep past the cap).
 Build and request metering tables exist, but caps and Pro billing arrive
 in M2.
 

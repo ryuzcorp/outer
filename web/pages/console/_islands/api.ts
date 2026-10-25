@@ -74,6 +74,8 @@ export interface ConsoleApp {
   url: string;
   role: string;
   visibility: string;
+  /** Pro keep-warm flag; stored for every plan, ignored on Free. */
+  always_on: boolean;
   status: string;
   last_request_at: number | null;
   last_deploy?: LastDeploy;

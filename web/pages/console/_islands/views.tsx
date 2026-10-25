@@ -2062,6 +2062,7 @@ export function SettingsView({
         </div>
       </section>
       {app.role === "owner" && <VisibilityCard app={app} plan={plan} onRefresh={onRefresh} />}
+      {app.role === "owner" && <KeepWarmCard app={app} plan={plan} onRefresh={onRefresh} />}
       {app.role === "owner" && (
         <DomainsCard
           slug={app.slug}
@@ -2278,6 +2279,77 @@ function ExportCard({
           >
             {busy() ? "Preparing…" : "Download .zip"}
           </button>
+        </div>
+        {error() && (
+          <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
+            <span class="min-w-0 break-words">{error()}</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function KeepWarmCard({
+  app,
+  plan,
+  onRefresh,
+}: {
+  app: AppDetail;
+  plan: string;
+  onRefresh: () => void;
+}) {
+  const pending = atom<boolean | null>(null);
+  const error = atom<string | null>(null);
+  const isPro = plan === "pro";
+  // Effective warmth: the stored flag only counts on Pro (a downgrade
+  // keeps the flag but the sweep ignores it). Free always renders cold.
+  const warm = app.always_on && isPro;
+  async function change(on: boolean): Promise<void> {
+    if (on === app.always_on || pending() !== null) {
+      return;
+    }
+    pending.set(true);
+    error.set(null);
+    try {
+      await settingsActions.setAlwaysOn.run({ slug: app.slug, on });
+      onRefresh();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      pending.set(null);
+    }
+  }
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Keep warm">
+      <div class="card-body min-w-0">
+        <h2 class="card-title min-w-0 truncate" title="Keep warm">
+          Keep warm
+          {!isPro && (
+            <span class="badge badge-soft badge-info badge-sm shrink-0" title="Keeping apps warm is a Pro feature">
+              Pro
+            </span>
+          )}
+          {pending() && <span class="loading loading-spinner loading-xs shrink-0" aria-label="Saving" />}
+        </h2>
+        <p class="m-0 min-w-0 break-words text-[13px] opacity-60">
+          Warm apps skip the idle sleep, so owners never wait out the cold start. On Free the switch stays off.
+        </p>
+        <div class="form-control min-w-0">
+          <label class="label min-w-0 cursor-pointer justify-start gap-3">
+            <input
+              type="checkbox"
+              class="toggle shrink-0"
+              checked={warm}
+              disabled={!isPro || pending() !== null}
+              onchange={(e) => void change((e.target as HTMLInputElement).checked)}
+              aria-label="Keep this app warm"
+            />
+            <span class="label-text min-w-0 break-words">
+              {warm ? "Warm — stays awake" : "Cold — sleeps on idle"}
+            </span>
+          </label>
         </div>
         {error() && (
           <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
