@@ -25,7 +25,7 @@ pub const WEBSITE_URL: &str = "https://github.com/ryuzcorp/outer-template-websit
 /// template. Placeholder until the integrator pushes
 /// `outer-template-website` and pins its first commit here — one line to
 /// change, then `outer templates sync --template website` vendors it.
-pub const WEBSITE_SHA: &str = "7899d776017013fb77cae545286badd30c4cbd9e";
+pub const WEBSITE_SHA: &str = "dc1754950a89485226452b6350913bdc2bfc5893";
 
 /// Which starter template an app is created from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
