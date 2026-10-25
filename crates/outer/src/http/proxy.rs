@@ -281,7 +281,7 @@ const LOOK_SKIP_OVERSIZE: &[u8] = b"<!--__outer_look:oversize-->";
 /// console entries and 50 failed requests, each at most 500 chars, mirrored
 /// into `#__outer_look` on every record so the serialized DOM Cloudflare
 /// returns carries the log.
-const LOOK_RECORDER_JS: &str = "!function(){if(window.__outerLook)return;window.__outerLook=1;var N=null,C=[],F=[];function T(s){s=String(s);return s.length>500?s.slice(0,500):s}function S(){try{N=document.getElementById(\"__outer_look\");if(!N){N=document.createElement(\"script\");N.type=\"application/json\";N.id=\"__outer_look\";(document.body||document.documentElement).appendChild(N)}N.textContent=JSON.stringify({console:C,failed:F})}catch(e){}}function c(l,m,s){if(C.length>=50)return;var o={level:l,message:T(m)};if(s)o.source=T(s);C.push(o);S()}function f(u,st,er){if(F.length>=50)return;var o={url:T(u||\"(unknown)\")};if(st)o.status=st;else o.error=T(er||\"failed\");F.push(o);S()}window.addEventListener(\"error\",function(e){var t=e.target;if(t&&t!==window){f(t.src||t.href||\"\",0,\"load failed\");return}c(\"error\",e.message||\"script error\",e.filename)},true);window.addEventListener(\"unhandledrejection\",function(e){var r=e.reason,m=r&&r.stack?String(r.stack).split(\"\\n\")[0]:(r&&r.message?r.message:String(r));c(\"error\",\"unhandled rejection: \"+m)});[\"error\",\"warn\"].forEach(function(k){try{var o=console[k];console[k]=function(){try{c(k,Array.prototype.map.call(arguments,function(a){try{return typeof a===\"string\"?a:JSON.stringify(a)}catch(_){return String(a)}}).join(\" \"))}catch(_){}return o.apply(console,arguments)}}catch(_){}});if(window.fetch){var of=window.fetch;window.fetch=function(u,o){var s=typeof u===\"string\"?u:(u&&u.url)||\"\";return of(u,o).then(function(r){if(!r.ok)f(s,r.status,\"failed\");return r},function(e){f(s,0,\"fetch failed\");throw e})}}if(window.XMLHttpRequest){try{var op=XMLHttpRequest.prototype.open,sd=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this._olu=u;return op.apply(this,arguments)};XMLHttpRequest.prototype.send=function(b){var x=this;try{x.addEventListener(\"loadend\",function(){try{var s=x.status;if((s<200||s>=300||s===0)&&x._olu!==undefined)f(x._olu,s,\"request failed\")}catch(_){}})}catch(_){}return sd.call(this,b)}}catch(_){}}S()}();";
+const LOOK_RECORDER_JS: &str = "!function(){if(window.__outerLook)return;window.__outerLook=1;var N=null,C=[],F=[];function T(s){s=String(s);return s.length>500?s.slice(0,500):s}function S(){try{var I=\"__outer_look\";N=document.getElementById(I);if(!N){N=document.createElement(\"script\");N.type=\"application/json\";N.id=I;(document.body||document.documentElement).appendChild(N)}N.textContent=JSON.stringify({console:C,failed:F})}catch(e){}}function c(l,m,s){if(C.length>=50)return;var o={level:l,message:T(m)};if(s)o.source=T(s);C.push(o);S()}function f(u,st,er){if(F.length>=50)return;var o={url:T(u||\"(unknown)\")};if(st)o.status=st;else o.error=T(er||\"failed\");F.push(o);S()}window.addEventListener(\"error\",function(e){var t=e.target;if(t&&t!==window){f(t.src||t.href||\"\",0,\"load failed\");return}c(\"error\",e.message||\"script error\",e.filename)},true);window.addEventListener(\"unhandledrejection\",function(e){var r=e.reason,m=r&&r.stack?String(r.stack).split(\"\\n\")[0]:(r&&r.message?r.message:String(r));c(\"error\",\"unhandled rejection: \"+m)});[\"error\",\"warn\"].forEach(function(k){try{var o=console[k];console[k]=function(){try{c(k,Array.prototype.map.call(arguments,function(a){try{return typeof a===\"string\"?a:JSON.stringify(a)}catch(_){return String(a)}}).join(\" \"))}catch(_){}return o.apply(console,arguments)}}catch(_){}});if(window.fetch){var of=window.fetch;window.fetch=function(u,o){var s=typeof u===\"string\"?u:(u&&u.url)||\"\";return of(u,o).then(function(r){if(!r.ok)f(s,r.status,\"failed\");return r},function(e){f(s,0,\"fetch failed\");throw e})}}if(window.XMLHttpRequest){try{var op=XMLHttpRequest.prototype.open,sd=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this._olu=u;return op.apply(this,arguments)};XMLHttpRequest.prototype.send=function(b){var x=this;try{x.addEventListener(\"loadend\",function(){try{var s=x.status;if((s<200||s>=300||s===0)&&x._olu!==undefined)f(x._olu,s,\"request failed\")}catch(_){}})}catch(_){}return sd.call(this,b)}}catch(_){}}S()}();";
 
 /// The injected head: the recorder plus the data element it mirrors into.
 fn look_snippet() -> Vec<u8> {
@@ -1919,6 +1919,23 @@ mod tests {
             Some("no-store, private"),
             "the edge must never cache the recorder page"
         );
+    }
+
+    /// What Cloudflare returns is the page's serialized DOM: the injected
+    /// recorder script followed by the log element it filled. The parser
+    /// must read the log element, never text inside the recorder itself.
+    #[test]
+    fn serialized_recorder_page_parses_to_the_recorded_log() {
+        let page =
+            inject_look_snippet(b"<html><head><title>T</title></head><body>hi</body></html>");
+        let recorded = String::from_utf8(page).unwrap().replace(
+            "{\"console\":[],\"failed\":[]}",
+            "{\"console\":[{\"level\":\"error\",\"message\":\"boom\"}],\"failed\":[{\"url\":\"/x.png\",\"error\":\"load failed\"}]}",
+        );
+        let capture = crate::browser::parse_look_capture(&recorded).expect("log element found");
+        assert_eq!(capture.console.len(), 1);
+        assert_eq!(capture.console[0].message, "boom");
+        assert_eq!(capture.failed.len(), 1);
     }
 
     /// Without any token the proxy path is byte-for-byte what upstream
