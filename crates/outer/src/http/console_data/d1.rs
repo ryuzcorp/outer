@@ -20,48 +20,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
 
+use super::owner_app;
 use crate::deploy::migrate::{self, D1Database};
 use crate::fleet::manager::{FleetManager, FleetStorage};
-use crate::http::console::{guard, visible_app};
+use crate::http::console::guard;
 use crate::store::Store;
 
-/// D1 is owner-only in v1 (spec §7.4): the shared role-scoped lookup, then
-/// the owner check. A slug the caller has no role on answers 404 exactly
-/// like a missing one (spec §8.2); a collaborator reads 403 with a user
-/// message, the same shape the owner-only MCP tools answer.
-async fn owner_app(
-    mcp: &crate::mcp::McpState,
-    account: &crate::auth::AccountRow,
-    slug: &str,
-) -> Result<crate::apps::App, Box<Response>> {
-    match visible_app(mcp, account, slug).await {
-        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok(app),
-        Ok(Some(_)) => Err(crate::http::console_data::data_error(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "only the app owner may open this database",
-            Some(
-                "Only the app owner can open this database. D1 editing stays owner-only."
-                    .to_string(),
-            ),
-        )
-        .into()),
-        Ok(None) => Err(crate::http::console_data::data_error(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "no such app",
-            None,
-        )
-        .into()),
-        Err(_) => Err(crate::http::console_data::data_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-            None,
-        )
-        .into()),
-    }
-}
+// D1 reads and writes go through the shared owner check in `super`
+// (owner-only in v1, spec §7.4); the noun keeps this panel's messages.
 
 /// Filters are AND-ed and bounded so a query can't grow without limit.
 pub const MAX_FILTERS: usize = 10;
@@ -1413,7 +1379,7 @@ async fn api_databases(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug).await {
+    let app = match owner_app(mcp, &account, &slug, "this database").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -1441,7 +1407,7 @@ async fn api_tables(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug).await {
+    let app = match owner_app(mcp, &account, &slug, "this database").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -1471,7 +1437,7 @@ async fn api_schema(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug).await {
+    let app = match owner_app(mcp, &account, &slug, "this database").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -1502,7 +1468,7 @@ async fn api_rows(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug).await {
+    let app = match owner_app(mcp, &account, &slug, "this database").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -1533,7 +1499,7 @@ async fn api_write(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug).await {
+    let app = match owner_app(mcp, &account, &slug, "this database").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -1603,7 +1569,7 @@ async fn api_delete_rows(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug).await {
+    let app = match owner_app(mcp, &account, &slug, "this database").await {
         Ok(app) => app,
         Err(res) => return *res,
     };

@@ -24,7 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use serde_json::json;
 
-use super::console::{guard, nostore_json, not_found, owned_app};
+use super::console::{guard, visible_app};
 
 /// Routes for every data panel.
 pub fn routes() -> Router<super::AppState> {
@@ -73,8 +73,43 @@ pub(crate) fn data_json(status: StatusCode, value: serde_json::Value) -> Respons
         .into_response()
 }
 
-/// Session + same-origin + owner-scoped app lookup. Foreign or unknown
-/// slugs answer 404 exactly like a missing one (spec §8.2).
+/// R2, Durable Objects and D1 are owner-only in v1 (spec §7.4): the shared
+/// role-scoped lookup, then the owner check. A slug the caller has no role
+/// on answers 404 exactly like a missing one (spec §8.2); a collaborator
+/// reads 403 with a user message, the same shape the owner-only MCP tools
+/// answer. `noun` names what the panel opens ("this database", "this data")
+/// so the three panels share one message shape.
+pub(crate) async fn owner_app(
+    mcp: &crate::mcp::McpState,
+    account: &crate::auth::AccountRow,
+    slug: &str,
+    noun: &str,
+) -> Result<crate::apps::App, Box<Response>> {
+    match visible_app(mcp, account, slug).await {
+        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok(app),
+        Ok(Some(_)) => Err(data_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            format!("only the app owner may open {noun}"),
+            Some(format!(
+                "Only the app owner can open {noun}. Data panels stay owner-only in v1."
+            )),
+        )
+        .into()),
+        Ok(None) => Err(data_error(StatusCode::NOT_FOUND, "not_found", "no such app", None).into()),
+        Err(_) => Err(data_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not load the app right now",
+            None,
+        )
+        .into()),
+    }
+}
+
+/// Session + same-origin + owner check. Foreign or unknown slugs answer 404
+/// exactly like a missing one (spec §8.2); collaborators read 403 (see
+/// [`owner_app`]).
 // `Response` is 128 bytes, so this trips `result_large_err`; boxing would
 // only add an allocation per request to satisfy the lint. The sibling
 // `console::guard` boxes because it nests inside other boxed results —
@@ -87,17 +122,10 @@ pub(crate) async fn console_app(
 ) -> Result<(crate::auth::AccountRow, crate::apps::App), Response> {
     let mcp = &state.mcp;
     let account = guard(&mcp.auth, headers).await.map_err(|b| *b)?;
-    let app = owned_app(mcp, &account, slug).await.map_err(|_| {
-        nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "storage is unavailable right now",
-        )
-    })?;
-    let Some(app) = app else {
-        return Err(not_found());
-    };
-    Ok((account, app))
+    match owner_app(mcp, &account, slug, "this data").await {
+        Ok(app) => Ok((account, app)),
+        Err(res) => Err(*res),
+    }
 }
 
 /// The deploy work dir the built wrangler config is read from at request
@@ -560,6 +588,63 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "for {path}");
             let body: serde_json::Value = body.parse().unwrap();
             assert_eq!(body["error"], "not_found");
+        }
+    }
+    #[tokio::test]
+    async fn data_panels_stay_owner_only_for_collaborators() {
+        let (app, pool, _, _) = test_state("celld").await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        // Collaborators count only while the owner is Pro (spec §7.4): the
+        // 403 below is the owner check, not a missing role.
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for email in ["bruno@example.com", "stranger@example.com"] {
+            sqlx::query(
+                "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(format!("acct-{email}"))
+            .bind(email)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+             VALUES ('app-groceries', 'bruno@example.com', 'acct-bruno@example.com', ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bruno = login(&pool, "bruno@example.com").await;
+        let stranger = login(&pool, "stranger@example.com").await;
+        // R2 and Durable Objects are owner-only in v1 exactly like D1: a
+        // collaborator reads 403 with a user message, before any store or
+        // fleet work runs. (`bucket` is required by the list extractor, so
+        // the query rides along; the 403 fires first.)
+        for path in [
+            "/api/console/apps/groceries/data/r2/list?bucket=FILES",
+            "/api/console/apps/groceries/data/do/classes",
+        ] {
+            let (status, _, body) =
+                send(&app, authed(path, &bruno).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "for {path}");
+            let body: serde_json::Value = body.parse().unwrap();
+            assert_eq!(body["error"], "forbidden");
+            assert!(
+                body["user_message"].as_str().is_some_and(|m| !m.is_empty()),
+                "for {path}: {body}"
+            );
+            // A stranger's slug still reads 404 exactly like a missing one.
+            let (status, _, _) =
+                send(&app, authed(path, &stranger).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "for {path}");
         }
     }
 

@@ -1300,11 +1300,6 @@ export function Console() {
                     ))}
                   </>
                 )}
-                      <DatabaseIcon />
-                      <span class="min-w-0 flex-1 truncate">{v.label}</span>
-                    </button>
-                  </li>
-                ))}
               </ul>
               <div class="side-foot">
                 <div class="divider my-2" aria-hidden="true" />
@@ -1499,8 +1494,24 @@ function ViewBody(props: {
       )
       );
     case "r2":
-      return <R2View slug={props.app.slug} />;
+      return (
+      props.app.role !== "owner" ? (
+        <EmptyState icon={<DatabaseIcon />} title="R2 is owner-only">
+          Only the app owner can open this bucket browser for now.
+        </EmptyState>
+      ) : (
+      <R2View slug={props.app.slug} />
+      )
+      );
     case "do":
-      return <DoView slug={props.app.slug} />;
+      return (
+      props.app.role !== "owner" ? (
+        <EmptyState icon={<DatabaseIcon />} title="Durable Objects are owner-only">
+          Only the app owner can open this panel for now.
+        </EmptyState>
+      ) : (
+      <DoView slug={props.app.slug} />
+      )
+      );
   }
 }
