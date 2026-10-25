@@ -2840,7 +2840,9 @@ async fn last_deploy_sha(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Opti
 
 /// The app's latest successful preview deploy sha, if any: the first-deploy
 /// routing signal for preview runs (a preview fleet starts from the preview
-/// upload, not the live one).
+/// upload, not the live one). Scoped to the current lineage: discard and
+/// promote delete the app's preview rows, so a fresh preview always routes
+/// as a first deploy (upload before migrate) against its empty namespace.
 async fn last_preview_success(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<String>> {
     let sha: Option<String> = sqlx::query_scalar(
         "SELECT sha FROM deploy WHERE app_id = ?1 AND kind = 'preview' AND status = 'success' \

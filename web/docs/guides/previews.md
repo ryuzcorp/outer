@@ -55,8 +55,10 @@ deploy, but live is untouched until you promote.
   preview's compare-and-swap.
 - **Promotion needs a clean line.** If someone committed to live after the
   preview branched, promotion refuses with `conflict` instead of silently
-  superseding their change: make a fresh preview from the new live version
-  and promote that.
+  superseding their change: a second preview commit would only refresh the
+  existing preview (it builds on the preview tip, not the new live version),
+  so run `discard_preview` first, then commit a fresh preview (it branches
+  from the new live version) and promote that.
 - **Host capacity.** The host holds at most `OUTER_PREVIEW_MAX` previews
   (default 20). Past that, a new preview refuses with `rate_limited` and a
   `retry_after_s` naming when the oldest preview expires; discard an idle

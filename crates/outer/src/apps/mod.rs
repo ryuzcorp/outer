@@ -494,16 +494,37 @@ pub async fn create(
     })
 }
 
-/// Claim two free loopback ports for an app's preview fleet: the same
-/// ranges and lowest-free rule as [`create`], under the same process lock
-/// so a concurrent create (or preview claim) can never take the same
-/// ports. The caller writes them into the app row together with the
-/// preview state. Errors only when the ranges are exhausted.
+/// The host preview cap filled between the commit path's pre-check and its
+/// reservation: the caller rolls back its git work and refuses with
+/// `rate_limited` instead of recording a preview past the cap.
+#[derive(Debug, thiserror::Error)]
+#[error("preview capacity is full ({used}/{max} active previews)")]
+pub struct PreviewCapFull {
+    /// Previews holding state when the reservation ran.
+    pub used: u64,
+    /// The host cap ([`crate::preview::DEFAULT_PREVIEW_MAX`]).
+    pub max: usize,
+}
+
+/// Claim two free loopback ports for an app's preview fleet and record them
+/// on the row: the same ranges and lowest-free rule as [`create`]. The host
+/// cap check, the port scan and the row write run under one process lock, so
+/// two concurrent first-time preview commits can neither take the same pair
+/// (the second claim already sees the first's row write) nor overshoot the
+/// host cap past its pre-check. The caller writes the sha alongside these
+/// same ports when it records the preview state. Errors when the cap is
+/// full ([`PreviewCapFull`]) or the ranges are exhausted.
 pub async fn claim_preview_ports(
     pool: &SqlitePool,
     alloc: &Allocation,
+    app_id: &str,
+    max: usize,
 ) -> anyhow::Result<(u16, u16)> {
     let _guard = CREATE_LOCK.lock().await;
+    let used = crate::preview::count_previews(pool).await?;
+    if used >= max as u64 {
+        anyhow::bail!(PreviewCapFull { used, max });
+    }
     let mut ports: Vec<i64> = sqlx::query_scalar(
         "SELECT port FROM app WHERE port IS NOT NULL \
          UNION SELECT internal_port FROM app WHERE internal_port IS NOT NULL \
@@ -520,6 +541,12 @@ pub async fn claim_preview_ports(
         2,
     )
     .ok_or_else(|| anyhow::anyhow!("no free ports left for a preview fleet"))?;
+    sqlx::query("UPDATE app SET preview_port = ?1, preview_internal_port = ?2 WHERE id = ?3")
+        .bind(free[0] as i64)
+        .bind(free[1] as i64)
+        .bind(app_id)
+        .execute(pool)
+        .await?;
     Ok((free[0] as u16, free[1] as u16))
 }
 
@@ -913,5 +940,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, vec!["live-quar"]);
+    }
+    #[tokio::test]
+    async fn preview_port_claims_reserve_under_one_lock() {
+        let (_dir, pool, owner) = setup().await;
+        let wide = Allocation {
+            uid_range: (220000, 220010),
+            port_range: (18100, 18109),
+        };
+        let a = create(&pool, &owner, "aaa", None, &wide, 10).await.unwrap();
+        let b = create(&pool, &owner, "bbb", None, &wide, 10).await.unwrap();
+        // The ports land on the row inside the claim lock: a second claim
+        // already sees the first's pair and cannot take it again.
+        let first = claim_preview_ports(&pool, &wide, &a.id, 10).await.unwrap();
+        assert_eq!(first, (18104, 18105));
+        let second = claim_preview_ports(&pool, &wide, &b.id, 10).await.unwrap();
+        assert_ne!(
+            first, second,
+            "two first-time preview claims must not take the same ports"
+        );
+        assert_eq!(second, (18106, 18107));
+        // And the host cap is enforced in the same critical section: with
+        // one preview recorded, a cap of one refuses the second app.
+        crate::preview::set_preview(&pool, &a.id, &"c".repeat(40), 1000, first.0, first.1)
+            .await
+            .unwrap();
+        let err = claim_preview_ports(&pool, &wide, &b.id, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is::<PreviewCapFull>(),
+            "a full host cap refuses with PreviewCapFull: {err:#}"
+        );
     }
 }

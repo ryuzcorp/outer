@@ -141,7 +141,14 @@ pub async fn delete_app(
             confirm.to_string(),
         ));
     }
-
+    // Clear the preview columns before stopping anything: a preview request
+    // that queued behind the stop re-reads the row under the preview wake
+    // lock and bails once no preview is named, instead of respawning the
+    // fleet from stale row data mid-delete. Independent of the fleet
+    // manager below (the CLI path has none); the row itself goes LAST.
+    crate::preview::clear_preview_row(pool, &app.id)
+        .await
+        .map_err(internal)?;
     // 1. Stop the fleet first: nothing may serve or write while its state
     // goes away. Missing is a no-op (already asleep or never woken); the
     // cached scoped credentials for the prefix go with it.

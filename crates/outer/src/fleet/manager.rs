@@ -123,18 +123,28 @@ struct WakeReport {
 }
 
 /// Persist a fleet's ring tail before the ring dies with the fleet (sleep
-/// and credential-refresh stops). The sweep flushes every tick, so this is
-/// normally a handful of lines. A flush failure only warns: the fleet
-/// still stops. Both callers hold the slug's wake lock (the sweep takes it
-/// across evaluate-and-stop; `ensure_awake` holds it from its first
-/// liveness check to its activity write), so a wake-spawned ring cannot be
-/// orphaned while this snapshot flushes.
+/// and credential-refresh stops), except preview fleets: their rings are
+/// dropped so preview output never lands in the live log namespace. The
+/// sweep flushes every tick, so this is normally a handful of lines. A flush
+/// failure only warns: the fleet still stops. Both callers hold the slug's
+/// wake lock (the sweep takes it across evaluate-and-stop; `ensure_awake`
+/// holds it from its first liveness check to its activity write), so a
+/// wake-spawned ring cannot be orphaned while this snapshot flushes.
 async fn flush_ring_before_stop(
     pool: &SqlitePool,
     app_id: &str,
     slug: &str,
     logs: &crate::fleet::supervisor::SharedLogRing,
 ) {
+    // Preview fleets share the base app id but track under their own
+    // `<slug>--preview` key: persisting their ring under the base id would
+    // advance the live log watermark and file preview errors as live app
+    // issues. Preview output stays in its deploy log tail; the sweep drops
+    // the ring tail here instead. Slugs can never end in `--preview`
+    // (reserved), so the suffix test cannot misfire on a live fleet.
+    if crate::preview::strip_preview_key(slug).is_some() {
+        return;
+    }
     let tail = crate::observe::logs::ring_snapshot(logs).await;
     if let Err(err) = crate::observe::logs::flush_fleet(pool, app_id, &tail).await {
         tracing::warn!(slug = %slug, error = %format!("{err:#}"), "pre-stop flush failed; tail lines lost");
@@ -188,6 +198,16 @@ impl FleetManager {
     /// path refuses past this cap (retryable, naming the oldest expiry).
     pub fn preview_max(&self) -> usize {
         self.inner.preview_max
+    }
+    /// Platform data dir: per-slug work/cache/fleet state live under it.
+    /// Preview discard wipes the preview key's share through this.
+    pub(crate) fn data_dir(&self) -> std::path::PathBuf {
+        self.inner.data_dir.clone()
+    }
+
+    /// Cgroup anchor when containment is active, else `None` (dev).
+    pub(crate) fn cgroups_anchor(&self) -> Option<std::path::PathBuf> {
+        self.inner.cgroups.clone()
     }
 
     async fn alive(fleets: &tokio::sync::Mutex<HashMap<String, LiveFleet>>, slug: &str) -> bool {
@@ -1233,6 +1253,44 @@ mod tests {
             "the error line groups an issue: {issues:?}"
         );
         assert!(issues[0].message.contains("must not lose me"));
+        pool.close().await;
+    }
+    /// Preview fleets share the base app id: persisting their ring under it
+    /// would advance the live watermark and surface preview errors as live
+    /// issues. Preview output stays in the deploy log tail; the sweep drops
+    /// it here instead.
+    #[tokio::test]
+    async fn pre_stop_flush_drops_preview_fleet_lines() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        let ring: crate::fleet::supervisor::SharedLogRing =
+            std::sync::Arc::new(tokio::sync::Mutex::new(LogRing::new(64)));
+        {
+            let mut guard = ring.lock().await;
+            guard.push(LogStream::Stdout, "preview serving on :0".to_string());
+            guard.push(
+                LogStream::Stderr,
+                "Error: preview must not pollute live logs".to_string(),
+            );
+        }
+        flush_ring_before_stop(&pool, "app1", "slug1--preview", &ring).await;
+        let lines: Vec<String> =
+            sqlx::query_scalar("SELECT line FROM app_log WHERE app_id = ?1 ORDER BY seq")
+                .bind("app1")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(lines.is_empty(), "preview lines are dropped: {lines:?}");
+        assert!(
+            crate::observe::logs::issues(&pool, "app1", None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "preview errors never group into live issues"
+        );
         pool.close().await;
     }
 

@@ -422,13 +422,14 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     ))
 }
 
-/// The `commit {preview: true}` path: the Pro gate, the host cap and the
-/// change claim all run BEFORE the git work (a refused preview burns no
-/// quota and writes nothing). The commit lands on the preview ref, the
+/// The `commit {preview: true}` path: the Pro gate, a host-cap fast check
+/// and the change claim all run BEFORE the git work (a refused preview burns
+/// no quota and writes nothing). The commit lands on the preview ref, the
 /// row names the fleet (reusing ports across refreshes of one preview
-/// lifetime), and the deploy runs under the preview identity with a fresh
-/// data namespace. A failed deploy still counts the change, exactly like
-/// a live commit.
+/// lifetime; the cap is enforced again with the port reservation, rolling
+/// the git work back when a rival filled the last slot), and the deploy runs
+/// under the preview identity with a fresh data namespace. A failed deploy
+/// still counts the change, exactly like a live commit.
 async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let (app, _) = visible_app(ctx, &input.app).await?;
     super::preview::require_pro(
@@ -489,11 +490,44 @@ async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, T
     let sha = outcome.sha;
     // Ports are claimed once per preview lifetime and reused across
     // refreshes, so a running preview fleet's ports never churn under it.
+    // The reservation runs after the commit (the sha is an input) under one
+    // lock: the second of two racing first-time commits already sees the
+    // first's ports, and a cap filled in between rolls the git work back.
     let (port, internal_port) = match crate::preview::preview_of(&app) {
         Some(existing) => (existing.port, existing.internal_port),
-        None => crate::apps::claim_preview_ports(&ctx.state.pool, &ctx.state.alloc)
-            .await
-            .map_err(internal)?,
+        None => {
+            let max = ctx.state.fleets.preview_max();
+            match crate::apps::claim_preview_ports(&ctx.state.pool, &ctx.state.alloc, &app.id, max)
+                .await
+            {
+                Ok(ports) => ports,
+                Err(e) if e.is::<crate::apps::PreviewCapFull>() => {
+                    // A rival preview took the last slot after the
+                    // pre-commit check: drop the just-published ref (it
+                    // names no row) and refuse without burning quota.
+                    let _ = crate::git::manifest::clear_preview(
+                        &ctx.state.store,
+                        &ctx.state.git,
+                        &ctx.state.sync,
+                        &app.slug,
+                    )
+                    .await;
+                    if let Err(refund) = refund_change(&ctx.state.pool, &app.owner_id).await {
+                        tracing::warn!("commit refund failed: {refund:#}");
+                    }
+                    let retry_after_s = crate::preview::oldest_preview_touch(&ctx.state.pool)
+                        .await
+                        .map_err(internal)?
+                        .map(|oldest| {
+                            (oldest + crate::preview::PREVIEW_IDLE_TTL_MS - crate::apps::now_ms())
+                                .max(1) as u64
+                        })
+                        .unwrap_or(60);
+                    return Err(ToolError::rate_limited(e.to_string(), retry_after_s));
+                }
+                Err(e) => return Err(internal(e)),
+            }
+        }
     };
     let now = crate::apps::now_ms();
     crate::preview::set_preview(&ctx.state.pool, &app.id, &sha, now, port, internal_port)

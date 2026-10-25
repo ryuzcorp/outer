@@ -140,12 +140,20 @@ pub async fn promote_preview_to(
         }
         Err(e) => return Err(map_promote_err(state, &app.slug, &e).await),
     }
-    // The preview is over: stop its fleet and clear the row. The manifest
-    // entry and bundles were already handled by the promote above.
-    state.fleets.stop_preview(&app.slug).await;
-    preview::clear_preview_row(&state.pool, &app.id)
-        .await
-        .map_err(internal)?;
+    // The preview is over: stop its fleet and wipe the trial namespace,
+    // deploy rows and row state (same cleanup as discard, minus the manifest
+    // entry the promote already cleared). The next preview then starts from
+    // a clean slate and routes as a first deploy.
+    preview::clear_preview_trial_state(
+        &state.pool,
+        &state.store,
+        &state.git,
+        &state.fleets,
+        &app.id,
+        &app.slug,
+    )
+    .await
+    .map_err(internal)?;
     let deploy = run_deploy(state, app, &sha, wait).await?;
     Ok(super::ok_deploy(
         format!(
@@ -171,7 +179,7 @@ async fn map_promote_err(state: &McpState, slug: &str, err: &anyhow::Error) -> T
             &current,
         )
         .with_user(
-            "Someone committed to the live site after the preview branched. Discard the preview or make a fresh one from the new live version, then promote again.",
+            "Someone committed to the live site after the preview branched. Run discard_preview, then commit a fresh preview from the new live version and promote that.",
         );
     }
     if text.contains("no preview to promote") || text.contains("preview moved") {

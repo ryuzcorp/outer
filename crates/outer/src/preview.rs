@@ -203,11 +203,64 @@ pub fn preview_slug_for(host: &str, apps_domain: &str) -> Option<String> {
     strip_preview_key(label).map(str::to_string)
 }
 
-/// Drop a preview completely: stop the fleet (no-op when asleep), clear the
-/// row, remove the preview ref from the manifest, and delete the preview
-/// bundles. Stops before clearing so the fleet key still resolves while it
-/// is being stopped. Idempotent: discarding twice is a quiet `false`.
-/// Shared by the discard tool and the expiry sweep.
+/// Drop an app's preview deploy rows. A discarded (or promoted) preview's
+/// successes must not route the next preview's first deploy: the pipeline
+/// uploads before migrating only when no successful preview run exists, and
+/// old rows would flip it to migrate-first against an empty namespace.
+/// Live (`kind = 'main'`) rows are untouched.
+pub async fn delete_preview_deploys(pool: &SqlitePool, app_id: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM deploy WHERE app_id = ?1 AND kind = 'preview'")
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Stop the preview fleet and wipe its trial state: the data namespace
+/// (`fleets/{slug}--preview/`), the preview key's local state, the preview
+/// deploy rows, and the app row's preview columns. The manifest entry is the
+/// caller's: discard clears it via [`crate::git::manifest::clear_preview`],
+/// promote via [`crate::git::manifest::promote_preview`] (both already run
+/// under the slug lock). Holds the preview key's wake lock throughout, so a
+/// request that queued behind the stop re-reads the cleared row and bails
+/// instead of respawning the fleet mid-cleanup. Idempotent: stopping and
+/// wiping are no-ops when already gone; the row clear is the caller's to
+/// order (discard clears it only after the manifest, promote after its
+/// fast-forward).
+pub async fn clear_preview_trial_state(
+    pool: &SqlitePool,
+    store: &crate::store::Store,
+    git: &crate::git::GitConfig,
+    fleets: &crate::fleet::manager::FleetManager,
+    app_id: &str,
+    slug: &str,
+) -> anyhow::Result<()> {
+    let key = preview_key(slug);
+    let wlock = fleets.wake_lock(&key).await;
+    let _wake = wlock.lock().await;
+    // Already holding the wake lock: `stop_tracked`, not `stop_preview`.
+    fleets.stop_tracked(&key).await;
+    // The preview's fresh namespace: D1/KV/R2 data plus the fleet's
+    // `deploy/current.json`. Without this wipe the next preview would
+    // inherit the discarded lineage's data.
+    store.delete_prefix(&format!("fleets/{key}/")).await?;
+    crate::apps::local::remove_local_state(
+        &fleets.data_dir(),
+        git,
+        fleets.cgroups_anchor().as_deref(),
+        &key,
+    )
+    .await?;
+    delete_preview_deploys(pool, app_id).await?;
+    clear_preview_row(pool, app_id).await?;
+    Ok(())
+}
+
+/// Drop a preview completely: the manifest entry goes first (under the slug
+/// lock, bundles included), then the fleet stops and the trial state is
+/// wiped under the preview wake lock. A failure keeps the row, so a retried
+/// discard finishes the job. Idempotent: discarding twice is a quiet
+/// `false`. Shared by the discard tool and the expiry sweep.
 pub async fn discard_state(
     pool: &SqlitePool,
     store: &crate::store::Store,
@@ -224,18 +277,15 @@ pub async fn discard_state(
     if app.slug != slug || preview_of(&app).is_none() {
         return Ok(false);
     }
-    fleets.stop_preview(slug).await;
-    clear_preview_row(pool, app_id).await?;
     crate::git::manifest::clear_preview(store, git, sync, slug).await?;
-    crate::git::manifest::delete_preview_bundles(store, slug).await;
+    clear_preview_trial_state(pool, store, git, fleets, app_id, slug).await?;
     Ok(true)
 }
 
-/// Discard every preview idle past [`PREVIEW_IDLE_TTL_MS`]: the fleet stops,
-/// the row clears, and the mirror ref plus bundles go away, so the next
-/// preview starts from a clean slate. Returns the discarded slugs. One
-/// app's failure warns and the rest still expire (the sweep retries the
-/// failed one next tick).
+/// Discard every preview idle past [`PREVIEW_IDLE_TTL_MS`]: the manifest
+/// entry, fleet, namespace and row go away, so the next preview starts from
+/// a clean slate. Returns the discarded slugs. One app's failure warns and
+/// the rest still expire (the sweep retries the failed one next tick).
 pub async fn expire_due(
     pool: &SqlitePool,
     store: &crate::store::Store,
@@ -469,5 +519,82 @@ mod tests {
             vec!["grocery".to_string()]
         );
         assert!(preview_of(&apps::get_by_id(&pool, &app_id).await.unwrap().unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    async fn discard_wipes_preview_namespace_and_deploy_signal() {
+        let pool = pool().await;
+        let app_id = seed_app(&pool).await;
+        let dir = tempfile::tempdir().unwrap();
+        let git = crate::git::GitConfig::new(dir.path().join("git"), None);
+        let sync = crate::git::GitSync::default();
+        let store = crate::store::Store::memory();
+        let fleets =
+            crate::fleet::manager::FleetManager::new(crate::fleet::manager::ManagerSettings {
+                data_dir: dir.path().join("data"),
+                celld_bin: "celld".to_string(),
+                storage: crate::fleet::manager::FleetStorage {
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                    region: "test".to_string(),
+                    bucket: "b".to_string(),
+                    credentials: crate::store::credentials::CredentialSource::Static {
+                        access_key_id: "k".to_string(),
+                        secret_access_key: "s".to_string(),
+                    },
+                },
+                cgroups: None,
+                memory_max_bytes: 0,
+                cpu_max: "1".to_string(),
+                sleep_after: std::time::Duration::from_secs(60),
+                credential_refresh_after: std::time::Duration::from_secs(60),
+                wake_timeout: std::time::Duration::from_secs(1),
+                wake_concurrency: 1,
+                always_on_max: 10,
+                preview_max: 20,
+            });
+        set_preview(&pool, &app_id, &"b".repeat(40), 1000, 18005, 18006)
+            .await
+            .unwrap();
+        // Stale lineage state: the previous preview's data namespace plus
+        // its successful deploy row (the first-deploy routing signal).
+        store
+            .put(
+                "fleets/grocery--preview/deploy/current.json",
+                b"{}".to_vec(),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO deploy (id, app_id, sha, status, kind, created_at) \
+             VALUES ('d1', ?1, ?2, 'success', 'preview', 1000)",
+        )
+        .bind(&app_id)
+        .bind("b".repeat(40))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            discard_state(&pool, &store, &git, &sync, &fleets, &app_id, "grocery")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list("fleets/grocery--preview/")
+                .await
+                .unwrap()
+                .is_empty(),
+            "discard wipes the preview namespace so the next preview starts clean"
+        );
+        let leftover: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM deploy WHERE app_id = ?1 AND kind = 'preview'")
+                .bind(&app_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            leftover.is_empty(),
+            "discard drops preview deploy rows so the next preview routes as a first deploy: {leftover:?}"
+        );
     }
 }

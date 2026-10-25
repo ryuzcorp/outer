@@ -745,7 +745,7 @@ pub async fn promote_preview(
     // preview entry next to a mirror that still has the ref. A crash here
     // rolls main back below; the next sync rebuilds the ref from the
     // manifest's bundle either way.
-    run_git(
+    if let Err(e) = run_git(
         &[
             &format!("--git-dir={}", bare.display()),
             "update-ref",
@@ -755,7 +755,11 @@ pub async fn promote_preview(
         &[],
         Duration::from_secs(15),
     )
-    .await?;
+    .await
+    {
+        let _ = set_ref(&bare, MAIN_REF, main_head.as_deref()).await;
+        return Err(e);
+    }
     let bundle = bundle_key(slug, preview_sha);
     let uploaded = async {
         let tmp = tmp_path(&format!("bundle-{slug}"));
@@ -816,9 +820,11 @@ pub async fn promote_preview(
 }
 
 /// Clear the manifest's preview entry (discard/expiry path): one seq bump
-/// with main preserved. The mirror's preview ref is deleted best-effort;
-/// the caller deletes the preview bundles and stops the fleet. Returns
-/// whether a preview entry was present.
+/// with main preserved. The mirror's preview ref is deleted best-effort and
+/// the preview bundles are deleted, all under the slug lock — the caller
+/// must not delete bundles itself (a concurrent publish between the unlock
+/// and the delete could lose the new bundle). Returns whether a preview
+/// entry was present.
 pub async fn clear_preview(
     store: &Store,
     cfg: &GitConfig,
@@ -829,6 +835,7 @@ pub async fn clear_preview(
     let _guard = sync.lock(slug).await;
     let old = read_manifest(store, slug).await?;
     let Some(_) = old.as_ref().and_then(|m| m.preview.clone()) else {
+        delete_preview_bundles(store, slug).await;
         return Ok(false);
     };
     let seq = old.as_ref().map(|m| m.seq + 1).unwrap_or(1);
@@ -840,6 +847,7 @@ pub async fn clear_preview(
     };
     write_manifest(store, slug, &manifest).await?;
     sync.set_applied_seq(slug, seq).await;
+    delete_preview_bundles(store, slug).await;
     let bare = mirror_path(cfg, slug);
     if bare.join("HEAD").exists() {
         let git_dir = format!("--git-dir={}", bare.display());
@@ -1168,5 +1176,42 @@ mod tests {
         assert!(bundle_is_live(Some(&landed), &bundle_key("s", &sha)));
         assert!(!bundle_is_live(Some(&landed), "git/s/main/deadbeef.bundle"));
         assert!(!bundle_is_live(None, &bundle_key("s", &sha)));
+    }
+    /// `clear_preview` deletes the preview bundles itself, under the slug
+    /// lock: a concurrent publish between the unlock and an unlocked delete
+    /// could lose the new bundle.
+    #[tokio::test]
+    async fn clear_preview_deletes_its_own_bundles() {
+        let (_dir, cfg, store, sync) = setup("clearprev").await;
+        let bare = mirror_path(&cfg, "clearprev");
+        let sha = commit_on_empty_tree(&bare, None).await;
+        publish_preview(&store, &cfg, &sync, "clearprev", None, &sha)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .list("git/clearprev/preview/")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a preview publish stores its bundle"
+        );
+        assert!(clear_preview(&store, &cfg, &sync, "clearprev")
+            .await
+            .unwrap());
+        assert!(
+            store
+                .list("git/clearprev/preview/")
+                .await
+                .unwrap()
+                .is_empty(),
+            "clear_preview deletes the preview bundles"
+        );
+        assert!(read_manifest(&store, "clearprev")
+            .await
+            .unwrap()
+            .unwrap()
+            .preview
+            .is_none());
     }
 }

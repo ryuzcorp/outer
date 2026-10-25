@@ -23,7 +23,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `topic` | string | yes | Which guide to read: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains or look. |
+| `topic` | string | yes | Which guide to read: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, previews or look. |
 
 ## `sign_in`
 
