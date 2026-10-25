@@ -104,12 +104,19 @@ async fn seed_app(
     .map_err(|err| ToolError::from_create(err, &plan))?;
     // New Pro apps default to keep-warm (feature #6); Free apps start
     // cold. The flag is stored per app, so a later downgrade keeps the
-    // value but the sweep ignores it until the owner upgrades again.
+    // value but the sweep ignores it until the owner upgrades again. Best
+    // effort: the row already exists here, so a flag write that fails must
+    // not abort creation and orphan it (the app stays usable; the flag can
+    // be set later). Seeding failures below still remove the row.
     if plan == "pro" {
-        apps::always_on::set_always_on(&ctx.state.pool, &app.id, true, &plan)
-            .await
-            .map_err(internal)?;
-        app.always_on = true;
+        match apps::always_on::set_always_on(&ctx.state.pool, &app.id, true, &plan).await {
+            Ok(()) => app.always_on = true,
+            Err(err) => tracing::warn!(
+                slug = %slug,
+                error = %format!("{err:#}"),
+                "pro default keep-warm flag not set; set it later"
+            ),
+        }
     }
     let author = crate::ops::noreply_author(owner_id, owner_email, &ctx.state.domain);
     let seeded = async {

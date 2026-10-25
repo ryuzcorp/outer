@@ -534,9 +534,10 @@ impl FleetManager {
     /// moderation ok, neither paused nor expired, deployed at least once):
     /// after a restart or crash nothing is tracked, and without this they
     /// would sit asleep until a request. Most-recently-active first, stopping
-    /// at `always_on_max` awake, and bounded across slugs by the wake
-    /// semaphore inside [`Self::ensure_awake`]. Failures warn and the next
-    /// tick retries. Apps that never deployed are skipped: there is nothing
+    /// at `always_on_max` awake — and after that many failures, so crashing
+    /// fleets can't stall the sweep — on top of the wake semaphore inside
+    /// [`Self::ensure_awake`]. Failures warn and the next tick retries.
+    /// Apps that never deployed are skipped: there is nothing
     /// to serve yet, and waking them would fail the health gate every tick.
     pub async fn warm_always_on(&self, pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
         let max = self.inner.always_on_max;
@@ -557,11 +558,16 @@ impl FleetManager {
         .await?;
         let mut awake = self.always_on_awake(pool).await?;
         let mut woken = Vec::new();
+        // A crashing fleet fails every wake (up to `wake_timeout` each, one
+        // after another), so bound failures per tick too: without this, a
+        // fleet that never starts stalls the sweep's flush/drain/sleep work.
+        // Failures warn and the next tick retries.
+        let mut failed = 0usize;
         for (id, slug) in rows {
             if Self::alive(&self.inner.fleets, &slug).await {
                 continue;
             }
-            if awake >= max {
+            if awake >= max || failed >= max {
                 break;
             }
             let Some(app) = apps::get_by_id(pool, &id).await? else {
@@ -575,11 +581,14 @@ impl FleetManager {
                     awake += 1;
                     woken.push(slug);
                 }
-                Err(err) => tracing::warn!(
-                    slug = %slug,
-                    error = %format!("{err:#}"),
-                    "keep-warm wake failed; next tick retries"
-                ),
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(
+                        slug = %slug,
+                        error = %format!("{err:#}"),
+                        "keep-warm wake failed; next tick retries"
+                    );
+                }
             }
         }
         Ok(woken)
@@ -1192,13 +1201,45 @@ mod tests {
     impl WarmRig {
         async fn new(always_on_max: usize) -> Self {
             let dir = tempfile::tempdir().unwrap();
+            Self::with_celld(
+                dir,
+                always_on_max,
+                "#!/bin/sh\nexec sleep 120\n",
+                Duration::from_secs(10),
+            )
+            .await
+        }
+
+        /// A rig whose fleet binary fails at once, logging each spawn's argv:
+        /// every wake attempt fails, and the gate runs to `wake_timeout`, so
+        /// the script always logs before the stop — tests can count attempts
+        /// exactly. Returns the rig plus the spawn log path.
+        async fn failing(always_on_max: usize) -> (Self, std::path::PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("spawns.log");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 1\n",
+                log.display()
+            );
+            (
+                Self::with_celld(dir, always_on_max, &script, Duration::from_secs(2)).await,
+                log,
+            )
+        }
+
+        async fn with_celld(
+            dir: tempfile::TempDir,
+            always_on_max: usize,
+            celld_script: &str,
+            wake_timeout: Duration,
+        ) -> Self {
             let pool = crate::db::open(&dir.path().join("outer.sqlite"))
                 .await
                 .unwrap();
             // A fleet binary that stays alive and ignores its argv: the
             // health gate is answered by the fake listener below.
             let celld = dir.path().join("celld");
-            std::fs::write(&celld, "#!/bin/sh\nexec sleep 120\n").unwrap();
+            std::fs::write(&celld, celld_script).unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -1224,7 +1265,7 @@ mod tests {
                 // uptime guard.
                 sleep_after: Duration::ZERO,
                 credential_refresh_after: Duration::from_secs(6 * 86400),
-                wake_timeout: Duration::from_secs(10),
+                wake_timeout,
                 wake_concurrency: 4,
                 always_on_max,
             });
@@ -1587,6 +1628,41 @@ mod tests {
                 .await
                 .unwrap();
         assert!(asleep.is_some(), "over-cap app stays asleep");
+        rig.manager.stop_all().await;
+    }
+
+    /// Crashing fleets must not stall the sweep: failed wakes stop at
+    /// `always_on_max` per tick, so a fleet that never starts can't eat
+    /// the tick's wake budget (each attempt would otherwise run to
+    /// `wake_timeout`). The rest wait for the next tick.
+    #[tokio::test]
+    async fn warm_always_on_stops_after_max_failures() {
+        let (rig, log) = WarmRig::failing(2).await;
+        rig.seed_user("a1", "a@example.com", "pro").await;
+        for (i, slug) in ["one", "two", "three"].iter().enumerate() {
+            let port = WarmRig::free_port().await as i64;
+            rig.seed_app(
+                &format!("app{i}"),
+                slug,
+                "a1",
+                220101 + i as i64,
+                port,
+                true,
+                None,
+                Some("sha"),
+                None,
+            )
+            .await;
+        }
+        let woken = rig.manager.warm_always_on(&rig.pool).await.unwrap();
+        assert!(woken.is_empty(), "nothing can wake: {woken:?}");
+        let attempts = std::fs::read_to_string(&log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            attempts, 2,
+            "the third eligible app waits for the next tick"
+        );
         rig.manager.stop_all().await;
     }
 }

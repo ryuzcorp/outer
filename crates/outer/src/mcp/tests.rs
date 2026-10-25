@@ -3100,6 +3100,31 @@ async fn new_pro_apps_default_to_keep_warm() {
     assert_eq!(result(&cold)["structuredContent"]["always_on"], false);
 }
 
+/// A failing keep-warm flag write must not orphan the app: creation still
+/// succeeds with the flag off (set it later), instead of erroring after
+/// the row exists.
+#[tokio::test]
+async fn create_app_survives_flag_write_failure() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    set_plan(&state, "ana@example.com", "pro").await;
+    sqlx::query(
+        "CREATE TRIGGER flag_fail BEFORE UPDATE OF always_on ON app \
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    create_app(&state, &token, "groceries").await;
+    let (_, body) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(result(&body)["structuredContent"]["always_on"], false);
+    let flag: i64 = sqlx::query_scalar("SELECT always_on FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(flag, 0, "row and response agree: the flag stays off");
+}
+
 #[tokio::test]
 async fn error_triage_tools_move_issues() {
     let (state, _) = setup().await;
