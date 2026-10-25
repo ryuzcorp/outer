@@ -10,6 +10,7 @@ pub(crate) mod apps;
 pub(crate) mod code;
 pub(crate) mod collaborators;
 pub(crate) mod domains;
+pub(crate) mod export;
 pub(crate) mod look;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
@@ -789,6 +790,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "list_files" => code::list_files(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "export_code" => export::export_code(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "read_file" => code::read_file(parse_args(args)?, ctx)

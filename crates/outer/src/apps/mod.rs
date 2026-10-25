@@ -475,13 +475,15 @@ pub async fn delete_row(pool: &SqlitePool, app_id: &str) -> anyhow::Result<()> {
 /// `create` treats `until > now` as taken and deletes the row otherwise, so
 /// `until <= now` is exactly the dead set — except a slug with a pending
 /// `prefix_cleanup` row, which stays blocked (and keeps redirecting, for
-/// renames) until the drain deletes its leftover prefix. Returns the rows
-/// removed.
+/// renames) until the drain deletes its leftover prefix. The export prefix
+/// counts too: a pending `outer/exports/{slug}/` row means a drain still
+/// owes that slug a delete, and reusing the name early would let the late
+/// drain eat the new app's exports. Returns the rows removed.
 pub async fn prune_quarantine(pool: &SqlitePool, now: i64) -> anyhow::Result<u64> {
     let result = sqlx::query(
         "DELETE FROM slug_quarantine WHERE until <= ?1 AND NOT EXISTS ( \
              SELECT 1 FROM prefix_cleanup \
-             WHERE prefix IN ('fleets/' || slug || '/', 'git/' || slug || '/'))",
+             WHERE prefix IN ('fleets/' || slug || '/', 'git/' || slug || '/', 'outer/exports/' || slug || '/'))",
     )
     .bind(now)
     .execute(pool)

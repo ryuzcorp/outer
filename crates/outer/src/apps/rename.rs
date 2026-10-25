@@ -687,8 +687,22 @@ pub async fn rename_app_with_hooks(
         return Err(internal(e));
     }
     let [old_fleets, old_git] = [from_fleets.clone(), from_git.clone()];
+    // Exports are 24 h-ephemeral links keyed under the old slug, so the
+    // rename drops them instead of moving them: the objects go through the
+    // same post-commit drain as the git/fleets prefixes, and the rows go
+    // inside the transaction (a pre-commit failure rolls them back).
+    let old_exports = format!("outer/exports/{old_slug}/");
+    sqlx::query("DELETE FROM app_export WHERE app_id = ?1")
+        .bind(&app.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
     let now = now_ms();
-    for (prefix, reason) in [(&old_fleets, "rename-old"), (&old_git, "rename-old")] {
+    for (prefix, reason) in [
+        (&old_fleets, "rename-old"),
+        (&old_git, "rename-old"),
+        (&old_exports, "rename-old"),
+    ] {
         if let Err(e) = sqlx::query(
             "INSERT INTO prefix_cleanup (prefix, reason, created_at) VALUES (?1, ?2, ?3)",
         )
@@ -733,7 +747,10 @@ pub async fn rename_app_with_hooks(
         if let Err(err) = store.delete_prefix(&from_fleets).await {
             tracing::warn!(error = %format!("{err:#}"), "rename post-commit fleets prefix delete failed; the maintenance drain retries it");
         }
-        for prefix in [&from_git, &from_fleets] {
+        if let Err(err) = store.delete_prefix(&old_exports).await {
+            tracing::warn!(error = %format!("{err:#}"), "rename post-commit exports prefix delete failed; the maintenance drain retries it");
+        }
+        for prefix in [&from_git, &from_fleets, &old_exports] {
             if let Err(err) = sqlx::query("DELETE FROM prefix_cleanup WHERE prefix = ?1")
                 .bind(prefix)
                 .execute(pool)
@@ -1234,7 +1251,8 @@ mod tests {
             cleanup_rows(&fx).await,
             vec![
                 "fleets/groceries/".to_string(),
-                "git/groceries/".to_string()
+                "git/groceries/".to_string(),
+                "outer/exports/groceries/".to_string()
             ]
         );
         // The new data is already live under the new prefix.
@@ -1248,9 +1266,15 @@ mod tests {
         let drained = drain_prefix_cleanup(&fx.pool, &fx.store, None)
             .await
             .unwrap();
-        assert_eq!(drained, 2);
+        assert_eq!(drained, 3);
         assert!(fx.store.list("fleets/groceries/").await.unwrap().is_empty());
         assert!(fx.store.list("git/groceries/").await.unwrap().is_empty());
+        assert!(fx
+            .store
+            .list("outer/exports/groceries/")
+            .await
+            .unwrap()
+            .is_empty());
         assert!(cleanup_rows(&fx).await.is_empty());
         // ...but the old slug stays quarantined (redirecting) until expiry.
         assert!(!claimable(&fx, "groceries").await);

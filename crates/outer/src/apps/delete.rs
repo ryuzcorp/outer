@@ -100,6 +100,7 @@ const CHILD_TABLES: &[&str] = &[
     "app_log",
     "error_issue",
     "agent_action",
+    "app_export",
 ];
 
 /// The live handles deletion touches: the row, the bucket, the repo mirror
@@ -155,11 +156,16 @@ pub async fn delete_app(
     super::domains::remove_all_for_app(pool, custom.as_ref(), cfg.cache_purge.as_ref(), &app.id)
         .await;
     // 2. Bucket: the repo WAL under `git/{slug}/`, and deploys, D1 data and
-    // assets under `fleets/{slug}/`. Trailing slashes keep a sibling slug
-    // (`{slug}-2`) out of the prefix. `manifest::purge` also drops the local
-    // bare mirror and the sync generation marker.
+    // assets under `fleets/{slug}/`, and Pro code exports under
+    // `outer/exports/{slug}/` (spec §7.5). Trailing slashes keep a sibling
+    // slug (`{slug}-2`) out of the prefix. `manifest::purge` also drops the
+    // local bare mirror and the sync generation marker.
     store
         .delete_prefix(&format!("fleets/{slug}/"))
+        .await
+        .map_err(internal)?;
+    store
+        .delete_prefix(&format!("outer/exports/{slug}/"))
         .await
         .map_err(internal)?;
     manifest::purge(store, git, sync, slug)

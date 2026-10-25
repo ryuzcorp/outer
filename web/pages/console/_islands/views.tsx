@@ -14,6 +14,7 @@
 // for text that should wrap: log lines and the expanded deploy message.
 import { atom } from "ilha";
 import {
+  liveDeploySha,
   shortSha,
   when,
   type AdminInvitesPage,
@@ -30,6 +31,7 @@ import {
   type WaitlistSummary,
 } from "./api.ts";
 import { deploysActions } from "./actions/deploys.ts";
+import { exportActions } from "./actions/export.ts";
 import { secretsActions } from "./actions/secrets.ts";
 import { settingsActions } from "./actions/settings.ts";
 import {
@@ -2070,6 +2072,7 @@ export function SettingsView({
           onRetry={onRetryDomains}
         />
       )}
+      {app.role === "owner" && <ExportCard app={app} plan={plan} />}
       <CollaboratorsCard
         app={app}
         panel={collaborators}
@@ -2173,6 +2176,108 @@ function VisibilityCard({
             !isPro,
             isPro ? null : "Pro",
           )}
+        </div>
+        {error() && (
+          <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
+            <span class="min-w-0 break-words">{error()}</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// Settings → Export code card (spec §7.5): Pro-gated zip download of the
+// whole tree. Owner-only: the card renders only for the app owner (like
+// VisibilityCard and DomainsCard). The version picker lists the app's
+// deploys (same shas as the Code view); the download navigates the browser
+// to the one-hour presigned URL.
+function ExportCard({
+  app,
+  plan,
+}: {
+  app: AppDetail;
+  plan: string;
+}) {
+  const picked = atom("");
+  const busy = atom(false);
+  const error = atom<string | null>(null);
+  const isPro = plan === "pro";
+  const deploys = app.deploys ?? [];
+  const live = liveDeploySha(deploys);
+
+  async function download(): Promise<void> {
+    if (busy() || !isPro) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      const out = await exportActions.exportCode.run({
+        slug: app.slug,
+        sha: picked() === "" ? undefined : picked(),
+      });
+      globalThis.location.assign(out.url);
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Export code">
+      <div class="card-body min-w-0">
+        <div class="flex min-w-0 items-center gap-2">
+          <h2 class="card-title m-0 min-w-0 flex-1 truncate text-base">Export code</h2>
+          {!isPro && (
+            <span class="badge badge-soft badge-sm badge-primary shrink-0" title="Code export is a Pro feature">
+              Pro
+            </span>
+          )}
+        </div>
+        <p class="m-0 min-w-0 break-words text-[13px] opacity-60">
+          Download the whole app as a zip at the picked version. The link works for one hour.
+        </p>
+        <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end">
+          <label class="form-control min-w-0 flex-1" for={`export-version-${app.slug}`}>
+            <span class="label min-w-0">
+              <span class="label-text truncate" title="The repo version to export (recent deploys with their status)">
+                Version{live && picked() !== "" && picked() === live ? " · live" : ""}
+              </span>
+            </span>
+            <select
+              id={`export-version-${app.slug}`}
+              class="select select-bordered select-sm w-full min-w-0"
+              value={picked()}
+              disabled={!isPro || busy() || deploys.length === 0}
+              onchange={(e: Event) => {
+                picked.set((e.target as HTMLSelectElement).value);
+              }}
+            >
+              <option value="" title={live ? `Live version ${live}` : "Live version"}>
+                {live ? `Live version (${shortSha(live)})` : "Live version"}
+              </option>
+              {deploys.map((d) => (
+                <option
+                  key={d.sha}
+                  value={d.sha}
+                  title={`${d.sha}\n${d.status}\n${when(d.created_at)}`}
+                >
+                  {`${shortSha(d.sha)} · ${d.status} · ${timeAgo(d.created_at)}`}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            class="btn btn-neutral min-w-0 shrink-0"
+            disabled={!isPro || busy() || deploys.length === 0}
+            title={isPro ? "Download the picked version as a zip" : "Code export is a Pro feature"}
+            onclick={() => void download()}
+          >
+            {busy() ? "Preparing…" : "Download .zip"}
+          </button>
         </div>
         {error() && (
           <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">

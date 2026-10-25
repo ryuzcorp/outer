@@ -164,6 +164,20 @@ impl S3Backend {
             .delete_object(Some(&self.creds), key)
             .sign(Duration::from_secs(300))
     }
+    /// A presigned GET that downloads as an attachment: `filename` rides the
+    /// signed `response-content-disposition` query, so the signature covers
+    /// it (an unsigned parameter would be ignored or break the signature).
+    /// `ttl` bounds how long the link works; signing is pure crypto, so
+    /// this needs no network.
+    pub fn presigned_get(&self, key: &str, filename: &str, ttl: Duration) -> reqwest::Url {
+        use rusty_s3::S3Action as _;
+        let mut action = self.bucket.get_object(Some(&self.creds), key);
+        action.query_mut().insert(
+            "response-content-disposition",
+            format!("attachment; filename=\"{filename}\""),
+        );
+        action.sign(ttl)
+    }
 
     /// Whole-object download into memory (manifests, meta, owner claims).
     /// Streamed into the buffer chunk by chunk; retried like the file
@@ -963,6 +977,29 @@ mod tests {
                 "token missing: {url}"
             );
         }
+    }
+
+    /// Export downloads ride a signed `response-content-disposition`: the
+    /// browser saves a zip instead of rendering it. No network: signing is
+    /// pure URL construction.
+    #[test]
+    fn presigned_download_carries_the_attachment_disposition() {
+        let backend = S3Backend::new(&test_cfg(None)).expect("backend");
+        let url = backend.presigned_get(
+            "outer/exports/groceries/abc1234-0123456789abcdef.zip",
+            "groceries-abc1234.zip",
+            Duration::from_secs(3600),
+        );
+        let url = url.as_str();
+        assert!(
+            url.contains("response-content-disposition=attachment"),
+            "no attachment override: {url}"
+        );
+        assert!(
+            url.contains("groceries-abc1234.zip"),
+            "filename missing: {url}"
+        );
+        assert!(url.contains("X-Amz-Expires=3600"), "wrong ttl: {url}");
     }
 
     /// LIST carries the session token as the signed `x-amz-security-token`

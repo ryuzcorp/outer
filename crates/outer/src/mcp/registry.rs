@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::mcp::tools::{
     account, apps as app_inputs, code as code_inputs, collaborators as collab_inputs,
-    domains as domain_inputs, look as look_inputs, runtime as runtime_inputs,
-    secrets as secrets_inputs, NoArgs,
+    domains as domain_inputs, export as export_inputs, look as look_inputs,
+    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -89,7 +89,9 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
         | "get_app" | "share_app" | "look_at_app" | "list_files" | "read_file" | "search_code"
         | "history" | "show_commit" | "deploy_status" | "deploy_log" | "app_logs"
-        | "app_errors" | "list_secrets" | "list_collaborators" | "list_domains" => Hints::READ,
+        | "app_errors" | "list_secrets" | "list_collaborators" | "list_domains" | "export_code" => {
+            Hints::READ
+        }
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain" => {
             Hints::WRITE
@@ -274,6 +276,11 @@ pub fn registry() -> Vec<ToolDef> {
             "An app's custom domain: hostname, live status (pending, active or failed with a reason), and the DNS records to create.",
             Account, false,
         ),
+        tool::<export_inputs::ExportCodeInput>(
+            "export_code",
+            "Download your app's whole code as a zip (Pro, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.",
+            Account, false,
+        ),
         tool::<code_inputs::ListFilesInput>(
             "list_files",
             "List an app's files at a commit: {app, sha?, path_prefix?}.",
@@ -390,7 +397,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 42);
+        assert_eq!(tools.len(), 43);
     }
 }
 

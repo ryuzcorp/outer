@@ -602,7 +602,7 @@ impl FleetManager {
                 }
                 let due = last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400));
                 if due {
-                    prune_retention(&pool).await;
+                    prune_retention(&pool, &store).await;
                     last_prune = Some(std::time::Instant::now());
                 }
             }
@@ -638,11 +638,11 @@ impl FleetManager {
 
 /// Daily retention prunes: the agent action log per plan (spec §3), the
 /// rate-limit ledger, expired email codes and web sessions, expired OAuth
-/// leftovers and stale DCR clients, releasable slug quarantines (spec §17)
-/// and deploys past the last 50 per app (spec §13). Each prune logs its
-/// own failure and the rest still run, so one bad table never blocks the
-/// others.
-async fn prune_retention(pool: &SqlitePool) {
+/// leftovers and stale DCR clients, releasable slug quarantines (spec §17),
+/// deploys past the last 50 per app (spec §13), and code exports older
+/// than 24 h (spec §7.5). Each prune logs its own failure and the rest
+/// still run, so one bad table never blocks the others.
+async fn prune_retention(pool: &SqlitePool, store: &crate::store::Store) {
     let now = crate::auth::now_ms();
     if let Err(err) = crate::mcp::actions::prune(pool, now).await {
         tracing::warn!(error = %format!("{err:#}"), "agent_action prune failed");
@@ -666,6 +666,9 @@ async fn prune_retention(pool: &SqlitePool) {
     }
     if let Err(err) = crate::observe::logs::prune_errors(pool, now).await {
         tracing::warn!(error = %format!("{err:#}"), "error_issue prune failed");
+    }
+    if let Err(err) = crate::git::export::prune_exports(pool, store, now).await {
+        tracing::warn!(error = %format!("{err:#}"), "export prune failed");
     }
 }
 
