@@ -45,7 +45,7 @@ pub fn backup_prefix(slug: &str) -> String {
 }
 
 /// One dump's key: the creation time sorts the prefix, and the sanitized
-/// binding keeps two bindings in one app from colliding.
+/// binding keeps the key unique per database.
 pub fn backup_key(slug: &str, created_at: i64, binding: &str) -> String {
     format!(
         "{}{created_at}-{}.sql",

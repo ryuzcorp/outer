@@ -538,7 +538,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `binding` | string | no | One D1 binding. Omit to list every binding's dumps. |
+| `binding` | string | no | The D1 binding. Omit to list the app's dumps (one database per app). |
 
 ## `backup_database`
 
@@ -550,7 +550,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `binding` | string | no | One D1 binding. Omit when the app declares exactly one. |
+| `binding` | string | no | The D1 binding. Omit to use the app's only declared binding. |
 
 ## `restore_backup`
 
@@ -563,6 +563,6 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
 | `backup_id` | string | yes | The backup id to restore, from `list_backups`. |
-| `binding` | string | no | One D1 binding. Omit when the app declares exactly one. |
+| `binding` | string | no | The D1 binding. Omit to use the app's only declared binding. |
 | `confirm` | string | yes | Must equal `backup_id`: restoring overwrites the live database (a fresh backup is taken first, so a bad restore is itself restorable). |
 

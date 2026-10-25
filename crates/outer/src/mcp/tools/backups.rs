@@ -8,23 +8,23 @@ use super::{owner_app, Ctx};
 use crate::http::console_data::d1::{D1Ctx, D1Error};
 use crate::mcp::error::ToolError;
 
-/// `list_backups` arguments: the app, and optionally one binding.
+/// `list_backups` arguments: the app, and optionally its D1 binding.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListBackupsInput {
     /// The app slug.
     pub app: String,
-    /// One D1 binding. Omit to list every binding's dumps.
+    /// The D1 binding. Omit to list the app's dumps (one database per app).
     #[serde(default)]
     pub binding: Option<String>,
 }
 
-/// `backup_database` arguments: the app, and optionally one binding (the
-/// single declared binding when omitted).
+/// `backup_database` arguments: the app, and optionally its D1 binding
+/// (defaults to the app's only declared binding).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BackupDatabaseInput {
     /// The app slug.
     pub app: String,
-    /// One D1 binding. Omit when the app declares exactly one.
+    /// The D1 binding. Omit to use the app's only declared binding.
     #[serde(default)]
     pub binding: Option<String>,
 }
@@ -34,7 +34,7 @@ pub struct BackupDatabaseInput {
 pub struct RestoreBackupInput {
     /// The app slug.
     pub app: String,
-    /// One D1 binding. Omit when the app declares exactly one.
+    /// The D1 binding. Omit to use the app's only declared binding.
     #[serde(default)]
     pub binding: Option<String>,
     /// The backup id to restore, from `list_backups`.
@@ -86,9 +86,9 @@ fn backup_ctx(ctx: &Ctx<'_>) -> D1Ctx {
     }
 }
 
-/// The one binding `input` names, or the single declared binding when
-/// omitted. Zero bindings is `not_found` (never deployed); two or more
-/// without a pick is `invalid_argument` naming the choices.
+/// The one binding `input` names, or the app's only declared binding when
+/// omitted (deploys refuse a second database, so there is never a choice
+/// to list). Zero bindings is `not_found` (never deployed with one).
 async fn resolve_binding(
     ctx: &Ctx<'_>,
     slug: &str,
@@ -102,24 +102,14 @@ async fn resolve_binding(
         }
         return Ok(binding.to_string());
     }
-    let mut bindings = crate::http::console_data::d1::database_bindings(&ctx.state.store, slug)
+    let bindings = crate::http::console_data::d1::database_bindings(&ctx.state.store, slug)
         .await
         .map_err(super::internal)?;
-    bindings.sort();
-    match bindings.len() {
-        1 => Ok(bindings.remove(0)),
-        0 => Err(ToolError::not_found(
+    bindings.into_iter().next().ok_or_else(|| {
+        ToolError::not_found(
             "this app has no deployed database config yet; add a d1_databases binding and deploy first",
-        )),
-        _ => Err(ToolError::invalid_argument(format!(
-            "the app declares several D1 bindings; pass binding, one of {}",
-            bindings
-                .iter()
-                .map(|b| format!("{b:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
-    }
+        )
+    })
 }
 
 pub async fn list_backups(
