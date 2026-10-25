@@ -17,9 +17,14 @@ mod slug;
 pub use slug::{brand_hit, check_slug_profanity, validate_slug, ProfanityError, SlugError};
 
 /// Bucket prefixes a slug owns. Shared by the claim check, the rename guard
-/// and the maintenance drain: a slug is exactly its two prefixes.
-pub(crate) fn cleanup_prefixes(slug: &str) -> [String; 2] {
-    [format!("fleets/{slug}/"), format!("git/{slug}/")]
+/// and the maintenance drain: a slug is its fleet state, its repo WAL, and
+/// its D1 backups (which live outside `fleets/` so app code can't touch them).
+pub(crate) fn cleanup_prefixes(slug: &str) -> [String; 3] {
+    [
+        format!("fleets/{slug}/"),
+        format!("git/{slug}/"),
+        crate::d1_backup::backup_prefix(slug),
+    ]
 }
 
 /// How long a deleted slug stays quarantined before anyone may reuse it.
@@ -47,14 +52,16 @@ pub(crate) async fn check_slug_claimable_conn(
     // prefix still holds someone's data, so no app may inherit it. Checked
     // first, so an expired quarantine row survives below and the old
     // hostname keeps redirecting while the drain is still due.
-    let [fleets_prefix, git_prefix] = cleanup_prefixes(slug);
-    let blocked: Option<String> =
-        sqlx::query_scalar("SELECT prefix FROM prefix_cleanup WHERE prefix IN (?1, ?2) LIMIT 1")
-            .bind(&fleets_prefix)
-            .bind(&git_prefix)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(internal)?;
+    let [fleets_prefix, git_prefix, backups_prefix] = cleanup_prefixes(slug);
+    let blocked: Option<String> = sqlx::query_scalar(
+        "SELECT prefix FROM prefix_cleanup WHERE prefix IN (?1, ?2, ?3) LIMIT 1",
+    )
+    .bind(&fleets_prefix)
+    .bind(&git_prefix)
+    .bind(&backups_prefix)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(internal)?;
     if blocked.is_some() {
         return Err(CreateError::Taken);
     }

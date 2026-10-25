@@ -7,6 +7,7 @@
 
 pub(crate) mod account;
 pub(crate) mod apps;
+pub(crate) mod backups;
 pub(crate) mod code;
 pub(crate) mod collaborators;
 pub(crate) mod domains;
@@ -870,6 +871,15 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "unset_secret" => secrets::unset_secret(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "list_backups" => backups::list_backups(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "backup_database" => backups::backup_database(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "restore_backup" => backups::restore_backup(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         _ => Err(CallError::Rpc(-32602, format!("unknown tool {tool:?}"))),

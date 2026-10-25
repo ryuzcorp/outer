@@ -13,6 +13,7 @@
 //! celld (never plain S3 PUT) and are recorded in `agent_action` via
 //! `mcp::actions::record_console` with both ids NULL (client "Console").
 
+pub mod backups;
 pub mod d1;
 pub mod durable;
 pub mod r2;
@@ -28,7 +29,10 @@ use super::console::{guard, visible_app};
 
 /// Routes for every data panel.
 pub fn routes() -> Router<super::AppState> {
-    d1::routes().merge(r2::routes()).merge(durable::routes())
+    d1::routes()
+        .merge(backups::routes())
+        .merge(r2::routes())
+        .merge(durable::routes())
 }
 
 /// The HTTP state, re-exported under the name the panel modules see it as:

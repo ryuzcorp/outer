@@ -3553,7 +3553,7 @@ async fn rename_app_store_fault_refunds_quota_and_keeps_the_old_identity() {
         .fetch_one(&state.pool)
         .await
         .unwrap();
-    assert_eq!(jobs, 2, "the target rows block the slug until drained");
+    assert_eq!(jobs, 3, "the target rows block the slug until drained");
     let (_, blocked) = call(&state, Some(&ana), "get_app", json!({"app": "pantry"})).await;
     assert_eq!(is_error(&blocked)["error"], "not_found");
     // The maintenance pass drains the abandoned copy; retry converges.
@@ -3561,7 +3561,7 @@ async fn rename_app_store_fault_refunds_quota_and_keeps_the_old_identity() {
         crate::apps::rename::drain_prefix_cleanup(&state.pool, &state.store, Some(&state.fleets))
             .await
             .unwrap();
-    assert_eq!(drained, 2);
+    assert_eq!(drained, 3);
     let (_, again) = call(
         &state,
         Some(&ana),
