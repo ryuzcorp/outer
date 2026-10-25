@@ -161,9 +161,11 @@ export function D1View({
   }
 
   // No wrapping card: the table rail + grid sit directly on the main
-  // panel, which is itself the surface.
+  // panel, which is itself the surface. On wide screens the editor takes
+  // the panel's full height (main is 100dvh minus its padding and title)
+  // and the grid scrolls inside it.
   return (
-    <div class="flex min-w-0 flex-col gap-3">
+    <div class="flex min-w-0 flex-col gap-3 md:h-[calc(100dvh-124px)]">
       {canWrite ? null : (
         <div class="alert alert-info alert-soft min-w-0" role="note">
           <span class="min-w-0 break-words">
@@ -172,14 +174,16 @@ export function D1View({
           </span>
         </div>
       )}
-      <D1Editor
-        key={editorKey}
-        binding={binding}
-        canWrite={canWrite}
-        route={route}
-        setRoute={setRoute}
-        slug={slug}
-      />
+      <div class="flex min-h-0 min-w-0 flex-1">
+        <D1Editor
+          key={editorKey}
+          binding={binding}
+          canWrite={canWrite}
+          route={route}
+          setRoute={setRoute}
+          slug={slug}
+        />
+      </div>
     </div>
   );
 }

@@ -353,6 +353,18 @@ a.rail-tile:hover {
   overflow: auto;
 }
 
+/* Code view on wide screens: the file tree and the file's lines run to the
+   bottom of the panel instead of stopping at 480px. */
+@media (min-width: 1024px) {
+  .code-fill-tree {
+    max-height: calc(100dvh - 232px);
+  }
+
+  .log-list.code-fill-lines {
+    max-height: calc(100dvh - 256px);
+  }
+}
+
 .log-line {
   display: flex;
   gap: 8px;

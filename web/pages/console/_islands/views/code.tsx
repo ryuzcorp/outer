@@ -560,7 +560,7 @@ function FilesTab({
           {nodes.length === 0 ? (
             <p class="m-0 min-w-0 text-sm opacity-60">This version has no files.</p>
           ) : (
-            <div class="max-h-[480px] min-w-0 overflow-auto">
+            <div class="code-fill-tree max-h-[480px] min-w-0 overflow-auto">
               <TreeNodes nodes={nodes} depth={0} selected={filePath} onSelect={onSelect} />
             </div>
           )}
@@ -656,7 +656,7 @@ function FileViewer({
                 </span>
               </p>
             )}
-            <ol class="log-list m-0" aria-label={`Contents of ${value.path}`}>
+            <ol class="log-list code-fill-lines m-0" aria-label={`Contents of ${value.path}`}>
               {lines.map((line, i) => (
                 <li key={i} class={`log-line${wrap ? "" : " is-nowrap"}`}>
                   <span class="log-stream w-10 shrink-0 text-right" aria-hidden="true">
