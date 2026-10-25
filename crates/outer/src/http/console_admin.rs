@@ -607,6 +607,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((tool.as_str(), outcome.as_str()), ("admin_review", "ok"));
+        // Decided blocks leave the queue.
+        let queue = crate::moderation::admin::queue(&pool).await.unwrap();
+        assert!(
+            queue.iter().all(|item| item.id != "dep-blocked"),
+            "denied block still queued"
+        );
     }
 
     #[tokio::test]

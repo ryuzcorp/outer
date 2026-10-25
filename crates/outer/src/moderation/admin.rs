@@ -98,6 +98,11 @@ pub async fn queue(pool: &SqlitePool) -> anyhow::Result<Vec<QueueItem>> {
         if !seen_deploys.insert(id.clone()) {
             continue;
         }
+        // Decided: an admin already reviewed this block, so it no longer
+        // needs attention.
+        if reviewed_by.is_some() {
+            continue;
+        }
         items.push(QueueItem {
             kind: "blocked_deploy".to_string(),
             id,
