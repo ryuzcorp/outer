@@ -58,6 +58,12 @@ pub struct RevokeConnectionInput {
     pub id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteAccountInput {
+    /// Type your account email again to confirm: must equal it exactly.
+    pub confirm: String,
+}
+
 pub async fn about(_input: NoArgs, _ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let structured = json!({
         "what": "Outer is your agent's own app cloud, built on Ilha. Your agent talks to Outer, Outer builds the app and serves it at https://<slug>.outer.now.",
@@ -261,5 +267,31 @@ pub async fn revoke_connection(
     Ok(ok(
         "OAuth connection revoked.".to_string(),
         json!({"revoked": true}),
+    ))
+}
+
+/// Delete the caller's account (spec §8.2): the same
+/// [`crate::accounts::delete_account`] domain path the console uses.
+/// `confirm` must equal the account email exactly. Deletes owned apps
+/// through the `delete_app` path, leaves apps the caller only
+/// collaborates on, and signs every session out.
+pub async fn delete_account(input: DeleteAccountInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let caller = authed(ctx)?;
+    let deps = crate::accounts::DeleteAccountDeps {
+        pool: &ctx.state.pool,
+        store: &ctx.state.store,
+        git: &ctx.state.git,
+        sync: &ctx.state.sync,
+        fleets: &ctx.state.fleets,
+        deploys: &ctx.state.deploys,
+        rollback_locks: &ctx.state.rollback_locks,
+        delete_cfg: &ctx.state.delete_cfg,
+    };
+    let out = crate::accounts::delete_account(&deps, &caller.account_id, &input.confirm)
+        .await
+        .map_err(|err| ToolError::new(err.code, err.message).with_user(err.user_message))?;
+    Ok(ok(
+        format!("Account {} deleted.", out.email),
+        json!({"deleted": true, "email": out.email, "deleted_apps": out.deleted_apps}),
     ))
 }

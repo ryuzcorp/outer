@@ -86,6 +86,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .merge(super::console_code::routes())
         .route("/api/console/sign-out", post(api_sign_out))
         .merge(super::console_observe::routes())
+        .merge(super::console_account::routes())
         .with_state(state)
 }
 

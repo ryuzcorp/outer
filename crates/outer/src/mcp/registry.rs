@@ -100,9 +100,8 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             open_world: true,
             ..Hints::WRITE
         },
-        "revoke_api_key" | "revoke_connection" | "delete_app" | "unset_secret" => {
-            Hints::DESTRUCTIVE
-        }
+        "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
+        | "unset_secret" => Hints::DESTRUCTIVE,
         _ => return None,
     })
 }
@@ -194,6 +193,11 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<account::RevokeConnectionInput>(
             "revoke_connection",
             "Revoke an OAuth grant by id. The client signs in again from scratch.",
+            Account, false,
+        ),
+        tool::<account::DeleteAccountInput>(
+            "delete_account",
+            "Delete your account: pass confirm equal to your email. Deletes your apps, signs every session out.",
             Account, false,
         ),
         tool::<app_inputs::CreateAppInput>(
@@ -362,7 +366,11 @@ mod hint_tests {
             );
             let destructive = matches!(
                 tool.name,
-                "revoke_api_key" | "revoke_connection" | "delete_app" | "unset_secret"
+                "revoke_api_key"
+                    | "revoke_connection"
+                    | "delete_app"
+                    | "delete_account"
+                    | "unset_secret"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);
             // Untrusted tools return app content; they must never change state.
