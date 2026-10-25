@@ -8,6 +8,7 @@ export const VIEWS = [
   { id: "metrics", label: "Metrics" },
   { id: "actions", label: "Agent actions" },
   { id: "deploys", label: "Deploys" },
+  { id: "code", label: "Code" },
   { id: "logs", label: "Logs" },
   { id: "errors", label: "Errors" },
   { id: "secrets", label: "Secrets" },
@@ -33,6 +34,12 @@ export interface Route {
   app: string | null;
   view: ViewId;
   range: number;
+  // The Code view's pinned version; null means the live sha. Other views
+  // ignore it, and it survives view switches so Code keeps its place.
+  sha: string | null;
+  // The Code view's section; null means files. The Deploys "what changed"
+  // link sets it so the diff shows immediately.
+  codeTab: "files" | "changes" | null;
 }
 
 export function toViewId(raw: string | null): ViewId {
@@ -49,13 +56,16 @@ export function toRange(raw: string | null): number {
 
 export function readRoute(): Route {
   if (typeof window === "undefined") {
-    return { app: null, view: "overview", range: 24 };
+    return { app: null, view: "overview", range: 24, sha: null, codeTab: null };
   }
   const q = new URLSearchParams(window.location.search);
+  const ct = q.get("ct");
   return {
     app: q.get("app"),
     view: toViewId(q.get("t")),
     range: toRange(q.get("r")),
+    sha: q.get("sha"),
+    codeTab: ct === "changes" ? "changes" : ct === "files" ? "files" : null,
   };
 }
 
@@ -66,6 +76,12 @@ export function routeUrl(route: Route): string {
   }
   q.set("t", route.view);
   q.set("r", String(route.range));
+  if (route.sha) {
+    q.set("sha", route.sha);
+  }
+  if (route.codeTab) {
+    q.set("ct", route.codeTab);
+  }
   return `/console?${q.toString()}`;
 }
 

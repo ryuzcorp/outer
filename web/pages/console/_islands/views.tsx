@@ -948,11 +948,13 @@ export function DeploysView({
   expanded,
   onToggle,
   onRolledBack,
+  onShowChanges,
 }: {
   app: AppDetail;
   expanded: string[];
   onToggle: (id: string) => void;
   onRolledBack: () => void;
+  onShowChanges: (sha: string) => void;
 }) {
   // The live version is the newest successful deploy (the list is newest
   // first; /apps/{slug} has no last_deploy field).
@@ -1046,6 +1048,19 @@ export function DeploysView({
                         {app.url}
                       </a>
                       <CopyButton value={app.url} label="Copy app URL" />
+                    </span>
+                  </div>
+                  <div class="flex min-w-0 gap-3">
+                    <span class="w-[90px] shrink-0 opacity-60">Changes</span>
+                    <span class="min-w-0 flex-1">
+                      <button
+                        type="button"
+                        class="link"
+                        title={`Show what changed in ${d.sha}`}
+                        onclick={() => onShowChanges(d.sha)}
+                      >
+                        What changed in {shortSha(d.sha)}
+                      </button>
                     </span>
                   </div>
                   {d.message && (

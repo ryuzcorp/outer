@@ -364,6 +364,11 @@ a.rail-tile:hover {
   white-space: pre-wrap;
   min-width: 0;
 }
+/* The Code view's wrap toggle: without wrapping, long lines scroll the
+   viewer itself instead of the page. */
+.log-line.is-nowrap code {
+  white-space: pre;
+}
 
 .log-stream {
   flex: none;

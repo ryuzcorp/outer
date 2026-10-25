@@ -16,6 +16,7 @@ import {
   ChartLine,
   Check,
   ChevronDown,
+  CodeXml,
   Copy,
   Database,
   Eye,
@@ -96,6 +97,9 @@ export function ActionsIcon({ size = 18 }: { size?: number }) {
 
 export function DeploysIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={Rocket} size={size} />;
+}
+export function CodeIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={CodeXml} size={size} />;
 }
 
 export function LogsIcon({ size = 18 }: { size?: number }) {
