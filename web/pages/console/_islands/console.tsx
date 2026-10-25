@@ -151,6 +151,15 @@ const VIEW_TITLES: Record<ViewId, string> = {
   admin: "Admin",
 };
 
+/** Shell UI state: sidebar collapse, mobile drawer, popovers, expanded deploy rows. */
+interface Ui {
+  collapsed: boolean;
+  drawer: boolean;
+  createOpen: boolean;
+  accountOpen: boolean;
+  expanded: string[];
+}
+
 export function Console() {
   const route = atom<Route>(readRoute());
   const apps = atom<Panel<ConsoleApp[]>>({ kind: "loading" });
@@ -997,6 +1006,7 @@ export function Console() {
                 {!accountView && detailPanel.kind === "ready" && (
                   <ViewBody
                     route={r}
+                    onView={(view) => navigate({ view })}
                     app={detailPanel.value}
                     metrics={metrics()}
                     actions={actions()}
@@ -1167,6 +1177,8 @@ function ViewBody(props: {
   onRefreshDetail: () => void;
   onRenamed: (slug: string) => void;
   onDeleted: () => void;
+  /** Switch the current app's view (ViewBody is outside `navigate`'s scope). */
+  onView: (view: ViewId) => void;
 }) {
   switch (props.route.view) {
     case "overview":
@@ -1176,7 +1188,7 @@ function ViewBody(props: {
           metrics={props.metrics}
           actions={props.actions}
           errors={props.errors}
-          onView={(view) => navigate({ view })}
+          onView={props.onView}
           onRetry={props.onRetry}
         />
       );

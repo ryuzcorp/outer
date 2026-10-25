@@ -45,6 +45,9 @@ import {
   EyeIcon,
   EyeOffIcon,
   LogsIcon,
+  MetricsIcon,
+  OverviewIcon,
+  SecretsIcon,
   TicketIcon,
 } from "./icons.tsx";
 
@@ -951,7 +954,9 @@ export function DeploysView({
   onToggle: (id: string) => void;
   onRolledBack: () => void;
 }) {
-  const liveSha = app.last_deploy?.sha ?? null;
+  // The live version is the newest successful deploy (the list is newest
+  // first; /apps/{slug} has no last_deploy field).
+  const liveSha = app.deploys.find((d) => d.status === "success")?.sha ?? null;
   const confirmTarget = atom<ConsoleDeploy | null>(null);
   const busy = atom(false);
   const error = atom<string | null>(null);
