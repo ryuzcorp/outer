@@ -1667,6 +1667,19 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
         .put("fleets/bobapp/deploy/current.json", b"{}".to_vec())
         .await
         .unwrap();
+    // A Pro export the delete must wipe: the zip object and its row.
+    state
+        .store
+        .put("outer/exports/groceries/abc1234-test.zip", b"zip".to_vec())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO app_export (key, app_id, sha, bytes, created_at) VALUES ('outer/exports/groceries/abc1234-test.zip', ?1, 'abc1234', 3, 0)",
+    )
+    .bind(&groceries_id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
     // Every app-scoped table with no cascade gets a row (deploys, secrets
     // and cron rows already exist from create/fake-deploy; add the rest).
     for sql in [
@@ -1742,6 +1755,12 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
         .await
         .unwrap()
         .is_empty());
+    assert!(state
+        .store
+        .list("outer/exports/groceries/")
+        .await
+        .unwrap()
+        .is_empty());
     assert!(!state.store.list("fleets/bobapp/").await.unwrap().is_empty());
     assert!(!state.store.list("git/bobapp/").await.unwrap().is_empty());
     // Local: worktree, sidecars, caches, fleet state and mirror gone.
@@ -1768,6 +1787,7 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
         "visitor_day",
         "app_log",
         "error_issue",
+        "app_export",
     ] {
         // `table` comes from the literal list above, never agent input.
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -3130,10 +3150,13 @@ async fn rename_app_moves_everything_and_quarantines_with_redirect() {
 
     // Fake deploys write no bucket objects, so seed both prefixes by hand:
     // a deploy pointer plus a D1-shaped object that must survive the move.
+    // Exports are 24 h-ephemeral links: the rename drops them instead of
+    // moving them, so seed one object plus its row.
     for (key, body) in [
         ("fleets/groceries/deploy/current.json", "{}"),
         ("fleets/groceries/cells/d1.sqlite", "D1DATA"),
         ("fleets/bobapp/deploy/current.json", "{}"),
+        ("outer/exports/groceries/abc1234-test.zip", "zip"),
     ] {
         state
             .store
@@ -3141,6 +3164,13 @@ async fn rename_app_moves_everything_and_quarantines_with_redirect() {
             .await
             .unwrap();
     }
+    sqlx::query(
+        "INSERT INTO app_export (key, app_id, sha, bytes, created_at) VALUES ('outer/exports/groceries/abc1234-test.zip', ?1, 'abc1234', 3, 0)",
+    )
+    .bind(&id_before)
+    .execute(&state.pool)
+    .await
+    .unwrap();
     // Local state the pipeline would have left behind.
     let data = &state.delete_cfg.data_dir;
     tokio::fs::create_dir_all(data.join("work/groceries"))
@@ -3224,8 +3254,26 @@ async fn rename_app_moves_everything_and_quarantines_with_redirect() {
         .unwrap()
         .is_empty());
     assert!(state.store.list("git/groceries/").await.unwrap().is_empty());
+    // Dropped, not moved: no objects under either slug, and no rows left.
+    assert!(state
+        .store
+        .list("outer/exports/groceries/")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(state
+        .store
+        .list("outer/exports/pantry/")
+        .await
+        .unwrap()
+        .is_empty());
+    let exports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_export WHERE app_id = ?1")
+        .bind(&id_before)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(exports, 0);
     assert!(!state.store.list("git/pantry/").await.unwrap().is_empty());
-    assert!(!state.store.list("fleets/bobapp/").await.unwrap().is_empty());
     // Local state moved.
     assert!(data.join("work/pantry").exists());
     assert!(!data.join("work/groceries").exists());

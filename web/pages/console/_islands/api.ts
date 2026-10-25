@@ -102,6 +102,15 @@ export interface LogLine {
   fingerprint?: string;
 }
 
+/**
+ * The live version: the newest successful deploy (the list is newest
+ * first), or null when nothing succeeded yet. Shared by DeploysView and
+ * the Export card so both agree on what "live" downloads or rolls back to.
+ */
+export function liveDeploySha(deploys: ConsoleDeploy[]): string | null {
+  return deploys.find((d) => d.status === "success")?.sha ?? null;
+}
+
 export interface LogFilter {
   q?: string;
   stream?: string;

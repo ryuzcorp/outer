@@ -21,9 +21,6 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::json;
 
-use crate::git::export;
-use crate::mcp::tools::plan_of;
-
 pub fn routes() -> Router<super::AppState> {
     Router::new().route("/api/console/apps/{slug}/export", post(api_export))
 }
@@ -95,36 +92,18 @@ async fn api_export(
     {
         return super::console_actions::tool_response(&ToolError::invalid_argument("sha too long"));
     }
-    let plan = plan_of(&state.mcp.pool, &app.owner_id)
-        .await
-        .unwrap_or_else(|_| "free".to_string());
-    let outcome = if plan != "pro" {
-        Err(ToolError::payment_required(
-            format!(
-                "{} is on a Free account; code export is a Pro feature",
-                app.slug
-            ),
-            "Code export is a Pro feature. Upgrade to Pro to download your app as a zip.",
-        ))
-    } else {
-        export::export_app(
-            &export::ExportDeps {
-                pool: &state.mcp.pool,
-                store: &state.mcp.store,
-                git: &state.mcp.git,
-                sync: &state.mcp.sync,
-            },
-            export::ExportParams {
-                slug: &app.slug,
-                app_id: &app.id,
-                rev: raw.sha.as_deref(),
-                caps: &export::ExportCaps::default(),
-                now: chrono::Utc::now(),
-            },
-        )
-        .await
-        .map_err(|err| crate::mcp::tools::export::tool_error(&app.slug, err))
-    };
+    let outcome = crate::mcp::tools::export::export_for_owner(
+        &state.mcp.pool,
+        &state.mcp.store,
+        &state.mcp.git,
+        &state.mcp.sync,
+        &app.slug,
+        &app.id,
+        &app.owner_id,
+        raw.sha.as_deref(),
+        chrono::Utc::now(),
+    )
+    .await;
     // Audited like the MCP tool (client "Console": both ids NULL). A
     // refused Pro-gated export is signal, not noise.
     let (outcome_str, error_code) = match &outcome {
@@ -400,5 +379,38 @@ mod tests {
         // The owner still downloads.
         let (status, body) = send(&app, post(path, &cookie, serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A plan-lookup failure is `internal`, never a Free-plan refusal: the
+    /// console endpoint shares the MCP tool's gate, and a transient DB
+    /// error must not bill the owner as a Free refusal in the audit log.
+    #[tokio::test]
+    async fn export_plan_lookup_failure_is_internal_not_free() {
+        let (config, _codes) = test_config();
+        let pool = test_pool().await;
+        let auth = AuthState {
+            pool: pool.clone(),
+            config: config.clone(),
+        };
+        let mcp = McpState::for_tests(pool.clone(), auth);
+        seed(&pool, &mcp, "pro").await;
+        // Sabotage the plan lookup with a pool that has no tables: the
+        // query fails, which must surface as an internal error — never as
+        // a Free-plan refusal.
+        let bare = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let err = crate::mcp::tools::export::export_for_owner(
+            &bare,
+            &mcp.store,
+            &mcp.git,
+            &mcp.sync,
+            "groceries",
+            "app-groceries",
+            "acct-ana@example.com",
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, "internal");
     }
 }

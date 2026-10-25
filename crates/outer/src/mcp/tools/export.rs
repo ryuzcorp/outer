@@ -46,38 +46,67 @@ pub(crate) fn tool_error(app: &str, err: export::ExportError) -> ToolError {
     }
 }
 
-pub async fn export_code(input: ExportCodeInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owner_app(ctx, &input.app).await?;
-    if let Some(sha) = input.sha.as_deref() {
-        check_rev("sha", sha)?;
+/// The Pro gate plus the zip build, shared by the `export_code` tool and the
+/// console `POST /api/console/apps/:slug/export` endpoint (same gate, same
+/// caps, same messages). The caller checks the role first; this checks the
+/// plan and builds the zip. A plan-lookup failure propagates as `internal`:
+/// a transient DB error must never read as a Free plan refusing with
+/// `payment_required`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn export_for_owner(
+    pool: &sqlx::SqlitePool,
+    store: &crate::store::Store,
+    git: &crate::git::manifest::GitConfig,
+    sync: &crate::git::manifest::GitSync,
+    slug: &str,
+    app_id: &str,
+    owner_id: &str,
+    rev: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<export::ExportOutcome, ToolError> {
+    if let Some(rev) = rev {
+        check_rev("sha", rev)?;
     }
-    let plan = plan_of(&ctx.state.pool, &app.owner_id).await?;
+    let plan = plan_of(pool, owner_id).await?;
     if plan != "pro" {
         return Err(ToolError::payment_required(
-            format!(
-                "{} is on a Free account; code export is a Pro feature",
-                app.slug
-            ),
+            format!("{slug} is on a Free account; code export is a Pro feature"),
             "Code export is a Pro feature. Upgrade to Pro to download your app as a zip.",
         ));
     }
-    let outcome = export::export_app(
+    export::export_app(
         &export::ExportDeps {
-            pool: &ctx.state.pool,
-            store: &ctx.state.store,
-            git: &ctx.state.git,
-            sync: &ctx.state.sync,
+            pool,
+            store,
+            git,
+            sync,
         },
         export::ExportParams {
-            slug: &app.slug,
-            app_id: &app.id,
-            rev: input.sha.as_deref(),
+            slug,
+            app_id,
+            rev,
             caps: &export::ExportCaps::default(),
-            now: chrono::Utc::now(),
+            now,
         },
     )
     .await
-    .map_err(|err| tool_error(&app.slug, err))?;
+    .map_err(|err| tool_error(slug, err))
+}
+
+pub async fn export_code(input: ExportCodeInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let app = owner_app(ctx, &input.app).await?;
+    let outcome = export_for_owner(
+        &ctx.state.pool,
+        &ctx.state.store,
+        &ctx.state.git,
+        &ctx.state.sync,
+        &app.slug,
+        &app.id,
+        &app.owner_id,
+        input.sha.as_deref(),
+        chrono::Utc::now(),
+    )
+    .await?;
     Ok(ok(
         format!(
             "Exported {} at {} ({} bytes, link good for one hour).",

@@ -14,6 +14,7 @@
 // for text that should wrap: log lines and the expanded deploy message.
 import { atom } from "ilha";
 import {
+  liveDeploySha,
   shortSha,
   when,
   type AdminInvitesPage,
@@ -2203,7 +2204,7 @@ function ExportCard({
   const error = atom<string | null>(null);
   const isPro = plan === "pro";
   const deploys = app.deploys ?? [];
-  const live = app.last_deploy?.sha ?? deploys[0]?.sha ?? null;
+  const live = liveDeploySha(deploys);
 
   async function download(): Promise<void> {
     if (busy() || !isPro) {
