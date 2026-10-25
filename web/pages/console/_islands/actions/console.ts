@@ -1,0 +1,195 @@
+// Console navigation actions: agents need to see and drive the console
+// itself, so these three join every other `actions/*.ts` registry in
+// `index.ts` and are exposed through the palette and WebMCP like the rest.
+//
+// They reach the Console island's `navigate` and route state through a
+// small module-level bridge the island sets on mount: a function setter,
+// not an Ilha atom (module-level `atom()` is illegal in Ilha).
+import {
+  ACCOUNT_VIEWS,
+  DATA_VIEWS,
+  VIEWS,
+  type Route,
+  type ViewId,
+} from "../common.tsx";
+import type { ConsoleApp } from "../api.ts";
+import type { ConsoleAction } from "./settings.ts";
+
+export interface ConsoleBridge {
+  getEmail: () => string;
+  getRoute: () => Route;
+  getApps: () => ConsoleApp[];
+  navigate: (next: Partial<Route>) => void;
+}
+
+let bridge: ConsoleBridge | null = null;
+
+/** The Console island calls this on mount (and with null never — the page is single-lived). */
+export function setConsoleBridge(next: ConsoleBridge | null): void {
+  bridge = next;
+}
+
+function needBridge(): ConsoleBridge {
+  if (!bridge) {
+    throw new Error("The console is not ready yet — open it and try again.");
+  }
+  return bridge;
+}
+
+const VIEW_IDS: ViewId[] = [
+  ...VIEWS.map((v) => v.id as ViewId),
+  ...DATA_VIEWS.map((v) => v.id as ViewId),
+  ...ACCOUNT_VIEWS.map((v) => v.id as ViewId),
+];
+
+function isViewId(raw: unknown): raw is ViewId {
+  return typeof raw === "string" && (VIEW_IDS as string[]).includes(raw);
+}
+
+export interface ConsoleStateOutput {
+  email: string;
+  slug: string | null;
+  view: ViewId;
+  params: Record<string, string | number | null>;
+  apps: { slug: string; role: string; status: string }[];
+}
+
+const consoleState: ConsoleAction<Record<string, never>, ConsoleStateOutput> = {
+  name: "console_state",
+  title: "Console state",
+  description:
+    "The console itself: the signed-in email, the current app slug, view and route params, and the app list with role and status. Read-only; call it first to learn what is open.",
+  inputSchema: { type: "object", properties: {} },
+  readOnly: true,
+  consequential: false,
+  untrusted: false,
+  async run(): Promise<ConsoleStateOutput> {
+    const b = needBridge();
+    const route = b.getRoute();
+    return {
+      email: b.getEmail(),
+      slug: route.app,
+      view: route.view,
+      params: {
+        range: route.range,
+        sha: route.sha,
+        codeTab: route.codeTab,
+        db: route.db || null,
+        table: route.table || null,
+      },
+      apps: b
+        .getApps()
+        .map((a) => ({ slug: a.slug, role: a.role, status: a.status })),
+    };
+  },
+};
+
+export interface OpenAppInput {
+  slug?: string;
+  view?: string;
+}
+
+const openApp: ConsoleAction<OpenAppInput, { slug: string; view: ViewId }> = {
+  name: "open_app",
+  title: "Open app",
+  description:
+    "Switch the console to an app, optionally on a view (defaults to overview). The slug defaults to the current app. Returns the opened {slug, view}.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      slug: { type: "string", description: "The app slug (defaults to the current app)." },
+      view: {
+        type: "string",
+        description: "A console view id (defaults to overview).",
+        enum: VIEW_IDS as unknown as string[],
+      },
+    },
+  },
+  readOnly: true,
+  consequential: false,
+  untrusted: false,
+  async run(input): Promise<{ slug: string; view: ViewId }> {
+    const b = needBridge();
+    const slug = input.slug ?? b.getRoute().app;
+    if (!slug) {
+      throw new Error("No app is open and no slug was given.");
+    }
+    if (!b.getApps().some((a) => a.slug === slug)) {
+      const known = b.getApps().map((a) => a.slug).join(", ");
+      throw new Error(`Unknown app "${slug}". Open one of: ${known || "(no apps yet)"}.`);
+    }
+    const view: ViewId = input.view === undefined ? "overview" : input.view as ViewId;
+    if (input.view !== undefined && !isViewId(input.view)) {
+      throw new Error(`Unknown view "${input.view}".`);
+    }
+    b.navigate({ app: slug, view });
+    return { slug, view };
+  },
+};
+
+export interface OpenViewInput {
+  view: string;
+  sha?: string | null;
+  codeTab?: "files" | "changes" | null;
+  db?: string;
+  table?: string;
+}
+
+const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId }> = {
+  name: "open_view",
+  title: "Open view",
+  description:
+    "Navigate within the current app: views, account pages (connections, usage, account, invites, admin), and D1/Code deep links (db, table, sha, codeTab). The app is the current one; pass an app-scoped view with no app open rejects. Returns the opened {slug, view}.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      view: {
+        type: "string",
+        description: "A console view id.",
+        enum: VIEW_IDS as unknown as string[],
+      },
+      sha: { type: "string", description: "Code view: pin this commit sha." },
+      codeTab: { type: "string", enum: ["files", "changes"] },
+      db: { type: "string", description: "D1 view: the binding to show." },
+      table: { type: "string", description: "D1 view: the table to show." },
+    },
+    required: ["view"],
+  },
+  readOnly: true,
+  consequential: false,
+  untrusted: false,
+  async run(input): Promise<{ slug: string | null; view: ViewId }> {
+    const b = needBridge();
+    if (!isViewId(input.view)) {
+      throw new Error(`Unknown view "${input.view}".`);
+    }
+    const route = b.getRoute();
+    const accountView = (ACCOUNT_VIEWS.map((v) => v.id) as string[]).includes(input.view);
+    if (!accountView && !route.app) {
+      throw new Error("No app is open — open_app first, or pick an account view.");
+    }
+    const next: Partial<Route> = { view: input.view };
+    if (input.sha !== undefined) {
+      next.sha = input.sha;
+    }
+    if (input.codeTab !== undefined) {
+      next.codeTab = input.codeTab;
+    }
+    if (input.db !== undefined) {
+      next.db = input.db;
+    }
+    if (input.table !== undefined) {
+      next.table = input.table;
+    }
+    b.navigate(next);
+    return { slug: route.app, view: input.view };
+  },
+};
+
+export const actions: ConsoleAction<unknown, unknown>[] = [
+  consoleState as ConsoleAction<unknown, unknown>,
+  openApp as ConsoleAction<unknown, unknown>,
+  openView as ConsoleAction<unknown, unknown>,
+];
+
+export const consoleActions = { consoleState, openApp, openView };

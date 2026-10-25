@@ -134,6 +134,11 @@ pub struct Config {
     pub outer_secret: String,
     /// `OUTER_EMAIL_FROM` (default `Outer <hello@outer.now>`).
     pub email_from: String,
+    /// WebMCP origin-trial token (`OUTER_WEBMCP_ORIGIN_TRIAL`, absent =
+    /// none): when set, `/console*` responses carry it as an `Origin-Trial`
+    /// header so Chrome enables WebMCP. The console's strict CSP is
+    /// untouched.
+    pub webmcp_origin_trial: Option<String>,
     /// `OUTER_OAUTH_ACCESS_TTL_S` (default 3600).
     pub oauth_access_ttl: Duration,
     /// `OUTER_OAUTH_REFRESH_TTL_D` (default 90).
@@ -316,6 +321,7 @@ impl Config {
         let email_from = get("OUTER_EMAIL_FROM")
             .unwrap_or("Outer <hello@outer.now>")
             .to_string();
+        let webmcp_origin_trial = get("OUTER_WEBMCP_ORIGIN_TRIAL").map(str::to_string);
         let oauth_access_ttl = Duration::from_secs(parse_num(
             get("OUTER_OAUTH_ACCESS_TTL_S"),
             "OUTER_OAUTH_ACCESS_TTL_S",
@@ -415,6 +421,7 @@ impl Config {
             terms_version: terms_version.unwrap_or_else(|| "dev".to_string()),
             outer_secret,
             email_from,
+            webmcp_origin_trial,
             oauth_access_ttl,
             oauth_refresh_ttl,
             tool_wait,
