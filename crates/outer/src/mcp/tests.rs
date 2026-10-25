@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 34);
+    assert_eq!(anon.len(), 35);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
