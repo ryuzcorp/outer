@@ -2721,7 +2721,7 @@ export function AdminView({
   onMoreCodes: () => void;
   onRetry: () => void;
   onMutated: () => void;
-  onOpenCode: (slug: string) => void;
+  onOpenCode: (slug: string, sha: string | null) => void;
 }) {
   if (!isAdmin) {
     return (
@@ -3165,7 +3165,7 @@ function ModerationQueueCard({
   panel: Panel<ModerationQueue>;
   onRetry: () => void;
   onMutated: () => void;
-  onOpenCode: (slug: string) => void;
+  onOpenCode: (slug: string, sha: string | null) => void;
 }) {
   const pending = atom<ModerationConfirm | null>(null);
   const reason = atom("");
@@ -3360,7 +3360,7 @@ function ModerationQueueCard({
                       <button
                         type="button"
                         class="btn btn-xs btn-outline"
-                        onclick={() => onOpenCode(item.app_slug)}
+                        onclick={() => onOpenCode(item.app_slug, item.sha)}
                       >
                         Code view
                       </button>

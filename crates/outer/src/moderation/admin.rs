@@ -449,12 +449,15 @@ pub async fn stats(pool: &SqlitePool, now: i64) -> anyhow::Result<Stats> {
         pool,
         "SELECT COUNT(*) FROM deploy WHERE status = 'blocked' AND NOT EXISTS \
          (SELECT 1 FROM deploy newer WHERE newer.app_id = deploy.app_id \
-          AND (newer.created_at, newer.rowid) > (deploy.created_at, deploy.rowid))",
+          AND (newer.created_at, newer.rowid) > (deploy.created_at, deploy.rowid)) \
+         AND NOT EXISTS (SELECT 1 FROM moderation_check c \
+          WHERE c.deploy_id = deploy.id AND c.stage = 'gate' AND c.reviewed_by IS NOT NULL)",
     )
     .await?;
     let unreviewed_checks = count(
         pool,
-        "SELECT COUNT(*) FROM moderation_check WHERE reviewed_by IS NULL AND verdict != 'pass'",
+        "SELECT COUNT(*) FROM moderation_check \
+         WHERE reviewed_by IS NULL AND stage != 'gate' AND verdict != 'pass'",
     )
     .await?;
     let week_ago = now - 7 * 24 * 60 * 60 * 1000;

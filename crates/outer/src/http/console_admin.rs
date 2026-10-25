@@ -276,7 +276,13 @@ async fn api_ban(
         Err(res) => return *res,
     };
     let started = crate::auth::now_ms();
-    let outcome = admin::ban_account(&mcp.pool, body.email.trim(), &body.reason).await;
+    let target = crate::auth::normalize_email(&body.email);
+    if crate::auth::is_admin(&mcp.auth.config, &target) {
+        return tool_response(&ToolError::forbidden(
+            "administrator accounts cannot be banned".to_string(),
+        ));
+    }
+    let outcome = admin::ban_account(&mcp.pool, &target, &body.reason).await;
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -284,7 +290,7 @@ async fn api_ban(
                 &mcp.pool,
                 &account.id,
                 "admin_ban_account",
-                &format!("admin_ban_account {}", body.email.trim()),
+                &format!("admin_ban_account {target}"),
                 "error",
                 Some(err.code),
                 started,
@@ -824,6 +830,112 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+    #[tokio::test]
+    async fn ban_refuses_admin_accounts_and_normalizes_email() {
+        let (app, pool) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_user(&pool, "ana@example.com", now).await;
+        seed_user(&pool, "owner@example.com", now).await;
+        let admin = login(&pool, "owner@example.com").await;
+
+        for target in ["owner@example.com", " Owner@Example.com "] {
+            let (status, body) = send(
+                &app,
+                post_json(
+                    "/api/console/admin/accounts/ban",
+                    &admin,
+                    serde_json::json!({"email": target, "reason": "spam"}),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "target {target:?} got: {body}"
+            );
+            assert_eq!(
+                body.parse::<serde_json::Value>().unwrap()["error"],
+                "forbidden"
+            );
+        }
+        let (banned,): (i64,) =
+            sqlx::query_as("SELECT banned FROM user WHERE email = 'owner@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(banned, 0);
+
+        // Mixed case still reaches the account: the lookup uses the normalized email.
+        let (status, _) = send(
+            &app,
+            post_json(
+                "/api/console/admin/accounts/ban",
+                &admin,
+                serde_json::json!({"email": " ANA@EXAMPLE.COM ", "reason": "spam"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn stats_match_queue_after_review() {
+        let (app, pool) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_user(&pool, "ana@example.com", now).await;
+        seed_user(&pool, "owner@example.com", now).await;
+        seed_app(&pool, "ana@example.com", "shop", now).await;
+        seed_blocked_deploy(&pool, now).await;
+        let admin = login(&pool, "owner@example.com").await;
+
+        // The blocked deploy queues, but its gate check is not an
+        // unreviewed after-live check.
+        let items = admin::queue(&pool).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "blocked_deploy");
+        let (status, body) = send(&app, authed("/api/console/admin/stats", &admin)).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["blocked_deploys"], 1);
+        assert_eq!(body["unreviewed_checks"], 0);
+
+        // A deny leaves the deploy blocked but reviewed: it drops out of
+        // both the queue and the blocked-deploy count.
+        admin::apply_review(
+            &pool,
+            admin::ReviewKind::Deploy,
+            "dep-blocked",
+            admin::Verdict::Deny,
+            "owner@example.com",
+            now,
+        )
+        .await
+        .unwrap();
+        let items = admin::queue(&pool).await.unwrap();
+        assert!(items.is_empty(), "queue after deny: {items:?}");
+        let (status, body) = send(&app, authed("/api/console/admin/stats", &admin)).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["blocked_deploys"], 0);
+        assert_eq!(body["unreviewed_checks"], 0);
+
+        // A non-gate check still counts in both places.
+        sqlx::query(
+            "INSERT INTO moderation_check (id, app_id, deploy_id, sha, stage, findings, scores, verdict, created_at) \
+             VALUES ('chk-2', 'app-shop', NULL, 'deadbee', 'crawl', '[]', '{}', 'flag', ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let items = admin::queue(&pool).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "flagged_check");
+        let (status, body) = send(&app, authed("/api/console/admin/stats", &admin)).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["blocked_deploys"], 0);
+        assert_eq!(body["unreviewed_checks"], 1);
+    }
 
     #[tokio::test]
     async fn stats_counts_match_seeds() {
@@ -847,7 +959,9 @@ mod tests {
         assert_eq!(body["waitlist_size"], 1);
         assert_eq!(body["apps_total"], 1);
         assert_eq!(body["blocked_deploys"], 1);
-        assert_eq!(body["unreviewed_checks"], 1);
+        // The only check is the gate check behind that blocked deploy:
+        // gate-stage checks never count as unreviewed after-live checks.
+        assert_eq!(body["unreviewed_checks"], 0);
         assert_eq!(body["deploys_7d"], 1);
     }
 }

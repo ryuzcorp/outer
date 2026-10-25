@@ -6,6 +6,7 @@ pub mod console;
 pub mod console_account;
 pub mod console_actions;
 pub mod console_admin;
+pub mod console_admin_code;
 pub mod console_code;
 pub mod console_collaborators;
 pub mod console_data;

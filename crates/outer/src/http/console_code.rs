@@ -135,13 +135,31 @@ async fn api_tree(
         Ok(app) => app,
         Err(res) => return *res,
     };
-    if let Some(raw) = query.get("sha") {
+    tree_for(
+        &state.mcp,
+        &app,
+        query.get("sha").cloned(),
+        query.get("prefix").cloned(),
+    )
+    .await
+}
+
+/// The tree listing both the role-scoped console route and the admin
+/// inspection route answer: the same files, bounds and errors, so an
+/// admin sees exactly what the owner sees.
+pub(crate) async fn tree_for(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    sha: Option<String>,
+    prefix_raw: Option<String>,
+) -> Response {
+    if let Some(raw) = sha.as_deref() {
         if let Err(res) = check_sha(raw) {
             return *res;
         }
     }
-    let prefix = query
-        .get("prefix")
+    let prefix = prefix_raw
+        .as_deref()
         .map(|p| p.trim_end_matches('/').to_string())
         .filter(|p| !p.is_empty());
     if let Some(prefix) = prefix.as_deref() {
@@ -149,12 +167,12 @@ async fn api_tree(
             return nostore_json(StatusCode::BAD_REQUEST, "invalid_argument", &e.to_string());
         }
     }
-    let live = live_sha(&state.mcp.pool, &app.id).await;
-    let bare = match mirror(&state.mcp, &app.slug).await {
+    let live = live_sha(&mcp.pool, &app.id).await;
+    let bare = match mirror(mcp, &app.slug).await {
         Ok(bare) => bare,
         Err(res) => return *res,
     };
-    let rev = query.get("sha").cloned().or(live.clone());
+    let rev = sha.or(live.clone());
     // Resolve first so a well-formed but unknown sha is a 404 ("no such
     // version"), not a 500: `resolve_rev` only fails on bad revs, and the
     // sha shape was checked above.
@@ -188,7 +206,24 @@ async fn api_file(
         Ok(app) => app,
         Err(res) => return *res,
     };
-    let Some(path) = query.get("path").cloned() else {
+    file_for(
+        &state.mcp,
+        &app,
+        query.get("path").cloned(),
+        query.get("sha").cloned(),
+    )
+    .await
+}
+
+/// The file read both the role-scoped console route and the admin
+/// inspection route answer: the same content, kinds and caps.
+pub(crate) async fn file_for(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    path: Option<String>,
+    sha: Option<String>,
+) -> Response {
+    let Some(path) = path else {
         return nostore_json(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
@@ -198,17 +233,17 @@ async fn api_file(
     if let Err(e) = local::validate_read_path(&path) {
         return nostore_json(StatusCode::BAD_REQUEST, "invalid_argument", &e.to_string());
     }
-    if let Some(raw) = query.get("sha") {
+    if let Some(raw) = sha.as_deref() {
         if let Err(res) = check_sha(raw) {
             return *res;
         }
     }
-    let live = live_sha(&state.mcp.pool, &app.id).await;
-    let bare = match mirror(&state.mcp, &app.slug).await {
+    let live = live_sha(&mcp.pool, &app.id).await;
+    let bare = match mirror(mcp, &app.slug).await {
         Ok(bare) => bare,
         Err(res) => return *res,
     };
-    let rev = query.get("sha").cloned().or(live.clone());
+    let rev = sha.or(live.clone());
     match local::read_blob(&bare, rev.as_deref(), &path).await {
         Ok((sha, bytes)) => {
             let size = bytes.len() as u64;
@@ -296,12 +331,23 @@ async fn api_history(
         Ok(app) => app,
         Err(res) => return *res,
     };
-    if let Some(path) = query.path.as_deref() {
+    history_for(&state.mcp, &app, query.path, query.skip).await
+}
+
+/// The commit list both the role-scoped console route and the admin
+/// inspection route answer.
+pub(crate) async fn history_for(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    path: Option<String>,
+    skip_raw: Option<String>,
+) -> Response {
+    if let Some(path) = path.as_deref() {
         if let Err(e) = local::validate_read_path(path) {
             return nostore_json(StatusCode::BAD_REQUEST, "invalid_argument", &e.to_string());
         }
     }
-    let skip: usize = match query.skip.as_deref() {
+    let skip: usize = match skip_raw.as_deref() {
         None => 0,
         Some(raw) => match raw.parse() {
             Ok(skip) => skip,
@@ -314,13 +360,13 @@ async fn api_history(
             }
         },
     };
-    let bare = match mirror(&state.mcp, &app.slug).await {
+    let bare = match mirror(mcp, &app.slug).await {
         Ok(bare) => bare,
         Err(res) => return *res,
     };
-    match local::log(&bare, query.path.as_deref(), skip, 50).await {
+    match local::log(&bare, path.as_deref(), skip, 50).await {
         Ok((head, entries, next_skip)) => {
-            let live = live_sha(&state.mcp.pool, &app.id).await;
+            let live = live_sha(&mcp.pool, &app.id).await;
             ok_json(json!({
                 "head": head,
                 "live_sha": live,
@@ -358,7 +404,17 @@ async fn api_diff(
         Ok(app) => app,
         Err(res) => return *res,
     };
-    let Some(raw) = query.get("sha").cloned() else {
+    diff_for(&state.mcp, &app, query.get("sha").cloned()).await
+}
+
+/// The single-commit diff both the role-scoped console route and the
+/// admin inspection route answer.
+pub(crate) async fn diff_for(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    sha: Option<String>,
+) -> Response {
+    let Some(raw) = sha else {
         return nostore_json(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
@@ -368,7 +424,7 @@ async fn api_diff(
     if let Err(res) = check_sha(&raw) {
         return *res;
     }
-    let bare = match mirror(&state.mcp, &app.slug).await {
+    let bare = match mirror(mcp, &app.slug).await {
         Ok(bare) => bare,
         Err(res) => return *res,
     };
@@ -424,7 +480,24 @@ async fn api_compare(
         Ok(app) => app,
         Err(res) => return *res,
     };
-    let (Some(from), Some(to)) = (query.get("from").cloned(), query.get("to").cloned()) else {
+    compare_for(
+        &state.mcp,
+        &app,
+        query.get("from").cloned(),
+        query.get("to").cloned(),
+    )
+    .await
+}
+
+/// The two-version comparison both the role-scoped console route and the
+/// admin inspection route answer.
+pub(crate) async fn compare_for(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    from: Option<String>,
+    to: Option<String>,
+) -> Response {
+    let (Some(from), Some(to)) = (from, to) else {
         return nostore_json(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
@@ -434,7 +507,7 @@ async fn api_compare(
     if let Err(res) = check_sha(&from).and(check_sha(&to)) {
         return *res;
     }
-    let bare = match mirror(&state.mcp, &app.slug).await {
+    let bare = match mirror(mcp, &app.slug).await {
         Ok(bare) => bare,
         Err(res) => return *res,
     };

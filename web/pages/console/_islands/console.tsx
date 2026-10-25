@@ -526,28 +526,24 @@ export function Console() {
       waitlist.set({ kind: "loading" });
       moderationQueue.set({ kind: "loading" });
       adminStats.set({ kind: "loading" });
-      try {
-        const [page, list, queue, stats] = await Promise.all([
-          api<AdminInvitesPage>("/api/console/admin/invites?limit=50"),
-          api<WaitlistSummary>("/api/console/admin/waitlist?limit=100"),
-          api<ModerationQueue>("/api/console/admin/moderation/queue"),
-          api<AdminStats>("/api/console/admin/stats"),
-        ]);
-        if (fresh()) {
-          adminInvites.set({ kind: "ready", value: page });
-          waitlist.set({ kind: "ready", value: list });
-          moderationQueue.set({ kind: "ready", value: queue });
-          adminStats.set({ kind: "ready", value: stats });
-          setTitle(route(), null);
-        }
-      } catch (err: unknown) {
-        if (fresh()) {
-          const message = String(err);
-          adminInvites.set({ kind: "error", message });
-          waitlist.set({ kind: "error", message });
-          moderationQueue.set({ kind: "error", message });
-          adminStats.set({ kind: "error", message });
-        }
+      // Each panel stands alone: a failing moderation endpoint must not
+      // wipe the invite-code or waitlist panels (or vice versa).
+      const [page, list, queue, stats] = await Promise.allSettled([
+        api<AdminInvitesPage>("/api/console/admin/invites?limit=50"),
+        api<WaitlistSummary>("/api/console/admin/waitlist?limit=100"),
+        api<ModerationQueue>("/api/console/admin/moderation/queue"),
+        api<AdminStats>("/api/console/admin/stats"),
+      ]);
+      if (fresh()) {
+        const settle = <T,>(r: PromiseSettledResult<T>): Panel<T> =>
+          r.status === "fulfilled"
+            ? { kind: "ready", value: r.value }
+            : { kind: "error", message: String(r.reason) };
+        adminInvites.set(settle(page));
+        waitlist.set(settle(list));
+        moderationQueue.set(settle(queue));
+        adminStats.set(settle(stats));
+        setTitle(route(), null);
       }
     }
   }
@@ -914,7 +910,7 @@ export function Console() {
           epoch += 1;
           void loadAccountView("admin", epoch);
         }}
-        onOpenCode={(slug) => navigate({ app: slug, view: "code" })}
+        onOpenCode={(slug, sha) => navigate({ app: slug, view: "code", sha })}
       />
     )
   ) : null;
@@ -1266,20 +1262,41 @@ export function Console() {
                     <div class="skeleton rounded-box h-30 w-full" />
                   </div>
                 )}
-                {!accountView && detailPanel.kind === "error" && (
-                  <div class="alert alert-error alert-soft" role="alert">
-                    <span class="min-w-0">Couldn't load this app (unknown or not yours).</span>
-                    <button
-                      type="button"
-                      class="btn btn-sm min-w-0 max-w-full shrink-0"
-                      onclick={() => navigate({ app: list[0].slug, view: "overview" })}
-                    >
-                      <span class="truncate" title={`Back to ${list[0].slug}`}>
-                        Back to {list[0].slug}
-                      </span>
-                    </button>
-                  </div>
-                )}
+                {!accountView && detailPanel.kind === "error" &&
+                  (isAdmin() && r.view === "code" && r.app
+                    ? (
+                      <div class="flex min-w-0 flex-col gap-3">
+                        <div class="alert alert-soft min-w-0" role="note">
+                          <span class="min-w-0">
+                            Inspecting <strong class="truncate" title={r.app}>{r.app}</strong> as admin (read-only — every read is audited).
+                          </span>
+                        </div>
+                        <CodeView
+                          key={r.sha ?? "live"}
+                          slug={r.app}
+                          deploys={[]}
+                          initialSha={r.sha}
+                          initialTab={r.codeTab ?? "files"}
+                          onPickSha={(sha) => navigate({ sha }, true)}
+                          onSwitchTab={(codeTab) => navigate({ codeTab }, true)}
+                          admin
+                        />
+                      </div>
+                    )
+                    : (
+                      <div class="alert alert-error alert-soft" role="alert">
+                        <span class="min-w-0">Couldn't load this app (unknown or not yours).</span>
+                        <button
+                          type="button"
+                          class="btn btn-sm min-w-0 max-w-full shrink-0"
+                          onclick={() => navigate({ app: list[0].slug, view: "overview" })}
+                        >
+                          <span class="truncate" title={`Back to ${list[0].slug}`}>
+                            Back to {list[0].slug}
+                          </span>
+                        </button>
+                      </div>
+                    ))}
                 {!accountView && detailPanel.kind === "ready" && (
                   <ViewBody
                     route={r}
