@@ -1010,14 +1010,18 @@ mod tests {
     fn tool_bins_resolve_against_path_but_never_fail() {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("bun");
-        std::fs::write(&fake, "#!/bin/sh\n").unwrap();
+        // Atomic install (write tmp, chmod, rename): an exec racing a direct
+        // write fails ETXTBSY under the parallel suite.
+        let tmp = fake.with_extension("tmp");
+        std::fs::write(&tmp, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+            let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&fake, perms).unwrap();
+            std::fs::set_permissions(&tmp, perms).unwrap();
         }
+        std::fs::rename(&tmp, &fake).unwrap();
         let path = dir.path().to_string_lossy().into_owned();
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),

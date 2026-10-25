@@ -518,6 +518,66 @@ pub fn build_table_counts(tables: &[String]) -> String {
     parts.join(" UNION ALL ")
 }
 
+/// Tag column stamping every row of a batched exec so `split_batched` can
+/// route the concatenated result sets back apart. `celld d1 execute` runs
+/// several `;`-separated statements in one call and prints one JSON object
+/// per row, so without a tag the sets would be indistinguishable.
+pub const BATCH_TAG: &str = "_q";
+
+/// One exec for the whole Definition schema except per-index columns:
+/// table_info + foreign_key_list + index_list + the sqlite_master DDL, each
+/// `SELECT` stamping its rows with a tag (see `BATCH_TAG`).
+pub fn build_schema_batch(table: &str) -> String {
+    let name = string_literal(table);
+    format!(
+        "SELECT 'ti' AS \"{tag}\", \"cid\", \"name\", \"type\", \"notnull\", \"dflt_value\", \"pk\" \
+         FROM pragma_table_info({name}); \
+         SELECT 'fk' AS \"{tag}\", \"from\", \"table\", \"to\" \
+         FROM pragma_foreign_key_list({name}); \
+         SELECT 'il' AS \"{tag}\", \"name\", \"unique\" FROM pragma_index_list({name}); \
+         SELECT 'ddl' AS \"{tag}\", \"sql\" FROM sqlite_master \
+         WHERE type = 'table' AND name = {name}",
+        tag = BATCH_TAG,
+    )
+}
+
+/// One exec for every index's columns (`None` when there are no indexes).
+/// Each `SELECT` stamps its rows `ii` and carries the index name in `_idx`,
+/// so `split_batched` callers can group columns back per index.
+pub fn build_index_info_batch(indexes: &[String]) -> Option<String> {
+    if indexes.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for name in indexes {
+        let literal = string_literal(name);
+        parts.push(format!(
+            "SELECT 'ii' AS \"{tag}\", {literal} AS \"_idx\", \"seqno\", \"name\" AS \"col\" \
+             FROM pragma_index_info({literal})",
+            tag = BATCH_TAG,
+        ));
+    }
+    Some(parts.join("; "))
+}
+
+/// Rows page plus total in one exec: the caller-built SELECTs wrapped as
+/// subqueries so their column lists stay untouched, each stamping its rows.
+/// Only valid when no user column is itself named `_q` (see
+/// `batch_tag_collides`) — the tag would collide with it.
+pub fn build_rows_batch(select: &str, count: &str) -> String {
+    format!(
+        "SELECT 'rows' AS \"{tag}\", \"__r\".* FROM ({select}) AS \"__r\"; \
+         SELECT 'count' AS \"{tag}\", \"__c\".* FROM ({count}) AS \"__c\"",
+        tag = BATCH_TAG,
+    )
+}
+
+/// True when the schema contains a column named like the batch tag, in
+/// which case `build_rows_batch` cannot stamp rows unambiguously.
+pub fn batch_tag_collides(schema: &TableSchema) -> bool {
+    schema.columns.iter().any(|c| c.name == BATCH_TAG)
+}
+
 // ---------------------------------------------------------------------------
 // celld plumbing
 // ---------------------------------------------------------------------------
@@ -852,6 +912,25 @@ fn parse_json_rows(out: &str) -> Vec<serde_json::Map<String, serde_json::Value>>
         .collect()
 }
 
+/// Split one batched exec's concatenated rows back into per-statement sets,
+/// keyed by the `BATCH_TAG` stamp each statement puts on its rows (the tag
+/// itself is stripped). Rows without a tag — e.g. a future celld summary
+/// object — land under the empty key instead of being silently dropped.
+pub fn split_batched(
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+) -> BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>> {
+    let mut sets: BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>> =
+        BTreeMap::new();
+    for mut row in rows {
+        let tag = row
+            .remove(BATCH_TAG)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        sets.entry(tag).or_default().push(row);
+    }
+    sets
+}
+
 fn json_i64(row: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<i64> {
     row.get(key).and_then(|v| v.as_i64())
 }
@@ -1025,6 +1104,9 @@ async fn load_table(
 }
 
 /// Full schema for the Definition view: columns, foreign keys, indexes, DDL.
+/// Two `celld d1 execute` calls at most: one for table_info +
+/// foreign_key_list + index_list + the sqlite_master DDL, and — only when
+/// the table has indexes — one for every index's columns.
 pub async fn table_schema(
     ctx: &D1Ctx,
     app: &crate::apps::App,
@@ -1039,23 +1121,44 @@ pub async fn table_schema(
     let project = materialize_project(&state.config)
         .await
         .map_err(D1Error::Unavailable)?;
-    let schema = load_table(ctx, &app.slug, &identity, project.path(), table).await?;
-
-    let fk_out = d1_exec(
+    let schema_out = d1_exec(
         ctx,
         &app.slug,
         &identity,
-        &format!("PRAGMA foreign_key_list({})", quote_ident(table)),
+        &build_schema_batch(table),
         true,
         project.path(),
     )
     .await?;
+    let sets = split_batched(parse_json_rows(&schema_out));
+    let empty = Vec::new();
+    let ti = sets.get("ti").unwrap_or(&empty);
+    let mut columns = Vec::new();
+    for row in ti {
+        let Some(name) = json_str(row, "name") else {
+            continue;
+        };
+        columns.push(D1Column {
+            name: name.to_string(),
+            col_type: json_str(row, "type").unwrap_or("").to_string(),
+            not_null: json_i64(row, "notnull").unwrap_or(0) != 0,
+            default_value: row.get("dflt_value").and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }),
+            pk: json_i64(row, "pk").unwrap_or(0),
+        });
+    }
+    if columns.is_empty() {
+        return Err(D1Error::UnknownTable(table.to_string()));
+    }
     let mut foreign_keys = Vec::new();
-    for row in parse_json_rows(&fk_out) {
+    for row in sets.get("fk").unwrap_or(&empty) {
         let (Some(from), Some(ftable), Some(to)) = (
-            json_str(&row, "from"),
-            json_str(&row, "table"),
-            json_str(&row, "to"),
+            json_str(row, "from"),
+            json_str(row, "table"),
+            json_str(row, "to"),
         ) else {
             continue;
         };
@@ -1065,65 +1168,51 @@ pub async fn table_schema(
             to: to.to_string(),
         });
     }
-
-    let idx_out = d1_exec(
-        ctx,
-        &app.slug,
-        &identity,
-        &format!("PRAGMA index_list({})", quote_ident(table)),
-        true,
-        project.path(),
-    )
-    .await?;
     let mut indexes = Vec::new();
-    for row in parse_json_rows(&idx_out) {
-        let Some(name) = json_str(&row, "name") else {
+    let mut index_names: Vec<String> = Vec::new();
+    for row in sets.get("il").unwrap_or(&empty) {
+        let Some(name) = json_str(row, "name") else {
             continue;
         };
-        let info_out = d1_exec(
-            ctx,
-            &app.slug,
-            &identity,
-            &format!("PRAGMA index_info({})", quote_ident(name)),
-            true,
-            project.path(),
-        )
-        .await?;
-        let mut cols: Vec<(i64, String)> = Vec::new();
-        for info in parse_json_rows(&info_out) {
-            let Some(col) = json_str(&info, "name") else {
-                continue;
-            };
-            cols.push((json_i64(&info, "seqno").unwrap_or(0), col.to_string()));
-        }
-        cols.sort_by_key(|(seqno, _)| *seqno);
+        index_names.push(name.to_string());
         indexes.push(D1Index {
             name: name.to_string(),
-            unique: json_i64(&row, "unique").unwrap_or(0) != 0,
-            columns: cols.into_iter().map(|(_, col)| col).collect(),
+            unique: json_i64(row, "unique").unwrap_or(0) != 0,
+            columns: Vec::new(),
         });
     }
-
-    let sql_out = d1_exec(
-        ctx,
-        &app.slug,
-        &identity,
-        &format!(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = {}",
-            string_literal(table)
-        ),
-        true,
-        project.path(),
-    )
-    .await?;
-    let sql = parse_json_rows(&sql_out)
-        .into_iter()
-        .find_map(|row| json_str(&row, "sql").map(str::to_string));
-
+    // Index columns need one lookup per index name, so they ride a second
+    // batched exec — skipped entirely when the table has no indexes.
+    if let Some(batch) = build_index_info_batch(&index_names) {
+        let info_out = d1_exec(ctx, &app.slug, &identity, &batch, true, project.path()).await?;
+        let info_sets = split_batched(parse_json_rows(&info_out));
+        let mut by_index: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+        for row in info_sets.get("ii").unwrap_or(&empty) {
+            let (Some(idx), Some(col)) = (json_str(row, "_idx"), json_str(row, "col")) else {
+                continue;
+            };
+            by_index
+                .entry(idx.to_string())
+                .or_default()
+                .push((json_i64(row, "seqno").unwrap_or(0), col.to_string()));
+        }
+        for index in &mut indexes {
+            if let Some(cols) = by_index.remove(&index.name) {
+                let mut cols = cols;
+                cols.sort_by_key(|(seqno, _)| *seqno);
+                index.columns = cols.into_iter().map(|(_, col)| col).collect();
+            }
+        }
+    }
+    let sql = sets
+        .get("ddl")
+        .unwrap_or(&empty)
+        .iter()
+        .find_map(|row| json_str(row, "sql").map(str::to_string));
     Ok(D1TableSchema {
         binding: binding.to_string(),
         table: table.to_string(),
-        columns: schema.columns,
+        columns,
         foreign_keys,
         indexes,
         sql,
@@ -1131,6 +1220,8 @@ pub async fn table_schema(
 }
 
 /// One server-side page of rows plus the total under the same filters/search.
+/// Two `celld d1 execute` calls: columns first (validation needs them), then
+/// the page and the total in one batched exec.
 pub async fn table_rows(
     ctx: &D1Ctx,
     app: &crate::apps::App,
@@ -1167,12 +1258,25 @@ pub async fn table_rows(
     )
     .map_err(bad_err)?;
     let count = build_count(&schema, &body.filters, &body.search).map_err(bad_err)?;
-    let rows_out = d1_exec(ctx, &app.slug, &identity, &select, true, project.path()).await?;
-    let count_out = d1_exec(ctx, &app.slug, &identity, &count, true, project.path()).await?;
-
+    // One exec for page + total, split back apart by tag — except when a
+    // user column is itself named `_q`, where the tag would collide.
+    let (row_sets, count_sets) = if batch_tag_collides(&schema) {
+        let rows_out = d1_exec(ctx, &app.slug, &identity, &select, true, project.path()).await?;
+        let count_out = d1_exec(ctx, &app.slug, &identity, &count, true, project.path()).await?;
+        (parse_json_rows(&rows_out), parse_json_rows(&count_out))
+    } else {
+        let batch = build_rows_batch(&select, &count);
+        let out = d1_exec(ctx, &app.slug, &identity, &batch, true, project.path()).await?;
+        let sets = split_batched(parse_json_rows(&out));
+        let empty = Vec::new();
+        (
+            sets.get("rows").unwrap_or(&empty).clone(),
+            sets.get("count").unwrap_or(&empty).clone(),
+        )
+    };
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    for row in parse_json_rows(&rows_out) {
+    for row in &row_sets {
         rows.push(
             columns
                 .iter()
@@ -1180,9 +1284,9 @@ pub async fn table_rows(
                 .collect(),
         );
     }
-    let total = parse_json_rows(&count_out)
-        .into_iter()
-        .find_map(|row| json_i64(&row, "n"))
+    let total = count_sets
+        .iter()
+        .find_map(|row| json_i64(row, "n"))
         .unwrap_or(0);
     Ok(RowsResponse {
         table: table.to_string(),
@@ -2014,6 +2118,72 @@ mod tests {
     }
 
     #[test]
+    fn schema_batch_is_one_tagged_exec() {
+        let sql = build_schema_batch("users");
+        // Four statements in one exec, each stamping its own tag.
+        assert_eq!(sql.matches(';').count(), 3, "{sql}");
+        for tag in ["'ti'", "'fk'", "'il'", "'ddl'"] {
+            assert!(sql.contains(tag), "{sql}");
+        }
+        assert!(sql.contains("pragma_table_info('users')"), "{sql}");
+        assert!(sql.contains("pragma_foreign_key_list('users')"), "{sql}");
+        assert!(sql.contains("pragma_index_list('users')"), "{sql}");
+        assert!(sql.contains("sqlite_master"), "{sql}");
+        // A quote in the table name stays inside its string literal.
+        let evil = build_schema_batch("a'b");
+        assert!(evil.contains("pragma_table_info('a''b')"), "{evil}");
+        assert!(!evil.contains("pragma_table_info('a'b')"), "{evil}");
+    }
+
+    #[test]
+    fn index_info_batch_is_none_without_indexes() {
+        assert!(build_index_info_batch(&[]).is_none());
+        let sql = build_index_info_batch(&["a".to_string(), "b".to_string()]).unwrap();
+        assert_eq!(sql.matches(';').count(), 1, "{sql}");
+        assert!(sql.contains("pragma_index_info('a')"), "{sql}");
+        assert!(sql.contains("pragma_index_info('b')"), "{sql}");
+        // The index name rides along so rows group back per index.
+        assert!(sql.contains("'a' AS \"_idx\""), "{sql}");
+        assert!(sql.contains("'b' AS \"_idx\""), "{sql}");
+    }
+
+    #[test]
+    fn rows_batch_wraps_both_statements() {
+        let t = users();
+        let select = build_select(&t, &[], "", None, 0, 25).unwrap();
+        let count = build_count(&t, &[], "").unwrap();
+        let sql = build_rows_batch(&select, &count);
+        assert_eq!(sql.matches(';').count(), 1, "{sql}");
+        assert!(sql.contains(&select), "{sql}");
+        assert!(sql.contains(&count), "{sql}");
+        // A user column named like the tag cannot be stamped unambiguously.
+        assert!(!batch_tag_collides(&t));
+        let mut quirky = t;
+        quirky.columns.push(col("_q", "TEXT", 0));
+        assert!(batch_tag_collides(&quirky));
+    }
+
+    #[test]
+    fn split_batched_routes_by_tag() {
+        let rows = vec![
+            serde_json::json!({"_q": "ti", "name": "id"}),
+            serde_json::json!({"_q": "fk", "from": "org_id"}),
+            serde_json::json!({"_q": "ti", "name": "name"}),
+            serde_json::json!({"no_tag": true}),
+        ];
+        let sets = split_batched(
+            rows.into_iter()
+                .map(|v| v.as_object().unwrap().clone())
+                .collect(),
+        );
+        assert_eq!(sets["ti"].len(), 2);
+        assert_eq!(sets["fk"].len(), 1);
+        // The tag itself is stripped; untagged rows are kept, not dropped.
+        assert!(!sets["ti"][0].contains_key("_q"));
+        assert_eq!(sets[""].len(), 1);
+    }
+
+    #[test]
     fn synthesized_config_is_minimal_and_secret_free() {
         let manifest = manifest_with(serde_json::json!([
             {"type": "d1", "name": "DB", "database_name": "app-db", "database_id": "abc-123"},
@@ -2054,8 +2224,11 @@ mod tests {
     /// reads back out of `--bucket s3://<dir>/fleets/<slug>`.
     fn install_fake_celld(state: &std::path::Path) -> PathBuf {
         let script = state.join("fake-celld");
+        // Atomic install (write tmp, chmod, rename): an exec racing a direct
+        // write fails ETXTBSY under the parallel suite.
+        let tmp = script.with_extension("tmp");
         std::fs::write(
-            &script,
+            &tmp,
             r#"#!/bin/sh
 state_of_bucket() {
   prev=""
@@ -2086,19 +2259,24 @@ case "$sql" in
   'PRAGMA table_info("users")')
     printf '%s\n' '{"name":"id","type":"INTEGER","notnull":1,"dflt_value":null,"pk":1}' '{"name":"name","type":"TEXT","notnull":0,"dflt_value":null,"pk":0}' '{"name":"age","type":"REAL","notnull":0,"dflt_value":null,"pk":0}'
     ;;
-  "PRAGMA table_info("*)
+  "PRAGMA table_info("*)  # unknown table: no columns, like the real thing
     ;;
-  'PRAGMA foreign_key_list("users")')
-    printf '%s\n' '{"from":"org_id","table":"orgs","to":"id"}'
+  "SELECT 'ti' AS "*)
+    # The schema batch: table_info + foreign_key_list + index_list + DDL in
+    # one exec, each row stamped with its section tag.
+    case "$sql" in
+      *"'users'"*)
+        printf '%s\n' '{"_q":"ti","cid":0,"name":"id","type":"INTEGER","notnull":1,"dflt_value":null,"pk":1}' '{"_q":"ti","cid":1,"name":"name","type":"TEXT","notnull":0,"dflt_value":null,"pk":0}' '{"_q":"ti","cid":2,"name":"age","type":"REAL","notnull":0,"dflt_value":null,"pk":0}' '{"_q":"fk","from":"org_id","table":"orgs","to":"id"}' '{"_q":"il","name":"idx_users_name","unique":0}' '{"_q":"ddl","sql":"CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY)"}'
+        ;;
+    esac
     ;;
-  'PRAGMA index_list("users")')
-    printf '%s\n' '{"name":"idx_users_name","unique":0}'
+  "SELECT 'ii' AS "*)
+    # The index-columns batch: one SELECT per index, rows tagged per index.
+    printf '%s\n' '{"_q":"ii","_idx":"idx_users_name","seqno":0,"col":"name"}'
     ;;
-  "PRAGMA index_info("*)
-    printf '%s\n' '{"seqno":0,"name":"name"}'
-    ;;
-  "SELECT sql FROM sqlite_master"*)
-    printf '%s\n' '{"sql":"CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY)"}'
+  "SELECT 'rows' AS "*)
+    # The rows batch: page plus total in one exec.
+    printf '%s\n' '{"_q":"rows","id":1,"name":"ada","age":36.6}' '{"_q":"rows","id":2,"name":null,"age":null}' '{"_q":"count","n":2}'
     ;;
   *"COUNT(*) AS n"*)
     printf '%s\n' '{"t":"users","n":2}'
@@ -2124,8 +2302,9 @@ exit 0
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        std::fs::rename(&tmp, &script).unwrap();
         script
     }
 
@@ -2409,6 +2588,10 @@ exit 0
                 .is_some_and(|s| s.contains("CREATE TABLE")),
             "{schema:?}"
         );
+        let log: Vec<String> = calls(&state).lines().map(str::to_string).collect();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log[0].contains("SELECT 'ti' AS"), "{log:?}");
+        assert!(log[1].contains("SELECT 'ii' AS"), "{log:?}");
         // Hidden tables never reach celld through this path either.
         assert!(matches!(
             table_schema(&ctx, &app, "DB", "d1_migrations")
@@ -2416,6 +2599,12 @@ exit 0
                 .unwrap_err(),
             D1Error::UnknownTable(_)
         ));
+        // An unknown visible table costs exactly the one schema batch.
+        assert!(matches!(
+            table_schema(&ctx, &app, "DB", "nope").await.unwrap_err(),
+            D1Error::UnknownTable(_)
+        ));
+        assert_eq!(calls(&state).lines().count(), 3, "{}", calls(&state));
     }
 
     #[tokio::test]
@@ -2452,6 +2641,10 @@ exit 0
             .unwrap_or_default()
             .to_string();
         assert!(select.contains("LIMIT 100 OFFSET 0"), "{select}");
+        // Two execs: columns for validation, then page + total in one batch.
+        let log: Vec<String> = calls(&state).lines().map(str::to_string).collect();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log[1].contains("SELECT 'rows' AS"), "{log:?}");
         // Unknown columns and absurd input never reach celld.
         let bad = RowsBody {
             page: 0,

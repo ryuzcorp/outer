@@ -3603,8 +3603,9 @@ mod tests {
     /// survive the worktree wipe between deploys.
     fn install_fake_celld(state: &Path) -> PathBuf {
         let script = state.join("fake-celld");
+        let tmp = script.with_extension("tmp");
         std::fs::write(
-            &script,
+            &tmp,
             r#"#!/bin/sh
 state_of_bucket() {
   prev=""
@@ -3646,11 +3647,14 @@ exit 0
 "#,
         )
         .unwrap();
+        // Atomic install (write tmp, chmod, rename): a deploy exec racing a
+        // direct write fails ETXTBSY, and the parallel suite forks freely.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        std::fs::rename(&tmp, &script).unwrap();
         script
     }
     /// A fake `bun` for the install and build steps: records argv and the
@@ -3658,8 +3662,11 @@ exit 0
     /// step's env (builds run untrusted code), so the test greps this log.
     fn install_fake_bun(state: &Path) -> PathBuf {
         let script = state.join("fake-bun");
+        // Atomic install like the celld fake above: execs must never catch
+        // the script mid-write (ETXTBSY under the parallel suite).
+        let tmp = script.with_extension("tmp");
         std::fs::write(
-             &script,
+             &tmp,
              format!(
                  "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}/build-calls.log\"\nenv | sort >> \"{}/build-env.log\"\nexit 0\n",
                  state.display(),
@@ -3670,8 +3677,9 @@ exit 0
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        std::fs::rename(&tmp, &script).unwrap();
         script
     }
 

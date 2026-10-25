@@ -470,7 +470,8 @@ a.rail-tile:hover {
   @apply bg-neutral text-neutral-content;
 }
 .side .menu :where(li > .menu-active),
-.side .menu :where(li > a.menu-active) {
+.side .menu :where(li > a.menu-active),
+.d1-rail .menu :where(li > .menu-active) {
   @apply bg-base-200 text-base-content font-medium;
 }
 

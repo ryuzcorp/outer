@@ -491,12 +491,16 @@ mod tests {
     fn fake_celld(exit: i32) -> std::path::PathBuf {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("celld");
-        std::fs::write(&bin, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
+        // Atomic install (write tmp, chmod, rename): an exec racing a direct
+        // write fails ETXTBSY under the parallel suite.
+        let tmp = bin.with_extension("tmp");
+        std::fs::write(&tmp, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        std::fs::rename(&tmp, &bin).unwrap();
         std::mem::forget(dir);
         bin
     }

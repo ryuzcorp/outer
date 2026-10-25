@@ -676,13 +676,10 @@ mod tests {
     /// in for the binary, so start/stop/is_alive run for real.
     #[tokio::test]
     async fn start_stop_and_liveness() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("celld");
-        std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = fake_celld(&dir, "#!/bin/sh\nsleep 30\n");
         let (mut spec, mut opts) = test_spec(dir.path());
-        opts.celld_bin = bin.to_string_lossy().into_owned();
+        opts.celld_bin = bin;
         spec.cgroup_leaf = dir.path().to_path_buf();
         let mut fleet = start(&spec, &opts, 0).await.unwrap();
         assert!(fleet.is_alive());
@@ -697,11 +694,18 @@ mod tests {
         assert!(!fleet.is_alive());
     }
 
+    /// Atomically installed: a child exec racing a direct write fails
+    /// ETXTBSY, so every fake binary appears via rename, never mid-write.
     fn fake_celld(dir: &tempfile::TempDir, script: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let bin = dir.path().join("celld");
-        std::fs::write(&bin, script).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tmp = bin.with_extension("tmp");
+        std::fs::write(&tmp, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::rename(&tmp, &bin).unwrap();
         bin.to_string_lossy().into_owned()
     }
 

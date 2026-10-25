@@ -11,6 +11,7 @@ import type { View } from "ilha";
 
 import { d1run } from "../../actions/data-d1.ts";
 import type {
+  D1RowsInput,
   D1SchemaInput,
   D1TablesInput,
 } from "../../actions/data-d1.ts";
@@ -25,6 +26,7 @@ import type {
   D1Cell,
   D1Column,
   D1Filter,
+  D1Rows,
   D1RowsQuery,
   D1TableInfo,
   D1TableSchema,
@@ -67,6 +69,13 @@ type SchemaState =
   | { kind: "loading" }
   | { kind: "error"; message: string }
   | { kind: "ready"; value: D1TableSchema };
+
+/** Rows state for one mounted query. The panel (not the grid) owns the
+ * fetch so it fires in parallel with the schema fetch. */
+type RowsFetchState =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; value: D1Rows };
 
 const ViewSwitch = ({
   onPick,
@@ -123,28 +132,77 @@ const TableWorkspace = ({
   slug: string;
   table: string;
 }) => {
-  const state = atom<SchemaState>({ kind: "loading" });
+  const schemaState = atom<SchemaState>({ kind: "loading" });
+  const rowsState = atom<RowsFetchState>({ kind: "loading" });
   const editor = atom<null | { row: Record<string, D1Cell> | null }>(null);
-  const started = atom("");
+  const startedSchema = atom("");
+  const startedRows = atom("");
 
-  const key = `${binding}:${table}:${generation}`;
-  if (started() !== key) {
-    started.set(key);
+  const schemaKey = `${binding}:${table}:${generation}`;
+  if (startedSchema() !== schemaKey) {
+    startedSchema.set(schemaKey);
+    const key = schemaKey;
     const input: D1SchemaInput = { slug, binding, table };
     d1run<D1SchemaInput, D1TableSchema>("d1_schema", input).then(
       (value) => {
-        state.set({ kind: "ready", value });
+        if (startedSchema() === key) {
+          schemaState.set({ kind: "ready", value });
+        }
       },
       (error: unknown) => {
-        state.set({
-          kind: "error",
-          message: error instanceof Error ? error.message : String(error),
-        });
+        if (startedSchema() === key) {
+          schemaState.set({
+            kind: "error",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
       },
     );
   }
 
-  const current = state();
+  // Rows fire alongside the schema fetch with the raw URL params, then
+  // re-fire with schema-validated params only when validation would change
+  // them — a stale URL naming a dropped column heals once the schema lands.
+  const rawQuery: D1RowsQuery = {
+    filters: decodeFilters(route.f),
+    page: toPageIndex(route.page),
+    page_size: toPageSize(route.size),
+    search: route.q,
+    sort: decodeSort(route.sort),
+    table,
+  };
+  const schemaNow = schemaState();
+  const validatedQuery: D1RowsQuery =
+    schemaNow.kind === "ready"
+      ? {
+          ...rawQuery,
+          sort: validSort(rawQuery.sort, schemaNow.value),
+          filters: validFilters(rawQuery.filters, schemaNow.value),
+        }
+      : rawQuery;
+  const rowsKey = `${schemaKey}:${JSON.stringify(validatedQuery)}`;
+  if (startedRows() !== rowsKey) {
+    startedRows.set(rowsKey);
+    const key = rowsKey;
+    const input: D1RowsInput = { slug, binding, ...validatedQuery };
+    d1run<D1RowsInput, D1Rows>("d1_rows", input).then(
+      (value) => {
+        if (startedRows() === key) {
+          rowsState.set({ kind: "ready", value });
+        }
+      },
+      (error: unknown) => {
+        if (startedRows() === key) {
+          rowsState.set({
+            kind: "error",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+    );
+  }
+
+  const current = schemaState();
 
   if (current.kind === "error") {
     return (
@@ -154,8 +212,8 @@ const TableWorkspace = ({
           type="button"
           class="btn btn-sm"
           onclick={() => {
-            state.set({ kind: "loading" });
-            started.set("");
+            schemaState.set({ kind: "loading" });
+            startedSchema.set("");
           }}
         >
           Retry
@@ -183,16 +241,12 @@ const TableWorkspace = ({
     sort: decodeSort(route.sort),
     view: toView(route.dview),
   };
-  const sort = validSort(urlState.sort, schema);
-  const filters = validFilters(urlState.filters, schema);
-
+  // Same validation the fetch above applies once the schema is ready: the
+  // grid's key and sort marks track exactly what `validatedQuery` carries.
   const query: D1RowsQuery = {
-    filters,
-    page: urlState.page,
-    page_size: urlState.pageSize,
-    search: urlState.search,
-    sort,
-    table,
+    ...rawQuery,
+    sort: validSort(rawQuery.sort, schema),
+    filters: validFilters(rawQuery.filters, schema),
   };
 
   const setFilters = (next: D1Filter[]) => {
@@ -216,15 +270,18 @@ const TableWorkspace = ({
         : `edit:${JSON.stringify(open.row)}`;
 
   const cycleSort = (column: string) => {
-    if (sort === null || sort.column !== column) {
+    const active = query.sort;
+    if (active === null || active.column !== column) {
       setRoute({ sort: encodeSort({ column, desc: false }), page: "" });
       return;
     }
     setRoute({
-      sort: encodeSort(sort.desc ? null : { column, desc: true }),
+      sort: encodeSort(active.desc ? null : { column, desc: true }),
       page: "",
     });
   };
+
+  const rows = rowsState();
 
   return (
     <div class="flex min-h-0 flex-1 flex-col">
@@ -248,11 +305,12 @@ const TableWorkspace = ({
       ) : null}
       {urlState.view === "definition" ? (
         <TableDefinition schema={schema} />
-      ) : (
+      ) : rows.kind === "ready" ? (
         <RowsGrid
           key={JSON.stringify({ ...query, generation })}
           binding={binding}
           canWrite={canWrite}
+          data={rows.value}
           onChanged={onChanged}
           onOpenRow={(row) => {
             editor.set({ row });
@@ -273,6 +331,26 @@ const TableWorkspace = ({
           slug={slug}
           viewSlot={viewSlot as View}
         />
+      ) : rows.kind === "error" ? (
+        <div class="flex flex-col items-start gap-2 p-4">
+          <p class="text-error m-0 text-sm">{rows.message}</p>
+          <button
+            type="button"
+            class="btn btn-sm"
+            onclick={() => {
+              rowsState.set({ kind: "loading" });
+              startedRows.set("");
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      ) : (
+        <div class="flex flex-col gap-2 p-4">
+          <span class="skeleton h-8 w-full" />
+          <span class="skeleton h-6 w-full" />
+          <span class="skeleton h-6 w-full" />
+        </div>
       )}
       {urlState.view === "definition" ? (
         <div class="border-base-300 flex items-center justify-end border-t px-3 py-2">
