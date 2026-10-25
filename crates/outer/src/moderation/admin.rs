@@ -157,7 +157,7 @@ pub async fn queue(pool: &SqlitePool) -> anyhow::Result<Vec<QueueItem>> {
         "SELECT c.id, c.app_id, c.sha, c.findings, c.scores, a.slug, u.email, c.created_at \
          FROM moderation_check c \
          JOIN app a ON a.id = c.app_id JOIN user u ON u.id = a.owner_id \
-         WHERE c.reviewed_by IS NULL AND c.stage != 'gate' ORDER BY c.created_at DESC",
+         WHERE c.reviewed_by IS NULL AND c.stage != 'gate' AND c.verdict != 'pass' ORDER BY c.created_at DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -449,7 +449,7 @@ pub async fn stats(pool: &SqlitePool, now: i64) -> anyhow::Result<Stats> {
     .await?;
     let unreviewed_checks = count(
         pool,
-        "SELECT COUNT(*) FROM moderation_check WHERE reviewed_by IS NULL",
+        "SELECT COUNT(*) FROM moderation_check WHERE reviewed_by IS NULL AND verdict != 'pass'",
     )
     .await?;
     let week_ago = now - 7 * 24 * 60 * 60 * 1000;
