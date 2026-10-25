@@ -17,11 +17,14 @@ Every `commit` runs these steps (each times out after 120 s):
 3. **`bun run build`** — skipped when `package.json` has no
    `scripts.build`.
 4. **Validate `dist/wrangler.json`** (else `wrangler.jsonc` /
-   `wrangler.json` at the repo root): only keys celld accepts pass —
-   `name`, `main`, `compatibility_date`, `durable_objects`, `migrations`,
-   `assets`, `services`, `triggers`, `vars`, `d1_databases`,
-   `kv_namespaces`, `queues`, `workflows`, `r2_buckets` and a few build
-   keys. Anything else fails the deploy naming the key.
+   `wrangler.json` at the repo root): only these top-level keys pass —
+   `$schema`, `name`, `main`, `no_bundle`, `compatibility_date`,
+   `compatibility_flags`, `durable_objects`, `migrations`, `assets`,
+   `services`, `triggers`, `vars`, `d1_databases`, `kv_namespaces`,
+   `queues`, `workflows`, `r2_buckets`, `worker_loaders`, `containers`,
+   `define`, `rules` (`crates/outer/src/deploy/pipeline.rs`,
+   `ACCEPTED_CONFIG_KEYS`). Anything else fails the deploy naming the key —
+   that includes Workers AI (`ai`), Vectorize, Cache, and `send_email`.
 5. **Review:** the pre-live gate (see the moderation guide).
 6. **Deploy** with celld, then poll the fleet's health. A deploy that
    fails any step or the health check never takes over — the previous
@@ -34,7 +37,10 @@ hand-write it: set bindings in `void.config.ts` and rebuild.
 ## Runtime rules
 
 - No module-scope state: every request must read fresh state.
-- `fetch` handlers only. No Workers AI, Vectorize or Cache bindings.
+- `fetch` handlers only. No Workers AI, Vectorize or Cache bindings — and
+  no Cache API either: celld's `caches.default` always misses, so never rely
+  on it. See [Sandboxes](/guides/sandboxes) for `containers`, and
+  [Email](/guides/email) for `send_email`.
 - Outbound traffic from an app can never reach loopback, private ranges,
   link-local or metadata addresses, and SMTP ports 25/465/587 are
   blocked — send email through an HTTP API with a secret.

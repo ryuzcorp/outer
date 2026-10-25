@@ -1,0 +1,111 @@
+---
+title: FAQ and troubleshooting
+description: Short answers to the questions every new Outer user asks — and what to do when a deploy fails.
+---
+
+## Building
+
+**What can I build?**
+
+Anything the Ilha + Void template expresses, backed by D1, KV, Durable
+Objects, R2, queues, cron and realtime. Starters with copy-paste prompts:
+[What you can build](/what-you-can-build).
+
+**How long does a change take?**
+
+Seconds to about a minute: build → review → deploy, then the URL serves the
+new version. The tool call that made the change waits and reports back —
+your agent doesn't need to poll.
+
+**My app is slow to answer the first request.**
+
+The fleet sleeps after ~30 minutes without requests and wakes on the next
+one — that first request pays the cold start. It adopts the newest deploy
+when it wakes.
+
+**The page shows a "paused / building / held" screen instead of my app.**
+
+Those are proxy-owned pages, not your code: the app has no successful
+deploy yet, is paused over quota, or is held/suspended by moderation. Ask
+your agent for the deploy status; [Moderation](/moderation) explains holds.
+
+## Sign-in and accounts
+
+**Which clients sign in with OAuth?**
+
+Claude, Codex, ChatGPT, Gemini and Perplexity. Anything else uses the
+emailed-code fallback: [Sign in](/sign-in).
+
+**Do I need an invite code?**
+
+During the closed beta, allowlisted emails get in directly; everyone else
+pastes an `OUTER-XXXX-XXXX` code at sign-in or lands on the waitlist. One
+code admits one account. Your own codes live on the console's Invites page.
+
+**How do I revoke a client or a key?**
+
+Console → Connections & keys, or `revoke_connection` / `revoke_api_key`
+over MCP.
+
+## Plans and limits
+
+**Free vs Pro?**
+
+1 app and 50 code changes a day vs 10 apps and 500 — full table:
+[Plans](/plans). Billing isn't live yet, so every account is on Free during
+the beta.
+
+**What happens at 100% of a quota?**
+
+Change/build/app/collaborator limits refuse with `quota_exceeded` plus a
+`user_message` your agent relays verbatim. Requests, storage or outbound
+traffic at 100% on Free pause the app until the month resets — data is kept.
+
+## Deploys
+
+**The deploy failed. What now?**
+
+Paste the log tail back to your agent and ask for the fix. Build errors
+name the file and line; `commit` returns `failed` with the log. Never edit
+around the gate — fix the cause and commit again.
+
+**The deploy is blocked. What now?**
+
+`blocked` means the pre-live review flagged page text: `commit` returns the
+file, the line, and an excerpt. Fix those lines and commit again — a blocked
+deploy keeps the previous version serving and counts as a code change. What
+trips it: [Moderation](/moderation).
+
+**How do I undo?**
+
+`rollback` to any earlier SHA (Console → Deploys → Roll back). Never counts
+as a change, never a moderation target.
+
+**Where are the logs?**
+
+Running app: Console → Logs, or `app_logs`. Build: expand the deploy, or
+`deploy_log`. Crashes grouped: Console → Errors, or `app_errors`.
+
+## Data and domains
+
+**Can my app send email?**
+
+Only through an HTTP email API like Resend with your own key — never SMTP
+(ports blocked) and never Void's native sender ([Email](/guides/email)).
+
+**Can I use my own domain?**
+
+Yes, one hostname per app on Pro, via Cloudflare for SaaS:
+[Custom domains](/guides/custom-domains).
+
+**Can I export my code?**
+
+Pro, via `export_code` — an archive, good for 24 hours. There is no git
+push; agents change code with `commit`.
+
+## Getting help
+
+Ask your agent first — it reads these docs over MCP. If a tool refuses
+something, its `user_message` is the answer; have the agent relay it word
+for word instead of working around it. During the closed beta there is no
+self-serve moderation appeal: relay the message and fix the flagged lines.

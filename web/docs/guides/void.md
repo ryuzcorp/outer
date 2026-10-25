@@ -101,7 +101,15 @@ props without a reload. One `useForm` per form, with its own `intent`.
   `@ilha/void`, not `useForm()`. The template ships no island page — see
   its `AGENTS.md` for the pattern.
 
-## Sources
+## Beyond pages
+
+Pages, loaders, actions and forms are the core. For the rest, each feature
+has its own guide with Outer's support verdict: [Auth](/guides/auth),
+[Cron](/guides/cron), [Queues](/guides/queues),
+[WebSockets](/guides/websockets), [SSE](/guides/sse), [KV](/guides/kv),
+[Storage](/guides/storage), [Email](/guides/email),
+[Sandboxes](/guides/sandboxes).
+
 
 - The template's pages (loader, intent action, forms, daisyUI):
   <https://github.com/ryuzcorp/outer-template/blob/32d413655a4f050485c14d04e9476325619f2b32/pages/index.server.ts>,

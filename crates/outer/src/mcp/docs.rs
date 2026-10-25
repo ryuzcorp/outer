@@ -33,6 +33,26 @@ pub const TOPICS: &[(&str, &str)] = &[
         "custom-domains",
         include_str!("../../../../web/docs/guides/custom-domains.md"),
     ),
+    ("auth", include_str!("../../../../web/docs/guides/auth.md")),
+    ("cron", include_str!("../../../../web/docs/guides/cron.md")),
+    (
+        "queues",
+        include_str!("../../../../web/docs/guides/queues.md"),
+    ),
+    (
+        "websockets",
+        include_str!("../../../../web/docs/guides/websockets.md"),
+    ),
+    ("sse", include_str!("../../../../web/docs/guides/sse.md")),
+    ("kv", include_str!("../../../../web/docs/guides/kv.md")),
+    (
+        "email",
+        include_str!("../../../../web/docs/guides/email.md"),
+    ),
+    (
+        "sandboxes",
+        include_str!("../../../../web/docs/guides/sandboxes.md"),
+    ),
 ];
 
 /// Strip one leading `---` YAML frontmatter block, if present. Anything else
@@ -74,7 +94,7 @@ mod tests {
 
     #[test]
     fn every_topic_is_nonempty() {
-        assert_eq!(TOPICS.len(), 9);
+        assert_eq!(TOPICS.len(), 17);
         for (name, md) in TOPICS {
             let stripped = strip_frontmatter(md);
             assert!(stripped.trim().len() > 200, "{name} is suspiciously short");

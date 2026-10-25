@@ -9,9 +9,13 @@ Extra state arrives as bindings in `void.config.ts`, validated from the
 built `dist/wrangler.json` at deploy time. Only keys celld accepts pass:
 
 - `kv_namespaces` and `durable_objects` for small state (sessions,
-  counters, rate flags). Anything relational belongs in D1 (see `d1.md`).
+  counters, rate flags). Anything relational belongs in [D1](/guides/d1).
+  Patterns: [KV](/guides/kv), [WebSockets](/guides/websockets) (rooms are
+  Durable Objects).
 - `r2_buckets` for file uploads. `queues` and `workflows` for background
-  work.
+  work ([Queues](/guides/queues)). Schedules are [Cron](/guides/cron).
+  [Sandboxes](/guides/sandboxes) and native [Email](/guides/email) are not
+  available — read those guides before promising them.
 
 One D1 database and one R2 bucket per app for now: a second
 `d1_databases` or `r2_buckets` entry fails the deploy at its validation
