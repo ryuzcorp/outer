@@ -273,10 +273,11 @@ pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<Stri
     for row in d1::parse_json_rows(&out) {
         let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let table = row.get("tbl_name").and_then(|v| v.as_str()).unwrap_or("");
-        // celld's migration bookkeeping stays out of the dump (and out of
-        // the restore's drops): a restore must never confuse a later
-        // `migrations apply`.
-        if name == "d1_migrations" || table == "d1_migrations" {
+        // Only the app's own tables, the same set the D1 panel shows and the
+        // restore drops: celld's migration bookkeeping must survive for a
+        // later `migrations apply`, and the runtime's internal tables
+        // (`_litestream_*` and friends) refuse reads outright.
+        if !d1::visible_table(name) || !d1::visible_table(table) {
             continue;
         }
         let (Some(kind), Some(sql)) = (
@@ -981,8 +982,13 @@ command_of() {{
 sql=$(command_of "$@")
 printf '%s\n' "$sql" >> "{log}"
 case "$sql" in
+  *_litestream_*)
+    # Real celld refuses any read of the runtime's internal tables.
+    echo "Error: D1_EXEC_ERROR: access to _litestream_seq.id is prohibited" >&2
+    exit 1
+    ;;
   "SELECT type, name, tbl_name, sql"*)
-    printf '%s\n' '{{"type":"table","name":"users","tbl_name":"users","sql":"CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT, \"avatar\" BLOB)"}}' '{{"type":"table","name":"orders","tbl_name":"orders","sql":"CREATE TABLE \"orders\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER REFERENCES \"users\" (\"id\"))"}}' '{{"type":"table","name":"d1_migrations","tbl_name":"d1_migrations","sql":"CREATE TABLE d1_migrations (id TEXT)"}}' '{{"type":"index","name":"idx_orders_user","tbl_name":"orders","sql":"CREATE INDEX \"idx_orders_user\" ON \"orders\" (\"user_id\")"}}' '{{"type":"view","name":"big","tbl_name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\""}}'
+    printf '%s\n' '{{"type":"table","name":"users","tbl_name":"users","sql":"CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT, \"avatar\" BLOB)"}}' '{{"type":"table","name":"orders","tbl_name":"orders","sql":"CREATE TABLE \"orders\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER REFERENCES \"users\" (\"id\"))"}}' '{{"type":"table","name":"d1_migrations","tbl_name":"d1_migrations","sql":"CREATE TABLE d1_migrations (id TEXT)"}}' '{{"type":"table","name":"_litestream_seq","tbl_name":"_litestream_seq","sql":"CREATE TABLE _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER)"}}' '{{"type":"index","name":"idx_orders_user","tbl_name":"orders","sql":"CREATE INDEX \"idx_orders_user\" ON \"orders\" (\"user_id\")"}}' '{{"type":"view","name":"big","tbl_name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\""}}'
     ;;
   'PRAGMA foreign_key_list("orders")')
     printf '%s\n' '{{"table":"users","from":"user_id","to":"id"}}'
