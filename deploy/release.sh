@@ -32,6 +32,32 @@ SHA="$(git rev-parse --short HEAD)"
     echo "release.sh: unexpected sha: $SHA" >&2
     exit 1
 }
+
+# Migrations are append-only. sqlx refuses to boot when an applied
+# migration's file is gone or its bytes changed (its checksum is the
+# SHA-384 of the file), and by then the old container is already stopped.
+# So before building: every migration the production database has applied
+# must exist here with the same SHA-384. New, unapplied files are fine.
+MIGRATIONS="crates/outer/migrations"
+APPLIED="$(ssh "$TARGET" "sqlite3 -separator ' ' /srv/outer/data/outer.sqlite \
+    'SELECT version, lower(hex(checksum)) FROM _sqlx_migrations ORDER BY version'" 2>/dev/null)" || {
+    echo "release.sh: could not read applied migrations from $TARGET (sqlite3 on the host?)" >&2
+    exit 1
+}
+while read -r version checksum; do
+    [[ -n "$version" ]] || continue
+    file="$(printf '%s/%04d_' "$MIGRATIONS" "$version")"
+    matches=("$file"*.sql)
+    [[ -f "${matches[0]}" ]] || {
+        echo "release.sh: migration $version is applied on $TARGET but missing from this tree" >&2
+        exit 1
+    }
+    local_sum="$(sha384sum "${matches[0]}" | cut -d' ' -f1)"
+    [[ "$local_sum" == "$checksum" ]] || {
+        echo "release.sh: ${matches[0]} differs from the copy applied on $TARGET; migrations are append-only (restore it byte-for-byte)" >&2
+        exit 1
+    }
+done <<<"$APPLIED"
 IMAGE="outer:$SHA"
 if command -v podman >/dev/null 2>&1; then
     # podman names unqualified tags localhost/outer:<sha>, and docker load
