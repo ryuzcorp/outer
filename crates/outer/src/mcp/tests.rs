@@ -2748,6 +2748,60 @@ async fn rename_app_refusals_keep_the_app_and_refund_quota() {
 }
 
 #[tokio::test]
+async fn rename_app_store_fault_refunds_quota_and_keeps_the_old_identity() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    // Fail the rename's first store op (the pre-copy listing): a crash
+    // before the commit, while the quota claim is held.
+    state.store.fail_next(1, "injected store outage");
+    let (_, body) = call(
+        &state,
+        Some(&ana),
+        "rename_app",
+        json!({"app": "groceries", "slug": "pantry"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "internal");
+    // Nothing committed, so nothing counted: the claimed change is refunded.
+    let account = crate::apps::ensure_account(&state.pool, "ana@example.com")
+        .await
+        .unwrap();
+    let used: i64 = sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
+        .bind(&account)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(used, 0, "a pre-commit failure must refund the claim");
+    // The old identity is untouched, but the target rows were already
+    // recorded (by design: the target is unclaimable from that moment on).
+    let (_, kept) = call(&state, Some(&ana), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(result(&kept)["structuredContent"]["slug"], "groceries");
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prefix_cleanup")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 2, "the target rows block the slug until drained");
+    let (_, blocked) = call(&state, Some(&ana), "get_app", json!({"app": "pantry"})).await;
+    assert_eq!(is_error(&blocked)["error"], "not_found");
+    // The maintenance pass drains the abandoned copy; retry converges.
+    let drained =
+        crate::apps::rename::drain_prefix_cleanup(&state.pool, &state.store, Some(&state.fleets))
+            .await
+            .unwrap();
+    assert_eq!(drained, 2);
+    let (_, again) = call(
+        &state,
+        Some(&ana),
+        "rename_app",
+        json!({"app": "groceries", "slug": "pantry"}),
+    )
+    .await;
+    assert_eq!(result(&again)["structuredContent"]["slug"], "pantry");
+}
+
+#[tokio::test]
 async fn rename_app_waits_for_the_deploy_lock() {
     let (state, _) = setup().await;
     let ana = api_key_for(&state, "ana@example.com").await;

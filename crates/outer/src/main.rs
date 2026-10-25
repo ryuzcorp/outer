@@ -590,8 +590,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         wake_timeout: Duration::from_secs(30),
         wake_concurrency: rt.wake_concurrency,
     });
+    // A previous process may have died between a rename's commit and its
+    // post-commit deletes: drain pending prefix cleanups before serving, so
+    // no old slug stays blocked (and no leftover prefix stays adoptable)
+    // across a restart. The sleep sweep below retries this every tick.
+    if let Err(err) = outer::apps::rename::drain_prefix_cleanup(&pool, &store, Some(&fleets)).await
+    {
+        tracing::warn!(error = %format!("{err:#}"), "startup prefix cleanup drain failed");
+    }
     fleets.spawn_sleep_sweep(
         pool.clone(),
+        store.clone(),
         Duration::from_secs(60.min(rt.sleep_after_secs.max(1))),
     );
     outer::cron::spawn_cron_task(

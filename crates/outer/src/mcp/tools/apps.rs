@@ -347,9 +347,11 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         )));
     }
     apps::validate_slug(&input.slug).map_err(|e| ToolError::invalid_argument(e.to_string()))?;
-    // Claimed before the move: a rename that never happens (bad target,
-    // taken slug, a racing delete) gives the change back, while a committed
-    // rename counts even when its redeploy fails or is blocked.
+    // Claimed before the move; refunded on any error. The domain rename
+    // never fails post-commit (post-commit steps are warn-and-continue, and
+    // the maintenance drain finishes them), so an error always means the
+    // rename never happened — while a committed rename counts even when
+    // its redeploy fails or is blocked.
     let claim = super::claim_change(&ctx.state.pool, &caller.account_id).await?;
     // Serialize against a racing rollback, deploy and wake, on both slugs:
     // the wake pair sorts by slug so two renames can never ABBA.
@@ -389,11 +391,8 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     let out = match crate::apps::rename::rename_app(&deps, &input.app, &input.slug, locks).await {
         Ok(out) => out,
         Err(err) => {
-            if !matches!(err, crate::apps::rename::RenameError::Internal(_)) {
-                if let Err(refund) = super::refund_change(&ctx.state.pool, &caller.account_id).await
-                {
-                    tracing::warn!("rename refund failed: {refund:#}");
-                }
+            if let Err(refund) = super::refund_change(&ctx.state.pool, &caller.account_id).await {
+                tracing::warn!("rename refund failed: {refund:#}");
             }
             return Err(ToolError::from_rename(err));
         }

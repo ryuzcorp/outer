@@ -573,8 +573,9 @@ impl FleetManager {
     /// Retention prunes run at most once a day (spec §3 log retention, §13
     /// deploys and errors, §17 TTLs); the timestamp lives in this task, not
     /// in global state.
-    pub fn spawn_sleep_sweep(&self, pool: SqlitePool, every: Duration) {
+    pub fn spawn_sleep_sweep(&self, pool: SqlitePool, store: crate::store::Store, every: Duration) {
         let this = self.clone();
+        let store = store.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(every);
             let mut last_prune: Option<std::time::Instant> = None;
@@ -588,6 +589,16 @@ impl FleetManager {
                 // `error_issue` once a tick.
                 if let Err(err) = crate::observe::logs::flush_all(&pool, &this).await {
                     tracing::warn!(error = %format!("{err:#}"), "log flush failed");
+                }
+                // A crashed rename's leftover bucket prefixes: the drain is
+                // idempotent (one indexed SELECT when empty) and holds each
+                // slug's wake lock, so it can never race a live rename's
+                // copy. Runs every tick — not just the daily prune — so an
+                // old slug unblocks within minutes, not a day.
+                if let Err(err) =
+                    crate::apps::rename::drain_prefix_cleanup(&pool, &store, Some(&this)).await
+                {
+                    tracing::warn!(error = %format!("{err:#}"), "prefix cleanup drain failed");
                 }
                 let due = last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400));
                 if due {

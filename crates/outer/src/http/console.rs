@@ -873,9 +873,9 @@ async fn api_rename(
     let out = match crate::apps::rename::rename_app(&deps, &slug, &new_slug, locks).await {
         Ok(out) => out,
         Err(err) => {
-            if !matches!(err, crate::apps::rename::RenameError::Internal(_)) {
-                let _ = refund_change(&mcp.pool, &account.id).await;
-            }
+            // Any domain error is pre-commit (post-commit steps never fail),
+            // so the rename never happened: refund the claimed change.
+            let _ = refund_change(&mcp.pool, &account.id).await;
             let err = crate::mcp::error::ToolError::from_rename(err);
             audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
             return mutation_error(mutation_status(&err), &err);
