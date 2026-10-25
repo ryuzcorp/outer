@@ -19,6 +19,7 @@ prerendered `dist/` HTML, and the slug plus app name.
 - Strong profanity, slurs, masked spellings and leetspeak, and the most severe content **block** the deploy. Mild words ("damn", "hell", "crap") pass.
 - A blocked deploy keeps the commit on `main` and the previous version keeps serving. `commit` returns `blocked` with the file, the line and an excerpt — fix those lines and commit again.
 - Only new text is checked; text cleared before is skipped.
+- Slugs and app names are checked when claimed too: brand and account-page fragments (`paypal`, `apple`, `bank`, …) are refused, and a Jev-flagged name is refused with the same thresholds as above. An unreachable Jev fails closed — retry in a minute.
 - Over the review caps (3000 files, 256 KiB each, 8 MiB total) the deploy is blocked as `too_large_to_review`.
 - When the classifier is unavailable, the deploy fails closed: nothing goes live and the previous version keeps serving.
 

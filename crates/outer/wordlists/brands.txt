@@ -1,0 +1,79 @@
+# Brand and account-page fragments refused in app slugs (spec §7.1).
+#
+# One lowercase entry per line. Matching (see apps/slug.rs `brand_hit`):
+# an entry hits when it is a whole hyphen-separated token of the slug, or —
+# for entries of 5+ characters — when it appears anywhere in the slug as a
+# substring. Short entries (aws, gov, irs, ups, dhl, …) are token-only, so
+# ordinary words like "paws", "governor" or "cups" stay claimable.
+#
+# The substring rule deliberately over-refuses: "appleton", "snapple" and
+# "pineapple" all contain "apple" and are refused. That is the documented
+# tradeoff — err on refusing, and the agent picks another slug — because
+# phishing slugs concatenate ("appleid", "paypalverify") far more often
+# than legitimate apps embed a brand name.
+#
+# Phishing targets first: payment, tech-platform and account pages, then
+# the carriers and agencies whose names carry seizure/delivery scams.
+# Payment and financial services.
+paypal
+stripe
+coinbase
+binance
+metamask
+ledger
+revolut
+wise
+venmo
+cashapp
+chase
+wellsfargo
+bankofamerica
+hsbc
+santander
+barclays
+# Tech platforms and their login-adjacent services.
+apple
+icloud
+google
+gmail
+microsoft
+outlook
+office365
+amazon
+aws
+netflix
+facebook
+meta
+instagram
+whatsapp
+twitter
+linkedin
+github
+# Gaming and chat, for gift-card and account-theft lures.
+steam
+roblox
+epicgames
+discord
+telegram
+# Account-page words: the credential-harvesting half of "secure-bank-verify".
+bank
+banking
+verify
+verification
+wallet
+login
+signin
+secure
+account
+support
+password
+recovery
+crypto
+bitcoin
+# Carriers and agencies, for delivery and seizure scams.
+dhl
+fedex
+ups
+usps
+irs
+gov

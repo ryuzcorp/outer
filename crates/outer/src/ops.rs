@@ -51,10 +51,14 @@ pub async fn create_app(
     let scratch = tempfile::tempdir().context("template scratch dir")?;
     let tree = scratch.path().join("tree");
     let template = templates::materialize(&p.store, &tree).await?;
-
+    // Cheap checks first (shape, reserved, brand), then the Jev name check:
+    // Jev never runs for a name the wordlists already refused, and a
+    // missing client on localhost dev logs a warning and passes — exactly
+    // like the gate. Failures here abort before the app row exists.
+    apps::validate_slug(slug)?;
+    apps::check_slug_profanity(p.deployer.settings().jev.as_ref(), slug, name).await?;
     let owner_id = apps::ensure_account(&p.pool, owner_email).await?;
     let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM user WHERE id = ?1")
-        .bind(&owner_id)
         .fetch_optional(&p.pool)
         .await?;
     let app = apps::create(

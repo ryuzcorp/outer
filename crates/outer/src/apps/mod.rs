@@ -13,7 +13,7 @@ pub mod domains;
 pub(crate) mod local;
 pub mod rename;
 mod slug;
-pub use slug::{validate_slug, SlugError};
+pub use slug::{brand_hit, check_slug_profanity, validate_slug, ProfanityError, SlugError};
 
 /// Bucket prefixes a slug owns. Shared by the claim check, the rename guard
 /// and the maintenance drain: a slug is exactly its two prefixes.
@@ -207,9 +207,12 @@ pub fn app_limit_for_plan(plan: &str) -> u64 {
 /// Why [`create`] refused the app. Each message tells the agent what to change.
 #[derive(Debug, thiserror::Error)]
 pub enum CreateError {
-    /// The slug breaks the shape rule or is reserved.
+    /// The slug breaks the shape rule, is reserved, or imitates a brand.
     #[error(transparent)]
     InvalidSlug(#[from] SlugError),
+    /// Jev flagged the slug (or app name), or was unreachable (fail closed).
+    #[error(transparent)]
+    Profanity(#[from] ProfanityError),
     /// The slug names a live app, or its quarantine has not expired yet.
     #[error("slug is taken or quarantined; choose another slug")]
     Taken,
@@ -654,6 +657,18 @@ mod tests {
             create(&pool, &owner, "api", None, &alloc(), 10).await,
             Err(CreateError::InvalidSlug(SlugError::Reserved(_)))
         ));
+        assert!(matches!(
+            create(&pool, &owner, "paypal-login", None, &alloc(), 10).await,
+            Err(CreateError::InvalidSlug(SlugError::Brand { .. }))
+        ));
+        let message = create(&pool, &owner, "secure-bank-verify", None, &alloc(), 10)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("bank") && message.contains("aren't allowed"),
+            "brand refusal tells the agent the rule: {message}"
+        );
         let app = create(&pool, &owner, "gone", None, &alloc(), 10)
             .await
             .unwrap();

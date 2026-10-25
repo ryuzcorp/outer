@@ -2,6 +2,20 @@
 // Outer change: a thiserror SlugError with fix-it messages, and the spec §7.1
 // reserved list instead of Noite's edge-route list.
 
+/// Brand and account-page fragments refused in slugs (spec §7.1). One entry
+/// per line, `#` comments; embedded so the check works with no data dir.
+const BRANDS_TXT: &str = include_str!("../../wordlists/brands.txt");
+
+/// The parsed wordlist: lowercase entries, comments and blanks dropped.
+/// Entries are matched by [`brand_hit`], never by callers directly.
+static BRANDS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    BRANDS_TXT
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+});
+
 /// Slugs that would collide with platform routes or invite abuse (spec §7.1).
 /// Checked before the shape rule so the error names the real problem.
 const RESERVED_SLUGS: &[&str] = &[
@@ -24,9 +38,34 @@ pub enum SlugError {
     /// On the spec §7.1 reserved list.
     #[error("slug {0:?} is reserved for the platform; choose another slug")]
     Reserved(String),
+    /// Imitates a well-known brand or an account page (spec §7.1).
+    #[error("slug {slug:?} looks like it imitates {entry:?}, and names imitating well-known brands or account pages aren't allowed; choose another slug")]
+    Brand { slug: String, entry: &'static str },
 }
 
-/// Noite's slug rule plus the spec §7.1 reserved list.
+/// The brand-list entry `slug` trips, if any.
+///
+/// An entry hits when it is a whole hyphen-separated token (`paypal-login`
+/// trips `paypal`, `secure-bank-verify` trips `bank`) or — for entries of 5+
+/// characters — when it appears anywhere in the slug (`appleid-check` trips
+/// `apple`). Short entries stay token-only: `aws`, `gov`, `irs` and `ups`
+/// are substrings of too many ordinary words (`paws`, `governor`, `cups`),
+/// so `awsome-paws` and `governor` stay claimable while `gov-verify` and
+/// `dhl-express` refuse on their whole tokens.
+///
+/// The substring half deliberately over-refuses: any slug containing a 5+
+/// entry refuses, so `appleton`, `snapple`, `pineapple` and `applet` all
+/// refuse on `apple`. Phishing slugs concatenate (`appleid`,
+/// `paypalverify`) far more often than legitimate apps embed a brand name,
+/// so the rule errs on refusing and the agent picks another slug.
+pub fn brand_hit(slug: &str) -> Option<&'static str> {
+    let slug = slug.to_lowercase();
+    BRANDS.iter().copied().find(|entry| {
+        slug.split('-').any(|token| token == *entry) || (entry.len() >= 5 && slug.contains(entry))
+    })
+}
+
+/// Noite's slug rule plus the spec §7.1 reserved list and brand filter.
 pub fn validate_slug(slug: &str) -> Result<(), SlugError> {
     if slug.is_empty() {
         return Err(SlugError::Empty);
@@ -45,11 +84,72 @@ pub fn validate_slug(slug: &str) -> Result<(), SlugError> {
         // Static invariant: a compile-time literal, so construction never fails.
         regex::Regex::new(r"^[a-z0-9]([a-z0-9\-]{0,46}[a-z0-9])?$").expect("slug re")
     });
-    if RE.is_match(slug) {
-        Ok(())
-    } else {
-        Err(SlugError::BadShape(slug.to_string()))
+    if !RE.is_match(slug) {
+        return Err(SlugError::BadShape(slug.to_string()));
     }
+    if let Some(entry) = brand_hit(slug) {
+        return Err(SlugError::Brand {
+            slug: slug.to_string(),
+            entry,
+        });
+    }
+    Ok(())
+}
+
+/// Why the Jev name check refused a slug (or app name). The flagged message
+/// names the offending text so the agent can pick another name; the
+/// unavailable message is retryable, mirroring the gate's fail-closed line.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProfanityError {
+    /// Jev scored the text at or past a gate block threshold.
+    #[error("the name {0:?} was flagged by the content check; choose another name")]
+    Flagged(String),
+    /// Jev was unreachable: fail closed, exactly like the gate.
+    #[error("Couldn't check this name right now; try again in a minute")]
+    Unavailable,
+}
+
+/// Classify the slug (and the app `name` when given) with the same Jev
+/// client and the same block decision as the pre-live gate (spec §15.1):
+/// hyphens become spaces, and any chunk the gate would block on
+/// ([`crate::moderation::gate::judge`] — profanity, minors, phishing,
+/// severe) refuses the name. Hate only queues in the gate and never blocks,
+/// so it passes here too.
+///
+/// `None` is localhost dev without the Cloudflare pair: log a warning and
+/// pass, exactly like the gate's [`crate::moderation::gate::run_skipped`].
+/// Call only after [`validate_slug`] passes, so Jev never pays for a name
+/// the cheap checks already refused.
+pub async fn check_slug_profanity(
+    jev: Option<&crate::moderation::JevClient>,
+    slug: &str,
+    name: Option<&str>,
+) -> Result<(), ProfanityError> {
+    let Some(jev) = jev else {
+        tracing::warn!(
+            slug = %slug,
+            "slug check: no Jev client (localhost dev without the Cloudflare pair); passing unchecked"
+        );
+        return Ok(());
+    };
+    let mut texts = vec![slug.replace('-', " ")];
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        texts.push(name.to_string());
+    }
+    let scores = jev
+        .classify(&texts)
+        .await
+        .map_err(|_| ProfanityError::Unavailable)?;
+    for (text, score) in texts.iter().zip(scores) {
+        if matches!(
+            crate::moderation::gate::judge(&score),
+            crate::moderation::gate::ChunkVerdict::BlockProfanity
+                | crate::moderation::gate::ChunkVerdict::BlockHarmful
+        ) {
+            return Err(ProfanityError::Flagged(text.clone()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -120,6 +220,62 @@ mod tests {
         for slug in ["outer2", "my-outer", "apiary", "www2"] {
             assert!(validate_slug(slug).is_ok(), "should accept {slug:?}");
         }
+    }
+    #[test]
+    fn brand_tokens_and_long_substrings_are_refused() {
+        // Whole-token hits (any entry length) and substring hits (5+
+        // entries): the phishing shapes `paypal-login`, `secure-bank-verify`
+        // and `appleid-check` all refuse.
+        for (slug, entry) in [
+            ("paypal-login", "paypal"),
+            ("secure-bank-verify", "bank"),
+            ("appleid-check", "apple"),
+            ("bankofamerica-login", "bankofamerica"),
+            ("dhl-express", "dhl"),
+            ("gov-verify", "verify"),
+            ("mypaypal", "paypal"),
+            ("paypalverify", "paypal"),
+            ("appleton", "apple"),
+            // Documented over-refusals: ordinary words embedding a 5+
+            // entry. The rule errs on refusing; the agent picks another slug.
+            ("snapple", "apple"),
+            ("pineapple-express", "apple"),
+            ("applet", "apple"),
+        ] {
+            assert_eq!(brand_hit(slug), Some(entry), "brand hit for {slug:?}");
+            assert_eq!(
+                validate_slug(slug),
+                Err(SlugError::Brand {
+                    slug: slug.to_string(),
+                    entry
+                }),
+                "brand slug {slug:?} must be refused"
+            );
+        }
+        // Short entries are token-only: their substrings stay claimable.
+        for slug in [
+            "governor",
+            "governor-app",
+            "awsome-paws",
+            "paws",
+            "cups",
+            "supper-club",
+            "grocery-list",
+            "my-shop",
+        ] {
+            assert_eq!(brand_hit(slug), None, "no brand hit for {slug:?}");
+            assert!(validate_slug(slug).is_ok(), "should accept {slug:?}");
+        }
+    }
+
+    #[test]
+    fn brand_refusal_names_the_entry() {
+        let err = validate_slug("paypal-login").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("paypal") && message.contains("aren't allowed"),
+            "refusal must name the brand and the rule: {message}"
+        );
     }
     #[test]
     fn length_counts_characters_not_bytes() {

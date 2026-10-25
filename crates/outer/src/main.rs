@@ -613,6 +613,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     );
 
     let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
+    // One client for the pipeline gate and the slug/name check alike: both
+    // fail closed when it is `None` on localhost dev, and pass with a
+    // warning there.
+    let jev = jev_client(&config)?;
     let deployer = outer::deploy::Deployer::new(
         outer::deploy::DeploySettings {
             data_dir: config.data_dir.clone(),
@@ -624,7 +628,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             cgroups: cgroups(),
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(&config),
-            jev: jev_client(&config)?,
+            jev: jev.clone(),
             // The migrate step wakes a sleeping fleet before applying D1
             // migrations (`celld d1` reaches the database through a node).
             wake: Some(fleets.clone()),
@@ -651,6 +655,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         app_scheme: scheme(&config).to_string(),
         app_port_suffix: port_suffix(config.listen, config.tls_enabled()),
         tool_wait: config.tool_wait,
+        jev,
         rollback_locks: outer::mcp::RollbackLocks::default(),
         delete_cfg: outer::apps::delete::DeleteConfig {
             data_dir: config.data_dir.clone(),
