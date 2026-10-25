@@ -37,9 +37,13 @@ import {
 } from "./common.tsx";
 import {
   ActionsIcon,
+  DeploysIcon,
   ErrorsIcon,
+  LogsIcon,
   MetricsIcon,
   OverviewIcon,
+  SecretsIcon,
+  TicketIcon,
 } from "./icons.tsx";
 
 // --- Small pieces ------------------------------------------------------------
@@ -47,25 +51,74 @@ import {
 function Loading({ label }: { label: string }) {
   return (
     <div class="flex min-w-0 flex-col gap-3" role="status" aria-label={label}>
-      <div class="skeleton rounded-box h-30 w-full" />
-      <div class="skeleton rounded-box h-70 w-full" />
+      <div class="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4" aria-hidden="true">
+        <div class="skeleton rounded-box h-28 w-full" />
+        <div class="skeleton rounded-box h-28 w-full" />
+        <div class="skeleton rounded-box h-28 w-full" />
+        <div class="skeleton rounded-box h-28 w-full" />
+        <div class="skeleton rounded-box h-64 w-full md:col-span-2 xl:col-span-4" />
+      </div>
+      <span class="sr-only">Loading…</span>
     </div>
   );
 }
 
-function Err({ message }: { message: string }) {
+function Err({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
-    <div class="alert alert-error alert-soft min-w-0" role="alert">
-      <span class="min-w-0 break-words">Couldn't load this view: {message}</span>
+    <div class="flex min-w-0 flex-col gap-3">
+      <div class="alert alert-error alert-soft min-w-0" role="alert">
+        <span class="min-w-0 break-words">Couldn't load this view: {message}</span>
+      </div>
+      {onRetry && (
+        <div class="min-w-0">
+          <button type="button" class="btn btn-sm" onclick={onRetry}>
+            Retry
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-function Empty({ children }: { children?: unknown }) {
+// One shared empty state: an icon in a soft circle, a title, a muted line,
+// and an optional action. `plain` skips the card chrome for empties that
+// already sit inside a card (Overview rows, log lines).
+function EmptyState({
+  icon,
+  title,
+  children,
+  action,
+  plain,
+}: {
+  icon?: unknown;
+  title: string;
+  children?: unknown;
+  action?: unknown;
+  plain?: boolean;
+}) {
+  const inner = (
+    <div class="contents">
+      {icon && (
+        <span class="bg-base-200 flex h-11 w-11 items-center justify-center rounded-full opacity-70" aria-hidden="true">
+          {icon}
+        </span>
+      )}
+      <h3 class="m-0 min-w-0 text-base font-semibold">{title}</h3>
+      {children && <p class="m-0 min-w-0 text-sm opacity-60">{children}</p>}
+      {action}
+    </div>
+  );
+  if (plain) {
+    return (
+      <div class="flex min-w-0 flex-col items-center gap-2 py-6 text-center" role="status" aria-label={title}>
+        {inner}
+      </div>
+    );
+  }
   return (
-    <section class="card card-border bg-base-100 min-w-0" role="status">
-      <div class="card-body min-w-0">
-        <p class="m-0 min-w-0 opacity-60">{children}</p>
+    <section class="card card-border bg-base-100 min-w-0" role="status" aria-label={title}>
+      <div class="card-body items-center gap-2 py-8 text-center">
+        {inner}
       </div>
     </section>
   );
@@ -138,12 +191,15 @@ function StatCard({
   label,
   value,
   pill,
+  pillTitle,
   sub,
 }: {
   icon?: unknown;
   label: string;
   value: string;
   pill?: string | null;
+  /** What the pill compares, shown on hover (e.g. the half-range delta). */
+  pillTitle?: string;
   sub?: string;
 }) {
   return (
@@ -152,10 +208,10 @@ function StatCard({
         {icon}
         <span class="min-w-0 flex-1 truncate" title={label}>{label}</span>
       </div>
-      <div class="stat-value min-w-0 truncate text-3xl" title={pill ? `${value} ${pill}` : value}>
+      <div class="stat-value min-w-0 truncate text-3xl font-medium" title={pill ? `${value} ${pill}` : value}>
         {value}
         {pill != null && pill !== "" && (
-          <span class="badge badge-soft badge-sm ml-2 shrink-0 align-middle">{pill}</span>
+          <span class="badge badge-soft badge-sm ml-2 shrink-0 align-middle" title={pillTitle}>{pill}</span>
         )}
       </div>
       {sub && <div class="stat-desc min-w-0 truncate" title={sub}>{sub}</div>}
@@ -446,17 +502,19 @@ export function OverviewView({
   actions,
   errors,
   onView,
+  onRetry,
 }: {
   app: AppDetail;
   metrics: Panel<{ hours: number; summary: MetricsSummary }>;
   actions: ActionsPanel;
   errors: Panel<ErrorsSummary>;
   onView: (view: ViewId) => void;
+  onRetry: () => void;
 }) {
   return (
     <div class="flex min-w-0 flex-col gap-3">
       {metrics.kind === "loading" && <Loading label="Loading overview" />}
-      {metrics.kind === "error" && <Err message={metrics.message} />}
+      {metrics.kind === "error" && <Err message={metrics.message} onRetry={onRetry} />}
       {metrics.kind === "ready" && (
         <OverviewReady
           summary={metrics.value.summary}
@@ -477,11 +535,13 @@ export function OverviewView({
               </button>
             </div>
             {app.deploys.length === 0 ? (
-              <p class="m-0 min-w-0 opacity-60" role="status">
-                No deploys yet.
-              </p>
+              <EmptyState plain icon={<DeploysIcon />} title="No deploys yet">
+                Deploys your agent ships will show up here.
+              </EmptyState>
             ) : (
-              <DeployRow deploy={app.deploys[0]} />
+              <ul class="list min-w-0">
+                <DeployRow deploy={app.deploys[0]} />
+              </ul>
             )}
           </div>
         </section>
@@ -498,9 +558,11 @@ export function OverviewView({
               </button>
             </div>
             {actions.kind === "loading" && (
-              <p class="m-0 min-w-0 opacity-60" role="status">
-                Loading actions…
-              </p>
+              <div class="flex min-w-0 flex-col gap-2" role="status" aria-label="Loading actions">
+                <div class="skeleton h-8 w-full" />
+                <div class="skeleton h-8 w-full" />
+                <div class="skeleton h-8 w-full" />
+              </div>
             )}
             {actions.kind === "error" && (
               <p class="m-0 min-w-0 break-words opacity-60" role="alert">
@@ -509,13 +571,13 @@ export function OverviewView({
             )}
             {actions.kind === "ready" &&
               (actions.state.actions.length === 0 ? (
-                <p class="m-0 min-w-0 opacity-60" role="status">
-                  No agent actions yet.
-                </p>
+                <EmptyState plain icon={<ActionsIcon />} title="No agent actions yet">
+                  Your agent's tool calls will show up here.
+                </EmptyState>
               ) : (
-                <ul class="m-0 flex min-w-0 list-none flex-col gap-2 p-0">
+                <ul class="list min-w-0">
                   {actions.state.actions.slice(0, 5).map((a) => (
-                    <li key={a.id} class="flex min-w-0 items-center gap-2.5 text-[13px]">
+                    <li key={a.id} class="list-row min-w-0 text-[13px]">
                       <span class={`badge badge-soft ${outcomeBadge(a.outcome)} shrink-0`} title={a.outcome}>
                         {a.outcome}
                       </span>
@@ -545,12 +607,12 @@ export function OverviewView({
                 View all
               </button>
             </div>
-            <ul class="m-0 flex min-w-0 list-none flex-col gap-2 p-0">
+            <ul class="list min-w-0">
               {errors.value.issues
                 .filter((i) => i.status === "open")
                 .slice(0, 3)
                 .map((i) => (
-                  <li key={i.fingerprint} class="flex min-w-0 items-center gap-2.5 text-[13px]">
+                  <li key={i.fingerprint} class="list-row min-w-0 text-[13px]">
                     <span class="min-w-0 flex-1 truncate font-mono text-xs" title={i.message}>
                       {i.message}
                     </span>
@@ -578,58 +640,65 @@ function OverviewReady({
   const errorRate = fmtRate(summary.s5xx, summary.requests);
   return (
     <div class="flex min-w-0 flex-col gap-3">
-      <div class="stats stats-vertical bg-base-100 border border-base-300 min-w-0 xl:stats-horizontal">
-        <StatCard
-          icon={<MetricsIcon size={16} />}
-          label="Requests"
-          value={summary.requests.toLocaleString()}
-          pill={halfChange(summary.buckets)}
-          sub="in range"
-        />
-        <StatCard
-          icon={<OverviewIcon size={16} />}
-          label="Visitors"
-          value={summary.visitors.toLocaleString()}
-          sub="daily uniques, summed"
-        />
-        <StatCard
-          icon={<ErrorsIcon size={16} />}
-          label="Error rate"
-          value={errorRate}
-          pill={summary.s5xx > 0 ? `${summary.s5xx.toLocaleString()} 5xx` : null}
-          sub="server errors share"
-        />
-        <StatCard
-          icon={<ActionsIcon size={16} />}
-          label="p95 latency"
-          value={`${summary.p95_ms} ms`}
-          pill={`p50 ${summary.p50_ms} ms`}
-          sub="response headers"
-        />
+      <div class="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Requests">
+          <StatCard
+            icon={<MetricsIcon size={16} />}
+            label="Requests"
+            value={summary.requests.toLocaleString()}
+            pill={halfChange(summary.buckets)}
+            pillTitle="Requests in the second half of the range vs the first half"
+            sub="in range"
+          />
+        </section>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Visitors">
+          <StatCard
+            icon={<OverviewIcon size={16} />}
+            label="Visitors"
+            value={summary.visitors.toLocaleString()}
+            sub="daily uniques, summed"
+          />
+        </section>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Error rate">
+          <StatCard
+            icon={<ErrorsIcon size={16} />}
+            label="Error rate"
+            value={errorRate}
+            pill={summary.s5xx > 0 ? `${summary.s5xx.toLocaleString()} 5xx` : null}
+            sub="server errors share"
+          />
+        </section>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="p95 latency">
+          <StatCard
+            icon={<ActionsIcon size={16} />}
+            label="p95 latency"
+            value={`${summary.p95_ms} ms`}
+            pill={`p50 ${summary.p50_ms} ms`}
+            sub="response headers"
+          />
+        </section>
       </div>
-      <section class="card card-border bg-base-100 min-w-0" aria-label="Requests chart">
-        <div class="card-body min-w-0">
-          <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
-            <h2 class="card-title min-w-0 truncate" title="Requests">Requests</h2>
-            <div class="flex shrink-0 items-center gap-4 text-xs opacity-60">
-              <span class="flex min-w-0 items-center gap-1.5">
-                <span class="inline-block h-[3px] w-3.5 shrink-0 rounded bg-base-content" aria-hidden="true" />
-                This period
-              </span>
-              <span class="flex min-w-0 items-center gap-1.5">
-                <span class="inline-block h-[3px] w-3.5 shrink-0 rounded bg-base-content opacity-40" aria-hidden="true" />
-                Errors (4xx + 5xx)
-              </span>
-            </div>
+      <section class="min-w-0" aria-label="Requests chart">
+        <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
+          <h2 class="card-title min-w-0 truncate" title="Requests">Requests</h2>
+          <div class="flex shrink-0 items-center gap-4 text-xs opacity-60">
+            <span class="flex min-w-0 items-center gap-1.5">
+              <span class="status status-neutral" aria-hidden="true" />
+              This period
+            </span>
+            <span class="flex min-w-0 items-center gap-1.5">
+              <span class="status" aria-hidden="true" />
+              Errors (4xx + 5xx)
+            </span>
           </div>
-          {summary.buckets.length === 0 ? (
-            <p class="m-0 min-w-0 opacity-60" role="status">
-              No traffic in this range.
-            </p>
-          ) : (
-            <RequestsLine buckets={summary.buckets} hours={hours} />
-          )}
         </div>
+        {summary.buckets.length === 0 ? (
+          <EmptyState plain title="No traffic in this range">
+            Requests your app serves will show up here.
+          </EmptyState>
+        ) : (
+          <RequestsLine buckets={summary.buckets} hours={hours} />
+        )}
       </section>
     </div>
   );
@@ -638,47 +707,58 @@ function OverviewReady({
 // --- Metrics -------------------------------------------------------------------
 export function MetricsView({
   metrics,
+  onRetry,
 }: {
   metrics: Panel<{ hours: number; summary: MetricsSummary }>;
+  onRetry: () => void;
 }) {
   if (metrics.kind === "loading") {
     return <Loading label="Loading metrics" />;
   }
   if (metrics.kind === "error") {
-    return <Err message={metrics.message} />;
+    return <Err message={metrics.message} onRetry={onRetry} />;
   }
   const { summary, hours } = metrics.value;
   const errorRate = fmtRate(summary.s5xx, summary.requests);
   return (
     <div class="flex min-w-0 flex-col gap-3">
-      <div class="stats stats-vertical bg-base-100 border border-base-300 min-w-0 xl:stats-horizontal">
-        <StatCard
-          icon={<MetricsIcon size={16} />}
-          label="Requests"
-          value={summary.requests.toLocaleString()}
-          pill={halfChange(summary.buckets)}
-          sub="in range"
-        />
-        <StatCard
-          icon={<OverviewIcon size={16} />}
-          label="Visitors"
-          value={summary.visitors.toLocaleString()}
-          sub="daily uniques, summed"
-        />
-        <StatCard
-          icon={<ErrorsIcon size={16} />}
-          label="Error rate"
-          value={errorRate}
-          pill={summary.s5xx > 0 ? `${summary.s5xx.toLocaleString()} 5xx` : null}
-          sub={`${summary.s4xx.toLocaleString()} client errors (4xx)`}
-        />
-        <StatCard
-          icon={<ActionsIcon size={16} />}
-          label="p95 latency"
-          value={`${summary.p95_ms} ms`}
-          pill={`p50 ${summary.p50_ms} ms`}
-          sub="response headers"
-        />
+      <div class="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Requests">
+          <StatCard
+            icon={<MetricsIcon size={16} />}
+            label="Requests"
+            value={summary.requests.toLocaleString()}
+            pill={halfChange(summary.buckets)}
+            pillTitle="Requests in the second half of the range vs the first half"
+            sub="in range"
+          />
+        </section>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Visitors">
+          <StatCard
+            icon={<OverviewIcon size={16} />}
+            label="Visitors"
+            value={summary.visitors.toLocaleString()}
+            sub="daily uniques, summed"
+          />
+        </section>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="Error rate">
+          <StatCard
+            icon={<ErrorsIcon size={16} />}
+            label="Error rate"
+            value={errorRate}
+            pill={summary.s5xx > 0 ? `${summary.s5xx.toLocaleString()} 5xx` : null}
+            sub={`${summary.s4xx.toLocaleString()} client errors (4xx)`}
+          />
+        </section>
+        <section class="card card-border bg-base-100 min-w-0" aria-label="p95 latency">
+          <StatCard
+            icon={<ActionsIcon size={16} />}
+            label="p95 latency"
+            value={`${summary.p95_ms} ms`}
+            pill={`p50 ${summary.p50_ms} ms`}
+            sub="response headers"
+          />
+        </section>
       </div>
       <section class="card card-border bg-base-100 min-w-0" aria-label={summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}>
         <div class="card-body min-w-0">
@@ -686,9 +766,9 @@ export function MetricsView({
             <h2 class="card-title min-w-0 truncate" title={summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}>{summary.buckets.length > 200 ? "Daily requests" : "Hourly requests"}</h2>
           </div>
           {summary.buckets.length === 0 ? (
-            <p class="m-0 min-w-0 opacity-60" role="status">
-              No traffic in this range.
-            </p>
+            <EmptyState plain title="No traffic in this range">
+              Requests your app serves will show up here.
+            </EmptyState>
           ) : (
             <Bars buckets={summary.buckets} hours={hours} />
           )}
@@ -700,9 +780,9 @@ export function MetricsView({
             <h2 class="card-title min-w-0 truncate" title="Top paths">Top paths</h2>
           </div>
           {summary.top_paths.length === 0 ? (
-            <p class="m-0 min-w-0 opacity-60" role="status">
-              No paths recorded in this range.
-            </p>
+            <EmptyState plain title="No paths recorded in this range">
+              Paths your app serves will show up here.
+            </EmptyState>
           ) : (
             <div class="min-w-0 overflow-x-auto">
               <table class="table table-fixed w-full">
@@ -744,19 +824,25 @@ export function MetricsView({
 export function ActionsView({
   panel,
   onMore,
+  onRetry,
 }: {
   panel: ActionsPanel;
   onMore: () => void;
+  onRetry: () => void;
 }) {
   if (panel.kind === "loading") {
     return <Loading label="Loading agent actions" />;
   }
   if (panel.kind === "error") {
-    return <Err message={panel.message} />;
+    return <Err message={panel.message} onRetry={onRetry} />;
   }
   const { actions, next, loadingMore, moreError } = panel.state;
   if (actions.length === 0) {
-    return <Empty>No agent actions yet.</Empty>;
+    return (
+      <EmptyState icon={<ActionsIcon />} title="No agent actions yet">
+        Your agent's tool calls will show up here.
+      </EmptyState>
+    );
   }
   return (
     <section class="card card-border bg-base-100 min-w-0" aria-label="Agent actions">
@@ -834,7 +920,7 @@ export function ActionsView({
 
 function DeployRow({ deploy }: { deploy: ConsoleDeploy }) {
   return (
-    <div class="flex min-w-0 items-center gap-2.5 text-[13px]">
+    <li class="list-row min-w-0 text-[13px]">
       <span class={`badge badge-soft ${statusBadge(deploy.status)} shrink-0`} title={deploy.status}>{deploy.status}</span>
       <span class="shrink-0 truncate font-mono" title={deploy.sha}>
         {shortSha(deploy.sha)}
@@ -848,7 +934,7 @@ function DeployRow({ deploy }: { deploy: ConsoleDeploy }) {
           ? ""
           : `${(deploy.duration_ms / 1000).toFixed(1)}s`}
       </span>
-    </div>
+    </li>
   );
 }
 
@@ -862,7 +948,11 @@ export function DeploysView({
   onToggle: (id: string) => void;
 }) {
   if (app.deploys.length === 0) {
-    return <Empty>No deploys yet.</Empty>;
+    return (
+      <EmptyState icon={<DeploysIcon />} title="No deploys yet">
+        Deploys your agent ships will show up here.
+      </EmptyState>
+    );
   }
   return (
     <div class="flex min-w-0 flex-col gap-3">
@@ -936,15 +1026,17 @@ export function DeploysView({
 export function LogsView({
   panel,
   onRefresh,
+  onRetry,
 }: {
   panel: Panel<LogLine[]>;
   onRefresh: () => void;
+  onRetry: () => void;
 }) {
   if (panel.kind === "loading") {
     return <Loading label="Loading logs" />;
   }
   if (panel.kind === "error") {
-    return <Err message={panel.message} />;
+    return <Err message={panel.message} onRetry={onRetry} />;
   }
   const lines = panel.value;
   return (
@@ -962,9 +1054,9 @@ export function LogsView({
           </button>
         </div>
         {lines.length === 0 ? (
-          <p class="m-0 min-w-0 opacity-60" role="status">
-            No log lines yet.
-          </p>
+          <EmptyState plain icon={<LogsIcon />} title="No log lines yet">
+            Lines your app writes will show up here.
+          </EmptyState>
         ) : (
           <ol class="log-list">
             {lines.map((entry) => (
@@ -990,19 +1082,19 @@ export function LogsView({
 // Ported from Noite's errors.tsx: grouped issues with counts + first/last
 // seen, plus the trailing-hour proxy 5xx count.
 
-export function ErrorsView({ panel }: { panel: Panel<ErrorsSummary> }) {
+export function ErrorsView({ panel, onRetry }: { panel: Panel<ErrorsSummary>; onRetry: () => void }) {
   if (panel.kind === "loading") {
     return <Loading label="Loading errors" />;
   }
   if (panel.kind === "error") {
-    return <Err message={panel.message} />;
+    return <Err message={panel.message} onRetry={onRetry} />;
   }
   const { issues, s5xx_last_hour } = panel.value;
   if (issues.length === 0) {
     return (
-      <Empty>
-        {`No errors recorded.${s5xx_last_hour > 0 ? ` ${s5xx_last_hour} proxy 5xx in the last hour, with no grouped issue.` : ""}`}
-      </Empty>
+      <EmptyState icon={<ErrorsIcon />} title="No errors recorded">
+        {`Grouped runtime errors will show up here.${s5xx_last_hour > 0 ? ` ${s5xx_last_hour} proxy 5xx in the last hour, with no grouped issue.` : ""}`}
+      </EmptyState>
     );
   }
   return (
@@ -1067,12 +1159,12 @@ export function ErrorsView({ panel }: { panel: Panel<ErrorsSummary> }) {
 
 // --- Secrets -------------------------------------------------------------------
 
-export function SecretsView({ panel }: { panel: Panel<SecretsSummary> }) {
+export function SecretsView({ panel, onRetry }: { panel: Panel<SecretsSummary>; onRetry: () => void }) {
   if (panel.kind === "loading") {
     return <Loading label="Loading secrets" />;
   }
   if (panel.kind === "error") {
-    return <Err message={panel.message} />;
+    return <Err message={panel.message} onRetry={onRetry} />;
   }
   const secrets = panel.value.secrets;
   return (
@@ -1087,7 +1179,9 @@ export function SecretsView({ panel }: { panel: Panel<SecretsSummary> }) {
         </div>
       </section>
       {secrets.length === 0 ? (
-        <Empty>No secrets set.</Empty>
+        <EmptyState icon={<SecretsIcon />} title="No secrets set">
+          Your agent manages secret names over MCP; values never leave the server.
+        </EmptyState>
       ) : (
         <section class="card card-border bg-base-100 min-w-0" aria-label="Secrets">
           <div class="card-body min-w-0">
@@ -1235,11 +1329,11 @@ export function InvitesView({
         </div>
       </section>
       {codes.length === 0 ? (
-        <Empty>
+        <EmptyState icon={<TicketIcon />} title="No invite codes">
           {isAdmin
             ? "Admins get no automatic codes — generate some on the Admin page."
-            : "You have no invite codes."}
-        </Empty>
+            : "Codes appear here when you earn or receive them."}
+        </EmptyState>
       ) : (
         <section class="card card-border bg-base-100 min-w-0" aria-label="Your invite codes">
           <div class="card-body min-w-0">
@@ -1474,7 +1568,9 @@ function AdminCodesCard({
           </p>
         )}
         {page.codes.length === 0 ? (
-          <Empty>No codes yet — generate some above.</Empty>
+          <EmptyState plain icon={<TicketIcon />} title="No codes yet">
+            Generate some above to invite new accounts.
+          </EmptyState>
         ) : (
           <div class="min-w-0 overflow-x-auto">
             <table class="table table-fixed w-full max-sm:[&_td]:px-2 max-sm:[&_th]:px-2">
@@ -1591,7 +1687,9 @@ function WaitlistCard({
       <div class="card-body min-w-0">
         <h2 class="card-title m-0 min-w-0 text-base">Waitlist</h2>
         {entries.length === 0 ? (
-          <Empty>Nobody waiting.</Empty>
+          <EmptyState plain title="Nobody waiting">
+            Signups that hit the closed beta land here.
+          </EmptyState>
         ) : (
           <div class="min-w-0 overflow-x-auto">
             <table class="table table-fixed w-full">
