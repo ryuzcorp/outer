@@ -483,6 +483,13 @@ async fn look_response(
     if !is_html || encoded {
         return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted);
     }
+    // Everything below rewrites the page for one browser render. The edge
+    // must never store it: Cloudflare's cache key ignores the look header,
+    // so a cached copy would serve the recorder to real visitors.
+    parts.headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, private"),
+    );
     let declared = parts
         .headers
         .get(axum::http::header::CONTENT_LENGTH)
@@ -1907,6 +1914,11 @@ mod tests {
             "content-length fixed for the injected body"
         );
         assert!(body.contains("id=\"__outer_look\""), "{body}");
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store, private"),
+            "the edge must never cache the recorder page"
+        );
     }
 
     /// Without any token the proxy path is byte-for-byte what upstream
