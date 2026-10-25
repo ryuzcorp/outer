@@ -2,8 +2,8 @@
 -- The bytes live in R2 under `outer/backups/{slug}/` (NOT under
 -- `fleets/{slug}/`, so app code can never touch them); the row carries the
 -- key, the binding, and the size for the Console/MCP list. Rows are keyed
--- by `app_id`, and a rename rewrites each row's `store_key` in the same
--- transaction that flips the slug; `delete_app` removes both explicitly.
+-- by `app_id`, so a rename moves only the bucket prefix while the rows
+-- follow untouched; `delete_app` removes both explicitly.
 CREATE TABLE d1_backup (
   id          TEXT NOT NULL PRIMARY KEY,
   app_id      TEXT NOT NULL REFERENCES app (id) ON DELETE CASCADE,
