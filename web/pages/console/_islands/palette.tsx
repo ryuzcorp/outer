@@ -250,6 +250,38 @@ function summarize(value: unknown): string {
   return text.length > 2000 ? `${text.slice(0, 2000)}\n…(truncated)` : text;
 }
 
+/** Empty-query listing: Recents first (when any), then every group in group
+ * order with nothing hidden or re-scored. Recent items leave their own
+ * groups so keys stay unique. */
+export function emptyQueryEntries(
+  groups: ItemGroup[],
+  recents: RecentEntry[],
+): { group: string; item: PaletteItem }[] {
+  const all = groups.flatMap((g) =>
+    g.items.map((item) => ({ group: g.title, item })),
+  );
+  if (recents.length === 0) {
+    return all;
+  }
+  const byKey = new Map(all.map((entry) => [entry.item.key, entry] as const));
+  const seen = new Set<string>();
+  const recentEntries: { group: string; item: PaletteItem }[] = [];
+  for (const recent of recents) {
+    const entry = byKey.get(recent.key);
+    if (entry !== undefined && !seen.has(recent.key)) {
+      seen.add(recent.key);
+      recentEntries.push({ group: "Recents", item: entry.item });
+    }
+  }
+  if (recentEntries.length === 0) {
+    return all;
+  }
+  return [
+    ...recentEntries,
+    ...all.filter((entry) => !seen.has(entry.item.key)),
+  ];
+}
+
 /** Search across groups: every group's hits stay together in group
  * order, ranked by score within the group, so headers never repeat. */
 export function searchEntries(
@@ -288,20 +320,7 @@ export function Palette(props: PaletteProps) {
     const groups = buildGroups(props);
     const q = query().trim();
     if (q === "") {
-      const byKey = new Map(
-        groups
-          .flatMap((g) => g.items.map((item) => ({ group: g.title, item })))
-          .map((entry) => [entry.item.key, entry] as const),
-      );
-      const recent = loadRecents()
-        .map((e) => byKey.get(e.key))
-        .filter((e) => e !== undefined);
-      if (recent.length > 0) {
-        return recent;
-      }
-      return groups.flatMap((g) =>
-        g.items.map((item) => ({ group: g.title, item })),
-      );
+      return emptyQueryEntries(groups, loadRecents());
     }
     return searchEntries(groups, q);
   };

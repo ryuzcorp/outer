@@ -15,9 +15,7 @@ type DatabasesState =
   | { kind: "error"; message: string }
   | { kind: "ready"; value: D1DatabasesOutput };
 
-/** One in-flight (or finished) fetch per app, shared by every mounted hook
- * instance: the sidebar nav and the view body mount separately, and without
- * this each mount fires its own `d1_databases`. Failures evict the entry so
+/** One in-flight (or finished) fetch per app. Failures evict the entry so
  * a retry fetches again. */
 const databasesCache = new Map<string, Promise<D1DatabasesOutput>>();
 
@@ -37,8 +35,7 @@ const fetchDatabases = (slug: string): Promise<D1DatabasesOutput> => {
   });
   return pending;
 };
-
-/** The app's declared D1 bindings, fetched once per app (not per mount). */
+/** The app's declared D1 binding, fetched once per app (not per mount). */
 const useDatabases = (slug: string): DatabasesState & { retry: () => void } => {
   const state = atom<DatabasesState>({ kind: "loading" });
   const started = atom("");
@@ -78,7 +75,7 @@ const useDatabases = (slug: string): DatabasesState & { retry: () => void } => {
   };
 };
 
-/** `d1` view body: database picker, editor, and empty states. */
+/** `d1` view body: the single declared database, editor, and empty states. */
 export function D1View({
   canWrite,
   route,
@@ -92,9 +89,9 @@ export function D1View({
   slug: string;
 }) {
   const databases = useDatabases(slug);
-  // Remount the whole editor when the app or database changes, so table
-  // and schema state never leaks across them.
-  const editorKey = `${slug}:${route.db}`;
+  // Remount the whole editor when the app changes, so table and schema
+  // state never leaks across apps.
+  const editorKey = `${slug}`;
 
   if (databases.kind === "error") {
     return (
@@ -136,10 +133,9 @@ export function D1View({
     );
   }
 
-  const list = databases.value.databases;
-  const binding =
-    list.find((candidate) => candidate.binding === route.db)?.binding ??
-    list[0]?.binding;
+  // At most one database per app (deploy validation refuses a second), so
+  // the single binding is used directly: no picker, no list.
+  const binding = databases.value.databases[0]?.binding;
 
   if (binding === undefined) {
     return (
@@ -164,38 +160,12 @@ export function D1View({
     );
   }
 
+  // No wrapping card: the table rail + grid sit directly on the main
+  // panel, which is itself the surface. On wide screens the editor takes
+  // the panel's full height (main is 100dvh minus its padding and title)
+  // and the grid scrolls inside it.
   return (
-    <div class="flex min-w-0 flex-col gap-3">
-      {list.length > 1 ? (
-        <div
-          class="join flex-wrap"
-          role="group"
-          aria-label="D1 database"
-        >
-          {list.map((candidate) => (
-            <button
-              key={candidate.binding}
-              type="button"
-              class={`btn btn-sm join-item ${candidate.binding === binding ? "btn-active" : ""}`}
-              aria-pressed={candidate.binding === binding ? "true" : "false"}
-              title={candidate.database_name}
-              onclick={() => {
-                setRoute({
-                  db: candidate.binding,
-                  table: "",
-                  f: "",
-                  sort: "",
-                  q: "",
-                  page: "",
-                  dview: "",
-                });
-              }}
-            >
-              {candidate.binding}
-            </button>
-          ))}
-        </div>
-      ) : null}
+    <div class="flex min-w-0 flex-col gap-3 md:h-[calc(100dvh-124px)]">
       {canWrite ? null : (
         <div class="alert alert-info alert-soft min-w-0" role="note">
           <span class="min-w-0 break-words">
@@ -204,96 +174,44 @@ export function D1View({
           </span>
         </div>
       )}
-      <section
-        class="card card-border bg-base-100 min-w-0 overflow-hidden"
-        aria-label={`D1 database ${binding}`}
-      >
-        <div class="card-body min-w-0 gap-0 p-0">
-          <D1Editor
-            key={editorKey}
-            binding={binding}
-            canWrite={canWrite}
-            route={route}
-            setRoute={setRoute}
-            slug={slug}
-          />
-        </div>
-      </section>
+      <div class="flex min-h-0 min-w-0 flex-1">
+        <D1Editor
+          key={editorKey}
+          binding={binding}
+          canWrite={canWrite}
+          route={route}
+          setRoute={setRoute}
+          slug={slug}
+        />
+      </div>
     </div>
   );
 }
 
-/** Sidebar Data entry: the D1 row plus one sub-row per declared binding. */
+/** Sidebar Data entry: a plain `D1` row. The app declares at most one
+ * database and the view uses its binding directly, so there is no nested
+ * list and no count badge. */
 export function D1Nav({
   active,
-  route,
   setRoute,
-  slug,
 }: {
   /** Whether the D1 view is showing. */
   active: boolean;
-  route: Route;
   setRoute: (next: Partial<Route>) => void;
-  slug: string;
 }) {
-  const databases = useDatabases(slug);
-
-  const open = (binding: string) => {
-    setRoute({
-      view: "d1",
-      db: binding,
-      table: "",
-      f: "",
-      sort: "",
-      q: "",
-      page: "",
-      dview: "",
-    });
-  };
-
-  const list = databases.kind === "ready" ? databases.value.databases : [];
-
   return (
-    <>
-      <li class="min-w-0">
-        <button
-          type="button"
-          class={active ? "menu-active min-w-0" : "min-w-0"}
-          aria-current={active ? "page" : undefined}
-          onclick={() => {
-            open(route.db || list[0]?.binding || "");
-          }}
-        >
-          <DatabaseIcon />
-          <span class="min-w-0 flex-1 truncate">D1</span>
-          {list.length > 0 ? (
-            <span
-              class="badge badge-soft badge-sm ml-auto shrink-0"
-              title={`${list.length} database${list.length === 1 ? "" : "s"}`}
-            >
-              {list.length}
-            </span>
-          ) : null}
-        </button>
-      </li>
-      {active || list.length === 0
-        ? null
-        : list.map((candidate) => (
-            <li key={candidate.binding} class="min-w-0">
-              <button
-                type="button"
-                class="min-w-0 pl-11"
-                title={candidate.database_name}
-                onclick={() => {
-                  open(candidate.binding);
-                }}
-              >
-                <span class="min-w-0 flex-1 truncate">
-                  {candidate.binding}
-                </span>
-              </button>
-            </li>
-          ))}
-    </>
+    <li class="min-w-0">
+      <button
+        type="button"
+        class={active ? "menu-active min-w-0" : "min-w-0"}
+        aria-current={active ? "page" : undefined}
+        onclick={() => {
+          setRoute({ view: "d1" });
+        }}
+      >
+        <DatabaseIcon />
+        <span class="min-w-0 flex-1 truncate">D1</span>
+      </button>
+    </li>
   );
 }

@@ -1418,9 +1418,7 @@ export function Console() {
                   <>
                     <D1Nav
                       active={r.view === "d1"}
-                      route={r}
                       setRoute={(next) => navigate(next)}
-                      slug={active.slug}
                     />
                     {DATA_VIEWS.map((v) => (
                       <li key={v.id} class="min-w-0">

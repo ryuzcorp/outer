@@ -68,7 +68,7 @@ const r2ListBuckets: ConsoleAction<{ slug: string }, BucketsResult> = {
   name: "r2_list_buckets",
   title: "List R2 buckets",
   description:
-    "List the app's declared R2 buckets (binding + bucket name) from its built wrangler config. Use when the R2 browser needs its bucket picker; an empty list means the app declares no r2_buckets.",
+    "List the app's declared R2 bucket (binding + bucket name; at most one) from its built wrangler config. The console uses the single bucket directly; an empty list means the app declares no r2_buckets.",
   inputSchema: {
     type: "object",
     properties: { slug: slugSchema },

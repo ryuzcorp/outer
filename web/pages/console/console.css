@@ -116,13 +116,13 @@ body {
 /* --- App frame --------------------------------------------------------- */
 
 /* Shell: rail (64px, transparent, flush left) | sidebar panel | main panel.
-   8px gaps; panels sit 8px in from the viewport top/right/bottom; the rail
+   4px rail gap; panels sit 8px in from the viewport top/right/bottom; the rail
    has 0 left margin. Both panels are full viewport height and scroll
    internally, so the page itself never scrolls. */
 .console {
   display: grid;
   grid-template-columns: 64px minmax(0, 1fr);
-  gap: 8px;
+  gap: 4px;
   align-items: start;
   height: 100dvh;
   overflow: hidden;
@@ -178,7 +178,7 @@ body {
   overflow-x: hidden;
   /* Side padding so focus rings and tile edges never clip: content (44px)
      plus padding still fits the 64px rail, so scrollWidth stays put. */
-  padding: 2px 10px;
+  padding: 2px 6px;
 }
 
 
@@ -353,6 +353,18 @@ a.rail-tile:hover {
   overflow: auto;
 }
 
+/* Code view on wide screens: the file tree and the file's lines run to the
+   bottom of the panel instead of stopping at 480px. */
+@media (min-width: 1024px) {
+  .code-fill-tree {
+    max-height: calc(100dvh - 232px);
+  }
+
+  .log-list.code-fill-lines {
+    max-height: calc(100dvh - 256px);
+  }
+}
+
 .log-line {
   display: flex;
   gap: 8px;
@@ -391,7 +403,7 @@ a.rail-tile:hover {
 .console-boot {
   display: grid;
   grid-template-columns: 64px minmax(0, 1fr);
-  gap: 8px;
+  gap: 4px;
   height: 100dvh;
   overflow: hidden;
   padding: 8px 8px 8px 0;
@@ -433,7 +445,7 @@ a.rail-tile:hover {
   .console {
     grid-template-columns: 56px minmax(0, 1fr);
     padding: 8px 8px 8px 0;
-    gap: 8px;
+    gap: 4px;
   }
 
   .rail {
@@ -441,7 +453,7 @@ a.rail-tile:hover {
   }
 
   .rail-apps {
-    padding: 2px 8px;
+    padding: 2px 4px;
   }
 
   .rail-tile {

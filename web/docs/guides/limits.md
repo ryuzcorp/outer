@@ -11,7 +11,12 @@ These numbers are constants in the code (`crates/outer/src/mcp/tools/mod.rs`):
 | --- | --- | --- |
 | Apps owned | 1 | 10 |
 | Code changes / day (UTC) | 50 | 500 |
+| D1 databases / app | 1 | 1 |
+| R2 buckets / app | 1 | 1 |
 
+A second `d1_databases` or `r2_buckets` entry fails the deploy at its
+validation step (`deploy-root`): "Outer apps can have one D1 database and
+one R2 bucket for now; merge the extra ones".
 Every account is on Free until billing ships — the Pro column shows what
 the code already honors for Pro accounts, not something you can buy yet.
 
