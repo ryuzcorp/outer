@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 31);
+    assert_eq!(anon.len(), 34);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,9 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 29);
+    assert_eq!(authed.len(), 32);
+    assert!(!authed.contains(&"sign_in".to_string()));
+    assert!(!authed.contains(&"verify_code".to_string()));
 
     // The test admin sees the same rows: M1 has no admin tools.
     let admin = api_key_for(&state, "owner@example.com").await;
@@ -2560,6 +2562,108 @@ async fn set_visibility_public_is_pro_gated() {
     )
     .await;
     assert_eq!(result(&public)["structuredContent"]["visibility"], "public");
+}
+
+#[tokio::test]
+async fn error_triage_tools_move_issues() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    let app_id = app_id(&state, "groceries").await;
+    let now = crate::apps::now_ms();
+    sqlx::query(
+        "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status) \
+         VALUES (?1, 'fp1', 'Error: kaboom', 'at handler (x:1:2)', 1, ?2, ?3, 'open')",
+    )
+    .bind(&app_id)
+    .bind(now - 1_000)
+    .bind(now - 500)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    // Resolve moves the issue out of the open list.
+    let (_, out) = call(
+        &state,
+        Some(&ana),
+        "resolve_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(
+        result(&out)["structuredContent"],
+        json!({"fingerprint": "fp1", "status": "resolved"})
+    );
+    let (_, resolved) = call(
+        &state,
+        Some(&ana),
+        "app_errors",
+        json!({"app": "groceries", "status": "resolved"}),
+    )
+    .await;
+    assert_eq!(
+        result(&resolved)["structuredContent"]["issues"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // A stranger's slug answers not_found, exactly like a missing one.
+    let (_, bob_body) = call(
+        &state,
+        Some(&bob),
+        "resolve_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(is_error(&bob_body)["error"], "not_found");
+    // Unknown fingerprints are not_found; empty ones are the caller's bug.
+    let (_, missing) = call(
+        &state,
+        Some(&ana),
+        "ignore_error",
+        json!({"app": "groceries", "fingerprint": "nobody"}),
+    )
+    .await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+    let (_, empty) = call(
+        &state,
+        Some(&ana),
+        "ignore_error",
+        json!({"app": "groceries", "fingerprint": ""}),
+    )
+    .await;
+    assert_eq!(is_error(&empty)["error"], "invalid_argument");
+    // Ignore then reopen round-trips back to open.
+    let (_, ignored) = call(
+        &state,
+        Some(&ana),
+        "ignore_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(result(&ignored)["structuredContent"]["status"], "ignored");
+    let (_, reopened) = call(
+        &state,
+        Some(&ana),
+        "reopen_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(result(&reopened)["structuredContent"]["status"], "open");
+    // Every triage call lands in the action log under its own name.
+    let actions = crate::mcp::actions::list(&state.pool, &app_id, None, 10)
+        .await
+        .unwrap();
+    for tool in ["resolve_error", "ignore_error", "reopen_error"] {
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.tool == tool && action.summary.starts_with(tool)),
+            "{tool} audited: {:?}",
+            actions.iter().map(|a| &a.tool).collect::<Vec<_>>(),
+        );
+    }
 }
 
 #[tokio::test]

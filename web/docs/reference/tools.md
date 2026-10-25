@@ -336,6 +336,42 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `status` | string | no | Only issues with this status (`open`, `resolved` or `ignored`); unset returns every status. |
 
+## `resolve_error`
+
+- **Access:** signed in
+- **Description:** Mark one grouped runtime error {app, fingerprint} resolved: it leaves the open list, and a new event for the same fingerprint reopens it as a regression.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `fingerprint` | string | yes | The issue fingerprint from `app_errors`. |
+
+## `ignore_error`
+
+- **Access:** signed in
+- **Description:** Ignore one grouped runtime error {app, fingerprint}: it keeps counting but stays out of the open list and never reopens automatically.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `fingerprint` | string | yes | The issue fingerprint from `app_errors`. |
+
+## `reopen_error`
+
+- **Access:** signed in
+- **Description:** Reopen one resolved or ignored error issue {app, fingerprint}: it returns to the open list as a fresh triage.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `fingerprint` | string | yes | The issue fingerprint from `app_errors`. |
+
 ## `list_secrets`
 
 - **Access:** signed in

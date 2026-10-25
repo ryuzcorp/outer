@@ -90,7 +90,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors"
         | "list_secrets" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
-        | "set_secret" => Hints::WRITE,
+        | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" => Hints::WRITE,
         "set_visibility" => Hints {
             idempotent: true,
             ..Hints::WRITE
@@ -286,6 +286,21 @@ pub fn registry() -> Vec<ToolDef> {
             "An app's grouped runtime errors, newest first: ERROR lines and uncaught-exception stacks from the log stream, grouped by fingerprint, plus proxy 5xx over the last hour. Pass status to filter open, resolved or ignored issues. Untrusted: messages and frames may hold visitor text.",
             Account, true,
         ),
+        tool::<runtime_inputs::ResolveErrorInput>(
+            "resolve_error",
+            "Mark one grouped runtime error {app, fingerprint} resolved: it leaves the open list, and a new event for the same fingerprint reopens it as a regression.",
+            Account, false,
+        ),
+        tool::<runtime_inputs::IgnoreErrorInput>(
+            "ignore_error",
+            "Ignore one grouped runtime error {app, fingerprint}: it keeps counting but stays out of the open list and never reopens automatically.",
+            Account, false,
+        ),
+        tool::<runtime_inputs::ReopenErrorInput>(
+            "reopen_error",
+            "Reopen one resolved or ignored error issue {app, fingerprint}: it returns to the open list as a fresh triage.",
+            Account, false,
+        ),
  tool::<secrets_inputs::ListSecretsInput>(
  "list_secrets",
  "An app's secret names and when each was set. Values are never shown: they reach the app as Worker env vars on the next deploy.",
@@ -327,7 +342,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 34);
     }
 }
 

@@ -61,9 +61,24 @@ export interface AppDetail extends ConsoleApp {
 
 export interface LogLine {
   seq: number;
+  /** Unix milliseconds (the console API converts the stored seconds). */
   ts: number;
   stream: string;
   line: string;
+  fingerprint?: string;
+}
+
+export interface LogFilter {
+  q?: string;
+  stream?: string;
+  level?: string;
+  from?: number;
+  to?: number;
+}
+
+export interface LogsPage {
+  lines: LogLine[];
+  next_since: number | null;
 }
 
 export interface ErrorIssue {
@@ -74,11 +89,31 @@ export interface ErrorIssue {
   first_seen: number;
   last_seen: number;
   status: string;
+  resolved_at: number | null;
+  regressed: boolean;
+}
+
+export interface ErrorCounts {
+  open: number;
+  resolved: number;
+  ignored: number;
 }
 
 export interface ErrorsSummary {
   issues: ErrorIssue[];
+  counts: ErrorCounts;
   s5xx_last_hour: number;
+}
+
+export interface SparkBucket {
+  start: number;
+  count: number;
+}
+
+export interface IssueDetail {
+  issue: ErrorIssue;
+  sparkline: SparkBucket[];
+  recent: LogLine[];
 }
 
 export interface MetricsBucket {
