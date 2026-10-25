@@ -16,6 +16,8 @@ pub struct DeployStatusInput {
     pub deploy_id: Option<String>,
     /// Wait for a terminal state (default false).
     pub wait: Option<bool>,
+    /// Look at preview runs instead of live ones (default false).
+    pub preview: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -24,6 +26,8 @@ pub struct DeployLogInput {
     pub app: String,
     /// A deploy id (default: the latest deploy).
     pub deploy_id: Option<String>,
+    /// Look at preview runs instead of live ones (default false).
+    pub preview: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -38,8 +42,9 @@ pub struct AppLogsInput {
 
 pub async fn deploy_status(input: DeployStatusInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let (app, _) = visible_app(ctx, &input.app).await?;
+    let kind = kind_for(input.preview);
     if let Some(deploy_id) = input.deploy_id.as_deref() {
-        if deploy_by(&ctx.state.pool, &app.id, Some(deploy_id))
+        if deploy_by(&ctx.state.pool, &app.id, Some(deploy_id), kind)
             .await?
             .is_none()
         {
@@ -51,6 +56,7 @@ pub async fn deploy_status(input: DeployStatusInput, ctx: &Ctx<'_>) -> Result<Va
         &app,
         input.deploy_id.as_deref(),
         input.wait.unwrap_or(false),
+        kind,
     )
     .await?;
     let status = deploy["status"].as_str().unwrap_or("");
@@ -61,9 +67,24 @@ pub async fn deploy_status(input: DeployStatusInput, ctx: &Ctx<'_>) -> Result<Va
     ))
 }
 
+/// Live or preview runs, from the tool input flag.
+fn kind_for(preview: Option<bool>) -> crate::deploy::DeployKind {
+    if preview.unwrap_or(false) {
+        crate::deploy::DeployKind::Preview
+    } else {
+        crate::deploy::DeployKind::Main
+    }
+}
+
 pub async fn deploy_log(input: DeployLogInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let (app, _) = visible_app(ctx, &input.app).await?;
-    let row = deploy_by(&ctx.state.pool, &app.id, input.deploy_id.as_deref()).await?;
+    let row = deploy_by(
+        &ctx.state.pool,
+        &app.id,
+        input.deploy_id.as_deref(),
+        kind_for(input.preview),
+    )
+    .await?;
     let Some(row) = row else {
         return Err(ToolError::not_found("no deploys for this app yet"));
     };

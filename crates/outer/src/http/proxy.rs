@@ -219,6 +219,43 @@ async fn touch_once(state: &ProxyState, app_id: &str) {
     }
 }
 
+/// The preview counterpart: throttled the same way (keyed by the preview
+/// fleet key so live and preview traffic throttle independently), but the
+/// write lands on the preview columns — preview traffic never extends the
+/// live app's idle window, and the TTL measures from the last request.
+async fn touch_preview_once(state: &ProxyState, key: &str, app_id: &str) {
+    let now = apps::now_ms();
+    {
+        let mut last = state.last_touch_ms.lock().unwrap();
+        match last.get(key) {
+            Some(prev) if now.saturating_sub(*prev) < TOUCH_EVERY_MS => return,
+            _ => {
+                last.insert(key.to_string(), now);
+            }
+        }
+    }
+    if let Err(err) = crate::preview::touch_preview(&state.pool, app_id, now).await {
+        tracing::warn!(app = app_id, error = %err, "preview touch failed");
+    }
+}
+
+/// The synthetic fleet identity for the `slug` label when it names a live
+/// preview (`foo--preview` while `foo` holds preview state), else `None`.
+/// The base visibility rides along, so preview responses get exactly the
+/// live app's robots treatment (unlisted → noindex).
+async fn resolve_preview(
+    pool: &sqlx::SqlitePool,
+    slug: &str,
+) -> anyhow::Result<Option<crate::apps::App>> {
+    let Some(base) = crate::preview::strip_preview_key(slug) else {
+        return Ok(None);
+    };
+    let Some(base_app) = apps::get_by_slug(pool, base).await? else {
+        return Ok(None);
+    };
+    Ok(crate::preview::preview_app(&base_app))
+}
+
 /// Bytes the upstream claims in `Content-Length`, else 0. Chunked/streamed
 /// bodies are never buffered to count them (see `observe::metrics`).
 fn response_bytes(res: &hyper::Response<hyper::body::Incoming>) -> u64 {
@@ -585,23 +622,36 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         return text(StatusCode::NOT_FOUND, "no such app");
     };
     let bare = strip_port(&raw_host);
-    let app = match slug_for(bare, &state.apps_domain) {
+    // The second element marks a preview fleet: its synthetic identity
+    // (preview key, ports, base visibility) flows through every use below,
+    // while the app id stays the base app's for metrics and audit.
+    let (app, is_preview) = match slug_for(bare, &state.apps_domain) {
         Some(slug) => match apps::get_by_slug(&state.pool, &slug).await {
-            Ok(Some(app)) => app,
-            Ok(None) => match apps::quarantine_lookup(&state.pool, &slug).await {
-                // A renamed-away slug redirects only while its quarantine holds
-                // (`until` in the future — the same live-set definition as
-                // `prune_quarantine`); past expiry it 404s exactly like a
-                // plain-deleted (or never-existing) slug.
-                Ok(Some(quarantine)) => match quarantine.renamed_to {
-                    Some(target) if quarantine.until > apps::now_ms() => {
-                        return redirect_to_slug(&state, &raw_host, &target, &req);
+            Ok(Some(app)) => (app, false),
+            // A live preview's key (`foo--preview`) is not an app slug, so
+            // the row lookup misses: resolve it to the preview fleet before
+            // falling through to the rename quarantine below.
+            Ok(None) => match resolve_preview(&state.pool, &slug).await {
+                Ok(Some(preview)) => (preview, true),
+                Ok(None) => match apps::quarantine_lookup(&state.pool, &slug).await {
+                    // A renamed-away slug redirects only while its quarantine holds
+                    // (`until` in the future — the same live-set definition as
+                    // `prune_quarantine`); past expiry it 404s exactly like a
+                    // plain-deleted (or never-existing) slug.
+                    Ok(Some(quarantine)) => match quarantine.renamed_to {
+                        Some(target) if quarantine.until > apps::now_ms() => {
+                            return redirect_to_slug(&state, &raw_host, &target, &req);
+                        }
+                        _ => return text(StatusCode::NOT_FOUND, "no such app"),
+                    },
+                    Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
+                    Err(err) => {
+                        tracing::warn!(slug = %slug, error = %err, "quarantine lookup failed");
+                        return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                     }
-                    _ => return text(StatusCode::NOT_FOUND, "no such app"),
                 },
-                Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
                 Err(err) => {
-                    tracing::warn!(slug = %slug, error = %err, "quarantine lookup failed");
+                    tracing::warn!(slug = %slug, error = %err, "preview lookup failed");
                     return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                 }
             },
@@ -612,7 +662,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         },
         // Not an app host: maybe a Pro custom domain.
         None => match crate::apps::domains::resolve_active(&state.pool, bare).await {
-            Ok(Some(app)) => app,
+            Ok(Some(app)) => (app, false),
             Ok(None) => {
                 // A known-but-not-active domain gets a setup page; anything
                 // else is exactly like a missing app host (spec §8.2).
@@ -637,7 +687,26 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // deploy marks `last_deploy_sha` only after the migrations succeed, so
     // this gate makes the upload-then-migrate order safe, without waking a
     // fleet for an app with nothing live.
-    if app.last_deploy_sha.is_none() {
+    //
+    // Previews gate on their own history instead: a preview with no
+    // successful run yet has nothing uploaded for a fleet to serve.
+    if is_preview {
+        let ready = match crate::mcp::tools::latest_preview_deploy(&state.pool, &app.id).await {
+            Ok(Some(row)) => row.status == "success",
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "preview deploy lookup failed");
+                return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
+        };
+        if !ready {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("retry-after", "2")
+                .body(Body::from("this preview is being built, try again"))
+                .unwrap();
+        }
+    } else if app.last_deploy_sha.is_none() {
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("retry-after", "2")
@@ -659,15 +728,26 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             .body(Body::from("User-agent: *\nDisallow: /\n"))
             .unwrap();
     }
-    if let Err(err) = state.fleets.ensure_awake(&state.pool, &app).await {
+    if is_preview {
+        if let Err(err) = state.fleets.ensure_awake_preview(&state.pool, &app).await {
+            tracing::warn!(slug = %app.slug, error = %err, "preview wake failed");
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("retry-after", "2")
+                .body(Body::from("this preview is starting, try again"))
+                .unwrap();
+        }
+        touch_preview_once(&state, &app.slug, &app.id).await;
+    } else if let Err(err) = state.fleets.ensure_awake(&state.pool, &app).await {
         tracing::warn!(slug = %app.slug, error = %err, "wake failed");
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("retry-after", "2")
             .body(Body::from("this app is starting, try again"))
             .unwrap();
+    } else {
+        touch_once(&state, &app.id).await;
     }
-    touch_once(&state, &app.id).await;
 
     let peer = req
         .extensions()
@@ -1055,6 +1135,7 @@ mod tests {
             wake_timeout: Duration::from_secs(5),
             wake_concurrency: 4,
             always_on_max: 10,
+            preview_max: 20,
         })
     }
 
@@ -1244,6 +1325,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_host_serves_the_preview_fleet_with_live_robots_rules() {
+        let fix = fixture().await;
+        let live_fleet = start_fake_fleet().await;
+        let preview_fleet = start_fake_fleet().await;
+        insert_app(
+            &fix.pool,
+            "app-shop",
+            "shop",
+            live_fleet.addr.port(),
+            "unlisted",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE app SET preview_sha = 'b', preview_updated_at = ?1, \
+             preview_port = ?2, preview_internal_port = 1 WHERE id = 'app-shop'",
+        )
+        .bind(crate::apps::now_ms())
+        .bind(i64::from(preview_fleet.addr.port()))
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO deploy (id, app_id, sha, kind, status, created_at, finished_at) \
+             VALUES ('dep-preview', 'app-shop', 'b', 'preview', 'success', 0, 1)",
+        )
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        let req = Request::builder()
+            .uri("/items?page=2")
+            .header("host", "shop--preview.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(echo(&body)["path"], "/items");
+        assert_eq!(echo(&body)["query"], "page=2");
+        assert_eq!(preview_fleet.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            live_fleet.hits.load(Ordering::SeqCst),
+            0,
+            "live fleet stays cold"
+        );
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+        // The preview host answers the same robots override, without
+        // touching either fleet.
+        let req = Request::builder()
+            .uri("/robots.txt")
+            .header("host", "shop--preview.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "User-agent: *\nDisallow: /\n");
+        assert_eq!(preview_fleet.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn preview_without_a_successful_run_is_a_503() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        sqlx::query(
+            "UPDATE app SET preview_sha = 'b', preview_updated_at = ?1, \
+             preview_port = ?2, preview_internal_port = 1 WHERE id = 'app-shop'",
+        )
+        .bind(crate::apps::now_ms())
+        .bind(i64::from(fleet.addr.port()))
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        // A failed preview deploy uploaded nothing servable.
+        sqlx::query(
+            "INSERT INTO deploy (id, app_id, sha, kind, status, created_at, finished_at) \
+             VALUES ('dep-preview', 'app-shop', 'b', 'preview', 'failed', 0, 1)",
+        )
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "shop--preview.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "this preview is being built, try again");
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preview_host_without_preview_state_is_a_404() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "shop--preview.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "no such app");
+    }
+
+    #[tokio::test]
     async fn public_apps_pass_robots_through_untagged() {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
@@ -1400,6 +1609,7 @@ mod tests {
                 wake_timeout: Duration::from_secs(2),
                 wake_concurrency: 4,
                 always_on_max: 10,
+                preview_max: 20,
             }),
             "outer.test".to_string(),
             false,

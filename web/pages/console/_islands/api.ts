@@ -91,8 +91,16 @@ export interface ConsoleDeploy {
   message?: string;
 }
 
+export interface PreviewInfo {
+  url: string;
+  sha: string;
+  status: string;
+  updated_at: number;
+}
+
 export interface AppDetail extends ConsoleApp {
   deploys: ConsoleDeploy[];
+  preview?: PreviewInfo | null;
 }
 
 export interface LogLine {

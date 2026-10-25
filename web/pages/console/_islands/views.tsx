@@ -971,6 +971,7 @@ export function DeploysView({
   // first; /apps/{slug} has no last_deploy field).
   const liveSha = app.deploys.find((d) => d.status === "success")?.sha ?? null;
   const confirmTarget = atom<ConsoleDeploy | null>(null);
+  const confirmPreviewAction = atom<"promote" | "discard" | null>(null);
   const busy = atom(false);
   const error = atom<string | null>(null);
   const notice = atom<string | null>(null);
@@ -995,6 +996,44 @@ export function DeploysView({
     }
   }
 
+  async function promote(): Promise<void> {
+    if (busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      const out = await deploysActions.promotePreview.run({ slug: app.slug });
+      notice.set(
+        `Promoted ${shortSha(out.sha ?? "")} to live: deploy ${out.deploy?.status ?? "building"}.`,
+      );
+      confirmPreviewAction.set(null);
+      onRolledBack();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  async function discard(): Promise<void> {
+    if (busy()) {
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await deploysActions.discardPreview.run({ slug: app.slug });
+      notice.set("Preview discarded. Live is untouched.");
+      confirmPreviewAction.set(null);
+      onRolledBack();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
   if (app.deploys.length === 0) {
     return (
       <EmptyState icon={<DeploysIcon />} title="No deploys yet">
@@ -1009,6 +1048,51 @@ export function DeploysView({
         <div class="alert alert-success alert-soft min-w-0" role="status">
           <span class="min-w-0 break-words">{notice()}</span>
         </div>
+      )}
+      {app.preview && (
+        <section class="border border-base-300 bg-base-100 min-w-0 rounded-box p-3" aria-label="Active preview">
+          <div class="flex min-w-0 flex-wrap items-center gap-2.5 text-sm">
+            <span class={`badge badge-soft ${statusBadge(app.preview.status)} shrink-0`} title={app.preview.status}>{app.preview.status}</span>
+            <span class="min-w-0 flex-1 truncate font-mono" title={app.preview.sha}>
+              Preview {shortSha(app.preview.sha)}
+            </span>
+            <span class="shrink-0 whitespace-nowrap text-xs opacity-60" title={when(app.preview.updated_at)}>
+              {timeAgo(app.preview.updated_at)}
+            </span>
+          </div>
+          <div class="mt-2 flex min-w-0 items-center gap-2 text-[13px]">
+            <a class="link min-w-0 flex-1 truncate" href={app.preview.url} title={app.preview.url} target="_blank" rel="noreferrer">
+              {app.preview.url}
+            </a>
+            <CopyButton value={app.preview.url} label="Copy preview URL" />
+          </div>
+          <p class="m-0 mt-1 min-w-0 break-words text-xs opacity-60">
+            Trial URL with a fresh, empty data namespace. Live is untouched until you promote.
+          </p>
+          <div class="mt-2 flex min-w-0 flex-wrap gap-2">
+            <button
+              type="button"
+              class="btn btn-sm btn-primary"
+              disabled={busy()}
+              onclick={() => confirmPreviewAction.set("promote")}
+            >
+              Promote
+            </button>
+            <button
+              type="button"
+              class="btn btn-sm btn-outline"
+              disabled={busy()}
+              onclick={() => confirmPreviewAction.set("discard")}
+            >
+              Discard
+            </button>
+          </div>
+          {error() && confirmPreviewAction() && (
+            <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
+              <span class="min-w-0 break-words">{error()}</span>
+            </div>
+          )}
+        </section>
       )}
       {app.deploys.map((d) => {
         const open = expanded.includes(d.deploy_id);
@@ -1155,6 +1239,85 @@ export function DeploysView({
             </div>
           </div>
           <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => confirmTarget.set(null)}>
+            Close
+          </button>
+        </div>
+      )}
+      {confirmPreviewAction() === "promote" && app.preview && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Confirm promote">
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 min-w-0 truncate text-base font-semibold" title={app.preview.sha}>
+              Promote preview {shortSha(app.preview.sha)} to live?
+            </h3>
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              Fast-forwards main to the preview commit and deploys it
+              normally. The preview goes away and the live URL serves the
+              promoted version.
+            </p>
+            {error() && (
+              <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                <span class="min-w-0 break-words">{error()}</span>
+              </div>
+            )}
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                disabled={busy()}
+                onclick={() => confirmPreviewAction.set(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-primary"
+                disabled={busy()}
+                onclick={() => void promote()}
+              >
+                {busy() ? "Promoting…" : "Promote"}
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => confirmPreviewAction.set(null)}>
+            Close
+          </button>
+        </div>
+      )}
+      {confirmPreviewAction() === "discard" && app.preview && (
+        <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Confirm discard">
+          <div class="modal-box min-w-0">
+            <h3 class="mb-2 min-w-0 truncate text-base font-semibold" title={app.preview.sha}>
+              Discard preview {shortSha(app.preview.sha)}?
+            </h3>
+            <p class="m-0 min-w-0 break-words text-sm opacity-70">
+              Stops the preview fleet and removes its trial state. Live is
+              untouched.
+            </p>
+            {error() && (
+              <div class="alert alert-error alert-soft mt-3 min-w-0" role="alert">
+                <span class="min-w-0 break-words">{error()}</span>
+              </div>
+            )}
+            <div class="modal-action">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                disabled={busy()}
+                onclick={() => confirmPreviewAction.set(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="btn btn-error"
+                disabled={busy()}
+                onclick={() => void discard()}
+              >
+                {busy() ? "Discarding…" : "Discard"}
+              </button>
+            </div>
+          </div>
+          <button type="button" class="modal-backdrop" aria-label="Close" onclick={() => confirmPreviewAction.set(null)}>
             Close
           </button>
         </div>

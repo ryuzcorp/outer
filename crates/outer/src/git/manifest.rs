@@ -16,9 +16,14 @@ use serde::{Deserialize, Serialize};
 use crate::store::Store;
 
 /// Manifest format version. Readers accept only what they know.
+/// Version 1 already tolerates a missing `preview` entry (serde default),
+/// so old manifests read as "no preview" without a version bump.
 pub const MANIFEST_VERSION: u8 = 1;
 /// The only ref Outer writes.
 pub const MAIN_REF: &str = "refs/heads/main";
+/// The trial ref preview deploys (Pro) write to instead of main: one per
+/// app, never merged except by an explicit promote.
+pub const PREVIEW_REF: &str = "refs/heads/preview";
 
 /// What git needs: the local bare-mirror root.
 #[derive(Debug, Clone)]
@@ -60,6 +65,13 @@ pub fn bundle_key(slug: &str, sha: &str) -> String {
     format!("git/{slug}/main/{sha}.bundle")
 }
 
+/// Key of a preview-tip bundle in the bucket. Preview bundles live under
+/// their own prefix so discarding a preview deletes exactly its bundles
+/// and main-tip pruning never touches them (nor vice versa).
+pub fn preview_bundle_key(slug: &str, sha: &str) -> String {
+    format!("git/{slug}/preview/{sha}.bundle")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestRef {
     pub sha: String,
@@ -71,6 +83,12 @@ pub struct Manifest {
     pub version: u8,
     pub seq: u64,
     pub main: Option<ManifestRef>,
+    /// The preview tip, if a preview is (or was) active. Old manifests
+    /// without this field read as `None`. Discard and promote clear it;
+    /// a stale entry only ever resurrects on a cold-mirror rehydrate, so
+    /// the DB row (preview_sha) is the authority, not this field.
+    #[serde(default)]
+    pub preview: Option<ManifestRef>,
 }
 
 /// Single-writer coordination for one slug: a per-slug mutex plus the last
@@ -315,6 +333,7 @@ pub async fn init_repo(
         version: MANIFEST_VERSION,
         seq: 0,
         main: None,
+        preview: None,
     };
     write_manifest(store, slug, &manifest).await?;
     sync.reset_applied_seq(slug, 0).await;
@@ -340,12 +359,18 @@ async fn init_bare(bare: &Path) -> anyhow::Result<()> {
 /// The head of `refs/heads/main` in a mirror, or `None` when the repo is
 /// empty (fresh init, or a manifest with `main: null`).
 pub async fn head_of(bare: &Path) -> anyhow::Result<Option<String>> {
+    head_of_ref(bare, MAIN_REF).await
+}
+
+/// The head of `refname` in a mirror, or `None` when the repo is empty or
+/// the ref does not exist yet (a fresh init, or an unborn preview ref).
+pub async fn head_of_ref(bare: &Path, refname: &str) -> anyhow::Result<Option<String>> {
     if !bare.join("HEAD").exists() {
         return Ok(None);
     }
     let git_dir = format!("--git-dir={}", bare.display());
     match run_git(
-        &[&git_dir, "rev-parse", "--verify", MAIN_REF],
+        &[&git_dir, "rev-parse", "--verify", refname],
         &[],
         Duration::from_secs(15),
     )
@@ -400,27 +425,55 @@ async fn rehydrate_inner(
 ) -> anyhow::Result<Option<String>> {
     let manifest = read_manifest(store, slug).await?;
     let bare = mirror_path(cfg, slug);
-    let (seq, entry) = match manifest {
-        Some(m) => (m.seq, m.main),
-        None => (0, None),
+    let (seq, main, preview) = match manifest {
+        Some(m) => (m.seq, m.main, m.preview),
+        None => (0, None, None),
     };
-    let Some(entry) = entry else {
+    let main_sha = main.as_ref().map(|e| e.sha.clone());
+    let preview_sha = preview.as_ref().map(|e| e.sha.clone());
+    if main.is_none() {
+        // No live tip yet: make sure an empty mirror exists (and drop a
+        // stale preview ref: without main there is nothing to preview).
         if !bare.join("HEAD").exists() {
             if bare.exists() {
                 tokio::fs::remove_dir_all(&bare).await?;
             }
             init_bare(&bare).await?;
+        } else if head_of_ref(&bare, PREVIEW_REF).await?.is_some() {
+            let git_dir = format!("--git-dir={}", bare.display());
+            let _ = run_git(
+                &[&git_dir, "update-ref", "-d", PREVIEW_REF],
+                &[],
+                Duration::from_secs(15),
+            )
+            .await;
         }
         sync.reset_applied_seq(slug, seq).await;
         return Ok(None);
-    };
-    if head_of(&bare).await?.as_deref() == Some(entry.sha.as_str()) {
-        sync.set_applied_seq(slug, seq).await;
-        return Ok(Some(entry.sha.clone()));
     }
-    let tmp = tmp_path(&format!("rehydrate-{slug}"));
-    if !store.get_to_file(&entry.bundle, &tmp).await? {
-        anyhow::bail!("bundle {} missing for {slug}", entry.bundle);
+    let main_ok = head_of(&bare).await? == main_sha;
+    let preview_ok = head_of_ref(&bare, PREVIEW_REF).await? == preview_sha;
+    if main_ok && preview_ok {
+        sync.set_applied_seq(slug, seq).await;
+        return Ok(main_sha);
+    }
+    // Fetch each live bundle into its ref. Tmp files download first so a
+    // missing bundle fails before the mirror is touched.
+    let mut fetched: Vec<(PathBuf, String, String)> = Vec::new();
+    for (entry, refname) in main
+        .iter()
+        .map(|e| (e, MAIN_REF))
+        .chain(preview.iter().map(|e| (e, PREVIEW_REF)))
+    {
+        let tmp = tmp_path(&format!("rehydrate-{slug}"));
+        if !store.get_to_file(&entry.bundle, &tmp).await? {
+            for (path, _, _) in &fetched {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            let _ = tokio::fs::remove_file(&tmp).await;
+            anyhow::bail!("bundle {} missing for {slug}", entry.bundle);
+        }
+        fetched.push((tmp, refname.to_string(), entry.sha.clone()));
     }
     let result = async {
         if bare.exists() {
@@ -428,27 +481,26 @@ async fn rehydrate_inner(
         }
         init_bare(&bare).await?;
         let git_dir = format!("--git-dir={}", bare.display());
-        let Some(bundle) = tmp.to_str() else {
-            anyhow::bail!("bundle tmp path is not valid UTF-8");
-        };
-        run_git(
-            &[
-                &git_dir,
-                "fetch",
-                bundle,
-                &format!("+{}:{MAIN_REF}", entry.sha),
-            ],
-            &[],
-            Duration::from_secs(120),
-        )
-        .await?;
+        for (tmp, refname, sha) in &fetched {
+            let Some(bundle) = tmp.to_str() else {
+                anyhow::bail!("bundle tmp path is not valid UTF-8");
+            };
+            run_git(
+                &[&git_dir, "fetch", bundle, &format!("+{sha}:{refname}")],
+                &[],
+                Duration::from_secs(120),
+            )
+            .await?;
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let _ = tokio::fs::remove_file(&tmp).await;
+    for (tmp, _, _) in &fetched {
+        let _ = tokio::fs::remove_file(tmp).await;
+    }
     result?;
     sync.reset_applied_seq(slug, seq).await;
-    Ok(Some(entry.sha.clone()))
+    Ok(main_sha)
 }
 
 /// CAS-update `refs/heads/main` in the mirror, then publish exactly like a
@@ -481,7 +533,7 @@ pub async fn publish(
     }
     // Read before the CAS: a failed read must leave the mirror untouched.
     let old = read_manifest(store, slug).await?;
-    cas_update(&bare, expected_old, new_sha).await?;
+    cas_update(&bare, MAIN_REF, expected_old, new_sha).await?;
     let bundle = bundle_key(slug, new_sha);
     let uploaded = async {
         let tmp = tmp_path(&format!("bundle-{slug}"));
@@ -505,7 +557,7 @@ pub async fn publish(
     }
     .await;
     if let Err(e) = uploaded {
-        let _ = set_ref(&bare, expected_old).await;
+        let _ = set_ref(&bare, MAIN_REF, expected_old).await;
         // Only a true orphan: bundle keys are content-addressed, so a
         // republish of the live tip reuses its key — deleting what the
         // manifest still names would remove the live bundle.
@@ -522,6 +574,9 @@ pub async fn publish(
             sha: new_sha.to_string(),
             bundle: bundle.clone(),
         }),
+        // A main publish never touches the preview tip: preview commits
+        // racing this publish keep their ref and bundle.
+        preview: old.as_ref().and_then(|m| m.preview.clone()),
     };
     if let Err(e) = write_manifest(store, slug, &manifest).await {
         // The write may have landed despite the error (a response lost after
@@ -537,7 +592,7 @@ pub async fn publish(
                 return Ok(new_sha.to_string());
             }
             _ => {
-                let _ = set_ref(&bare, expected_old).await;
+                let _ = set_ref(&bare, MAIN_REF, expected_old).await;
             }
         }
         return Err(e);
@@ -547,6 +602,291 @@ pub async fn publish(
     // already moved on.
     prune_superseded(store, slug, &bundle).await;
     Ok(new_sha.to_string())
+}
+
+/// Publish `new_sha` to the preview ref: the CAS + bundle + manifest shape
+/// of [`publish`], but the main tip is preserved untouched and the seq
+/// still moves forward (both refs share the manifest's seq space, so a
+/// concurrent main publish and preview publish serialize on `seq + 1`
+/// without losing either tip). The bundle covers the preview ref after the
+/// CAS (a raw sha is not a valid bundle revision on its own), and prune
+/// keeps only the live preview bundle. A CAS mismatch errors with "tip
+/// moved" like [`publish`].
+pub async fn publish_preview(
+    store: &Store,
+    cfg: &GitConfig,
+    sync: &GitSync,
+    slug: &str,
+    expected_old: Option<&str>,
+    new_sha: &str,
+) -> anyhow::Result<String> {
+    validate_slug(slug)?;
+    if !is_full_sha(new_sha) {
+        anyhow::bail!("publish_preview needs a full sha, got {new_sha:?}");
+    }
+    let _guard = sync.lock(slug).await;
+    let bare = mirror_path(cfg, slug);
+    if !bare.join("HEAD").exists() {
+        rehydrate_inner(store, cfg, sync, slug).await?;
+    }
+    let old = read_manifest(store, slug).await?;
+    cas_update(&bare, PREVIEW_REF, expected_old, new_sha).await?;
+    let bundle = preview_bundle_key(slug, new_sha);
+    let uploaded = async {
+        let tmp = tmp_path(&format!("preview-bundle-{slug}"));
+        let result = async {
+            let git_dir = format!("--git-dir={}", bare.display());
+            let Some(path) = tmp.to_str() else {
+                anyhow::bail!("bundle tmp path is not valid UTF-8");
+            };
+            run_git(
+                &[&git_dir, "bundle", "create", path, PREVIEW_REF],
+                &[],
+                Duration::from_secs(120),
+            )
+            .await?;
+            store.put_file(&bundle, &tmp).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        result
+    }
+    .await;
+    if let Err(e) = uploaded {
+        let _ = set_ref(&bare, PREVIEW_REF, expected_old).await;
+        if !preview_bundle_is_live(old.as_ref(), &bundle) {
+            let _ = store.delete(&bundle).await;
+        }
+        return Err(e);
+    }
+    let seq = old.as_ref().map(|m| m.seq + 1).unwrap_or(1);
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        seq,
+        main: old.as_ref().and_then(|m| m.main.clone()),
+        preview: Some(ManifestRef {
+            sha: new_sha.to_string(),
+            bundle: bundle.clone(),
+        }),
+    };
+    if let Err(e) = write_manifest(store, slug, &manifest).await {
+        match read_manifest(store, slug).await {
+            Ok(current) if manifest_names_preview_tip(current.as_ref(), seq, new_sha) => {
+                sync.set_applied_seq(slug, seq).await;
+                prune_preview_bundles(store, slug, &bundle).await;
+                return Ok(new_sha.to_string());
+            }
+            _ => {
+                let _ = set_ref(&bare, PREVIEW_REF, expected_old).await;
+            }
+        }
+        return Err(e);
+    }
+    sync.set_applied_seq(slug, seq).await;
+    prune_preview_bundles(store, slug, &bundle).await;
+    Ok(new_sha.to_string())
+}
+
+/// Fast-forward main to the preview tip: checks `preview_sha` is still the
+/// manifest's preview entry and that the current main head is its ancestor
+/// (a live commit since the preview branched refuses with "main moved"),
+/// then CAS-updates main, re-bundles the main tip, and clears the preview
+/// entry — all in one manifest write. Preview bundles are deleted: the
+/// preview is over, and its history now ships inside the main bundle.
+pub async fn promote_preview(
+    store: &Store,
+    cfg: &GitConfig,
+    sync: &GitSync,
+    slug: &str,
+    preview_sha: &str,
+) -> anyhow::Result<String> {
+    validate_slug(slug)?;
+    if !is_full_sha(preview_sha) {
+        anyhow::bail!("promote_preview needs a full sha, got {preview_sha:?}");
+    }
+    let _guard = sync.lock(slug).await;
+    let bare = mirror_path(cfg, slug);
+    if !bare.join("HEAD").exists() {
+        rehydrate_inner(store, cfg, sync, slug).await?;
+    }
+    let old = read_manifest(store, slug).await?;
+    let preview_entry = old.as_ref().and_then(|m| m.preview.clone());
+    let Some(entry) = preview_entry else {
+        anyhow::bail!("no preview to promote for {slug}");
+    };
+    if entry.sha != preview_sha {
+        anyhow::bail!(
+            "preview moved under this promote: expected {preview_sha}, manifest has {}",
+            entry.sha
+        );
+    }
+    let main_head = old
+        .as_ref()
+        .and_then(|m| m.main.as_ref().map(|r| r.sha.clone()));
+    if let Some(head) = main_head.as_ref() {
+        let git_dir = format!("--git-dir={}", bare.display());
+        if run_git(
+            &[&git_dir, "merge-base", "--is-ancestor", head, preview_sha],
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .is_err()
+        {
+            anyhow::bail!(
+                "main moved under this preview: {MAIN_REF} is {head}, not an ancestor of {preview_sha}"
+            );
+        }
+    }
+    cas_update(&bare, MAIN_REF, main_head.as_deref(), preview_sha).await?;
+    // The trial ref dies with the promote: delete it from the mirror before
+    // the manifest flip, so no window ever shows a manifest without a
+    // preview entry next to a mirror that still has the ref. A crash here
+    // rolls main back below; the next sync rebuilds the ref from the
+    // manifest's bundle either way.
+    run_git(
+        &[
+            &format!("--git-dir={}", bare.display()),
+            "update-ref",
+            "-d",
+            PREVIEW_REF,
+        ],
+        &[],
+        Duration::from_secs(15),
+    )
+    .await?;
+    let bundle = bundle_key(slug, preview_sha);
+    let uploaded = async {
+        let tmp = tmp_path(&format!("bundle-{slug}"));
+        let result = async {
+            let git_dir = format!("--git-dir={}", bare.display());
+            let Some(path) = tmp.to_str() else {
+                anyhow::bail!("bundle tmp path is not valid UTF-8");
+            };
+            run_git(
+                &[&git_dir, "bundle", "create", path, MAIN_REF],
+                &[],
+                Duration::from_secs(120),
+            )
+            .await?;
+            store.put_file(&bundle, &tmp).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        result
+    }
+    .await;
+    if let Err(e) = uploaded {
+        let _ = set_ref(&bare, MAIN_REF, main_head.as_deref()).await;
+        if !bundle_is_live(old.as_ref(), &bundle) {
+            let _ = store.delete(&bundle).await;
+        }
+        return Err(e);
+    }
+    let seq = old.as_ref().map(|m| m.seq + 1).unwrap_or(1);
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        seq,
+        main: Some(ManifestRef {
+            sha: preview_sha.to_string(),
+            bundle: bundle.clone(),
+        }),
+        preview: None,
+    };
+    if let Err(e) = write_manifest(store, slug, &manifest).await {
+        match read_manifest(store, slug).await {
+            Ok(current) if manifest_names_tip(current.as_ref(), seq, preview_sha) => {
+                sync.set_applied_seq(slug, seq).await;
+                prune_superseded(store, slug, &bundle).await;
+                delete_preview_bundles(store, slug).await;
+                return Ok(preview_sha.to_string());
+            }
+            _ => {
+                let _ = set_ref(&bare, MAIN_REF, main_head.as_deref()).await;
+            }
+        }
+        return Err(e);
+    }
+    sync.set_applied_seq(slug, seq).await;
+    prune_superseded(store, slug, &bundle).await;
+    delete_preview_bundles(store, slug).await;
+    Ok(preview_sha.to_string())
+}
+
+/// Clear the manifest's preview entry (discard/expiry path): one seq bump
+/// with main preserved. The mirror's preview ref is deleted best-effort;
+/// the caller deletes the preview bundles and stops the fleet. Returns
+/// whether a preview entry was present.
+pub async fn clear_preview(
+    store: &Store,
+    cfg: &GitConfig,
+    sync: &GitSync,
+    slug: &str,
+) -> anyhow::Result<bool> {
+    validate_slug(slug)?;
+    let _guard = sync.lock(slug).await;
+    let old = read_manifest(store, slug).await?;
+    let Some(_) = old.as_ref().and_then(|m| m.preview.clone()) else {
+        return Ok(false);
+    };
+    let seq = old.as_ref().map(|m| m.seq + 1).unwrap_or(1);
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        seq,
+        main: old.as_ref().and_then(|m| m.main.clone()),
+        preview: None,
+    };
+    write_manifest(store, slug, &manifest).await?;
+    sync.set_applied_seq(slug, seq).await;
+    let bare = mirror_path(cfg, slug);
+    if bare.join("HEAD").exists() {
+        let git_dir = format!("--git-dir={}", bare.display());
+        let _ = run_git(
+            &[&git_dir, "update-ref", "-d", PREVIEW_REF],
+            &[],
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+    Ok(true)
+}
+
+/// Delete every preview bundle for the slug (discard/expiry/promote path).
+/// Best-effort per key; the live bundles under `git/{slug}/main/` are
+/// never listed here.
+pub async fn delete_preview_bundles(store: &Store, slug: &str) {
+    let prefix = format!("git/{slug}/preview/");
+    if let Ok(keys) = store.list(&prefix).await {
+        for key in keys {
+            if key.ends_with(".bundle") {
+                let _ = store.delete(&key).await;
+            }
+        }
+    }
+}
+
+fn manifest_names_preview_tip(current: Option<&Manifest>, seq: u64, sha: &str) -> bool {
+    current.is_some_and(|m| m.seq == seq && m.preview.as_ref().is_some_and(|p| p.sha == sha))
+}
+
+fn preview_bundle_is_live(manifest: Option<&Manifest>, bundle: &str) -> bool {
+    manifest
+        .as_ref()
+        .is_some_and(|m| m.preview.as_ref().is_some_and(|p| p.bundle == bundle))
+}
+
+/// Delete superseded preview bundles, keeping only the live preview tip.
+async fn prune_preview_bundles(store: &Store, slug: &str, bundle: &str) {
+    let prefix = format!("git/{slug}/preview/");
+    if let Ok(keys) = store.list(&prefix).await {
+        for key in keys {
+            if key != bundle && key.ends_with(".bundle") {
+                let _ = store.delete(&key).await;
+            }
+        }
+    }
 }
 
 /// Whether the store's manifest already reflects this publish: it names our
@@ -601,23 +941,28 @@ pub async fn purge(
     Ok(())
 }
 
-/// Compare-and-swap the main ref. Distinguishes "the tip moved" from a real
+/// Compare-and-swap one ref. Distinguishes "the tip moved" from a real
 /// git failure by re-reading the ref after a failed update.
-async fn cas_update(bare: &Path, expected_old: Option<&str>, new_sha: &str) -> anyhow::Result<()> {
+async fn cas_update(
+    bare: &Path,
+    refname: &str,
+    expected_old: Option<&str>,
+    new_sha: &str,
+) -> anyhow::Result<()> {
     let git_dir = format!("--git-dir={}", bare.display());
     // An empty old value is git's "the ref must not exist yet".
     let args = vec![
         git_dir.as_str(),
         "update-ref",
-        MAIN_REF,
+        refname,
         new_sha,
         expected_old.unwrap_or(""),
     ];
     if let Err(e) = run_git(&args, &[], Duration::from_secs(15)).await {
-        let now = head_of(bare).await.unwrap_or(None);
+        let now = head_of_ref(bare, refname).await.unwrap_or(None);
         if now.as_deref() != expected_old {
             anyhow::bail!(
-                "tip moved under this update: {MAIN_REF} is {}",
+                "tip moved under this update: {refname} is {}",
                 now.as_deref().unwrap_or("<absent>")
             );
         }
@@ -626,12 +971,12 @@ async fn cas_update(bare: &Path, expected_old: Option<&str>, new_sha: &str) -> a
     Ok(())
 }
 
-async fn set_ref(bare: &Path, sha: Option<&str>) -> anyhow::Result<()> {
+async fn set_ref(bare: &Path, refname: &str, sha: Option<&str>) -> anyhow::Result<()> {
     let git_dir = format!("--git-dir={}", bare.display());
     match sha {
         Some(sha) => {
             run_git(
-                &[&git_dir, "update-ref", MAIN_REF, sha],
+                &[&git_dir, "update-ref", refname, sha],
                 &[],
                 Duration::from_secs(15),
             )
@@ -639,7 +984,7 @@ async fn set_ref(bare: &Path, sha: Option<&str>) -> anyhow::Result<()> {
         }
         None => {
             run_git(
-                &[&git_dir, "update-ref", "-d", MAIN_REF],
+                &[&git_dir, "update-ref", "-d", refname],
                 &[],
                 Duration::from_secs(15),
             )
@@ -797,6 +1142,7 @@ mod tests {
                 sha: "a".repeat(40),
                 bundle: bundle_key("s", &"a".repeat(40)),
             }),
+            preview: None,
         };
         let sha = "a".repeat(40);
         assert!(manifest_names_tip(Some(&landed), 3, &sha));
@@ -811,7 +1157,8 @@ mod tests {
                 Some(&Manifest {
                     version: MANIFEST_VERSION,
                     seq: 3,
-                    main: None
+                    main: None,
+                    preview: None,
                 }),
                 3,
                 &sha

@@ -43,8 +43,79 @@ const rollbackApp: ConsoleAction<RollbackInput, RollbackOutput> = {
   },
 };
 
+export interface PreviewInput {
+  slug: string;
+}
+
+export interface PreviewDeploy {
+  status: string;
+  [key: string]: unknown;
+}
+
+export interface PromotePreviewOutput {
+  sha: string | null;
+  deploy: PreviewDeploy | null;
+}
+
+const promotePreview: ConsoleAction<PreviewInput, PromotePreviewOutput> = {
+  name: "promote_preview",
+  title: "Promote preview to live",
+  description:
+    "Promote the app's preview to live: fast-forwards main to the preview commit and deploys it normally without waiting. Needs a successful preview deploy. Returns {sha, deploy}; the UI refreshes the app to show the new live version.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      slug: { type: "string" },
+    },
+    required: ["slug"],
+  },
+  readOnly: false,
+  consequential: true,
+  untrusted: true,
+  run(input, _ctx, signal) {
+    return request<PromotePreviewOutput>(
+      "POST",
+      `/api/console/apps/${encodeURIComponent(input.slug)}/preview/promote`,
+      {},
+      signal,
+    );
+  },
+};
+
+export interface DiscardPreviewOutput {
+  app: string | null;
+}
+
+const discardPreview: ConsoleAction<PreviewInput, DiscardPreviewOutput> = {
+  name: "discard_preview",
+  title: "Discard the preview",
+  description:
+    "Discard the app's preview: stops the preview fleet and removes its trial state. Live is untouched. Returns {app}; the UI refreshes the app to drop the preview card.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      slug: { type: "string" },
+    },
+    required: ["slug"],
+  },
+  readOnly: false,
+  consequential: true,
+  untrusted: false,
+  run(input, _ctx, signal) {
+    return request<DiscardPreviewOutput>(
+      "POST",
+      `/api/console/apps/${encodeURIComponent(input.slug)}/preview/discard`,
+      {},
+      signal,
+    );
+  },
+};
+
 export const actions: ConsoleAction<unknown, unknown>[] = [
   rollbackApp as ConsoleAction<unknown, unknown>,
+  promotePreview as ConsoleAction<unknown, unknown>,
+  discardPreview as ConsoleAction<unknown, unknown>,
 ];
 
-export const deploysActions = { rollbackApp };
+export const deploysActions = { rollbackApp, promotePreview, discardPreview };
+

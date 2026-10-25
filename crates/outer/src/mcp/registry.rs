@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::mcp::tools::{
     account, apps as app_inputs, backups as backup_inputs, code as code_inputs,
     collaborators as collab_inputs, domains as domain_inputs, export as export_inputs,
-    look as look_inputs, runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
+    look as look_inputs, preview as preview_inputs, runtime as runtime_inputs,
+    secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -93,7 +94,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "list_backups" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
-        | "backup_database" => Hints::WRITE,
+        | "backup_database" | "promote_preview" => Hints::WRITE,
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -110,7 +111,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             ..Hints::WRITE
         },
         "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
-        | "unset_secret" | "remove_domain" => Hints::DESTRUCTIVE,
+        | "unset_secret" | "remove_domain" | "discard_preview" => Hints::DESTRUCTIVE,
         // Repeating a restore takes another fresh backup, so one call is
         // never a no-op repeat of the last: not idempotent.
         "restore_backup" => Hints {
@@ -167,7 +168,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<account::DocsInput>(
             "docs",
-"Read an Outer guide: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains or look. Read the ilha guide before writing any code.",
+"Read an Outer guide: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, previews or look. Read the ilha guide before writing any code.",
             Public, false,
         ),
         tool::<account::SignInInput>(
@@ -307,7 +308,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<code_inputs::CommitInput>(
             "commit",
-            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), deletes and moves. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why.",
+            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), deletes and moves. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.",
             Account, false,
         ),
         tool::<code_inputs::HistoryInput>(
@@ -325,14 +326,24 @@ pub fn registry() -> Vec<ToolDef> {
             "Redeploy an earlier successfully deployed commit: a new commit copying its tree, then the deploy. Never counts as a code change.",
             Account, false,
         ),
+        tool::<preview_inputs::PromotePreviewInput>(
+            "promote_preview",
+            "Promote your app's preview to live: fast-forwards main to the preview commit and deploys it normally. Needs a successful preview deploy; Pro. The preview goes away and the URL serves the promoted version.",
+            Account, false,
+        ),
+        tool::<preview_inputs::DiscardPreviewInput>(
+            "discard_preview",
+            "Discard your app's preview: stops the preview fleet and removes its trial state. Live is untouched, and cleanup is always allowed, even off Pro.",
+            Account, false,
+        ),
         tool::<runtime_inputs::DeployStatusInput>(
             "deploy_status",
-            "A deploy's status: success + url, failed + step and error, blocked + findings, or building + next. wait: true blocks until it finishes.",
+            "A deploy's status: success + url, failed + step and error, blocked + findings, or building + next. wait: true blocks until it finishes. Pass preview: true for preview runs.",
             Account, false,
         ),
         tool::<runtime_inputs::DeployLogInput>(
             "deploy_log",
-            "A deploy's build log. Untrusted: the log may hold visitor text.",
+            "A deploy's build log. Untrusted: the log may hold visitor text. Pass preview: true for preview runs.",
             Account, true,
         ),
         tool::<runtime_inputs::AppLogsInput>(
@@ -421,7 +432,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 47);
+        assert_eq!(tools.len(), 49);
     }
 }
 
@@ -429,7 +440,8 @@ mod tests {
 mod hint_tests {
     use super::*;
     #[test]
-    fn every_tool_is_classified_and_only_revoke_delete_unset_remove_and_restore_are_destructive() {
+    fn every_tool_is_classified_and_only_revoke_delete_unset_remove_discard_and_restore_are_destructive(
+    ) {
         for tool in registry() {
             let hints = hints_for(tool.name)
                 .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
@@ -447,6 +459,7 @@ mod hint_tests {
                     | "unset_secret"
                     | "remove_collaborator"
                     | "remove_domain"
+                    | "discard_preview"
                     | "restore_backup"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);

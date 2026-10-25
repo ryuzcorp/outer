@@ -625,6 +625,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         wake_timeout: Duration::from_secs(30),
         wake_concurrency: rt.wake_concurrency,
         always_on_max: rt.always_on_max,
+        preview_max: rt.preview_max,
     });
     // A previous process may have died between a rename's commit and its
     // post-commit deletes: drain pending prefix cleanups before serving, so
@@ -637,6 +638,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     fleets.spawn_sleep_sweep(
         pool.clone(),
         store.clone(),
+        git_config(&config),
+        outer::git::GitSync::default(),
         Duration::from_secs(60.min(rt.sleep_after_secs.max(1))),
     );
     outer::cron::spawn_cron_task(

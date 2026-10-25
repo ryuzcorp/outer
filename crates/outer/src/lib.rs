@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod moderation;
 pub mod observe;
 pub mod ops;
+pub mod preview;
 pub mod secrets;
 pub mod store;
 pub mod templates;

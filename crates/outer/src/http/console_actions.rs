@@ -37,6 +37,14 @@ pub fn routes() -> Router<AppState> {
             put(api_secret_put).delete(api_secret_delete),
         )
         .route("/api/console/apps/{slug}/rollback", post(api_rollback))
+        .route(
+            "/api/console/apps/{slug}/preview/promote",
+            post(api_preview_promote),
+        )
+        .route(
+            "/api/console/apps/{slug}/preview/discard",
+            post(api_preview_discard),
+        )
 }
 
 /// Map a domain refusal to its HTTP status. The body always carries the same
@@ -451,6 +459,72 @@ async fn api_rollback(
     }
     .await;
     audited(mcp, &account, &app, "rollback", &summary, result).await
+}
+
+/// `POST /api/console/apps/:slug/preview/promote`: the MCP
+/// `promote_preview` path (Pro gate, success-deploy check and fast-forward
+/// included), without waiting: the answer carries the sha and the building
+/// live deploy, and the UI refreshes the app. Audited under
+/// `promote_preview`.
+async fn api_preview_promote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Response {
+    let mcp = &state.mcp;
+    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+        Ok(pair) => pair,
+        Err(res) => return *res,
+    };
+    let result = async {
+        let out = crate::mcp::tools::preview::promote_preview_to(mcp, &app, false).await?;
+        let structured = out.get("structuredContent").cloned().unwrap_or_default();
+        Ok(json!({
+            "sha": structured.pointer("/sha"),
+            "deploy": structured.pointer("/deploy"),
+        }))
+    }
+    .await;
+    audited(
+        mcp,
+        &account,
+        &app,
+        "promote_preview",
+        "promote preview to live",
+        result,
+    )
+    .await
+}
+
+/// `POST /api/console/apps/:slug/preview/discard`: the MCP
+/// `discard_preview` path. Audited under `discard_preview`.
+async fn api_preview_discard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Response {
+    let mcp = &state.mcp;
+    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+        Ok(pair) => pair,
+        Err(res) => return *res,
+    };
+    let result = async {
+        let out = crate::mcp::tools::preview::discard_preview_for(mcp, &app).await?;
+        let structured = out.get("structuredContent").cloned().unwrap_or_default();
+        Ok(json!({
+            "app": structured.pointer("/app"),
+        }))
+    }
+    .await;
+    audited(
+        mcp,
+        &account,
+        &app,
+        "discard_preview",
+        "discard preview",
+        result,
+    )
+    .await
 }
 
 /// `POST /api/console/apps/:slug/rename {slug: "<new>"}`: the console side

@@ -51,6 +51,11 @@ pub struct ManagerSettings {
     /// may still sleep, and the warm-up stops waking. 0 disables the
     /// keep-warm protection entirely.
     pub always_on_max: usize,
+    /// At most this many apps hold preview state at once (from
+    /// `OUTER_PREVIEW_MAX`). A preview commit past the cap refuses with a
+    /// retryable error naming the cap, so one app's trials can't starve the
+    /// host's fleet memory for everyone else.
+    pub preview_max: usize,
 }
 
 /// Bucket and credentials a fleet pulls its deploys from. The credentials
@@ -89,6 +94,7 @@ struct Inner {
     credential_refresh_after: Duration,
     wake_timeout: Duration,
     always_on_max: usize,
+    preview_max: usize,
     wake_permits: tokio::sync::Semaphore,
     fleets: tokio::sync::Mutex<HashMap<String /* slug */, LiveFleet>>,
     wakes: tokio::sync::Mutex<HashMap<String /* slug */, Arc<tokio::sync::Mutex<()>>>>,
@@ -154,6 +160,7 @@ impl FleetManager {
             credential_refresh_after: settings.credential_refresh_after,
             wake_timeout: settings.wake_timeout,
             always_on_max: settings.always_on_max,
+            preview_max: settings.preview_max,
             wake_permits: tokio::sync::Semaphore::new(settings.wake_concurrency.max(1)),
             fleets: tokio::sync::Mutex::new(HashMap::new()),
             wakes: tokio::sync::Mutex::new(HashMap::new()),
@@ -175,6 +182,12 @@ impl FleetManager {
     /// manager; callers that need to own it (tests) clone it instead.
     pub fn storage(&self) -> &FleetStorage {
         &self.inner.storage
+    }
+
+    /// How many apps may hold preview state at once. The preview commit
+    /// path refuses past this cap (retryable, naming the oldest expiry).
+    pub fn preview_max(&self) -> usize {
+        self.inner.preview_max
     }
 
     async fn alive(fleets: &tokio::sync::Mutex<HashMap<String, LiveFleet>>, slug: &str) -> bool {
@@ -366,8 +379,46 @@ impl FleetManager {
             Some(current) if current.id == app.id => {}
             _ => anyhow::bail!("app {} no longer exists", app.slug),
         }
+        self.wake_checked(pool, app, false).await
+    }
+
+    /// Wake the preview fleet for `papp`, the synthetic preview identity
+    /// ([`crate::preview::preview_app`]). The base row is re-read under the
+    /// preview key's wake lock and must still name exactly this fleet
+    /// (ports included): a request that queued behind a discard, an
+    /// expiry, or a refreshed preview can't respawn the wrong fleet.
+    /// Activity lands on the preview columns, never on the live row.
+    pub async fn ensure_awake_preview(&self, pool: &SqlitePool, papp: &App) -> anyhow::Result<()> {
+        let base_slug = crate::preview::strip_preview_key(&papp.slug)
+            .ok_or_else(|| anyhow::anyhow!("not a preview fleet: {}", papp.slug))?;
+        let key = self.wake_lock(&papp.slug).await;
+        let _wake = key.lock().await;
+        let base = match apps::get_by_slug(pool, base_slug).await? {
+            Some(base) => base,
+            None => anyhow::bail!("preview base {base_slug} no longer exists"),
+        };
+        match crate::preview::preview_of(&base) {
+            Some(preview)
+                if base.id == papp.id
+                    && preview.port == papp.port
+                    && preview.internal_port == papp.internal_port => {}
+            _ => anyhow::bail!("preview for {base_slug} changed or was discarded"),
+        }
+        self.wake_checked(pool, papp, true).await
+    }
+
+    /// The wake after the existence check: share one start per slug, reuse
+    /// a healthy port, else spawn and health-gate. Preview wakes record
+    /// activity on the preview columns and never clear the live asleep
+    /// marker.
+    async fn wake_checked(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        is_preview: bool,
+    ) -> anyhow::Result<()> {
         if Self::alive(&self.inner.fleets, &app.slug).await {
-            self.mark_wake_activity(pool, app).await?;
+            self.mark_activity(pool, app, is_preview).await?;
             return Ok(());
         }
         let _permit = self
@@ -382,16 +433,20 @@ impl FleetManager {
         // a healthy port means awake. `wait_healthy` tries once before its
         // first sleep, so a zero timeout is a single probe, not a skip.
         if health::wait_healthy("127.0.0.1", app.port, Duration::ZERO).await {
-            self.mark_wake_activity(pool, app).await?;
-            apps::set_asleep(pool, &app.id, None).await?;
+            self.mark_activity(pool, app, is_preview).await?;
+            if !is_preview {
+                apps::set_asleep(pool, &app.id, None).await?;
+            }
             return Ok(());
         }
         let report = self
             .spawn_and_gate(pool, app, false)
             .await
             .map_err(|err| anyhow::anyhow!("failed wake for fleet {}: {err:#}", app.slug))?;
-        self.mark_wake_activity(pool, app).await?;
-        apps::set_asleep(pool, &app.id, None).await?;
+        self.mark_activity(pool, app, is_preview).await?;
+        if !is_preview {
+            apps::set_asleep(pool, &app.id, None).await?;
+        }
         // One INFO line per successful wake, for the VPS wake-time baseline:
         // `mint_ms` is 0 when the spawn reused the cached grant. No secrets
         // in the fields.
@@ -408,9 +463,20 @@ impl FleetManager {
     }
 
     /// A successful wake counts as activity: without this, the next sweep
-    /// would sleep a fleet whose first requests are still in flight.
-    async fn mark_wake_activity(&self, pool: &SqlitePool, app: &App) -> anyhow::Result<()> {
-        apps::touch_request(pool, &app.id, apps::now_ms()).await
+    /// would sleep a fleet whose first requests are still in flight. A
+    /// preview wake touches the preview columns, so preview traffic never
+    /// extends the live app's activity (and vice versa).
+    async fn mark_activity(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        is_preview: bool,
+    ) -> anyhow::Result<()> {
+        if is_preview {
+            crate::preview::touch_preview(pool, &app.id, apps::now_ms()).await
+        } else {
+            apps::touch_request(pool, &app.id, apps::now_ms()).await
+        }
     }
 
     /// Reload a live fleet without a restart; a no-op while asleep.
@@ -455,6 +521,14 @@ impl FleetManager {
         let key = self.wake_lock(slug).await;
         let _wake = key.lock_owned().await;
         self.stop_tracked(slug).await;
+    }
+
+    /// Stop the preview fleet for `slug` (no-op when asleep or missing) and
+    /// drop its cached scoped credentials. The row keeps its preview state:
+    /// the fleet wakes on the next preview request until the preview is
+    /// discarded or expires.
+    pub async fn stop_preview(&self, slug: &str) {
+        self.stop_app(&crate::preview::preview_key(slug)).await;
     }
 
     /// Stop every fleet whose app has been quieter than `sleep_after`, drop
@@ -625,21 +699,69 @@ impl FleetManager {
             let Ok(_wake) = key.try_lock() else {
                 continue;
             };
-            let app = match apps::get_by_slug(pool, &slug).await? {
-                Some(app) => app,
-                // The app row is gone: its fleet serves nothing, so stop it
-                // without marking sleep.
-                None => {
-                    tracing::warn!(slug = %slug, "app row gone; stopping its orphan fleet");
-                    let mut fleets = self.inner.fleets.lock().await;
-                    if let Some(live) = fleets.remove(&slug) {
-                        let mut fleet = live.fleet;
-                        drop(fleets);
-                        fleet.stop(StopGrace::NORMAL).await;
-                    }
-                    continue;
-                }
+            // A tracked key resolves to a live app row, a live preview (the
+            // base row still names exactly this fleet), or nothing (orphan).
+            // Previews sleep on the same idleness rule but from the preview
+            // columns, are never keep-warm exempt, and never mark the live
+            // row asleep.
+            struct SweepFleet {
+                app_id: String,
+                idle_since: Option<i64>,
+                created_at: i64,
+                is_preview: bool,
+                wake_app: App,
+            }
+            let resolved: Option<SweepFleet> = match apps::get_by_slug(pool, &slug).await? {
+                Some(app) => Some(SweepFleet {
+                    app_id: app.id.clone(),
+                    idle_since: app.last_request_at,
+                    created_at: app.created_at,
+                    is_preview: false,
+                    wake_app: app,
+                }),
+                None => match crate::preview::strip_preview_key(&slug) {
+                    Some(base_slug) => match apps::get_by_slug(pool, base_slug).await? {
+                        Some(base) => match crate::preview::preview_of(&base) {
+                            Some(p) if crate::preview::preview_key(&base.slug) == slug => {
+                                let mut fleet = base.clone();
+                                fleet.slug = slug.clone();
+                                fleet.port = p.port;
+                                fleet.internal_port = p.internal_port;
+                                fleet.last_request_at = Some(p.updated_at_ms);
+                                Some(SweepFleet {
+                                    app_id: base.id.clone(),
+                                    idle_since: Some(p.updated_at_ms),
+                                    created_at: base.created_at,
+                                    is_preview: true,
+                                    wake_app: fleet,
+                                })
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    },
+                    None => None,
+                },
             };
+            let Some(resolved) = resolved else {
+                // The app row is gone (or the preview was discarded): its
+                // fleet serves nothing, so stop it without marking sleep.
+                tracing::warn!(slug = %slug, "app row gone; stopping its orphan fleet");
+                let mut fleets = self.inner.fleets.lock().await;
+                if let Some(live) = fleets.remove(&slug) {
+                    let mut fleet = live.fleet;
+                    drop(fleets);
+                    fleet.stop(StopGrace::NORMAL).await;
+                }
+                continue;
+            };
+            let SweepFleet {
+                app_id,
+                idle_since,
+                created_at,
+                is_preview,
+                wake_app,
+            } = resolved;
             let mut fleets = self.inner.fleets.lock().await;
             let Some(live) = fleets.get_mut(&slug) else {
                 continue;
@@ -650,24 +772,28 @@ impl FleetManager {
             }
             // Always-on Pro apps (up to the cap) skip the sleep below and
             // fall through to the credential refresh: their flag only buys
-            // freedom from idleness, not from expiring credentials.
-            if !exempt.contains(&slug)
-                && should_sleep(
-                    app.last_request_at,
-                    app.created_at,
-                    now,
-                    live.started.elapsed(),
-                    self.inner.sleep_after,
-                )
-            {
+            // freedom from idleness, not from expiring credentials. Previews
+            // are never exempt: a quiet preview sleeps like any idle fleet
+            // (its row keeps the preview state for wake-on-request), and a
+            // preview idle past the TTL is discarded by the expiry step.
+            let idle = should_sleep(
+                idle_since,
+                created_at,
+                now,
+                live.started.elapsed(),
+                self.inner.sleep_after,
+            );
+            if idle && (is_preview || !exempt.contains(&slug)) {
                 let Some(live) = fleets.remove(&slug) else {
                     continue;
                 };
                 let mut fleet = live.fleet;
                 drop(fleets);
-                flush_ring_before_stop(pool, &app.id, &slug, &fleet.logs).await;
+                flush_ring_before_stop(pool, &app_id, &slug, &fleet.logs).await;
                 fleet.stop(StopGrace::NORMAL).await;
-                apps::set_asleep(pool, &app.id, Some(now)).await?;
+                if !is_preview {
+                    apps::set_asleep(pool, &app_id, Some(now)).await?;
+                }
                 slept.push(slug);
                 continue;
             }
@@ -701,11 +827,11 @@ impl FleetManager {
             // restarts the fleet; the warn carries the slug.
             let mut fleet = live.fleet;
             drop(fleets);
-            flush_ring_before_stop(pool, &app.id, &slug, &fleet.logs).await;
+            flush_ring_before_stop(pool, &app_id, &slug, &fleet.logs).await;
             fleet.stop(StopGrace::NORMAL).await;
             // The restart forces a fresh mint: restarting on the cached grant
             // would restart on the same near-expiry credentials.
-            match self.spawn_and_gate(pool, &app, true).await {
+            match self.spawn_and_gate(pool, &wake_app, true).await {
                 Ok(report) => tracing::info!(
                     slug = %slug,
                     total_ms = report.total_ms,
@@ -721,12 +847,19 @@ impl FleetManager {
         Ok(slept)
     }
 
-    /// A tokio interval loop that sleeps idle fleets and flushes fleet logs
-    /// to SQLite. Failures log and the loop continues on the next tick.
-    /// Retention prunes run at most once a day (spec §3 log retention, §13
-    /// deploys and errors, §17 TTLs); the timestamp lives in this task, not
-    /// in global state.
-    pub fn spawn_sleep_sweep(&self, pool: SqlitePool, store: crate::store::Store, every: Duration) {
+    /// A tokio interval loop that sleeps idle fleets, discards expired
+    /// previews, and flushes fleet logs to SQLite. Failures log and the
+    /// loop continues on the next tick. Retention prunes run at most once a
+    /// day (spec §3 log retention, §13 deploys and errors, §17 TTLs); the
+    /// timestamp lives in this task, not in global state.
+    pub fn spawn_sleep_sweep(
+        &self,
+        pool: SqlitePool,
+        store: crate::store::Store,
+        git: crate::git::GitConfig,
+        sync: crate::git::GitSync,
+        every: Duration,
+    ) {
         let this = self.clone();
         let store = store.clone();
         tokio::spawn(async move {
@@ -736,6 +869,14 @@ impl FleetManager {
                 interval.tick().await;
                 if let Err(err) = this.sleep_idle(&pool).await {
                     tracing::warn!(error = %err, "sleep sweep failed");
+                }
+                // Previews idle past the TTL are discarded: fleet stopped,
+                // row cleared, mirror ref and bundles removed. One app's
+                // failure warns and the rest still expire.
+                if let Err(err) =
+                    crate::preview::expire_due(&pool, &store, &git, &sync, &this).await
+                {
+                    tracing::warn!(error = %format!("{err:#}"), "preview expiry failed");
                 }
                 // Keep-warm: restart stopped always-on fleets (after a
                 // process restart or crash nothing is tracked). The
@@ -956,6 +1097,7 @@ mod tests {
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
             always_on_max: 10,
+            preview_max: 20,
         });
         assert!(!manager.wake_in_progress("ghost"));
         // Peeking must not create a map entry either.
@@ -1035,6 +1177,7 @@ mod tests {
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
             always_on_max: 10,
+            preview_max: 20,
         });
         let app = apps::get_by_slug(&pool, "wake").await.unwrap().unwrap();
         manager.ensure_awake(&pool, &app).await.unwrap();
@@ -1181,6 +1324,7 @@ mod tests {
             wake_timeout: Duration::from_secs(60),
             wake_concurrency: 2,
             always_on_max: 10,
+            preview_max: 20,
         });
         let app = apps::get_by_slug(&pool, "real").await.unwrap().unwrap();
         manager.ensure_awake(&pool, &app).await.unwrap();
@@ -1268,6 +1412,7 @@ mod tests {
                 wake_timeout,
                 wake_concurrency: 4,
                 always_on_max,
+                preview_max: 20,
             });
             Self {
                 _dir: dir,

@@ -13,6 +13,7 @@ pub(crate) mod collaborators;
 pub(crate) mod domains;
 pub(crate) mod export;
 pub(crate) mod look;
+pub(crate) mod preview;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
 
@@ -272,6 +273,34 @@ pub async fn refund_change(pool: &sqlx::SqlitePool, account_id: &str) -> anyhow:
     Ok(())
 }
 
+/// Quota threshold emails (alerts #2): the claim counted even when the
+/// deploy failed, so evaluate from the claim numbers. Never raises.
+/// Spawned: the mailer network call must not delay the commit response
+/// after the deploy is already done (deploy-failure mail already runs
+/// inside the spawned `run_deploy` task the same way).
+pub fn spawn_quota_email(state: &McpState, owner_id: &str, used: u64, limit: u64) {
+    let pool = state.pool.clone();
+    let sender = state.auth.config.email.clone();
+    let issuer = state.auth.config.issuer.clone();
+    let key = state.unsub_key.clone();
+    let owner = owner_id.to_string();
+    tokio::spawn(async move {
+        crate::alerts::notify_quota(
+            &crate::alerts::Ctx {
+                pool: &pool,
+                sender: &sender,
+                issuer: &issuer,
+                key: &key,
+            },
+            &owner,
+            used,
+            limit,
+            crate::auth::now_ms(),
+        )
+        .await;
+    });
+}
+
 /// How many apps `account_id` owns.
 pub async fn apps_owned(pool: &sqlx::SqlitePool, account_id: &str) -> Result<u64, ToolError> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE owner_id = ?1")
@@ -415,12 +444,15 @@ pub fn ok_deploy(summary: String, deploy: &Value, structured: Value) -> Value {
     }
 }
 
-/// One deploy row, newest-first lookups included.
+/// One deploy row, newest-first lookups included. `kind` is `'main'` or
+/// `'preview'`; every live-history lookup filters to `'main'` so a preview
+/// run never becomes the rollback target or the console's latest deploy.
 #[derive(Debug, Clone)]
 pub struct DeployRow {
     pub deploy_id: String,
     pub app_id: String,
     pub sha: String,
+    pub kind: String,
     pub status: String,
     pub steps: Option<String>,
     pub error: Option<String>,
@@ -430,23 +462,34 @@ pub struct DeployRow {
     pub finished_at: Option<i64>,
 }
 
+/// The latest live (`kind = 'main'`) deploy, if any.
 pub async fn latest_deploy(
     pool: &sqlx::SqlitePool,
     app_id: &str,
 ) -> Result<Option<DeployRow>, ToolError> {
-    deploy_by(pool, app_id, None).await
+    deploy_by(pool, app_id, None, crate::deploy::DeployKind::Main).await
+}
+
+/// The latest preview (`kind = 'preview'`) deploy, if any.
+pub async fn latest_preview_deploy(
+    pool: &sqlx::SqlitePool,
+    app_id: &str,
+) -> Result<Option<DeployRow>, ToolError> {
+    deploy_by(pool, app_id, None, crate::deploy::DeployKind::Preview).await
 }
 
 pub async fn deploy_by(
     pool: &sqlx::SqlitePool,
     app_id: &str,
     deploy_id: Option<&str>,
+    kind: crate::deploy::DeployKind,
 ) -> Result<Option<DeployRow>, ToolError> {
     #[derive(sqlx::FromRow)]
     struct Row {
         id: String,
         app_id: String,
         sha: String,
+        kind: String,
         status: String,
         steps: Option<String>,
         error: Option<String>,
@@ -457,20 +500,22 @@ pub async fn deploy_by(
     }
     let row: Option<Row> = if let Some(deploy_id) = deploy_id {
         sqlx::query_as::<_, Row>(
-            "SELECT id, app_id, sha, status, steps, error, findings, log_tail, created_at, finished_at \
-             FROM deploy WHERE id = ?1 AND app_id = ?2",
+            "SELECT id, app_id, sha, kind, status, steps, error, findings, log_tail, created_at, finished_at \
+             FROM deploy WHERE id = ?1 AND app_id = ?2 AND kind = ?3",
         )
         .bind(deploy_id)
         .bind(app_id)
+        .bind(kind.sql())
         .fetch_optional(pool)
         .await
         .map_err(internal)?
     } else {
         sqlx::query_as::<_, Row>(
-            "SELECT id, app_id, sha, status, steps, error, findings, log_tail, created_at, finished_at \
-             FROM deploy WHERE app_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, app_id, sha, kind, status, steps, error, findings, log_tail, created_at, finished_at \
+             FROM deploy WHERE app_id = ?1 AND kind = ?2 ORDER BY created_at DESC LIMIT 1",
         )
         .bind(app_id)
+        .bind(kind.sql())
         .fetch_optional(pool)
         .await
         .map_err(internal)?
@@ -479,6 +524,7 @@ pub async fn deploy_by(
         deploy_id: r.id,
         app_id: r.app_id,
         sha: r.sha,
+        kind: r.kind,
         status: r.status,
         steps: r.steps,
         error: r.error,
@@ -523,7 +569,18 @@ pub fn deploy_json(state: &McpState, app: &App, row: &DeployRow) -> Value {
     });
     if is_terminal(&row.status) {
         if row.status == "success" {
-            out["url"] = json!(state.app_url(&app.slug));
+            // Preview rows resolve to the preview host; the row knows its
+            // kind, so mixed histories render the right URL per row.
+            out["url"] = if row.kind == "preview" {
+                json!(crate::preview::preview_url(
+                    &state.app_scheme,
+                    &app.slug,
+                    &state.apps_domain,
+                    &state.app_port_suffix
+                ))
+            } else {
+                json!(state.app_url(&app.slug))
+            };
         }
         if let (Some(created), Some(finished)) = (Some(row.created_at), row.finished_at) {
             out["duration_ms"] = json!((finished - created).max(0));
@@ -578,14 +635,25 @@ fn blocked_user_message(row: &DeployRow) -> Option<String> {
 }
 
 /// The `commit`/`create_app`/`rollback` deploy object from a live outcome.
-pub fn outcome_json(state: &McpState, app: &App, outcome: &DeployOutcome) -> Value {
+/// `preview` selects the preview host for the success URL instead of the
+/// live one.
+pub fn outcome_json(state: &McpState, app: &App, outcome: &DeployOutcome, preview: bool) -> Value {
     let mut out = json!({
         "status": outcome.status,
         "deploy_id": outcome.deploy_id,
         "sha": outcome.sha,
     });
     if outcome.status == "success" {
-        out["url"] = json!(state.app_url(&app.slug));
+        out["url"] = if preview {
+            json!(crate::preview::preview_url(
+                &state.app_scheme,
+                &app.slug,
+                &state.apps_domain,
+                &state.app_port_suffix
+            ))
+        } else {
+            json!(state.app_url(&app.slug))
+        };
     }
     let duration_ms: u64 = outcome.steps.iter().map(|s| s.ms).sum();
     out["duration_ms"] = json!(duration_ms);
@@ -621,6 +689,29 @@ pub async fn run_deploy(
     sha: &str,
     wait: bool,
 ) -> Result<Value, ToolError> {
+    run_deploy_inner(state, app, sha, wait, crate::deploy::DeployKind::Main).await
+}
+
+/// The preview counterpart: the pipeline runs under the preview identity
+/// and the success URL is the preview host. The failure email still fires:
+/// a broken preview is worth the same mail as a broken live deploy.
+/// The `deploy_status` follow-up needs `preview: true` to see this run.
+pub async fn run_preview_deploy(
+    state: &McpState,
+    app: &App,
+    sha: &str,
+    wait: bool,
+) -> Result<Value, ToolError> {
+    run_deploy_inner(state, app, sha, wait, crate::deploy::DeployKind::Preview).await
+}
+
+async fn run_deploy_inner(
+    state: &McpState,
+    app: &App,
+    sha: &str,
+    wait: bool,
+    kind: crate::deploy::DeployKind,
+) -> Result<Value, ToolError> {
     let deploys = state.deploys.clone();
     let pool = state.pool.clone();
     let git = state.git.clone();
@@ -630,7 +721,16 @@ pub async fn run_deploy(
     let issuer = state.auth.config.issuer.clone();
     let unsub_key = state.unsub_key.clone();
     let handle = tokio::spawn(async move {
-        let outcome = deploys.deploy(&pool, &git, &app_owned, &sha_owned).await;
+        let outcome = match kind {
+            crate::deploy::DeployKind::Main => {
+                deploys.deploy(&pool, &git, &app_owned, &sha_owned).await
+            }
+            crate::deploy::DeployKind::Preview => {
+                deploys
+                    .deploy_preview(&pool, &git, &app_owned, &sha_owned)
+                    .await
+            }
+        };
         // Email the app owner on failure (alerts #2): the spawned task
         // always runs to a terminal row, so this fires for background
         // deploys too. Never raises: a dead mailer must not fail deploys.
@@ -661,7 +761,12 @@ pub async fn run_deploy(
         }));
     }
     match tokio::time::timeout(state.tool_wait, handle).await {
-        Ok(Ok((finished_app, Ok(outcome)))) => Ok(outcome_json(state, &finished_app, &outcome)),
+        Ok(Ok((finished_app, Ok(outcome)))) => Ok(outcome_json(
+            state,
+            &finished_app,
+            &outcome,
+            kind.is_preview(),
+        )),
         Ok(Ok((_, Err(e)))) => Err(internal(e)),
         Ok(Err(e)) => Err(internal(anyhow::Error::new(e))),
         Err(_) => Ok(json!({
@@ -673,21 +778,23 @@ pub async fn run_deploy(
 }
 
 /// `deploy_status` with `wait`: poll the row to a terminal state or the
-/// `tool_wait` cap, then the same shape as [`deploy_json`].
+/// `tool_wait` cap, then the same shape as [`deploy_json`]. `kind` scopes
+/// the lookup to live or preview runs.
 pub async fn await_row(
     state: &McpState,
     app: &App,
     deploy_id: Option<&str>,
     wait: bool,
+    kind: crate::deploy::DeployKind,
 ) -> Result<Value, ToolError> {
     let deadline = tokio::time::Instant::now() + state.tool_wait;
     loop {
-        let row = deploy_by(&state.pool, &app.id, deploy_id).await?;
+        let row = deploy_by(&state.pool, &app.id, deploy_id, kind).await?;
         match row {
             Some(row) if is_terminal(&row.status) || !wait => {
                 let mut out = deploy_json(state, app, &row);
                 if deploy_id.is_none() {
-                    out["recent"] = recent_deploys(&state.pool, &app.id).await?;
+                    out["recent"] = recent_deploys(&state.pool, &app.id, kind).await?;
                 }
                 return Ok(out);
             }
@@ -709,7 +816,11 @@ pub async fn await_row(
     }
 }
 
-async fn recent_deploys(pool: &sqlx::SqlitePool, app_id: &str) -> Result<Value, ToolError> {
+async fn recent_deploys(
+    pool: &sqlx::SqlitePool,
+    app_id: &str,
+    kind: crate::deploy::DeployKind,
+) -> Result<Value, ToolError> {
     #[derive(sqlx::FromRow)]
     struct Recent {
         id: String,
@@ -720,9 +831,10 @@ async fn recent_deploys(pool: &sqlx::SqlitePool, app_id: &str) -> Result<Value, 
     }
     let rows: Vec<Recent> = sqlx::query_as::<_, Recent>(
         "SELECT id, sha, status, created_at, finished_at FROM deploy \
-         WHERE app_id = ?1 ORDER BY created_at DESC LIMIT 5",
+         WHERE app_id = ?1 AND kind = ?2 ORDER BY created_at DESC LIMIT 5",
     )
     .bind(app_id)
+    .bind(kind.sql())
     .fetch_all(pool)
     .await
     .map_err(internal)?;
@@ -838,6 +950,12 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "rollback" => code::rollback(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "promote_preview" => preview::promote_preview(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "discard_preview" => preview::discard_preview(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "deploy_status" => runtime::deploy_status(parse_args(args)?, ctx)

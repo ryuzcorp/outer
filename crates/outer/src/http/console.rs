@@ -60,7 +60,7 @@ use serde_json::json;
 
 use crate::auth::{AccountRow, AuthState};
 use crate::http::client_ip::client_ip;
-use crate::mcp::tools::{latest_deploy, plan_of};
+use crate::mcp::tools::{latest_deploy, latest_preview_deploy, plan_of};
 use crate::mcp::McpState;
 
 pub fn router(state: super::AppState) -> Router<super::AppState> {
@@ -570,7 +570,7 @@ async fn api_app(
     // object stays small and each panel loads independently.
     let rows: Vec<DeployListRow> = match sqlx::query_as::<_, DeployListRow>(
         "SELECT id, sha, status, error, findings, created_at, finished_at \
-         FROM deploy WHERE app_id = ?1 ORDER BY created_at DESC LIMIT 20",
+         FROM deploy WHERE app_id = ?1 AND kind = 'main' ORDER BY created_at DESC LIMIT 20",
     )
     .bind(&app.id)
     .fetch_all(&mcp.pool)
@@ -606,6 +606,28 @@ async fn api_app(
             v
         })
         .collect();
+    let preview = match crate::preview::preview_of(&app) {
+        Some(preview) => {
+            let status = latest_preview_deploy(&mcp.pool, &app.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|row| row.status)
+                .unwrap_or_else(|| "building".to_string());
+            Some(json!({
+                "url": crate::preview::preview_url(
+                    &mcp.app_scheme,
+                    &app.slug,
+                    &mcp.apps_domain,
+                    &mcp.app_port_suffix,
+                ),
+                "sha": preview.sha,
+                "status": status,
+                "updated_at": preview.updated_at_ms,
+            }))
+        }
+        None => None,
+    };
     (
         StatusCode::OK,
         [
@@ -624,6 +646,7 @@ async fn api_app(
             "status": status,
             "last_request_at": app.last_request_at,
             "deploys": deploys,
+            "preview": preview,
         })
         .to_string(),
     )

@@ -196,6 +196,13 @@ pub struct App {
     /// is Pro (up to the host cap) and the warm-up restarts it when stopped.
     /// Stored for every plan; ignored on Free.
     pub always_on: bool,
+    /// The active preview deploy (Pro feature #7), if any: the commit on
+    /// the `preview` git ref, served at `<slug>--preview.<apps_domain>`
+    /// from a fresh data namespace. All four are set or cleared together.
+    pub preview_sha: Option<String>,
+    pub preview_updated_at: Option<i64>,
+    pub preview_port: Option<u16>,
+    pub preview_internal_port: Option<u16>,
 }
 
 /// The free uid/port ranges one app takes its [`App::uid`], [`App::port`]
@@ -249,7 +256,8 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visibility, \
-    asleep_since, last_request_at, last_deploy_sha, created_at, always_on";
+    asleep_since, last_request_at, last_deploy_sha, created_at, always_on, \
+    preview_sha, preview_updated_at, preview_port, preview_internal_port";
 
 #[derive(Debug, sqlx::FromRow)]
 struct AppRow {
@@ -266,6 +274,10 @@ struct AppRow {
     last_deploy_sha: Option<String>,
     created_at: i64,
     always_on: i64,
+    preview_sha: Option<String>,
+    preview_updated_at: Option<i64>,
+    preview_port: Option<i64>,
+    preview_internal_port: Option<i64>,
 }
 
 impl AppRow {
@@ -291,6 +303,18 @@ impl AppRow {
             last_deploy_sha: self.last_deploy_sha,
             created_at: self.created_at,
             always_on: self.always_on != 0,
+            preview_sha: self.preview_sha,
+            preview_updated_at: self.preview_updated_at,
+            preview_port: self
+                .preview_port
+                .map(u16::try_from)
+                .transpose()
+                .context("preview port out of range")?,
+            preview_internal_port: self
+                .preview_internal_port
+                .map(u16::try_from)
+                .transpose()
+                .context("preview port out of range")?,
         })
     }
 }
@@ -404,9 +428,14 @@ pub async fn create(
     uids.sort_unstable();
     let uid = lowest_free(&uids, alloc.uid_range.0 as i64, alloc.uid_range.1 as i64, 1)
         .ok_or(CreateError::Exhausted("uids"))?[0];
+    // Preview fleets take their ports from the same ranges, so their ports
+    // count here too: a create must never hand a live app a port a preview
+    // fleet is serving on (and vice versa in `claim_preview_ports`).
     let mut ports: Vec<i64> = sqlx::query_scalar(
         "SELECT port FROM app WHERE port IS NOT NULL \
-         UNION SELECT internal_port FROM app WHERE internal_port IS NOT NULL",
+         UNION SELECT internal_port FROM app WHERE internal_port IS NOT NULL \
+         UNION SELECT preview_port FROM app WHERE preview_port IS NOT NULL \
+         UNION SELECT preview_internal_port FROM app WHERE preview_internal_port IS NOT NULL",
     )
     .fetch_all(pool)
     .await
@@ -458,7 +487,40 @@ pub async fn create(
         // New rows start cold; the MCP `create_app` path flips Pro apps
         // on right after (the plan lives with the caller, not here).
         always_on: false,
+        preview_sha: None,
+        preview_updated_at: None,
+        preview_port: None,
+        preview_internal_port: None,
     })
+}
+
+/// Claim two free loopback ports for an app's preview fleet: the same
+/// ranges and lowest-free rule as [`create`], under the same process lock
+/// so a concurrent create (or preview claim) can never take the same
+/// ports. The caller writes them into the app row together with the
+/// preview state. Errors only when the ranges are exhausted.
+pub async fn claim_preview_ports(
+    pool: &SqlitePool,
+    alloc: &Allocation,
+) -> anyhow::Result<(u16, u16)> {
+    let _guard = CREATE_LOCK.lock().await;
+    let mut ports: Vec<i64> = sqlx::query_scalar(
+        "SELECT port FROM app WHERE port IS NOT NULL \
+         UNION SELECT internal_port FROM app WHERE internal_port IS NOT NULL \
+         UNION SELECT preview_port FROM app WHERE preview_port IS NOT NULL \
+         UNION SELECT preview_internal_port FROM app WHERE preview_internal_port IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    ports.sort_unstable();
+    let free = lowest_free(
+        &ports,
+        alloc.port_range.0 as i64,
+        alloc.port_range.1 as i64,
+        2,
+    )
+    .ok_or_else(|| anyhow::anyhow!("no free ports left for a preview fleet"))?;
+    Ok((free[0] as u16, free[1] as u16))
 }
 
 /// Delete the app row and quarantine its slug for 30 days. Missing rows are a
