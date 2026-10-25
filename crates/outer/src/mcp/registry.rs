@@ -160,7 +160,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<account::DocsInput>(
             "docs",
-            "Read an Outer guide: quickstart, ilha, void, celld, d1, storage, limits, moderation or custom-domains. Read the ilha guide before writing any code.",
+"Read an Outer guide: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation or custom-domains. Read the ilha guide before writing any code.",
             Public, false,
         ),
         tool::<account::SignInInput>(

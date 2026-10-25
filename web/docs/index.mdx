@@ -5,37 +5,76 @@ description: A personal software forge for AI agents — your agent builds the a
 
 Outer is a personal software forge for AI agents. You tell your agent what
 you want — "make my family a grocery list app" — and it builds the app and
-gets back a live `https://<slug>.outer.now` link you can share. There is no
-dashboard; agents talk to Outer over MCP, humans sign in once to approve
-them.
+gets back a live `https://<slug>.outer.now` link you can share.
+
+## Core concepts
+
+Three terms, used everywhere in these docs:
+
+- **App** — an Ilha + Void web app, live at `https://<slug>.outer.now`.
+  Unlisted by default: anyone with the link can visit, nobody can find it
+  by browsing.
+- **Agent** — your AI agent (Claude, Codex, ChatGPT, …), connected to Outer
+  over MCP. The agent writes the code, ships it, and reads back the result.
+- **Deploy** — one shipped change. Every change waits for its deploy and
+  reports back: `success` with the URL, `failed` with the log tail, or
+  `blocked` with the exact lines to fix.
 
 ## The core loop
 
-1. Your agent connects to `https://outer.now/mcp` (see [Connect](/connect)).
-2. It calls `create_app` — a live Ilha + Void app in seconds.
-3. It reads the [quickstart](/guides/quickstart) and [Ilha guide](/guides/ilha), then changes code with `commit`.
-4. Every change waits for its deploy: `success` with the URL, `failed` with the log, or `blocked` with the lines to fix.
-5. `share_app` returns the URL plus a QR code for the family chat.
+<Steps>
+<Step title="Connect your agent">
+Point it at `https://outer.now/mcp` — one line per client in [Connect](/connect).
+Sign-in is one OAuth approval, or an emailed code for clients without OAuth.
+</Step>
+<Step title="Ask for an app">
+"Make a grocery list app for my family." Your agent calls `create_app` and
+a live Ilha + Void app serves in seconds.
+</Step>
+<Step title="Refine it">
+"Add a filter for who bought what." Every change ships through the same
+loop: build, review, deploy — the previous version keeps serving until the
+new one is healthy.
+</Step>
+<Step title="Share the link">
+Your agent returns the URL plus a QR code for the family chat
+(`share_app`). Open the [Console](/console) to see what it built.
+</Step>
+</Steps>
 
-::::note
+## What you can build
+
+Anything the Ilha + Void template can express, backed by D1, KV, Durable
+Objects, R2, queues, cron and realtime: family tools, sign-up sheets,
+dashboards, games, chat rooms, scheduled digests. Concrete starters with
+copy-paste prompts: [What you can build](/what-you-can-build).
+
+:::note
 Outer is in closed beta. New accounts need an invite code (`OUTER-XXXX-XXXX`) —
 if your email is not allowed in yet and you have no code, sign-in tells you
-that you are on the waitlist.
-::::
+that you are on the waitlist. [Sign in](/sign-in) has the details.
+:::
 
-## Connect your agent
+## Start here
 
-One line per client (full table in [Connect](/connect)):
+<CardGroup cols={3}>
+<Card title="Quickstart" href="/guides/quickstart" icon="rocket">
+Connect your chat app, ask for an app, see it live — about ten minutes.
+</Card>
+<Card title="Connect" href="/connect" icon="plug">
+One line per client: Claude, Codex, ChatGPT, Gemini, Perplexity, anything else.
+</Card>
+<Card title="Console" href="/console" icon="layout-dashboard">
+Watch your apps: deploys, logs, errors, data, secrets, settings.
+</Card>
+</CardGroup>
 
-- Claude Code: `claude mcp add --transport http outer https://outer.now/mcp`, then `/mcp` → `outer` to sign in
-- claude.ai, Desktop, mobile: Settings → Connectors → Add custom connector → `https://outer.now/mcp`
-- Codex CLI, IDE, ChatGPT desktop app: `codex mcp add outer --url https://outer.now/mcp`, then `codex mcp login outer`
-- Anything else: OAuth if supported, else the emailed-code fallback in [Sign in](/sign-in)
+## Get help
 
-## What your agent should know
-
-- Read the [quickstart](/guides/quickstart) before writing code, and the [Ilha guide](/guides/ilha) before touching components.
-- Change code with `commit` (prefer `edits`); read `app_errors` after deploys that touch server code.
-- No strong profanity in page text, seed data or the app name — see [Moderation](/moderation).
-- [Limits](/guides/limits): Free gives 1 app and 50 code changes a day; Pro gives 10 apps and 500. [Plans](/plans) compares them.
-- When a tool refuses something, relay its `user_message` to your human verbatim.
+- Ask your agent first — it reads these docs over MCP (`docs` tool) and
+  relays any `user_message` from a refusal verbatim. Those messages are
+  written for you; don't let it improvise around them.
+- Deploy stuck? [FAQ and troubleshooting](/faq) covers the common failures:
+  sign-in, blocked deploys, held apps, sleeping fleets.
+- Prompting tips — how to ask so your agent gets it right the first time:
+  [Prompting your agent](/prompting).

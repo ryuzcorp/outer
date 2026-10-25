@@ -17,13 +17,13 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `docs`
 
 - **Access:** anyone (no token needed)
-- **Description:** Read an Outer guide: quickstart, ilha, void, celld, d1, storage, limits, moderation or custom-domains. Read the ilha guide before writing any code.
+- **Description:** Read an Outer guide: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation or custom-domains. Read the ilha guide before writing any code.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `topic` | string | yes | Which guide to read: quickstart, ilha, void, celld, d1, storage, limits, moderation or custom-domains. |
+| `topic` | string | yes | Which guide to read: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation or custom-domains. |
 
 ## `sign_in`
 
