@@ -13,7 +13,6 @@ import {
   r2RawUrl,
   type R2Object,
 } from "../../actions/data-r2.ts";
-import { errorMessage } from "../../actions/types.ts";
 import { CopyButton } from "../../common.tsx";
 import {
   DownloadIcon,
@@ -23,6 +22,7 @@ import {
   ConfirmModal,
   DataEmptyState,
   DetailPanel,
+  errorMessage,
   formatAgo,
   formatBytes,
   formatDateTime,

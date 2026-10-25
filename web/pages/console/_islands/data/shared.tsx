@@ -218,6 +218,14 @@ export function formatAgo(iso: string): string {
   return timeAgo(ms);
 }
 
+/** Parse an unknown thrown value into a display message. */
+export function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
+
 /** What the R2 detail panel can show for one object. */
 export type PreviewKind = "image" | "text" | "binary";
 

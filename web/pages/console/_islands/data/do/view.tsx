@@ -14,13 +14,13 @@ import {
   type DoBinding,
   type DoInstance,
 } from "../../actions/data-do.ts";
-import { errorMessage } from "../../actions/types.ts";
 import { CopyButton } from "../../common.tsx";
 import { DatabaseIcon, RefreshIcon, SearchIcon } from "../../icons.tsx";
 import {
   DataBreadcrumb,
   DataEmptyState,
   DetailPanel,
+  errorMessage,
   prettyJson,
 } from "../shared.tsx";
 

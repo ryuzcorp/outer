@@ -13,12 +13,12 @@ import {
   type R2Bucket,
   type R2Preview,
 } from "../../actions/data-r2.ts";
-import { errorMessage } from "../../actions/types.ts";
 import { DatabaseIcon } from "../../icons.tsx";
 import {
   ConfirmModal,
   DataBreadcrumb,
   DataEmptyState,
+  errorMessage,
   Toaster,
   useToasts,
 } from "../shared.tsx";
