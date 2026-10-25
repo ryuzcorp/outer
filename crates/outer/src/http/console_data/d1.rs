@@ -36,13 +36,14 @@ pub const MIN_PAGE_SIZE: i64 = 1;
 pub const MAX_PAGE_SIZE: i64 = 100;
 /// `celld d1 execute` budget, matching Noite's 30 s.
 pub const D1_TIMEOUT: Duration = Duration::from_secs(30);
-/// The deployed wrangler config celld resolves the database identity from,
-/// as uploaded by `celld deploy` (plus a `dist/`-rooted fallback).
-fn config_keys(slug: &str) -> [String; 2] {
-    [
-        format!("fleets/{slug}/wrangler.json"),
-        format!("fleets/{slug}/dist/wrangler.json"),
-    ]
+/// The deploy pointer celld publishes per upload: `deploy/current.json` carries
+/// the versioned `prefix`, and the authoritative deployed config is the manifest
+/// at `fleets/{slug}/{prefix}/manifest.json`. There is no
+/// `fleets/{slug}/wrangler.json` in the bucket, and the worktree
+/// `dist/wrangler.json` is a wipeable build artifact — so the manifest is the
+/// only source of truth. A missing pointer or manifest means never-deployed.
+fn deploy_pointer_key(slug: &str) -> String {
+    format!("fleets/{slug}/deploy/current.json")
 }
 
 // ---------------------------------------------------------------------------
@@ -583,25 +584,192 @@ fn bad_err(err: anyhow::Error) -> D1Error {
     D1Error::BadQuery(format!("{err:#}"))
 }
 
-/// The declared bindings of one app, from the deployed wrangler config in the
-/// bucket. `d1_databases` validates the shape; the binding lookup below
-/// allowlists the path segment before it ever reaches celld.
-async fn declared_databases(ctx: &D1Ctx, slug: &str) -> Result<Vec<D1Database>, D1Error> {
-    for key in config_keys(slug) {
-        let bytes =
-            ctx.store.get(&key).await.map_err(|e| {
-                D1Error::Unavailable(anyhow::anyhow!("reading deployed config: {e:#}"))
+/// The live manifest's declared D1 databases, from `raw_metadata.bindings`:
+/// `type: "d1"` entries map `name` → binding and
+/// `database_name`/`database_id` → identity. Other binding types are ignored.
+/// `vars` — which may carry injected secret values — is never read here and
+/// never lands in the synthesized cwd config, so secrets can't leak through
+/// the materialized project dir or the fake-celld-style logs that read it.
+fn manifest_dbs(manifest: &serde_json::Value) -> anyhow::Result<Vec<D1Database>> {
+    let Some(bindings) = manifest.pointer("/raw_metadata/bindings") else {
+        return Ok(Vec::new());
+    };
+    let bindings = bindings.as_array().ok_or_else(|| {
+        anyhow::anyhow!("deployed manifest raw_metadata.bindings must be an array")
+    })?;
+    let mut dbs = Vec::new();
+    for (i, entry) in bindings.iter().enumerate() {
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("deployed manifest bindings[{i}] must be an object"))?;
+        let kind = obj.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("deployed manifest bindings[{i}] needs a string type")
+        })?;
+        if kind != "d1" {
+            continue;
+        }
+        let binding = obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("deployed manifest bindings[{i}] needs a string name")
+        })?;
+        let database_name = obj
+            .get("database_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("deployed manifest bindings[{i}] needs a string database_name")
             })?;
-        let Some(bytes) = bytes else { continue };
-        // The uploaded config carries the app's secret values (injected at
-        // deploy time): parse out `d1_databases` and drop the rest.
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing deployed config: {e:#}")))?;
-        let dbs = migrate::d1_databases(&value)
-            .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing d1_databases: {e:#}")))?;
-        return Ok(dbs);
+        let database_id = match obj.get("database_id") {
+            None => None,
+            Some(v) => {
+                let id = v.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("deployed manifest bindings[{i}] needs a string database_id")
+                })?;
+                migrate::validate_database_id(id)
+                    .map_err(|e| anyhow::anyhow!("deployed manifest bindings[{i}]: {e:#}"))?;
+                Some(id.to_string())
+            }
+        };
+        migrate::validate_database_name(database_name)
+            .map_err(|e| anyhow::anyhow!("deployed manifest bindings[{i}]: {e:#}"))?;
+        dbs.push(D1Database {
+            binding: binding.to_string(),
+            database_name: database_name.to_string(),
+            database_id,
+            migrations_dir: None,
+        });
     }
-    Err(D1Error::NoConfig)
+    Ok(dbs)
+}
+
+/// The minimal wrangler.json synthesized for the `celld d1 execute` cwd: only
+/// name (script_name), main, compatibility_date/flags, and `d1_databases`
+/// [{binding, database_name, database_id?}]. No vars, nothing else — celld
+/// resolves the database identity from the cwd config, so it needs the
+/// declarations but must never see secret values.
+fn synthesize_config(manifest: &serde_json::Value, dbs: &[D1Database]) -> anyhow::Result<Vec<u8>> {
+    let script_name = manifest
+        .get("script_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("deployed manifest has no script_name"))?;
+    let main = manifest
+        .get("main_module")
+        .and_then(|v| v.as_str())
+        .unwrap_or("index.js");
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "name".to_string(),
+        serde_json::Value::String(script_name.to_string()),
+    );
+    config.insert(
+        "main".to_string(),
+        serde_json::Value::String(main.to_string()),
+    );
+    if let Some(date) = manifest.pointer("/raw_metadata/compatibility_date") {
+        let date = date.as_str().ok_or_else(|| {
+            anyhow::anyhow!("deployed manifest compatibility_date must be a string")
+        })?;
+        config.insert(
+            "compatibility_date".to_string(),
+            serde_json::Value::String(date.to_string()),
+        );
+    }
+    if let Some(flags) = manifest.pointer("/raw_metadata/compatibility_flags") {
+        let flags = flags.as_array().ok_or_else(|| {
+            anyhow::anyhow!("deployed manifest compatibility_flags must be an array")
+        })?;
+        for flag in flags {
+            flag.as_str().ok_or_else(|| {
+                anyhow::anyhow!("deployed manifest compatibility_flags must be strings")
+            })?;
+        }
+        config.insert(
+            "compatibility_flags".to_string(),
+            serde_json::Value::Array(flags.clone()),
+        );
+    }
+    let dbs_json: Vec<serde_json::Value> = dbs
+        .iter()
+        .map(|db| {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "binding".to_string(),
+                serde_json::Value::String(db.binding.clone()),
+            );
+            entry.insert(
+                "database_name".to_string(),
+                serde_json::Value::String(db.database_name.clone()),
+            );
+            if let Some(id) = &db.database_id {
+                entry.insert(
+                    "database_id".to_string(),
+                    serde_json::Value::String(id.clone()),
+                );
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect();
+    config.insert(
+        "d1_databases".to_string(),
+        serde_json::Value::Array(dbs_json),
+    );
+    Ok(serde_json::to_vec(&serde_json::Value::Object(config))?)
+}
+
+/// The deploy pointer's versioned prefix must stay a relative deploy path:
+/// it becomes a store key suffix, so anything absolute or escaping fails the
+/// read instead of probing an unintended key.
+fn validate_prefix(prefix: &str) -> anyhow::Result<()> {
+    if prefix.is_empty()
+        || prefix.starts_with('/')
+        || prefix.contains("..")
+        || prefix.contains('\\')
+        || prefix.contains('\0')
+    {
+        anyhow::bail!("deploy pointer prefix {prefix:?} is not a relative deploy path");
+    }
+    Ok(())
+}
+
+/// Declared databases plus the synthesized cwd config, read from the live
+/// manifest via the scoped store. A missing pointer or manifest means
+/// never-deployed (`NoConfig`: the existing "not deployed yet" answer);
+/// malformed JSON fails `Unavailable`.
+struct DeployedState {
+    dbs: Vec<D1Database>,
+    config: Vec<u8>,
+}
+
+async fn deployed_state(ctx: &D1Ctx, slug: &str) -> Result<DeployedState, D1Error> {
+    let pointer = ctx
+        .store
+        .get(&deploy_pointer_key(slug))
+        .await
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("reading deploy pointer: {e:#}")))?;
+    let Some(pointer) = pointer else {
+        return Err(D1Error::NoConfig);
+    };
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer)
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing deploy pointer: {e:#}")))?;
+    let prefix = pointer
+        .get("prefix")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| D1Error::Unavailable(anyhow::anyhow!("deploy pointer has no prefix")))?;
+    validate_prefix(prefix).map_err(D1Error::Unavailable)?;
+    let key = format!("fleets/{slug}/{prefix}/manifest.json");
+    let manifest =
+        ctx.store.get(&key).await.map_err(|e| {
+            D1Error::Unavailable(anyhow::anyhow!("reading deployed manifest: {e:#}"))
+        })?;
+    let Some(manifest) = manifest else {
+        return Err(D1Error::NoConfig);
+    };
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest)
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing deployed manifest: {e:#}")))?;
+    let dbs = manifest_dbs(&manifest)
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing d1 bindings: {e:#}")))?;
+    let config = synthesize_config(&manifest, &dbs).map_err(|e| {
+        D1Error::Unavailable(anyhow::anyhow!("synthesizing wrangler config: {e:#}"))
+    })?;
+    Ok(DeployedState { dbs, config })
 }
 
 /// The celld identity for `binding`: the declared `database_id` when present,
@@ -613,28 +781,13 @@ fn identity_for(dbs: &[D1Database], binding: &str) -> Result<String, D1Error> {
         .ok_or_else(|| D1Error::UnknownDatabase(binding.to_string()))
 }
 
-/// Materialize the deployed wrangler config into a temp project dir: celld
+/// Materialize the synthesized wrangler config into a temp project dir: celld
 /// resolves the database identity from the cwd config. The dir holds only
 /// the config — no app code — and is removed with the `TempDir` guard.
 async fn materialize_project(config: &[u8]) -> anyhow::Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     tokio::fs::write(dir.path().join("wrangler.json"), config).await?;
     Ok(dir)
-}
-
-/// The deployed config bytes backing `declared_databases`, for the project
-/// dir. Same lookup, kept as bytes so celld sees exactly what was deployed.
-async fn deployed_config_bytes(ctx: &D1Ctx, slug: &str) -> Result<Vec<u8>, D1Error> {
-    for key in config_keys(slug) {
-        let bytes =
-            ctx.store.get(&key).await.map_err(|e| {
-                D1Error::Unavailable(anyhow::anyhow!("reading deployed config: {e:#}"))
-            })?;
-        if let Some(bytes) = bytes {
-            return Ok(bytes);
-        }
-    }
-    Err(D1Error::NoConfig)
 }
 
 /// One `celld d1 execute` against the app's fleet. Callers pass validated
@@ -779,14 +932,14 @@ fn hex(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Wake the fleet when the server runs one (D1 goes through a live node),
-/// then hand back the deployed config bytes for the project dir.
-async fn ready_config(ctx: &D1Ctx, app: &crate::apps::App) -> Result<Vec<u8>, D1Error> {
+/// then hand back the manifest-derived state for the project dir.
+async fn ready_config(ctx: &D1Ctx, app: &crate::apps::App) -> Result<DeployedState, D1Error> {
     if let Some(wake) = &ctx.wake {
         wake.ensure_awake(&ctx.pool, app)
             .await
             .map_err(|_| D1Error::AppStarting)?;
     }
-    deployed_config_bytes(ctx, &app.slug).await
+    deployed_state(ctx, &app.slug).await
 }
 
 /// Tables plus row counts, in one `SELECT … UNION ALL …` exec.
@@ -795,10 +948,9 @@ pub async fn list_tables(
     app: &crate::apps::App,
     binding: &str,
 ) -> Result<(String, Vec<D1TableInfo>), D1Error> {
-    let config = ready_config(ctx, app).await?;
-    let dbs = declared_databases(ctx, &app.slug).await?;
-    let identity = identity_for(&dbs, binding)?;
-    let project = materialize_project(&config)
+    let state = ready_config(ctx, app).await?;
+    let identity = identity_for(&state.dbs, binding)?;
+    let project = materialize_project(&state.config)
         .await
         .map_err(D1Error::Unavailable)?;
     let out = d1_exec(
@@ -916,10 +1068,9 @@ pub async fn table_schema(
     if !visible_table(table) {
         return Err(D1Error::UnknownTable(table.to_string()));
     }
-    let config = ready_config(ctx, app).await?;
-    let dbs = declared_databases(ctx, &app.slug).await?;
-    let identity = identity_for(&dbs, binding)?;
-    let project = materialize_project(&config)
+    let state = ready_config(ctx, app).await?;
+    let identity = identity_for(&state.dbs, binding)?;
+    let project = materialize_project(&state.config)
         .await
         .map_err(D1Error::Unavailable)?;
     let schema = load_table(ctx, &app.slug, &identity, project.path(), table).await?;
@@ -1032,10 +1183,9 @@ pub async fn table_rows(
             return Err(D1Error::bad("filter is too long"));
         }
     }
-    let config = ready_config(ctx, app).await?;
-    let dbs = declared_databases(ctx, &app.slug).await?;
-    let identity = identity_for(&dbs, binding)?;
-    let project = materialize_project(&config)
+    let state = ready_config(ctx, app).await?;
+    let identity = identity_for(&state.dbs, binding)?;
+    let project = materialize_project(&state.config)
         .await
         .map_err(D1Error::Unavailable)?;
     let schema = load_table(ctx, &app.slug, &identity, project.path(), table).await?;
@@ -1109,10 +1259,9 @@ pub async fn write_row(
             return Err(D1Error::bad("value is too long"));
         }
     }
-    let config = ready_config(ctx, app).await?;
-    let dbs = declared_databases(ctx, &app.slug).await?;
-    let identity = identity_for(&dbs, binding)?;
-    let project = materialize_project(&config)
+    let state = ready_config(ctx, app).await?;
+    let identity = identity_for(&state.dbs, binding)?;
+    let project = materialize_project(&state.config)
         .await
         .map_err(D1Error::Unavailable)?;
     let schema = load_table(ctx, &app.slug, &identity, project.path(), table).await?;
@@ -1139,10 +1288,9 @@ pub async fn delete_rows(
     if keys.is_empty() || keys.len() > MAX_DELETE_KEYS {
         return Err(D1Error::bad(format!("send 1..={MAX_DELETE_KEYS} keys")));
     }
-    let config = ready_config(ctx, app).await?;
-    let dbs = declared_databases(ctx, &app.slug).await?;
-    let identity = identity_for(&dbs, binding)?;
-    let project = materialize_project(&config)
+    let state = ready_config(ctx, app).await?;
+    let identity = identity_for(&state.dbs, binding)?;
+    let project = materialize_project(&state.config)
         .await
         .map_err(D1Error::Unavailable)?;
     let schema = load_table(ctx, &app.slug, &identity, project.path(), table).await?;
@@ -1319,9 +1467,9 @@ async fn api_databases(
     };
     let ctx = D1Ctx::from_state(&state);
     let result = async {
-        let dbs = declared_databases(&ctx, &app.slug).await?;
+        let state = deployed_state(&ctx, &app.slug).await?;
         Ok::<_, D1Error>(json!({
-            "databases": dbs.iter().map(|db| json!({
+            "databases": state.dbs.iter().map(|db| json!({
                 "binding": db.binding,
                 "database_name": db.database_name,
             })).collect::<Vec<_>>(),
@@ -1955,6 +2103,106 @@ mod tests {
         assert!(identity_for(&dbs(), "db").is_err());
     }
 
+    // --- manifest parsing ----------------------------------------------------
+
+    fn manifest_with(bindings: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 2,
+            "script_name": "outer-app",
+            "main_module": "index.js",
+            "raw_metadata": {
+                "bindings": bindings,
+                "compatibility_date": "2026-09-01",
+                "compatibility_flags": ["nodejs_als"],
+                "main_module": "index.js"
+            }
+        })
+    }
+
+    #[test]
+    fn manifest_maps_d1_bindings_with_and_without_id() {
+        let dbs = manifest_dbs(&manifest_with(serde_json::json!([
+            {"type": "d1", "name": "DB", "database_name": "app-db", "database_id": "abc-123"},
+            {"type": "d1", "name": "PLAIN", "database_name": "plain-db"}
+        ])))
+        .unwrap();
+        assert_eq!(dbs.len(), 2);
+        assert_eq!(dbs[0].binding, "DB");
+        assert_eq!(dbs[0].effective_identity(), "abc-123");
+        assert_eq!(dbs[1].binding, "PLAIN");
+        assert_eq!(dbs[1].database_id, None);
+        assert_eq!(dbs[1].effective_identity(), "plain-db");
+    }
+
+    #[test]
+    fn manifest_ignores_other_binding_types() {
+        let dbs = manifest_dbs(&manifest_with(serde_json::json!([
+            {"type": "d1", "name": "DB", "database_name": "app-db"},
+            {"type": "kv_namespace", "name": "CACHE", "namespace_id": "kv-1"},
+            {"type": "assets", "name": "ASSETS"},
+            {"type": "plain_text", "name": "KEY", "text": "v"}
+        ])))
+        .unwrap();
+        assert_eq!(dbs.len(), 1);
+        assert_eq!(dbs[0].binding, "DB");
+    }
+
+    #[test]
+    fn manifest_without_bindings_is_empty() {
+        let bare = serde_json::json!({"schema_version": 2, "script_name": "x"});
+        assert!(manifest_dbs(&bare).unwrap().is_empty());
+        let dbs = manifest_dbs(&manifest_with(serde_json::json!([]))).unwrap();
+        assert!(dbs.is_empty());
+    }
+
+    #[test]
+    fn manifest_rejects_malformed_d1_entries() {
+        for bindings in [
+            serde_json::json!([{"type": "d1", "database_name": "app-db"}]),
+            serde_json::json!([{"type": "d1", "name": "DB"}]),
+            serde_json::json!([{"type": "d1", "name": "DB", "database_name": "-evil"}]),
+            serde_json::json!([{"type": "d1", "name": "DB", "database_name": "app-db", "database_id": 7}]),
+            serde_json::json!([{"name": "DB", "database_name": "app-db"}]),
+            serde_json::json!("d1_databases"),
+        ] {
+            assert!(manifest_dbs(&manifest_with(bindings)).is_err());
+        }
+    }
+
+    #[test]
+    fn synthesized_config_is_minimal_and_secret_free() {
+        let manifest = manifest_with(serde_json::json!([
+            {"type": "d1", "name": "DB", "database_name": "app-db", "database_id": "abc-123"},
+            {"type": "d1", "name": "PLAIN", "database_name": "plain-db"}
+        ]));
+        let dbs = manifest_dbs(&manifest).unwrap();
+        let bytes = synthesize_config(&manifest, &dbs).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "outer-app",
+                "main": "index.js",
+                "compatibility_date": "2026-09-01",
+                "compatibility_flags": ["nodejs_als"],
+                "d1_databases": [
+                    {"binding": "DB", "database_name": "app-db", "database_id": "abc-123"},
+                    {"binding": "PLAIN", "database_name": "plain-db"}
+                ]
+            })
+        );
+        // Exact key set: no vars, no other metadata.
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.len(), 5);
+        // A manifest carrying injected secret values leaves no trace: vars is
+        // never read, so the secret can't appear in the synthesized bytes.
+        let mut leaky = manifest.clone();
+        leaky["vars"] = serde_json::json!({"SECRET": "super-secret-value"});
+        leaky["raw_metadata"]["vars"] = serde_json::json!({"OTHER": "super-secret-value"});
+        let bytes = synthesize_config(&leaky, &manifest_dbs(&leaky).unwrap()).unwrap();
+        assert!(!bytes.windows(18).any(|w| w == b"super-secret-value"));
+    }
+
     // --- fake celld --------------------------------------------------------
 
     /// A fake `celld` for D1 tests: answers `d1 execute` with canned JSON
@@ -2066,15 +2314,64 @@ exit 0
         }
     }
 
-    fn seed_config() -> serde_json::Value {
+    const DEPLOY_PREFIX: &str = "deploy/outer-app/fd031dff832ad90a";
+
+    /// The live manifest celld published for this app: two D1 bindings (one
+    /// with an id, one plain), plus non-D1 binding types and a top-level
+    /// `vars` map carrying a would-be secret — all of which the panel must
+    /// ignore, never echoing the secret anywhere.
+    fn seed_manifest() -> serde_json::Value {
         serde_json::json!({
-            "name": "acme",
+            "schema_version": 2,
+            "script_name": "outer-app",
+            "main_module": "index.js",
+            "raw_metadata": {
+                "bindings": [
+                    {"type": "d1", "name": "DB", "database_name": "app-db", "database_id": "abc-123"},
+                    {"type": "d1", "name": "PLAIN", "database_name": "plain-db"},
+                    {"type": "kv_namespace", "name": "CACHE", "namespace_id": "kv-1"},
+                    {"type": "assets", "name": "ASSETS"},
+                    {"type": "plain_text", "name": "PUBLIC_KEY", "text": "pk-1"}
+                ],
+                "compatibility_date": "2026-09-01",
+                "compatibility_flags": ["nodejs_als"],
+                "main_module": "index.js"
+            },
+            "vars": {"SECRET": "super-secret-value"}
+        })
+    }
+
+    /// The exact minimal config the panel must synthesize for the cwd.
+    fn expected_config() -> serde_json::Value {
+        serde_json::json!({
+            "name": "outer-app",
             "main": "index.js",
             "compatibility_date": "2026-09-01",
+            "compatibility_flags": ["nodejs_als"],
             "d1_databases": [
-                {"binding": "DB", "database_name": "app-db", "database_id": "abc-123"}
+                {"binding": "DB", "database_name": "app-db", "database_id": "abc-123"},
+                {"binding": "PLAIN", "database_name": "plain-db"}
             ]
         })
+    }
+
+    /// Pointer plus manifest, as `celld deploy` leaves them in the bucket.
+    async fn seed_deployed(store: &Store) {
+        store
+            .put(
+                "fleets/acme/deploy/current.json",
+                format!("{{\"script_name\":\"outer-app\",\"version\":\"fd031dff832ad90a\",\"prefix\":\"{DEPLOY_PREFIX}\"}}")
+                    .into_bytes(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &format!("fleets/acme/{DEPLOY_PREFIX}/manifest.json"),
+                serde_json::to_vec(&seed_manifest()).unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     async fn seed_app(pool: &SqlitePool, port: i64) {
@@ -2157,13 +2454,7 @@ exit 0
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
         let store = Store::memory();
-        store
-            .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
-            )
-            .await
-            .unwrap();
+        seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let (identity, tables) = list_tables(&ctx, &app, "DB").await.unwrap();
@@ -2191,15 +2482,16 @@ exit 0
         assert!(!env.contains("AWS_SESSION_TOKEN"), "{env}");
         assert!(env.contains("S3_ENDPOINT=http://127.0.0.1:1"), "{env}");
         assert!(env.contains("AWS_REGION=test-region"), "{env}");
-        // The command ran from a materialized deploy root holding the live config.
+        // The command ran from a materialized deploy root holding only the
+        // synthesized minimal config — never the secret-bearing manifest.
         let roots = std::fs::read_to_string(state.path().join("root-config.log")).unwrap();
-        assert!(
-            !roots.is_empty()
-                && roots
-                    .lines()
-                    .all(|l| l == serde_json::to_string(&seed_config()).unwrap()),
-            "{roots}"
-        );
+        let lines: Vec<&str> = roots.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(!lines.is_empty(), "{roots}");
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value, expected_config(), "{line}");
+            assert!(!line.contains("super-secret-value"), "{line}");
+        }
     }
 
     #[tokio::test]
@@ -2208,13 +2500,7 @@ exit 0
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
         let store = Store::memory();
-        store
-            .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
-            )
-            .await
-            .unwrap();
+        seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let err = list_tables(&ctx, &app, "OTHER").await.unwrap_err();
@@ -2234,18 +2520,33 @@ exit 0
     }
 
     #[tokio::test]
-    async fn schema_loads_fk_indexes_ddl() {
+    async fn pointer_without_manifest_is_no_config() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
         let store = Store::memory();
         store
             .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
+                "fleets/acme/deploy/current.json",
+                br#"{"script_name":"outer-app","version":"v1","prefix":"deploy/outer-app/v1"}"#
+                    .to_vec(),
             )
             .await
             .unwrap();
+        let ctx = op_ctx(&pool, &state, &script, store);
+        let app = test_app(&pool).await;
+        let err = list_tables(&ctx, &app, "DB").await.unwrap_err();
+        assert!(matches!(err, D1Error::NoConfig));
+        assert!(calls(&state).is_empty(), "no celld call without a manifest");
+    }
+
+    #[tokio::test]
+    async fn schema_loads_fk_indexes_ddl() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let store = Store::memory();
+        seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let schema = table_schema(&ctx, &app, "DB", "users").await.unwrap();
@@ -2279,13 +2580,7 @@ exit 0
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
         let store = Store::memory();
-        store
-            .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
-            )
-            .await
-            .unwrap();
+        seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let body = RowsBody {
@@ -2335,13 +2630,7 @@ exit 0
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
         let store = Store::memory();
-        store
-            .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
-            )
-            .await
-            .unwrap();
+        seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         // Insert with a quote in the value and an explicit NULL.
@@ -2420,13 +2709,7 @@ exit 0
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
         let store = Store::memory();
-        store
-            .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
-            )
-            .await
-            .unwrap();
+        seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let deleted = delete_rows(
@@ -2466,13 +2749,7 @@ exit 0
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
         let store = Store::memory();
-        store
-            .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
-            )
-            .await
-            .unwrap();
+        seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let err = write_row(
@@ -2547,13 +2824,7 @@ exit 0
         };
         let script = install_fake_celld(state.path());
         let store = Store::memory();
-        store
-            .put(
-                "fleets/acme/wrangler.json",
-                serde_json::to_vec(&seed_config()).unwrap(),
-            )
-            .await
-            .unwrap();
+        seed_deployed(&store).await;
         // The wake probe hits this stub and counts the fleet awake, so no
         // celld spawn ever runs in router tests.
         let (port, health) = stub_health().await;
