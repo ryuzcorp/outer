@@ -112,6 +112,8 @@ fn fetch_ok(headers: &HeaderMap) -> bool {
     headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("same-origin")
 }
 
+/// Shared with `console_data` (the D1/R2/DO panels): the same session,
+/// same-origin and owner-scoped-404 checks as every other console API.
 pub(crate) async fn guard(
     auth: &AuthState,
     headers: &HeaderMap,
@@ -154,6 +156,7 @@ pub(crate) async fn guard(
 
 /// The app `slug` names, owned by `account`. Anything else — missing, or
 /// owned by someone else — is `None`, and the caller answers 404 (spec §8.2).
+/// Shared with `console_data`.
 pub(crate) async fn owned_app(
     mcp: &McpState,
     account: &AccountRow,
@@ -1844,6 +1847,8 @@ mod tests {
         assert_eq!(first["outcome"], "failed");
         assert!(first["error_code"].is_null());
         assert_eq!(first["duration_ms"], 120);
+        // NULL consent + API key IDs are console writes (console-actions
+        // contract): the action log labels them "Console".
         assert_eq!(first["by"], "Console");
         let next = body["next"]
             .as_str()

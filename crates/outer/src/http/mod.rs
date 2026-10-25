@@ -5,6 +5,7 @@ pub mod client_ip;
 pub mod console;
 pub mod console_actions;
 pub mod console_code;
+pub mod console_data;
 pub mod proxy;
 pub mod site;
 pub mod tls;
@@ -34,6 +35,10 @@ pub fn router(state: AppState) -> Router {
     // if a build ever emitted `console/sign-in/index.html`, the Rust
     // handler still answers `/console/sign-in`.
     let console = console::router(state.clone());
+    // Data panels (D1 now; R2 + Durable Objects land in console_data too):
+    // explicit Axum routes like the console API above, so they win over the
+    // site fallback below.
+    let console_data = console_data::routes();
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -42,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         // method router; the handler refuses bodies over 32 MiB (§8.1).
         .route("/mcp", post(crate::mcp::mcp_handler))
         .merge(console)
+        .merge(console_data)
         .fallback(platform_fallback)
         .with_state(state)
 }

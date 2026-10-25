@@ -156,6 +156,20 @@ impl FleetManager {
         }
     }
 
+    /// The celld binary console data panels shell out to (`celld d1 …`,
+    /// `celld cell …`). Cloned out so `console_data` can build its argv
+    /// without reaching into the manager's internals.
+    pub fn celld_bin(&self) -> String {
+        self.inner.celld_bin.clone()
+    }
+
+    /// Bucket coordinates and the per-prefix credential source the data
+    /// panels mint scoped grants from. The borrow lives as long as the
+    /// manager; callers that need to own it (tests) clone it instead.
+    pub fn storage(&self) -> &FleetStorage {
+        &self.inner.storage
+    }
+
     async fn alive(fleets: &tokio::sync::Mutex<HashMap<String, LiveFleet>>, slug: &str) -> bool {
         let mut fleets = fleets.lock().await;
         let Some(live) = fleets.get_mut(slug) else {

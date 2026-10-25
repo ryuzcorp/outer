@@ -13,6 +13,7 @@ export const VIEWS = [
   { id: "errors", label: "Errors" },
   { id: "secrets", label: "Secrets" },
   { id: "settings", label: "Settings" },
+  { id: "d1", label: "D1" },
 ] as const;
 
 export const ACCOUNT_VIEWS = [
@@ -40,7 +41,27 @@ export interface Route {
   // The Code view's section; null means files. The Deploys "what changed"
   // link sets it so the diff shows immediately.
   codeTab: "files" | "changes" | null;
+  /** D1 editor state (only read while `view` is `d1`; see `data/d1/state`). */
+  db: string;
+  table: string;
+  page: string;
+  size: string;
+  sort: string;
+  f: string;
+  q: string;
+  dview: string;
 }
+
+const D1_DEFAULTS: Pick<Route, "db" | "table" | "page" | "size" | "sort" | "f" | "q" | "dview"> = {
+  db: "",
+  table: "",
+  page: "",
+  size: "",
+  sort: "",
+  f: "",
+  q: "",
+  dview: "",
+};
 
 export function toViewId(raw: string | null): ViewId {
   if (VIEWS.some((v) => v.id === raw) || ACCOUNT_VIEWS.some((v) => v.id === raw)) {
@@ -56,7 +77,7 @@ export function toRange(raw: string | null): number {
 
 export function readRoute(): Route {
   if (typeof window === "undefined") {
-    return { app: null, view: "overview", range: 24, sha: null, codeTab: null };
+    return { app: null, view: "overview", range: 24, sha: null, codeTab: null, ...D1_DEFAULTS };
   }
   const q = new URLSearchParams(window.location.search);
   const ct = q.get("ct");
@@ -66,6 +87,14 @@ export function readRoute(): Route {
     range: toRange(q.get("r")),
     sha: q.get("sha"),
     codeTab: ct === "changes" ? "changes" : ct === "files" ? "files" : null,
+    db: q.get("db") ?? "",
+    table: q.get("table") ?? "",
+    page: q.get("page") ?? "",
+    size: q.get("size") ?? "",
+    sort: q.get("sort") ?? "",
+    f: q.get("f") ?? "",
+    q: q.get("q") ?? "",
+    dview: q.get("dview") ?? "",
   };
 }
 
@@ -81,6 +110,12 @@ export function routeUrl(route: Route): string {
   }
   if (route.codeTab) {
     q.set("ct", route.codeTab);
+  }
+  // The D1 editor's deep-link state rides alongside; other views ignore it.
+  for (const key of ["db", "table", "page", "size", "sort", "f", "q", "dview"] as const) {
+    if (route[key] !== "") {
+      q.set(key, route[key]);
+    }
   }
   return `/console?${q.toString()}`;
 }
@@ -121,12 +156,12 @@ export type ActionsPanel =
   | { kind: "ready"; state: ActionsState };
 
 // Copy button (Noite's $lib/ui/copy-button, per-instance feedback).
-export function CopyButton({ value, label }: { value: string; label: string }) {
+export function CopyButton({ value, label, class: klass }: { value: string; label: string; class?: string }) {
   const copied = atom(false);
   return (
     <button
       type="button"
-      class="btn btn-ghost btn-square btn-xs tooltip shrink-0"
+      class={klass ?? "btn btn-ghost btn-square btn-xs tooltip shrink-0"}
       data-tip={copied() ? "Copied" : label}
       title={copied() ? "Copied" : label}
       aria-label={label}

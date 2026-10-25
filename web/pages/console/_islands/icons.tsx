@@ -12,25 +12,34 @@
 import { h } from "ilha";
 import {
   Activity,
+  ArrowLeft,
+  ArrowUpDown,
   BookOpen,
   ChartLine,
   Check,
   ChevronDown,
   CodeXml,
+  ChevronLeft,
+  ChevronRight,
   Copy,
   Database,
   Eye,
   EyeOff,
+  Filter,
   KeyRound,
   LayoutGrid,
+  Lock,
   LogOut,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  RefreshCw,
   Rocket,
+  Search,
   Settings,
   ShieldCheck,
+  Table,
   Terminal,
   Ticket,
   TriangleAlert,
@@ -175,4 +184,44 @@ export function EyeIcon({ size = 18 }: { size?: number }) {
 
 export function EyeOffIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={EyeOff} size={size} label="Hide" />;
+}
+
+export function SearchIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Search} size={size} />;
+}
+
+export function FilterIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Filter} size={size} />;
+}
+
+export function SortIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={ArrowUpDown} size={size} />;
+}
+
+export function RefreshIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={RefreshCw} size={size} />;
+}
+
+export function ChevronLeftIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={ChevronLeft} size={size} />;
+}
+
+export function ChevronRightIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={ChevronRight} size={size} />;
+}
+
+export function TableIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Table} size={size} />;
+}
+
+export function BackIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={ArrowLeft} size={size} />;
+}
+
+export function LockIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Lock} size={size} />;
+}
+
+export function KeyIcon({ size = 14 }: { size?: number }) {
+  return <Lucide node={KeyRound} size={size} />;
 }
