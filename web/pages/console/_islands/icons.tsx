@@ -43,6 +43,7 @@ import {
   Terminal,
   Ticket,
   TriangleAlert,
+  UserRound,
   X,
   type IconNode,
 } from "lucide";
@@ -224,4 +225,8 @@ export function LockIcon({ size = 18 }: { size?: number }) {
 
 export function KeyIcon({ size = 14 }: { size?: number }) {
   return <Lucide node={KeyRound} size={size} />;
+}
+
+export function AccountIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={UserRound} size={size} />;
 }

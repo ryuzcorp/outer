@@ -3,6 +3,7 @@
 //! The library holds the platform's modules; `src/main.rs` is the `outer`
 //! binary that boots them.
 
+pub mod accounts;
 pub mod apps;
 pub mod auth;
 pub mod cloudflare;

@@ -1,5 +1,39 @@
 // Shared fetch for the console islands: same-origin JSON, and a missing or
 // expired web session sends the human through the Rust sign-in flow.
+// Failures throw ApiError carrying the parsed `{error, message,
+// user_message}` body, so views can show the server's human message.
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+  constructor(status: number, body: unknown) {
+    // Older endpoints answer `{error, message}` with no `user_message`;
+    // prefer the server's sentence either way over the bare status text.
+    let message = `request failed: ${status}`;
+    if (body !== null && typeof body === "object") {
+      const human =
+        (body as Record<string, unknown>).user_message ??
+        (body as Record<string, unknown>).message;
+      if (typeof human === "string" && human.length > 0) {
+        message = human;
+      }
+    }
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function fail(res: Response): Promise<never> {
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  throw new ApiError(res.status, body);
+}
+
 export async function api<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { accept: "application/json" } });
   if (res.status === 401) {
@@ -7,7 +41,7 @@ export async function api<T>(path: string): Promise<T> {
     throw new Error("signed out");
   }
   if (!res.ok) {
-    throw new Error(`request failed: ${res.status}`);
+    await fail(res);
   }
   return (await res.json()) as T;
 }
@@ -23,7 +57,7 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
     throw new Error("signed out");
   }
   if (!res.ok) {
-    throw new Error(`request failed: ${res.status}`);
+    await fail(res);
   }
   return (await res.json()) as T;
 }
@@ -193,6 +227,70 @@ export interface WaitlistEntry {
 
 export interface WaitlistSummary {
   entries: WaitlistEntry[];
+}
+
+export interface ConnectionEntry {
+  id: string;
+  client_id: string;
+  client_name: string | null;
+  host: string | null;
+  scope: string;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+export interface ConnectionsSummary {
+  console_session: string;
+  connections: ConnectionEntry[];
+}
+
+export interface ApiKeyEntry {
+  id: string;
+  name: string | null;
+  prefix: string;
+  created_at: number;
+  last_used_at: number | null;
+  client: string | null;
+}
+
+export interface ApiKeysSummary {
+  console_session: string;
+  keys: ApiKeyEntry[];
+}
+
+export interface CreatedKey {
+  id: string;
+  name: string | null;
+  prefix: string;
+  api_key: string;
+}
+
+export interface RollbackUsage {
+  slug: string;
+  used_today: number;
+  limit: number;
+}
+
+export interface AccountUsage {
+  apps_owned: number;
+  apps_limit: number;
+  code_changes_today: number;
+  code_changes_limit: number;
+  build_ms_today: number;
+  rollbacks: RollbackUsage[];
+  rollback_limit: number;
+  requests_month: number;
+  storage_peak_bytes: number;
+  egress_bytes_month: number;
+}
+
+export interface AccountSummary {
+  email: string;
+  plan: string;
+  plan_status: string | null;
+  member_since: number;
+  usage: AccountUsage;
+  resets_at: string;
 }
 
 export function shortSha(sha: string): string {

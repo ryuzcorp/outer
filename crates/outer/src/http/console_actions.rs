@@ -39,7 +39,7 @@ pub fn routes() -> Router<AppState> {
 /// Map a domain refusal to its HTTP status. The body always carries the same
 /// `{error, message, user_message?}` shape the MCP tool returns, so the UI
 /// shows `user_message` in an `alert alert-error alert-soft`.
-fn tool_status(code: &str) -> StatusCode {
+pub(crate) fn tool_status(code: &str) -> StatusCode {
     match code {
         "not_found" => StatusCode::NOT_FOUND,
         "invalid_argument" => StatusCode::BAD_REQUEST,
@@ -51,7 +51,7 @@ fn tool_status(code: &str) -> StatusCode {
     }
 }
 
-fn tool_response(err: &ToolError) -> Response {
+pub(crate) fn tool_response(err: &ToolError) -> Response {
     let mut body = json!({"error": err.code, "message": err.message});
     if let Some(user) = &err.user_message {
         body["user_message"] = json!(user);

@@ -12,8 +12,11 @@ import {
   api,
   apiPost,
   type ActionsPage,
+  type AccountSummary,
   type AdminInvitesPage,
+  type ApiKeysSummary,
   type AppDetail,
+  type ConnectionsSummary,
   type ConsoleApp,
   type ErrorsSummary,
   type InvitesSummary,
@@ -23,6 +26,7 @@ import {
   type WaitlistSummary,
 } from "./api.ts";
 import {
+  AccountIcon,
   ActionsIcon,
   CloseIcon,
   CodeIcon,
@@ -61,6 +65,11 @@ import { secretsActions } from "./actions/secrets.ts";
 import { ErrorsView } from "./views/errors.tsx";
 import { LogsView } from "./views/logs.tsx";
 import { setJumpToIssue } from "./actions/observe.ts";
+import {
+  AccountView,
+  ConnectionsView,
+  UsageView,
+} from "./views/account.tsx";
 
 import {
   CopyButton,
@@ -155,6 +164,9 @@ const VIEW_TITLES: Record<ViewId, string> = {
   d1: "D1",
   invites: "Invite codes",
   admin: "Admin",
+  connections: "Connections & keys",
+  usage: "Usage & plan",
+  account: "Account",
 };
 
 /** Shell UI state: sidebar collapse, mobile drawer, popovers, expanded deploy rows. */
@@ -183,6 +195,9 @@ export function Console() {
   const errors = atom<Panel<ErrorsSummary>>({ kind: "loading" });
   const logs = atom<Panel<LogLine[]>>({ kind: "loading" });
   const secrets = atom<Panel<SecretsSummary>>({ kind: "loading" });
+  const connections = atom<Panel<ConnectionsSummary>>({ kind: "loading" });
+  const apiKeys = atom<Panel<ApiKeysSummary>>({ kind: "loading" });
+  const accountSummary = atom<Panel<AccountSummary>>({ kind: "loading" });
   const ui = atom<Ui>({
     collapsed: readCollapsed(),
     drawer: false,
@@ -223,6 +238,9 @@ export function Console() {
       case "secrets":
         return ["secrets"];
       case "settings":
+      case "connections":
+      case "usage":
+      case "account":
       case "invites":
       case "admin":
         return [];
@@ -344,7 +362,13 @@ export function Console() {
   }
 
   function isAccountView(view: ViewId): boolean {
-    return view === "invites" || view === "admin";
+    return (
+      view === "connections" ||
+      view === "usage" ||
+      view === "account" ||
+      view === "invites" ||
+      view === "admin"
+    );
   }
 
   async function loadAccountView(view: ViewId, myEpoch: number): Promise<void> {
@@ -360,6 +384,43 @@ export function Console() {
       } catch (err: unknown) {
         if (fresh()) {
           invites.set({ kind: "error", message: String(err) });
+        }
+      }
+      return;
+    }
+    if (view === "connections") {
+      connections.set({ kind: "loading" });
+      apiKeys.set({ kind: "loading" });
+      try {
+        const [conns, keys] = await Promise.all([
+          api<ConnectionsSummary>("/api/console/connections"),
+          api<ApiKeysSummary>("/api/console/api-keys"),
+        ]);
+        if (fresh()) {
+          connections.set({ kind: "ready", value: conns });
+          apiKeys.set({ kind: "ready", value: keys });
+          setTitle(route(), null);
+        }
+      } catch (err: unknown) {
+        if (fresh()) {
+          const message = String(err);
+          connections.set({ kind: "error", message });
+          apiKeys.set({ kind: "error", message });
+        }
+      }
+      return;
+    }
+    if (view === "usage" || view === "account") {
+      accountSummary.set({ kind: "loading" });
+      try {
+        const summary = await api<AccountSummary>("/api/console/account");
+        if (fresh()) {
+          accountSummary.set({ kind: "ready", value: summary });
+          setTitle(route(), null);
+        }
+      } catch (err: unknown) {
+        if (fresh()) {
+          accountSummary.set({ kind: "error", message: String(err) });
         }
       }
       return;
@@ -587,6 +648,15 @@ export function Console() {
       })
       .catch((err: unknown) => {
         apps.set({ kind: "error", message: String(err) });
+        const r = route();
+        if (isAccountView(r.view)) {
+          // Account views never need the app list: a failing
+          // `/api/console/apps` still shows them instead of the fatal
+          // error screen.
+          epoch += 1;
+          void enter(r, epoch);
+          return;
+        }
         detail.set({ kind: "error", message: String(err) });
       });
     window.addEventListener("keydown", (e: KeyboardEvent) => {
@@ -640,7 +710,11 @@ export function Console() {
       </div>
     );
   }
-  if (appsPanel.kind === "error") {
+  // A failing `/api/console/apps` is fatal for app views only: account
+  // views (`?t=connections`, `?t=usage`, ...) stand alone on an empty rail.
+  const list = appsPanel.kind === "ready" ? appsPanel.value : [];
+  const accountView = isAccountView(r.view);
+  if (appsPanel.kind === "error" && !accountView) {
     return (
       <div class="console-error" role="alert">
         <div class="alert alert-error alert-soft max-w-md">
@@ -650,8 +724,7 @@ export function Console() {
       </div>
     );
   }
-  const list = appsPanel.value;
-  const accountView = isAccountView(r.view);
+
   if (list.length === 0 && !accountView) {
     return (
       <div class="console-empty" role="status">
@@ -665,8 +738,23 @@ export function Console() {
       </div>
     );
   }
+  function reloadAccount(view: ViewId): void {
+    epoch += 1;
+    void loadAccountView(view, epoch);
+  }
   const accountPanel = accountView ? (
-    r.view === "invites" ? (
+    r.view === "connections" ? (
+      <ConnectionsView
+        connections={connections()}
+        keys={apiKeys()}
+        onReload={() => reloadAccount("connections")}
+        onRetry={() => reloadAccount("connections")}
+      />
+    ) : r.view === "usage" ? (
+      <UsageView panel={accountSummary()} onRetry={() => reloadAccount("usage")} />
+    ) : r.view === "account" ? (
+      <AccountView panel={accountSummary()} onRetry={() => reloadAccount("account")} />
+    ) : r.view === "invites" ? (
       <InvitesView
         panel={invites()}
         isAdmin={isAdmin()}
@@ -875,6 +963,42 @@ export function Console() {
                   <span class="block truncate" title={email()}>
                     {email() || "Account"}
                   </span>
+                </li>
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => {
+                      patchUi({ accountOpen: false });
+                      navigate({ view: "connections" });
+                    }}
+                  >
+                    <SecretsIcon size={16} />
+                    Connections &amp; keys
+                  </button>
+                </li>
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => {
+                      patchUi({ accountOpen: false });
+                      navigate({ view: "usage" });
+                    }}
+                  >
+                    <MetricsIcon size={16} />
+                    Usage &amp; plan
+                  </button>
+                </li>
+                <li>
+                  <button
+                    type="button"
+                    onclick={() => {
+                      patchUi({ accountOpen: false });
+                      navigate({ view: "account" });
+                    }}
+                  >
+                    <AccountIcon size={16} />
+                    Account
+                  </button>
                 </li>
                 <li>
                   <button
@@ -1184,6 +1308,12 @@ function ViewIcon({ id }: { id: ViewId }) {
       return <TicketIcon />;
     case "admin":
       return <ShieldIcon />;
+    case "connections":
+      return <SecretsIcon />;
+    case "usage":
+      return <MetricsIcon />;
+    case "account":
+      return <AccountIcon />;
   }
 }
 

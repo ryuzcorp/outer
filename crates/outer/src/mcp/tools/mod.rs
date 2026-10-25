@@ -713,6 +713,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "revoke_connection" => account::revoke_connection(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
+        "delete_account" => account::delete_account(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
         "create_app" => apps::create_app(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
