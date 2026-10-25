@@ -18,6 +18,7 @@ import {
   when,
   type AdminInvitesPage,
   type AppDetail,
+  type CollaboratorsSummary,
   type ConsoleDeploy,
   type ErrorsSummary,
   type InviteEntry,
@@ -48,7 +49,9 @@ import {
   OverviewIcon,
   SecretsIcon,
   TicketIcon,
+  UsersIcon,
 } from "./icons.tsx";
+import { actions as collaboratorActions } from "./actions/collaborators.ts";
 
 // --- Small pieces ------------------------------------------------------------
 
@@ -1141,11 +1144,14 @@ export function DeploysView({
 // --- Secrets -------------------------------------------------------------------
 
 export function SecretsView({
+  canWrite,
   slug,
   panel,
   onRetry,
   onChanged,
 }: {
+  /** False for collaborators: names stay visible, writes hide. */
+  canWrite: boolean;
   slug: string;
   panel: Panel<SecretsSummary>;
   onRetry: () => void;
@@ -1253,6 +1259,7 @@ export function SecretsView({
           <span class="min-w-0 break-words">{error()}</span>
         </div>
       )}
+      {canWrite ? (
       <section class="card card-border bg-base-100 min-w-0" aria-label="Add secret">
         <div class="card-body min-w-0">
           <h2 class="card-title min-w-0 truncate" title="Add secret">Add secret</h2>
@@ -1310,25 +1317,44 @@ export function SecretsView({
           </div>
         </div>
       </section>
+      ) : (
+        <div class="alert alert-info alert-soft min-w-0" role="note">
+          <span class="min-w-0 break-words">
+            Secret values stay hidden and only the app owner can add or remove
+            them. Ask the owner to add anything this app needs.
+          </span>
+        </div>
+      )}
       {secrets.length === 0 ? (
         <EmptyState icon={<SecretsIcon />} title="No secrets set">
-          Add an API key or token above, or ask your agent to set one.
+          {canWrite
+            ? "Add an API key or token above, or ask your agent to set one."
+            : "Nothing here yet. Ask the app owner to add the secrets this app needs."}
         </EmptyState>
       ) : (
         <section class="card card-border bg-base-100 min-w-0" aria-label="Secrets">
           <div class="card-body min-w-0">
             <div class="min-w-0 overflow-x-auto">
               <table class="table table-fixed w-full">
-                <colgroup>
-                  <col />
-                  <col class="w-28" />
-                  <col class="w-36" />
-                </colgroup>
+                {canWrite ? (
+                  <colgroup>
+                    <col />
+                    <col class="w-28" />
+                    <col class="w-36" />
+                  </colgroup>
+                ) : (
+                  <colgroup>
+                    <col />
+                    <col class="w-28" />
+                  </colgroup>
+                )}
                 <thead>
                   <tr>
                     <th scope="col">Name</th>
                     <th scope="col">Updated</th>
-                    <th scope="col"><span class="sr-only">Actions</span></th>
+                    {canWrite ? (
+                      <th scope="col"><span class="sr-only">Actions</span></th>
+                    ) : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -1343,34 +1369,36 @@ export function SecretsView({
                       <td class="whitespace-nowrap" title={when(s.updated_at)}>
                         {timeAgo(s.updated_at)}
                       </td>
-                      <td class="whitespace-nowrap">
-                        <span class="flex items-center justify-end gap-1">
-                          <button
-                            type="button"
-                            class="btn btn-ghost btn-xs shrink-0"
-                            disabled={busy()}
-                            onclick={() => {
-                              error.set(null);
-                              replaceValue.set("");
-                              showReplace.set(false);
-                              replaceTarget.set(s.name);
-                            }}
-                          >
-                            Replace
-                          </button>
-                          <button
-                            type="button"
-                            class="btn btn-ghost btn-xs shrink-0 text-error"
-                            disabled={busy()}
-                            onclick={() => {
-                              error.set(null);
-                              removeTarget.set(s.name);
-                            }}
-                          >
-                            Remove
-                          </button>
-                        </span>
-                      </td>
+                      {canWrite ? (
+                        <td class="whitespace-nowrap">
+                          <span class="flex items-center justify-end gap-1">
+                            <button
+                              type="button"
+                              class="btn btn-ghost btn-xs shrink-0"
+                              disabled={busy()}
+                              onclick={() => {
+                                error.set(null);
+                                replaceValue.set("");
+                                showReplace.set(false);
+                                replaceTarget.set(s.name);
+                              }}
+                            >
+                              Replace
+                            </button>
+                            <button
+                              type="button"
+                              class="btn btn-ghost btn-xs shrink-0 text-error"
+                              disabled={busy()}
+                              onclick={() => {
+                                error.set(null);
+                                removeTarget.set(s.name);
+                              }}
+                            >
+                              Remove
+                            </button>
+                          </span>
+                        </td>
+                      ) : null}
                     </tr>
                   ))}
                 </tbody>
@@ -1379,7 +1407,7 @@ export function SecretsView({
           </div>
         </section>
       )}
-      {replacing && (
+      {replacing && canWrite && (
         <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={`Replace ${replacing}`}>
           <div class="modal-box min-w-0">
             <h3 class="mb-2 min-w-0 truncate font-mono text-base font-semibold" title={replacing}>
@@ -1442,7 +1470,7 @@ export function SecretsView({
           </button>
         </div>
       )}
-      {removing && (
+      {removing && canWrite && (
         <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={`Remove ${removing}`}>
           <div class="modal-box min-w-0">
             <h3 class="mb-2 min-w-0 truncate font-mono text-base font-semibold" title={removing}>
@@ -1486,18 +1514,259 @@ export function SecretsView({
 
 // --- Settings --------------------------------------------------------------------
 
+function collaboratorAction(name: "list_collaborators" | "add_collaborator" | "remove_collaborator") {
+  const action = collaboratorActions.find((a) => a.name === name);
+  if (!action) {
+    throw new Error(`${name} is unavailable`);
+  }
+  return action;
+}
+
+export function CollaboratorsCard({
+  app,
+  panel,
+  onRetry,
+  onChanged,
+}: {
+  app: AppDetail;
+  panel: Panel<CollaboratorsSummary>;
+  onRetry: () => void;
+  onChanged: () => void;
+}) {
+  const busy = atom(false);
+  const error = atom<string | null>(null);
+  const confirming = atom<string | null>(null);
+  if (panel.kind === "loading") {
+    return <Loading label="Loading collaborators" />;
+  }
+  if (panel.kind === "error") {
+    return (
+      <div class="flex min-w-0 flex-col gap-3">
+        <Err message={panel.message} />
+        <div class="min-w-0">
+          <button type="button" class="btn btn-sm" onclick={onRetry}>
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const summary = panel.value;
+  const isOwner = summary.role === "owner";
+  const isPro = summary.owner_plan === "pro";
+  const entries = summary.collaborators;
+
+  async function invite(): Promise<void> {
+    const input = document.getElementById("collab-email") as HTMLInputElement | null;
+    const email = (input?.value ?? "").trim();
+    if (!email) {
+      error.set("Type an email address to invite.");
+      return;
+    }
+    busy.set(true);
+    error.set(null);
+    try {
+      await collaboratorAction("add_collaborator").run({ app: app.slug, email });
+      if (input) {
+        input.value = "";
+      }
+      onChanged();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  async function remove(email: string): Promise<void> {
+    busy.set(true);
+    error.set(null);
+    try {
+      await collaboratorAction("remove_collaborator").run({ app: app.slug, email });
+      confirming.set(null);
+      onChanged();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy.set(false);
+    }
+  }
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Collaborators">
+      <div class="card-body min-w-0">
+        <div class="flex min-w-0 items-center gap-2">
+          <h2 class="card-title m-0 min-w-0 flex-1 text-base">Collaborators</h2>
+          <span class="badge badge-soft badge-sm shrink-0" title={`${entries.length} of 10 collaborator slots used`}>
+            {entries.length} / 10
+          </span>
+          {isOwner && !isPro && (
+            <span class="badge badge-soft badge-sm badge-primary shrink-0" title="Collaborators are a Pro feature">
+              Pro
+            </span>
+          )}
+        </div>
+        {isOwner && !isPro && (
+          <p class="m-0 min-w-0 text-sm opacity-60">
+            Collaborators are a Pro feature. Upgrade to Pro to invite people to
+            your apps — up to 10 per app.
+          </p>
+        )}
+        {!isOwner && (
+          <p class="m-0 min-w-0 text-sm opacity-60">
+            Shared with you — you can change this app, but only the owner
+            manages collaborators.
+          </p>
+        )}
+        {isOwner && (
+          <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end">
+            <label class="form-control min-w-0 flex-1" for="collab-email">
+              <span class="label min-w-0">
+                <span class="label-text truncate" title="The collaborator's email: allowlisted for the closed beta and emailed an invite">
+                  Email to invite
+                </span>
+              </span>
+              <input
+                type="email"
+                id="collab-email"
+                class="input input-bordered w-full min-w-0"
+                maxlength="320"
+                placeholder="friend@example.com"
+                disabled={busy() || !isPro}
+              />
+            </label>
+            <button
+              type="button"
+              class="btn btn-neutral min-w-0 shrink-0"
+              disabled={busy() || !isPro}
+              title={isPro ? "Invite this address" : "Collaborators are a Pro feature"}
+              onclick={() => void invite()}
+            >
+              {busy() ? "Inviting…" : "Invite"}
+            </button>
+          </div>
+        )}
+        {error() && (
+          <p class="m-0 min-w-0 break-words text-sm text-error" role="alert">
+            {error()}
+          </p>
+        )}
+        {entries.length === 0 ? (
+          <EmptyState icon={<UsersIcon />} title="No collaborators" plain>
+            {isOwner
+              ? "Invite someone by email and they show here once added."
+              : "Nobody else has been invited to this app."}
+          </EmptyState>
+        ) : (
+          <div class="min-w-0 overflow-x-auto">
+            <table class="table table-fixed w-full">
+              <colgroup>
+                <col />
+                <col class="w-24" />
+                <col class="hidden w-24 sm:table-column" />
+                {isOwner && <col class="w-20" />}
+              </colgroup>
+              <thead>
+                <tr>
+                  <th scope="col">Email</th>
+                  <th scope="col">Status</th>
+                  <th scope="col" class="hidden sm:table-cell">Added</th>
+                  {isOwner && <th scope="col"><span class="sr-only">Remove</span></th>}
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((entry) => (
+                  <tr key={entry.email}>
+                    <td class="min-w-0">
+                      <span class="block min-w-0 truncate font-mono" title={entry.email}>
+                        {entry.email}
+                      </span>
+                    </td>
+                    <td>
+                      <span
+                        class={`badge badge-soft badge-sm ${entry.status === "joined" ? "badge-success" : "badge-info"}`}
+                        title={entry.status === "joined" ? "Signed in and linked" : "Invited, hasn't signed in yet"}
+                      >
+                        {entry.status === "joined" ? "Joined" : "Pending"}
+                      </span>
+                    </td>
+                    <td class="hidden whitespace-nowrap sm:table-cell" title={when(entry.added_at)}>
+                      {timeAgo(entry.added_at)}
+                    </td>
+                    {isOwner && (
+                      <td class="text-right">
+                        <button
+                          type="button"
+                          class="btn btn-ghost btn-xs shrink-0"
+                          disabled={busy()}
+                          title={`Remove ${entry.email}`}
+                          aria-label={`Remove ${entry.email}`}
+                          onclick={() => confirming.set(entry.email)}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {confirming() && (
+          <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Confirm removal">
+            <div class="modal-box min-w-0">
+              <h3 class="m-0 min-w-0 truncate text-base font-semibold" title={`Remove ${confirming()}`}>
+                Remove {confirming()}?
+              </h3>
+              <p class="min-w-0 break-words py-3 text-sm opacity-70">
+                They lose access to {app.slug} immediately. They stay on the
+                closed-beta list and can be re-invited later.
+              </p>
+              <div class="modal-action">
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  disabled={busy()}
+                  onclick={() => confirming.set(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-error"
+                  disabled={busy()}
+                  onclick={() => void remove(confirming() ?? "")}
+                >
+                  {busy() ? "Removing…" : "Remove"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export function SettingsView({
   app,
   plan,
   onRefresh,
   onRenamed,
   onDeleted,
+  collaborators,
+  onCollaboratorsRetry,
+  onCollaboratorsChanged,
 }: {
   app: AppDetail;
   plan: string;
   onRefresh: () => void;
   onRenamed: (slug: string) => void;
   onDeleted: () => void;
+  collaborators: Panel<CollaboratorsSummary>;
+  onCollaboratorsRetry: () => void;
+  onCollaboratorsChanged: () => void;
 }) {
   return (
     <div class="flex min-w-0 flex-col gap-3">
@@ -1541,8 +1810,14 @@ export function SettingsView({
           </dl>
         </div>
       </section>
-      <VisibilityCard app={app} plan={plan} onRefresh={onRefresh} />
-      <DangerZone app={app} onRenamed={onRenamed} onDeleted={onDeleted} />
+      {app.role === "owner" && <VisibilityCard app={app} plan={plan} onRefresh={onRefresh} />}
+      <CollaboratorsCard
+        app={app}
+        panel={collaborators}
+        onRetry={onCollaboratorsRetry}
+        onChanged={onCollaboratorsChanged}
+      />
+      {app.role === "owner" && <DangerZone app={app} onRenamed={onRenamed} onDeleted={onDeleted} />}
     </div>
   );
 }

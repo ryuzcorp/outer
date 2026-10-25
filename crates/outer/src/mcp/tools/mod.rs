@@ -8,6 +8,7 @@
 pub(crate) mod account;
 pub(crate) mod apps;
 pub(crate) mod code;
+pub(crate) mod collaborators;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
 
@@ -108,17 +109,47 @@ pub fn authed<'x, 'a>(ctx: &'x Ctx<'a>) -> Result<&'x Principal, ToolError> {
         .ok_or_else(|| ToolError::internal("unauthenticated tool call"))
 }
 
-/// The app `slug` names, owned by the caller. Anything else — missing, or
-/// owned by someone else — is `not_found`, never `forbidden` (spec §8.2: a
-/// slug the caller has no role on answers exactly like a missing one).
-pub async fn owned_app(ctx: &Ctx<'_>, slug: &str) -> Result<App, ToolError> {
+/// The app `slug` names, visible to the caller as owner or collaborator.
+/// Anything else — missing, or an app the caller has no role on — is
+/// `not_found`, never `forbidden` (spec §8.2: a slug the caller has no role
+/// on answers exactly like a missing one). Collaborators only count while
+/// the owner's plan is Pro (spec §7.4).
+pub async fn visible_app(
+    ctx: &Ctx<'_>,
+    slug: &str,
+) -> Result<(App, crate::collaborators::Role), ToolError> {
     let caller = authed(ctx)?;
     let app = crate::apps::get_by_slug(&ctx.state.pool, slug)
         .await
         .map_err(internal)?;
-    match app {
-        Some(app) if app.owner_id == caller.account_id => Ok(app),
-        _ => Err(ToolError::not_found(format!("no app {slug:?}"))),
+    let Some(app) = app else {
+        return Err(ToolError::not_found(format!("no app {slug:?}")));
+    };
+    match crate::collaborators::role(
+        &ctx.state.pool,
+        &app.id,
+        &app.owner_id,
+        &caller.account_id,
+        &caller.email,
+    )
+    .await
+    .map_err(internal)?
+    {
+        Some(role) => Ok((app, role)),
+        None => Err(ToolError::not_found(format!("no app {slug:?}"))),
+    }
+}
+
+/// The app `slug` names, owned by the caller. A collaborator's call answers
+/// `forbidden` (spec §8.2 table); anything else is `not_found` as usual.
+pub async fn owner_app(ctx: &Ctx<'_>, slug: &str) -> Result<App, ToolError> {
+    let (app, role) = visible_app(ctx, slug).await?;
+    if role == crate::collaborators::Role::Owner {
+        Ok(app)
+    } else {
+        Err(ToolError::forbidden(format!(
+            "only the app owner may do this to {slug:?}"
+        )))
     }
 }
 
@@ -735,6 +766,15 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "rename_app" => apps::rename_app(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "add_collaborator" => collaborators::add_collaborator(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "remove_collaborator" => collaborators::remove_collaborator(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "list_collaborators" => collaborators::list_collaborators(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "list_files" => code::list_files(parse_args(args)?, ctx)

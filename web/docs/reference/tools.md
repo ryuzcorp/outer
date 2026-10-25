@@ -194,6 +194,41 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app's current slug. |
 | `slug` | string | yes | The new slug: lowercase letters, digits and dashes, 1-48 chars. The old name stays reserved for 30 days and redirects to the new one. |
 
+## `add_collaborator`
+
+- **Access:** signed in
+- **Description:** Invite a collaborator to your Pro app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; at most 10 collaborators per app.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `email` | string | yes | The collaborator's email: allowlisted for the closed beta and emailed the invite. |
+
+## `remove_collaborator`
+
+- **Access:** signed in
+- **Description:** Remove a collaborator from your app by email: {app, email}. Their access ends immediately. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `email` | string | yes | The collaborator's email to remove. |
+
+## `list_collaborators`
+
+- **Access:** signed in
+- **Description:** List your app's collaborators: email, joined or pending status, and when each was added. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+
 ## `list_files`
 
 - **Access:** signed in

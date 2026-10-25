@@ -5,14 +5,14 @@
 use serde_json::Value;
 
 use crate::mcp::tools::{
-    account, apps as app_inputs, code as code_inputs, runtime as runtime_inputs,
-    secrets as secrets_inputs, NoArgs,
+    account, apps as app_inputs, code as code_inputs, collaborators as collab_inputs,
+    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
 /// answers `401` before it runs when the caller is anonymous (spec §6.1).
-/// M1 has no admin tools; collaborators are Pro/M2, so every account tool is
-/// owner-only.
+/// Collaborators (Pro, spec §7.4) may call the read and change tools; the
+/// owner-only tools refuse them with `forbidden`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Public,
@@ -88,9 +88,15 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
         | "get_app" | "share_app" | "list_files" | "read_file" | "search_code" | "history"
         | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors"
-        | "list_secrets" => Hints::READ,
+        | "list_secrets" | "list_collaborators" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" => Hints::WRITE,
+        // Emails an invite to an address outside Outer.
+        "add_collaborator" => Hints {
+            open_world: true,
+            ..Hints::WRITE
+        },
+        "remove_collaborator" => Hints::DESTRUCTIVE,
         "set_visibility" => Hints {
             idempotent: true,
             ..Hints::WRITE
@@ -235,6 +241,21 @@ pub fn registry() -> Vec<ToolDef> {
             "Rename an app: {app, slug}. Moves its slug, hostname, code, data and files to the new name (D1 and Durable Object data survive); the old name stays reserved for 30 days and redirects to the new one. Counts one code change; a running app redeploys.",
             Account, false,
         ),
+        tool::<collab_inputs::AddCollaboratorInput>(
+            "add_collaborator",
+            "Invite a collaborator to your Pro app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; at most 10 collaborators per app.",
+            Account, false,
+        ),
+        tool::<collab_inputs::RemoveCollaboratorInput>(
+            "remove_collaborator",
+            "Remove a collaborator from your app by email: {app, email}. Their access ends immediately. Owner only.",
+            Account, false,
+        ),
+        tool::<collab_inputs::ListCollaboratorsInput>(
+            "list_collaborators",
+            "List your app's collaborators: email, joined or pending status, and when each was added. Owner only.",
+            Account, false,
+        ),
         tool::<code_inputs::ListFilesInput>(
             "list_files",
             "List an app's files at a commit: {app, sha?, path_prefix?}.",
@@ -346,7 +367,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 35);
+        assert_eq!(tools.len(), 38);
     }
 }
 
@@ -355,7 +376,7 @@ mod hint_tests {
     use super::*;
 
     #[test]
-    fn every_tool_is_classified_and_only_revoke_delete_and_unset_are_destructive() {
+    fn every_tool_is_classified_and_only_revoke_delete_unset_and_remove_are_destructive() {
         for tool in registry() {
             let hints = hints_for(tool.name)
                 .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
@@ -371,6 +392,7 @@ mod hint_tests {
                     | "delete_app"
                     | "delete_account"
                     | "unset_secret"
+                    | "remove_collaborator"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);
             // Untrusted tools return app content; they must never change state.

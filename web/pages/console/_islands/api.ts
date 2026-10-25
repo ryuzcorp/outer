@@ -199,6 +199,19 @@ export interface SecretsSummary {
   secrets: SecretEntry[];
 }
 
+export interface CollaboratorEntry {
+  email: string;
+  status: "joined" | "pending";
+  added_at: number;
+}
+
+export interface CollaboratorsSummary {
+  app: string;
+  role: string;
+  owner_plan: string;
+  collaborators: CollaboratorEntry[];
+}
+
 export interface InviteEntry {
   code: string;
   kind: string;

@@ -14,9 +14,9 @@
 //!   files and patch between two versions (`to` is the live sha for the
 //!   "compare with live" button).
 //!
-//! Read-only. Owner-scoped exactly like the console app endpoints (and the
-//! MCP read tools, which are owner-only until collaborators land): a foreign
-//! or unknown slug answers 404 like a missing one. Every read goes through
+//! Read-only. Role-scoped like the console app endpoints and the MCP read
+//! tools (spec §7.4: owners and collaborators read code and history): a
+//! slug the caller has no role on answers 404 like a missing one. Every read goes through
 //! the same [`crate::git::local`] functions the MCP `list_files`/`read_file`
 //! tools use — no second implementation, same bounds (256 KiB blob cap,
 //! 64 KiB patch/text caps) and the same binary detection.
@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 
-use super::console::{guard, nostore_json, not_found, ok_json, owned_app};
+use super::console::{guard, nostore_json, not_found, ok_json, visible_app};
 use crate::git::local;
 use crate::mcp::McpState;
 
@@ -52,15 +52,17 @@ const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Most files one tree listing carries before `truncated` is set.
 const MAX_TREE_FILES: usize = 5000;
 
-/// The caller's app, or the response to answer when it isn't theirs.
+/// The caller's app, or the response to answer when it isn't theirs. Reads
+/// admit collaborators (spec §7.4: code and history), so this is the shared
+/// role-scoped lookup: no role answers 404 exactly like a missing slug.
 async fn app_ctx(
     mcp: &McpState,
     headers: &HeaderMap,
     slug: &str,
 ) -> Result<crate::apps::App, Box<Response>> {
     let account = guard(&mcp.auth, headers).await?;
-    match owned_app(mcp, &account, slug).await {
-        Ok(Some(app)) => Ok(app),
+    match visible_app(mcp, &account, slug).await {
+        Ok(Some((app, _))) => Ok(app),
         Ok(None) => Err(not_found().into()),
         Err(_) => Err(nostore_json(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -964,5 +966,45 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn code_reads_admit_collaborators() {
+        let (app, pool, _, _, c2) = harness().await;
+        // Collaborators count only while the owner is Pro (spec §7.4).
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = crate::auth::now_ms();
+        sqlx::query(
+            "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('acct-bruno@example.com', 'bruno@example.com', ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+             VALUES ('app-groceries', 'bruno@example.com', 'acct-bruno@example.com', ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bruno = create_session(&pool, "acct-bruno@example.com")
+            .await
+            .unwrap();
+        let bruno = format!("__Host-outer_sid={bruno}");
+        let (status, body) = send(
+            &app,
+            authed("/api/console/apps/groceries/code/tree", &bruno),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "collaborator tree failed: {body}");
+        let tree: serde_json::Value = body.parse().unwrap();
+        assert_eq!(tree["sha"], json!(c2), "same live default as the owner");
     }
 }

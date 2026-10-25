@@ -1,14 +1,18 @@
 //! The app tools: `create_app`, `list_apps`, `get_app`, `set_visibility`,
-//! `share_app`. Owner only in M1 (collaborators are Pro/M2).
+//! `share_app`, plus the collaborator tools (Pro, spec §7.4). Reads and
+//! `share_app` admit collaborators; visibility, collaborators and delete
+//! stay owner-only (spec §8.2 table).
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    authed, check_app_quota, internal, latest_deploy, ok, owned_app, run_deploy, Ctx, NoArgs,
+    authed, check_app_quota, internal, latest_deploy, ok, owner_app, run_deploy, visible_app, Ctx,
+    NoArgs,
 };
 use crate::apps::{self, App, Visibility};
+use crate::collaborators::Role;
 use crate::mcp::error::ToolError;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -183,13 +187,16 @@ pub(crate) fn app_status(app: &App, last_status: Option<&str>) -> &'static str {
     }
 }
 
-pub async fn app_summary(ctx: &Ctx<'_>, app: &App) -> Result<Value, ToolError> {
+pub async fn app_summary(ctx: &Ctx<'_>, app: &App, role: Role) -> Result<Value, ToolError> {
     let last = latest_deploy(&ctx.state.pool, &app.id).await?;
     let status = app_status(app, last.as_ref().map(|r| r.status.as_str()));
     let mut v = json!({
         "slug": app.slug,
         "url": ctx.state.app_url(&app.slug),
-        "role": "owner",
+        "role": match role {
+            Role::Owner => "owner",
+            Role::Collaborator => "collaborator",
+        },
         "visibility": app.visibility.as_str(),
         "status": status,
     });
@@ -203,22 +210,35 @@ pub async fn list_apps(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError
     let caller = authed(ctx)?;
     let all = apps::list(&ctx.state.pool).await.map_err(internal)?;
     let mut out = Vec::new();
-    for app in all.iter().filter(|a| a.owner_id == caller.account_id) {
-        out.push(app_summary(ctx, app).await?);
+    for app in &all {
+        // One role lookup per app: owners match inline, collaborators read
+        // their row (Pro-gated, so a downgrade hides the app again).
+        let role = crate::collaborators::role(
+            &ctx.state.pool,
+            &app.id,
+            &app.owner_id,
+            &caller.account_id,
+            &caller.email,
+        )
+        .await
+        .map_err(internal)?;
+        if let Some(role) = role {
+            out.push(app_summary(ctx, app, role).await?);
+        }
     }
     Ok(ok(format!("{} app(s).", out.len()), json!({"apps": out})))
 }
 
 pub async fn get_app(input: GetAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, role) = visible_app(ctx, &input.app).await?;
     Ok(ok(
         format!("{} ({})", app.slug, ctx.state.app_url(&app.slug)),
-        app_summary(ctx, &app).await?,
+        app_summary(ctx, &app, role).await?,
     ))
 }
 
 pub async fn set_visibility(input: SetVisibilityInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let app = owner_app(ctx, &input.app).await?;
     let visibility = match input.visibility.as_str() {
         "unlisted" => Visibility::Unlisted,
         "public" => Visibility::Public,
@@ -263,7 +283,7 @@ pub fn visibility_tool_error(slug: &str, err: crate::apps::VisibilityError) -> T
 }
 
 pub async fn share_app(input: ShareAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     let url = ctx.state.app_url(&app.slug);
     let name = app.name.as_deref().unwrap_or(&app.slug);
     let text = format!("{name} is live at {url}");
@@ -288,7 +308,7 @@ pub async fn share_app(input: ShareAppInput, ctx: &Ctx<'_>) -> Result<Value, Too
 /// caller has no role on answers `not_found`, exactly like a missing one.
 pub async fn delete_app(input: DeleteAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     // `not_found` first: a foreign slug never reaches the confirm check.
-    let app = owned_app(ctx, &input.app).await?;
+    let app = owner_app(ctx, &input.app).await?;
     // Serialize against a racing rollback, deploy and wake: rollback waits
     // on its guard instead of failing, while a deploy or wake holds its own
     // lock and runs to a state the idempotent steps tolerate.
@@ -352,7 +372,7 @@ pub async fn delete_app(input: DeleteAppInput, ctx: &Ctx<'_>) -> Result<Value, T
 /// caller has no role on answers `not_found`, exactly like a missing one.
 pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     // `not_found` first: a foreign slug never reaches validation or quota.
-    let app = owned_app(ctx, &input.app).await?;
+    let app = owner_app(ctx, &input.app).await?;
     let caller = authed(ctx)?;
     if input.app == input.slug {
         return Err(ToolError::invalid_argument(format!(
