@@ -191,12 +191,15 @@ function StatCard({
   label,
   value,
   pill,
+  pillTitle,
   sub,
 }: {
   icon?: unknown;
   label: string;
   value: string;
   pill?: string | null;
+  /** What the pill compares, shown on hover (e.g. the half-range delta). */
+  pillTitle?: string;
   sub?: string;
 }) {
   return (
@@ -208,7 +211,7 @@ function StatCard({
       <div class="stat-value min-w-0 truncate text-3xl font-medium" title={pill ? `${value} ${pill}` : value}>
         {value}
         {pill != null && pill !== "" && (
-          <span class="badge badge-soft badge-sm ml-2 shrink-0 align-middle">{pill}</span>
+          <span class="badge badge-soft badge-sm ml-2 shrink-0 align-middle" title={pillTitle}>{pill}</span>
         )}
       </div>
       {sub && <div class="stat-desc min-w-0 truncate" title={sub}>{sub}</div>}
@@ -644,6 +647,7 @@ function OverviewReady({
             label="Requests"
             value={summary.requests.toLocaleString()}
             pill={halfChange(summary.buckets)}
+            pillTitle="Requests in the second half of the range vs the first half"
             sub="in range"
           />
         </section>
@@ -725,6 +729,7 @@ export function MetricsView({
             label="Requests"
             value={summary.requests.toLocaleString()}
             pill={halfChange(summary.buckets)}
+            pillTitle="Requests in the second half of the range vs the first half"
             sub="in range"
           />
         </section>
