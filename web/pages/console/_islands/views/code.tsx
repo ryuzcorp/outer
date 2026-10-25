@@ -25,6 +25,7 @@ import {
   type HistoryResult,
   type TreeResult,
 } from "../actions/code.ts";
+import { adminCodeActions } from "../actions/admin-code.ts";
 import { DeploysIcon } from "../icons.tsx";
 
 const [treeAction, fileAction, historyAction, diffAction, compareAction] = actions;
@@ -244,6 +245,7 @@ export function CodeView({
   initialTab,
   onPickSha,
   onSwitchTab,
+  admin,
 }: {
   slug: string;
   deploys: ConsoleDeploy[];
@@ -251,6 +253,10 @@ export function CodeView({
   initialTab: "files" | "changes";
   onPickSha: (sha: string | null) => void;
   onSwitchTab: (tab: "files" | "changes") => void;
+  /** Admin inspection mode (moderation queue): read through the
+      admin-guarded endpoints, since the role-scoped ones 404 for apps
+      the admin has no role on. Read-only; every read is audited. */
+  admin?: boolean;
 }) {
   const tree = atom<Panel<TreeResult>>({ kind: "loading" });
   const history = atom<Panel<HistoryResult>>({ kind: "loading" });
@@ -281,7 +287,9 @@ export function CodeView({
   async function loadHistory(): Promise<void> {
     const my = epoch;
     try {
-      const value = (await historyAction.run({ slug })) as HistoryResult;
+      const value = (await (admin
+        ? adminCodeActions.history({ slug })
+        : historyAction.run({ slug }))) as HistoryResult;
       if (epoch === my) {
         history.set({ kind: "ready", value });
       }
@@ -295,7 +303,9 @@ export function CodeView({
     const my = epoch;
     tree.set({ kind: "loading" });
     try {
-      const value = (await treeAction.run({ slug, sha: sha ?? undefined })) as TreeResult;
+      const value = (await (admin
+        ? adminCodeActions.tree({ slug, sha: sha ?? undefined })
+        : treeAction.run({ slug, sha: sha ?? undefined }))) as TreeResult;
       if (epoch !== my) {
         return;
       }
@@ -320,7 +330,9 @@ export function CodeView({
     file.set({ kind: "loading" });
     const my = epoch;
     try {
-      const value = (await fileAction.run({ slug, path, sha: sha ?? undefined })) as FileResult;
+      const value = (await (admin
+        ? adminCodeActions.file({ slug, path, sha: sha ?? undefined })
+        : fileAction.run({ slug, path, sha: sha ?? undefined }))) as FileResult;
       if (epoch === my) {
         file.set({ kind: "ready", value });
       }
@@ -338,7 +350,7 @@ export function CodeView({
     const my = epoch;
     diff.set({ kind: "loading" });
     try {
-      const value = (await diffAction.run({ slug, sha })) as DiffResult;
+      const value = (await (admin ? adminCodeActions.diff({ slug, sha }) : diffAction.run({ slug, sha }))) as DiffResult;
       if (epoch === my) {
         diff.set({ kind: "ready", value });
       }
@@ -353,7 +365,9 @@ export function CodeView({
     const my = epoch;
     compared.set({ kind: "loading" });
     try {
-      const value = (await compareAction.run({ slug, from, to })) as CompareResult;
+      const value = (await (admin
+        ? adminCodeActions.compare({ slug, from, to })
+        : compareAction.run({ slug, from, to }))) as CompareResult;
       if (epoch === my) {
         compared.set({ kind: "ready", value });
       }

@@ -77,6 +77,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
             post(api_admin_revoke_invite),
         )
         .route("/api/console/admin/waitlist", get(api_admin_waitlist))
+        .merge(super::console_admin::routes())
         .route("/api/console/apps", get(api_apps))
         .route("/api/console/apps/{slug}", get(api_app))
         .route("/api/console/apps/{slug}/actions", get(api_actions))
@@ -86,6 +87,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/apps/{slug}/secrets", get(api_secrets))
         .merge(super::console_actions::routes())
         .merge(super::console_code::routes())
+        .merge(super::console_admin_code::routes())
         .merge(super::console_domains::routes())
         .merge(super::console_export::routes())
         .route("/api/console/sign-out", post(api_sign_out))
@@ -226,7 +228,10 @@ async fn api_me(State(state): State<super::AppState>, headers: HeaderMap) -> Res
 
 /// The `guard` plus the admin check: non-admins get 403, decided by the
 /// `OUTER_ADMIN_EMAILS` config like everywhere else.
-async fn admin_guard(auth: &AuthState, headers: &HeaderMap) -> Result<AccountRow, Box<Response>> {
+pub(crate) async fn admin_guard(
+    auth: &AuthState,
+    headers: &HeaderMap,
+) -> Result<AccountRow, Box<Response>> {
     let account = guard(auth, headers).await?;
     if !crate::auth::is_admin(&auth.config, &account.email) {
         return Err(nostore_json(StatusCode::FORBIDDEN, "forbidden", "admin only").into());

@@ -7,10 +7,10 @@
 //! wordlists, no masking. Jev is the only classifier, and when it is
 //! unreachable the deploy fails closed (`review_unavailable`).
 
+pub mod admin;
 pub mod extract;
 pub mod gate;
 pub mod jev;
-
 pub use extract::{Chunk, TooLarge, MAX_FILES, MAX_FILE_BYTES, MAX_TEXT_BYTES};
 pub use gate::{
     cache_key, judge, run_gate, run_skipped, run_too_large, BlockReason, ChunkVerdict, Decision,
