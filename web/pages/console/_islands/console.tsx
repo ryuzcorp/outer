@@ -1439,6 +1439,7 @@ function ViewBody(props: {
     case "secrets":
       return (
         <SecretsView
+          canWrite={props.app.role === "owner"}
           slug={props.app.slug}
           panel={props.secrets}
           onRetry={props.onRetry}
@@ -1460,11 +1461,12 @@ function ViewBody(props: {
       );
     case "d1":
       return (
-        <D1View
-          route={props.route}
-          setRoute={props.onRoute}
-          slug={props.app.slug}
-        />
+      <D1View
+        canWrite={props.app.role === "owner"}
+        route={props.route}
+        setRoute={props.onRoute}
+        slug={props.app.slug}
+      />
       );
   }
 }

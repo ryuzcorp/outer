@@ -120,17 +120,25 @@ async fn api_logs_stream(
             seed,
             true,
         ),
-        move |(pool, fleets, account_id, account_email, app_id, slug, filter, mut cursor, mut first)| async move {
+        move |(
+            pool,
+            fleets,
+            account_id,
+            account_email,
+            app_id,
+            slug,
+            filter,
+            mut cursor,
+            mut first,
+        )| async move {
             // The visibility check runs every tick: an app deleted,
             // transferred, or unshared mid-follow ends the stream
             // instead of leaking lines to a caller with no role left.
             loop {
                 tokio::time::sleep(Duration::from_secs(FOLLOW_POLL_SECS)).await;
                 let visible = crate::apps::get_by_slug(&pool, &slug).await.ok()?;
-                let Some(app) = visible.as_ref() else {
-                    return None;
-                };
-                let role = crate::collaborators::role(
+                let app = visible.as_ref()?;
+                crate::collaborators::role(
                     &pool,
                     &app.id,
                     &app.owner_id,
@@ -138,10 +146,7 @@ async fn api_logs_stream(
                     &account_email,
                 )
                 .await
-                .ok()?;
-                if role.is_none() {
-                    return None;
-                }
+                .ok()??;
                 let lines = crate::observe::logs::read_filtered(
                     &pool,
                     &fleets,
@@ -162,7 +167,14 @@ async fn api_logs_stream(
                     })
                     .to_string();
                     let state = (
-                        pool, fleets, account_id, account_email, app_id, slug, filter, cursor,
+                        pool,
+                        fleets,
+                        account_id,
+                        account_email,
+                        app_id,
+                        slug,
+                        filter,
+                        cursor,
                         first,
                     );
                     return Some((Ok::<Event, Infallible>(Event::default().data(data)), state));
@@ -245,6 +257,8 @@ async fn api_error_detail(
 /// Move one issue (or a bulk list) to a new status through the same
 /// domain function the MCP triage tools call, and record the console
 /// mutation as an `agent_action` row under the MCP tool's name.
+/// Collaborators may triage, like the MCP tools (spec §7.4): the endpoints
+/// below gate on `visible_app`, not the owner.
 async fn triage(
     pool: &sqlx::SqlitePool,
     account_id: &str,

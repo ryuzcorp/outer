@@ -282,6 +282,7 @@ const SortPopover = ({
 
 export const TableToolbar = ({
   applied,
+  canWrite,
   columns,
   onApplyFilters,
   onApplySort,
@@ -290,6 +291,8 @@ export const TableToolbar = ({
   onSearch,
 }: {
   applied: D1RowsQuery;
+  /** False for collaborators: reads stay, the Insert button hides. */
+  canWrite: boolean;
   /** Columns the table can be filtered/sorted on. */
   columns: D1Column[];
   onApplyFilters: (filters: D1Filter[]) => void;
@@ -347,19 +350,21 @@ export const TableToolbar = ({
       >
         <RefreshIcon />
       </button>
-      <div class="ml-auto flex items-center gap-2">
-        <button
-          type="button"
-          class="btn btn-sm btn-neutral"
-          title="Insert a row"
-          onclick={() => {
-            onInsert();
-          }}
-        >
-          <PlusIcon />
-          Insert
-        </button>
-      </div>
+      {canWrite ? (
+        <div class="ml-auto flex items-center gap-2">
+          <button
+            type="button"
+            class="btn btn-sm btn-neutral"
+            title="Insert a row"
+            onclick={() => {
+              onInsert();
+            }}
+          >
+            <PlusIcon />
+            Insert
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 };

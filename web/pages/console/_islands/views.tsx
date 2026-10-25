@@ -1144,11 +1144,14 @@ export function DeploysView({
 // --- Secrets -------------------------------------------------------------------
 
 export function SecretsView({
+  canWrite,
   slug,
   panel,
   onRetry,
   onChanged,
 }: {
+  /** False for collaborators: names stay visible, writes hide. */
+  canWrite: boolean;
   slug: string;
   panel: Panel<SecretsSummary>;
   onRetry: () => void;
@@ -1256,6 +1259,7 @@ export function SecretsView({
           <span class="min-w-0 break-words">{error()}</span>
         </div>
       )}
+      {canWrite ? (
       <section class="card card-border bg-base-100 min-w-0" aria-label="Add secret">
         <div class="card-body min-w-0">
           <h2 class="card-title min-w-0 truncate" title="Add secret">Add secret</h2>
@@ -1313,25 +1317,44 @@ export function SecretsView({
           </div>
         </div>
       </section>
+      ) : (
+        <div class="alert alert-info alert-soft min-w-0" role="note">
+          <span class="min-w-0 break-words">
+            Secret values stay hidden and only the app owner can add or remove
+            them. Ask the owner to add anything this app needs.
+          </span>
+        </div>
+      )}
       {secrets.length === 0 ? (
         <EmptyState icon={<SecretsIcon />} title="No secrets set">
-          Add an API key or token above, or ask your agent to set one.
+          {canWrite
+            ? "Add an API key or token above, or ask your agent to set one."
+            : "Nothing here yet. Ask the app owner to add the secrets this app needs."}
         </EmptyState>
       ) : (
         <section class="card card-border bg-base-100 min-w-0" aria-label="Secrets">
           <div class="card-body min-w-0">
             <div class="min-w-0 overflow-x-auto">
               <table class="table table-fixed w-full">
-                <colgroup>
-                  <col />
-                  <col class="w-28" />
-                  <col class="w-36" />
-                </colgroup>
+                {canWrite ? (
+                  <colgroup>
+                    <col />
+                    <col class="w-28" />
+                    <col class="w-36" />
+                  </colgroup>
+                ) : (
+                  <colgroup>
+                    <col />
+                    <col class="w-28" />
+                  </colgroup>
+                )}
                 <thead>
                   <tr>
                     <th scope="col">Name</th>
                     <th scope="col">Updated</th>
-                    <th scope="col"><span class="sr-only">Actions</span></th>
+                    {canWrite ? (
+                      <th scope="col"><span class="sr-only">Actions</span></th>
+                    ) : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -1346,34 +1369,36 @@ export function SecretsView({
                       <td class="whitespace-nowrap" title={when(s.updated_at)}>
                         {timeAgo(s.updated_at)}
                       </td>
-                      <td class="whitespace-nowrap">
-                        <span class="flex items-center justify-end gap-1">
-                          <button
-                            type="button"
-                            class="btn btn-ghost btn-xs shrink-0"
-                            disabled={busy()}
-                            onclick={() => {
-                              error.set(null);
-                              replaceValue.set("");
-                              showReplace.set(false);
-                              replaceTarget.set(s.name);
-                            }}
-                          >
-                            Replace
-                          </button>
-                          <button
-                            type="button"
-                            class="btn btn-ghost btn-xs shrink-0 text-error"
-                            disabled={busy()}
-                            onclick={() => {
-                              error.set(null);
-                              removeTarget.set(s.name);
-                            }}
-                          >
-                            Remove
-                          </button>
-                        </span>
-                      </td>
+                      {canWrite ? (
+                        <td class="whitespace-nowrap">
+                          <span class="flex items-center justify-end gap-1">
+                            <button
+                              type="button"
+                              class="btn btn-ghost btn-xs shrink-0"
+                              disabled={busy()}
+                              onclick={() => {
+                                error.set(null);
+                                replaceValue.set("");
+                                showReplace.set(false);
+                                replaceTarget.set(s.name);
+                              }}
+                            >
+                              Replace
+                            </button>
+                            <button
+                              type="button"
+                              class="btn btn-ghost btn-xs shrink-0 text-error"
+                              disabled={busy()}
+                              onclick={() => {
+                                error.set(null);
+                                removeTarget.set(s.name);
+                              }}
+                            >
+                              Remove
+                            </button>
+                          </span>
+                        </td>
+                      ) : null}
                     </tr>
                   ))}
                 </tbody>
@@ -1382,7 +1407,7 @@ export function SecretsView({
           </div>
         </section>
       )}
-      {replacing && (
+      {replacing && canWrite && (
         <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={`Replace ${replacing}`}>
           <div class="modal-box min-w-0">
             <h3 class="mb-2 min-w-0 truncate font-mono text-base font-semibold" title={replacing}>
@@ -1445,7 +1470,7 @@ export function SecretsView({
           </button>
         </div>
       )}
-      {removing && (
+      {removing && canWrite && (
         <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={`Remove ${removing}`}>
           <div class="modal-box min-w-0">
             <h3 class="mb-2 min-w-0 truncate font-mono text-base font-semibold" title={removing}>

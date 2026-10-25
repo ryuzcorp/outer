@@ -95,6 +95,7 @@ const ViewSwitch = ({
 /** One table's workspace: schema, toolbar, grid/definition, pager, editor. */
 const TableWorkspace = ({
   binding,
+  canWrite,
   generation,
   nav,
   onChanged,
@@ -105,6 +106,8 @@ const TableWorkspace = ({
   table,
 }: {
   binding: string;
+  /** False for collaborators: toolbar and grid render read-only. */
+  canWrite: boolean;
   generation: number;
   nav: {
     openForeignKey: (target: {
@@ -228,6 +231,7 @@ const TableWorkspace = ({
       {urlState.view === "data" ? (
         <TableToolbar
           applied={query}
+          canWrite={canWrite}
           columns={schema.columns}
           onApplyFilters={setFilters}
           onApplySort={(next) => {
@@ -248,6 +252,7 @@ const TableWorkspace = ({
         <RowsGrid
           key={JSON.stringify({ ...query, generation })}
           binding={binding}
+          canWrite={canWrite}
           onChanged={onChanged}
           onOpenRow={(row) => {
             editor.set({ row });
@@ -295,11 +300,14 @@ const TableWorkspace = ({
 
 export const D1Editor = ({
   binding,
+  canWrite,
   route,
   setRoute,
   slug,
 }: {
   binding: string;
+  /** False for collaborators: tables and rows stay browsable, writes hide. */
+  canWrite: boolean;
   route: Route;
   setRoute: (next: Partial<Route>) => void;
   slug: string;
@@ -425,6 +433,7 @@ export const D1Editor = ({
         <TableWorkspace
           key={`${selected.name}:${generation()}`}
           binding={binding}
+          canWrite={canWrite}
           generation={generation()}
           nav={nav}
           onChanged={() => {

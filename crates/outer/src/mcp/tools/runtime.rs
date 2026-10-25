@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{await_row, deploy_by, latest_deploy, ok, ok_untrusted, visible_app, Ctx};
+use crate::mcp::error::ToolError;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeployStatusInput {
@@ -232,9 +233,12 @@ pub struct ReopenErrorInput {
 /// triage buttons: the same [`crate::observe::logs::set_status`] domain
 /// function, so MCP and console agree on the rules (resolve/ignore stamp
 /// `resolved_at`; a resolved issue that recurs reopens automatically;
-/// reopen clears the stamp). The answer carries no message or frame
-/// text, so the tool stays trusted (`Hints::WRITE`): read the issue
-/// through `app_errors` instead.
+/// reopen clears the stamp). Collaborators may triage: spec §7.4 keeps
+/// owner-only for membership, visibility, secrets and destructive actions,
+/// while collaborators already make operational writes (`commit`,
+/// `rollback`) — triage is in that second class. The answer carries no
+/// message or frame text, so the tool stays trusted (`Hints::WRITE`):
+/// read the issue through `app_errors` instead.
 async fn set_issue_status(
     ctx: &Ctx<'_>,
     app_slug: &str,

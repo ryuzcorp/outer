@@ -3570,12 +3570,16 @@ mod tests {
             "invalid_argument"
         );
 
-        // Visibility, secret writes and delete stay owner-only: a
+        // Visibility, rename, secret writes and delete stay owner-only: a
         // collaborator reads 403 with the MCP code and a user message.
         for (path, body) in [
             (
                 "/api/console/apps/groceries/visibility",
                 serde_json::json!({"visibility": "unlisted"}),
+            ),
+            (
+                "/api/console/apps/groceries/rename",
+                serde_json::json!({"slug": "brand-new"}),
             ),
             (
                 "/api/console/apps/groceries/delete",
@@ -3625,6 +3629,86 @@ mod tests {
                 "/api/console/apps/groceries/rollback",
                 &stranger,
                 serde_json::json!({"sha": "0123456789abcdef0123456789abcdef01234567"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn console_collaborator_may_triage_and_read_observe() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_account(&pool, "bruno@example.com").await;
+        seed_account(&pool, "stranger@example.com").await;
+        sqlx::query(
+            "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+             VALUES ('app-groceries', 'bruno@example.com', 'acct-bruno@example.com', ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_issue(&pool, "fp1", "open", None, now).await;
+        let bruno = login(&pool, "bruno@example.com").await;
+        let stranger = login(&pool, "stranger@example.com").await;
+
+        // Observe reads admit collaborators: the error list and one issue.
+        let (status, _, _) = send(&app, authed("/api/console/apps/groceries/errors", &bruno)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(
+            &app,
+            authed("/api/console/apps/groceries/errors/fp1", &bruno),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Triage admits collaborators, like the MCP tools: resolve one
+        // issue, then ignore the selection through bulk.
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/errors/fp1/resolve",
+                &bruno,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let triaged: serde_json::Value = body.parse().unwrap();
+        assert_eq!(triaged["status"], "resolved");
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/errors/bulk",
+                &bruno,
+                serde_json::json!({"fingerprints": ["fp1"], "action": "ignore"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let bulk: serde_json::Value = body.parse().unwrap();
+        assert_eq!(bulk["updated"], 1);
+
+        // A stranger's slug reads 404 exactly like a missing one, for
+        // reads and triage alike.
+        let (status, _, _) = send(
+            &app,
+            authed("/api/console/apps/groceries/errors/fp1", &stranger),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/errors/fp1/resolve",
+                &stranger,
+                serde_json::json!({}),
             ),
         )
         .await;

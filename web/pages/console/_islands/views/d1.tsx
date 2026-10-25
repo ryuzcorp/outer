@@ -52,10 +52,13 @@ const useDatabases = (slug: string): DatabasesState & { retry: () => void } => {
 
 /** `d1` view body: database picker, editor, and empty states. */
 export function D1View({
+  canWrite,
   route,
   setRoute,
   slug,
 }: {
+  /** False for collaborators: D1 editing stays owner-only. */
+  canWrite: boolean;
   route: Route;
   setRoute: (next: Partial<Route>) => void;
   slug: string;
@@ -165,6 +168,14 @@ export function D1View({
           ))}
         </div>
       ) : null}
+      {canWrite ? null : (
+        <div class="alert alert-info alert-soft min-w-0" role="note">
+          <span class="min-w-0 break-words">
+            D1 editing is owner-only. You can browse tables and rows, but only
+            the app owner can insert, edit, or delete rows.
+          </span>
+        </div>
+      )}
       <section
         class="card card-border bg-base-100 min-w-0 overflow-hidden"
         aria-label={`D1 database ${binding}`}
@@ -173,6 +184,7 @@ export function D1View({
           <D1Editor
             key={editorKey}
             binding={binding}
+            canWrite={canWrite}
             route={route}
             setRoute={setRoute}
             slug={slug}

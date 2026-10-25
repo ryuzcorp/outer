@@ -116,6 +116,7 @@ const Pager = ({
 
 export const RowsGrid = ({
   binding,
+  canWrite,
   onChanged,
   onOpenRow,
   onPage,
@@ -128,6 +129,8 @@ export const RowsGrid = ({
   viewSlot,
 }: {
   binding: string;
+  /** False for collaborators: rows render read-only, no selection. */
+  canWrite: boolean;
   onChanged: () => void;
   onOpenRow: (row: Record<string, D1Cell>) => void;
   onPage: (page: number) => void;
@@ -313,26 +316,28 @@ export const RowsGrid = ({
           <table class="table-sm table-pin-rows table w-full">
             <thead>
               <tr>
-                <th class="w-10">
-                  <input
-                    class="checkbox checkbox-sm"
-                    type="checkbox"
-                    aria-label="Select all rows on this page"
-                    checked={allSelected}
-                    onchange={() => {
-                      if (allSelected) {
-                        selected.set({});
-                        return;
-                      }
+                {canWrite ? (
+                  <th class="w-10">
+                    <input
+                      class="checkbox checkbox-sm"
+                      type="checkbox"
+                      aria-label="Select all rows on this page"
+                      checked={allSelected}
+                      onchange={() => {
+                        if (allSelected) {
+                          selected.set({});
+                          return;
+                        }
 
-                      const next: Record<string, true> = {};
-                      for (const [index] of data.rows.entries()) {
-                        next[String(index)] = true;
-                      }
-                      selected.set(next);
-                    }}
-                  />
-                </th>
+                        const next: Record<string, true> = {};
+                        for (const [index] of data.rows.entries()) {
+                          next[String(index)] = true;
+                        }
+                        selected.set(next);
+                      }}
+                    />
+                  </th>
+                ) : null}
                 {data.columns.map((name) => {
                   const column = schemaColumn(name);
                   const sort = query.sort;
@@ -379,35 +384,41 @@ export const RowsGrid = ({
                 return (
                   <tr
                     key={String(index)}
-                    class="hover cursor-pointer"
-                    onclick={() => {
-                      onOpenRow(record);
-                    }}
+                    class={canWrite ? "hover cursor-pointer" : undefined}
+                    onclick={
+                      canWrite
+                        ? () => {
+                            onOpenRow(record);
+                          }
+                        : undefined
+                    }
                   >
-                    <td
-                      onclick={(event) => {
-                        event.stopPropagation();
-                      }}
-                    >
-                      <input
-                        class="checkbox checkbox-sm"
-                        type="checkbox"
-                        aria-label={`Select row ${index + 1}`}
-                        checked={selected()[String(index)] === true}
-                        onchange={(event) => {
-                          const next: Record<string, true> = {};
-                          for (const [key] of Object.entries(selected())) {
-                            if (key !== String(index)) {
-                              next[key] = true;
-                            }
-                          }
-                          if (event.currentTarget.checked) {
-                            next[String(index)] = true;
-                          }
-                          selected.set(next);
+                    {canWrite ? (
+                      <td
+                        onclick={(event) => {
+                          event.stopPropagation();
                         }}
-                      />
-                    </td>
+                      >
+                        <input
+                          class="checkbox checkbox-sm"
+                          type="checkbox"
+                          aria-label={`Select row ${index + 1}`}
+                          checked={selected()[String(index)] === true}
+                          onchange={(event) => {
+                            const next: Record<string, true> = {};
+                            for (const [key] of Object.entries(selected())) {
+                              if (key !== String(index)) {
+                                next[key] = true;
+                              }
+                            }
+                            if (event.currentTarget.checked) {
+                              next[String(index)] = true;
+                            }
+                            selected.set(next);
+                          }}
+                        />
+                      </td>
+                    ) : null}
                     {data.columns.map((name, columnIndex) => {
                       const column = schemaColumn(name);
 

@@ -2754,6 +2754,10 @@ async fn collaborator_calls_allowed_tools_and_is_refused_owner_only_ones() {
             json!({"app": "groceries", "visibility": "public"}),
         ),
         (
+            "rename_app",
+            json!({"app": "groceries", "slug": "brand-new"}),
+        ),
+        (
             "set_secret",
             json!({"app": "groceries", "key": "K", "value": "v"}),
         ),
@@ -2779,6 +2783,64 @@ async fn collaborator_calls_allowed_tools_and_is_refused_owner_only_ones() {
     // A slug with no role reads exactly like a missing one.
     let (_, missing) = call(&state, Some(&bruno), "get_app", json!({"app": "nope"})).await;
     assert_eq!(is_error(&missing)["error"], "not_found");
+}
+
+#[tokio::test]
+async fn collaborator_may_triage_errors() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let stranger = api_key_for(&state, "stranger@example.com").await;
+    let app_id = app_id(&state, "groceries").await;
+    let now = crate::apps::now_ms();
+    sqlx::query(
+        "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status) \
+         VALUES (?1, 'fp1', 'Error: kaboom', 'at handler (x:1:2)', 1, ?2, ?3, 'open')",
+    )
+    .bind(&app_id)
+    .bind(now - 1_000)
+    .bind(now - 500)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    // A collaborator triages like the owner: resolve, ignore, reopen.
+    let (_, resolved) = call(
+        &state,
+        Some(&bruno),
+        "resolve_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(
+        result(&resolved)["structuredContent"],
+        json!({"fingerprint": "fp1", "status": "resolved"})
+    );
+    let (_, ignored) = call(
+        &state,
+        Some(&bruno),
+        "ignore_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(result(&ignored)["structuredContent"]["status"], "ignored");
+    let (_, reopened) = call(
+        &state,
+        Some(&bruno),
+        "reopen_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(result(&reopened)["structuredContent"]["status"], "open");
+    // A stranger's slug still answers not_found, exactly like a missing one.
+    let (_, refused) = call(
+        &state,
+        Some(&stranger),
+        "resolve_error",
+        json!({"app": "groceries", "fingerprint": "fp1"}),
+    )
+    .await;
+    assert_eq!(is_error(&refused)["error"], "not_found");
 }
 
 #[tokio::test]
