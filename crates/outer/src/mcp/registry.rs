@@ -346,7 +346,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<look_inputs::LookAtAppInput>(
             "look_at_app",
-            "Look at your app's live page: renders it in a real browser and returns a screenshot plus its HTTP status and title. Call after each change to verify your work. Untrusted: the screenshot renders app content. Cannot report console errors or failed requests: use app_logs and app_errors for those.",
+            "Look at your app's live page: renders it in a real browser and returns a screenshot plus its HTTP status and title, console errors and failed requests. Call after each change to verify your work. Untrusted: the screenshot and console entries render app content. When the console recorder cannot run (blocking CSP, oversize page), the note says why: use app_logs and app_errors for those cases.",
             Account, true,
         ),
  tool::<secrets_inputs::ListSecretsInput>(

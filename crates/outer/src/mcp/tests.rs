@@ -4180,3 +4180,119 @@ async fn look_at_app_refuses_without_browser_and_on_render_failure() {
             .unwrap();
     assert_eq!(used, 1);
 }
+
+fn look_page_with_capture() -> String {
+    "<html><head>\
+        <script>recorder</script>\
+        <script type=\"application/json\" id=\"__outer_look\">{\"console\":\
+        [{\"level\":\"error\",\"message\":\"boom\",\"source\":\"app.js:3\"}],\
+        \"failed\":[{\"url\":\"/api/x\",\"status\":500}]}\
+        </script></head><body></body></html>"
+        .to_string()
+}
+
+#[tokio::test]
+async fn look_at_app_returns_console_and_failed_requests() {
+    let (mut state, _) = setup().await;
+    let fake = crate::browser::fake::FakeRender::start().await;
+    with_fake_browser(&mut state, &fake);
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    fake.program(
+        200,
+        json!({
+            "success": true,
+            "result": {"screenshot": jpeg_b64(), "content": look_page_with_capture()},
+            "meta": {"status": 200, "title": "Groceries"},
+        }),
+    );
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "look_at_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let out = result(&body);
+    assert!(out.get("isError").is_none(), "render succeeds: {body}");
+    let structured = &out["structuredContent"];
+    assert_eq!(structured["capture"], "ok");
+    assert_eq!(structured["console"][0]["level"], "error");
+    assert_eq!(structured["console"][0]["message"], "boom");
+    assert_eq!(structured["console"][0]["source"], "app.js:3");
+    assert_eq!(structured["failed_requests"][0]["url"], "/api/x");
+    assert_eq!(structured["failed_requests"][0]["status"], 500);
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Console: 1 entry, failed requests: 1."),
+        "{text}"
+    );
+    assert!(text.contains("[error] boom"), "{text}");
+    assert!(text.contains("/api/x -> 500"), "{text}");
+    assert!(
+        !text.contains("cannot report console errors"),
+        "no stale gap note when capture worked: {text}"
+    );
+    // The render asked Cloudflare to send back a capture token.
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 1);
+    let token = calls[0]["setExtraHTTPHeaders"]["x-outer-look"]
+        .as_str()
+        .expect("capture token sent");
+    assert_eq!(token.len(), 32, "128-bit hex token");
+}
+
+#[tokio::test]
+async fn look_at_app_reports_precise_capture_notes() {
+    let (mut state, _) = setup().await;
+    let fake = crate::browser::fake::FakeRender::start().await;
+    with_fake_browser(&mut state, &fake);
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    for (content, capture, note) in [
+        (
+            "<!--__outer_look:csp--><html><body>x</body></html>",
+            "csp-blocked",
+            "blocked by the app's CSP",
+        ),
+        (
+            "<!--__outer_look:oversize--><html><body>x</body></html>",
+            "oversize",
+            "exceeded",
+        ),
+        ("{\"json\": true}", "not-html", "not an HTML document"),
+        (
+            "<html><body>no recorder</body></html>",
+            "missing",
+            "did not report",
+        ),
+    ] {
+        fake.program(
+            200,
+            json!({
+                "success": true,
+                "result": {"screenshot": jpeg_b64(), "content": content},
+                "meta": {"status": 200, "title": "Shop"},
+            }),
+        );
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "look_at_app",
+            json!({"app": "groceries"}),
+        )
+        .await;
+        let out = result(&body);
+        assert_eq!(out["structuredContent"]["capture"], capture);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(note), "{capture}: {text}");
+        assert!(
+            out["structuredContent"]["console"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{capture}"
+        );
+    }
+}

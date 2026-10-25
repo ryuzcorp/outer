@@ -1,18 +1,20 @@
 //! Look at your app (wave 3 feature 1): render the live app page in a
-//! real browser through Cloudflare and return a screenshot.
+//! real browser through Cloudflare and return a screenshot plus console
+//! errors and failed requests.
 //!
 //! The REST Quick Actions endpoint (`POST
 //! `/accounts/{account_id}/browser-rendering/snapshot`, permission
 //! `Browser Rendering Write` — renamed `Browser Run - Edit` in the
-//! current dashboard) returns a base64 screenshot plus the page's HTTP
-//! status and title in one call:
+//! current dashboard) returns a base64 screenshot, the page's HTTP status
+//! and title, and the rendered HTML in one call:
 //! <https://developers.cloudflare.com/api/resources/browser_rendering/subresources/snapshot/methods/create/>.
 //!
-//! What REST cannot return is the gap this module documents: console
-//! errors and failed sub-requests need a CDP/log stream, which the
-//! Quick Actions REST API does not expose. The tool returns the
-//! screenshot, the HTTP status and the title, and points at `app_logs` /
-//! `app_errors` for server-side failures. Like the other Cloudflare
+//! REST cannot stream console logs, so for console capture the tool mints a
+//! single-use token (see `look_tokens`) and asks Cloudflare to send it as
+//! `setExtraHTTPHeaders` on the navigation. The app proxy injects a tiny
+//! inline recorder only for that tokened navigation and mirrors what it
+//! sees into a `#__outer_look` data element, which the returned HTML
+//! carries back here for [`parse_look_capture`]. Like the other Cloudflare
 //! clients the base URL is overridable so tests point it at a local fake.
 //!
 //! SSRF guard: callers never supply a URL. The tool builds it from the
@@ -34,6 +36,12 @@ pub const MAX_IMAGE_BYTES: usize = 1_000_000;
 /// Largest Cloudflare response body accepted (base64 inflates the image
 /// plus the rendered HTML): 8 MiB.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest upstream HTML body the proxy instruments with the console
+/// recorder: above this the recorder is skipped and the tool reports
+/// `oversize`. The proxy streams such pages with a marker prepended, so
+/// this never means buffering a huge page.
+pub const MAX_LOOK_HTML_BYTES: usize = 2 * 1024 * 1024;
 
 /// Whole render budget: the browser navigation gets 15 s inside a 20 s
 /// HTTP timeout (task spec: ~20 s).
@@ -86,6 +94,10 @@ pub struct Snapshot {
     pub http_status: Option<i64>,
     /// The page title, when the API reported one.
     pub title: Option<String>,
+    /// The rendered HTML (`result.content`), carrying the console-capture
+    /// data element the proxy injected — when the navigation sent a
+    /// capture token and the page allowed the recorder to run.
+    pub content: Option<String>,
 }
 
 /// What went wrong rendering the page. Callers map these to
@@ -162,12 +174,18 @@ pub async fn claim_look(pool: &sqlx::SqlitePool, account_id: &str) -> Result<u64
 /// Render `url` in Cloudflare's browser and return the screenshot plus
 /// the navigation status/title. One `/snapshot` call with
 /// `formats: ["screenshot", "content"]`: JPEG at quality 60 keeps the
-/// result under [`MAX_IMAGE_BYTES`] without a second request.
+/// result under [`MAX_IMAGE_BYTES`] without a second request. `waitUntil`
+/// stays `networkidle2` so late console errors land before the HTML is
+/// read, inside the same ~20 s budget. When `look_header` carries
+/// `(name, token)`, it is sent as `setExtraHTTPHeaders` so the navigation
+/// (and only the navigation, since the token is single-use) reaches the app
+/// proxy carrying the console-capture token.
 pub async fn snapshot_page(
     render: &BrowserRender,
     url: &str,
     width: u32,
     full_page: bool,
+    look_header: Option<(&str, &str)>,
 ) -> Result<Snapshot, RenderError> {
     let client = reqwest::Client::builder()
         .timeout(RENDER_TIMEOUT)
@@ -178,16 +196,20 @@ pub async fn snapshot_page(
         "{}/accounts/{}/browser-rendering/snapshot",
         render.api_base, render.account_id
     );
+    let mut request = serde_json::json!({
+        "url": url,
+        "formats": ["screenshot", "content"],
+        "viewport": {"width": width, "height": 800},
+        "screenshotOptions": {"type": "jpeg", "quality": 60, "fullPage": full_page},
+        "gotoOptions": {"waitUntil": "networkidle2", "timeout": GOTO_TIMEOUT_MS},
+    });
+    if let Some((name, token)) = look_header {
+        request["setExtraHTTPHeaders"] = serde_json::json!({name: token});
+    }
     let response = client
         .post(&endpoint)
         .bearer_auth(&render.api_token)
-        .json(&serde_json::json!({
-            "url": url,
-            "formats": ["screenshot", "content"],
-            "viewport": {"width": width, "height": 800},
-            "screenshotOptions": {"type": "jpeg", "quality": 60, "fullPage": full_page},
-            "gotoOptions": {"waitUntil": "networkidle2", "timeout": GOTO_TIMEOUT_MS},
-        }))
+        .json(&request)
         .send()
         .await
         .map_err(|err| RenderError::Transport(anyhow::anyhow!(err)))?;
@@ -225,6 +247,121 @@ pub async fn snapshot_page(
             .pointer("/meta/title")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        content: parsed
+            .pointer("/result/content")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// One console line the page's recorder saw: `error` from `window.onerror`
+/// / `unhandledrejection` / resource load failures, `error` or `warn` from
+/// intercepted `console` calls. Untrusted app output, like the screenshot.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConsoleEntry {
+    pub level: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// One sub-request the page's recorder saw fail: a non-2xx `fetch`/XHR
+/// (with its status) or a load/network failure (with an error string).
+/// Untrusted app output, like the screenshot.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FailedRequest {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The recorder's report parsed out of the rendered HTML.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookCapture {
+    pub console: Vec<ConsoleEntry>,
+    pub failed: Vec<FailedRequest>,
+}
+
+/// Why a tokened page carries no recorder, from the proxy's skip markers
+/// (HTML comments, so no CSP can block them): `csp` means an enforced
+/// policy blocks inline scripts, `oversize` means the HTML exceeded
+/// [`MAX_LOOK_HTML_BYTES`].
+pub fn look_skip_reason(html: &str) -> Option<&'static str> {
+    if html.contains("__outer_look:csp") {
+        Some("csp")
+    } else if html.contains("__outer_look:oversize") {
+        Some("oversize")
+    } else {
+        None
+    }
+}
+
+/// Parse the recorder's `#__outer_look` data element out of the rendered
+/// HTML: `None` when the recorder never ran (blocked, skipped, or a page
+/// without the token). Entries are capped defensively; the recorder bounds
+/// itself to 50 entries of 500 chars each.
+pub fn parse_look_capture(html: &str) -> Option<LookCapture> {
+    let id = html
+        .find("id=\"__outer_look\"")
+        .or_else(|| html.find("id='__outer_look'"))?;
+    let open = html[..id].rfind("<script")?;
+    let tag_end = open + html[open..].find('>')?;
+    let close = tag_end + html[tag_end..].find("</script>")?;
+    let inner = html.get(tag_end + 1..close)?;
+    let parsed: serde_json::Value = serde_json::from_str(inner).ok()?;
+    Some(LookCapture {
+        console: parsed
+            .pointer("/console")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .take(50)
+                    .map(|entry| ConsoleEntry {
+                        level: entry
+                            .get("level")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("error")
+                            .to_string(),
+                        message: entry
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .chars()
+                            .take(500)
+                            .collect(),
+                        source: entry
+                            .get("source")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        failed: parsed
+            .pointer("/failed")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .take(50)
+                    .map(|entry| FailedRequest {
+                        url: entry
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        status: entry.get("status").and_then(|v| v.as_i64()),
+                        error: entry
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -387,12 +524,13 @@ mod tests {
                 "meta": {"status": 200, "title": "Groceries"},
             }),
         );
-        let shot = snapshot_page(&fake.render(), "https://shop.outer.now/", 1280, false)
+        let shot = snapshot_page(&fake.render(), "https://shop.outer.now/", 1280, false, None)
             .await
             .unwrap();
         assert_eq!(shot.image, test_jpeg_bytes());
         assert_eq!(shot.http_status, Some(200));
         assert_eq!(shot.title.as_deref(), Some("Groceries"));
+        assert_eq!(shot.content.as_deref(), Some("<html></html>"));
         let calls = fake.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["url"], "https://shop.outer.now/");
@@ -411,7 +549,7 @@ mod tests {
             400,
             serde_json::json!({"success": false, "errors": ["bad url"]}),
         );
-        let err = snapshot_page(&fake.render(), "https://shop.outer.now/", 390, true)
+        let err = snapshot_page(&fake.render(), "https://shop.outer.now/", 390, true, None)
             .await
             .unwrap_err();
         assert!(matches!(err, RenderError::Refused(_)), "{err:?}");
@@ -428,7 +566,7 @@ mod tests {
                 200,
                 serde_json::json!({"success": true, "result": {"screenshot": screenshot}}),
             );
-            let err = snapshot_page(&fake.render(), "https://shop.outer.now/", 390, false)
+            let err = snapshot_page(&fake.render(), "https://shop.outer.now/", 390, false, None)
                 .await
                 .unwrap_err();
             assert!(matches!(err, RenderError::BadImage), "{err:?}");
@@ -442,10 +580,105 @@ mod tests {
             200,
             serde_json::json!({"success": true, "result": {"screenshot": jpeg_b64(MAX_IMAGE_BYTES)}}),
         );
-        let err = snapshot_page(&fake.render(), "https://shop.outer.now/", 390, false)
+        let err = snapshot_page(&fake.render(), "https://shop.outer.now/", 390, false, None)
             .await
             .unwrap_err();
         assert!(matches!(err, RenderError::TooLarge(_, _)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_sends_extra_headers_and_returns_content() {
+        let fake = FakeRender::start().await;
+        fake.program(
+            200,
+            serde_json::json!({
+                "success": true,
+                "result": {"screenshot": jpeg_b64(0), "content": "<html><body>x</body></html>"},
+                "meta": {"status": 200},
+            }),
+        );
+        let shot = snapshot_page(
+            &fake.render(),
+            "https://shop.outer.now/",
+            1280,
+            false,
+            Some(("x-outer-look", "tok-1")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(shot.content.as_deref(), Some("<html><body>x</body></html>"));
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]["setExtraHTTPHeaders"],
+            serde_json::json!({"x-outer-look": "tok-1"})
+        );
+        // Without a token the render asks for no extra headers.
+        let _ = snapshot_page(&fake.render(), "https://shop.outer.now/", 390, false, None)
+            .await
+            .unwrap();
+        assert_eq!(fake.calls().len(), 2);
+        assert!(
+            fake.calls()[1].get("setExtraHTTPHeaders").is_none(),
+            "no token, no extra headers"
+        );
+    }
+
+    #[test]
+    fn look_capture_parses_console_and_failed_requests() {
+        let html = "<html><head>\
+            <script>recorder</script>\
+            <script type=\"application/json\" id=\"__outer_look\">{\"console\":\
+            [{\"level\":\"error\",\"message\":\"boom\",\"source\":\"app.js:3\"},\
+            {\"level\":\"warn\",\"message\":\"slow\"}],\
+            \"failed\":[{\"url\":\"/api/x\",\"status\":500},{\"url\":\"/img.png\",\"error\":\"load failed\"}]\
+            }</script></head><body></body></html>";
+        let capture = parse_look_capture(html).expect("recorder element parses");
+        assert_eq!(
+            capture.console,
+            vec![
+                ConsoleEntry {
+                    level: "error".to_string(),
+                    message: "boom".to_string(),
+                    source: Some("app.js:3".to_string()),
+                },
+                ConsoleEntry {
+                    level: "warn".to_string(),
+                    message: "slow".to_string(),
+                    source: None,
+                },
+            ]
+        );
+        assert_eq!(
+            capture.failed,
+            vec![
+                FailedRequest {
+                    url: "/api/x".to_string(),
+                    status: Some(500),
+                    error: None,
+                },
+                FailedRequest {
+                    url: "/img.png".to_string(),
+                    status: None,
+                    error: Some("load failed".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn look_capture_absent_without_recorder_and_markers_parse() {
+        assert!(parse_look_capture("<html><body>plain</body></html>").is_none());
+        assert!(parse_look_capture("{\"not\": \"html\"}").is_none());
+        assert_eq!(
+            look_skip_reason("<!--__outer_look:csp--><html></html>"),
+            Some("csp")
+        );
+        assert_eq!(
+            look_skip_reason("<!--__outer_look:oversize--><html></html>"),
+            Some("oversize")
+        );
+        assert!(look_skip_reason("<html><body>plain</body></html>").is_none());
     }
 
     #[tokio::test]

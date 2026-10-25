@@ -648,6 +648,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     );
     let purges = deployer.purges();
     let auth = auth_state(&config, &pool)?;
+    // Console-capture tokens: `look_at_app` mints into this table, the app
+    // proxy claims from it. One table shared by both states, never global.
+    let look_tokens = outer::look_tokens::LookTokens::new();
     let mcp = outer::mcp::McpState {
         pool: pool.clone(),
         auth: auth.clone(),
@@ -668,6 +671,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         jev,
         rollback_locks: outer::mcp::RollbackLocks::default(),
         browser: browser_render(&config),
+        look_tokens: look_tokens.clone(),
         delete_cfg: outer::apps::delete::DeleteConfig {
             data_dir: config.data_dir.clone(),
             cgroups: cgroups(),
@@ -700,7 +704,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             rt.apps_domain.clone(),
             config.tls_enabled(),
             metrics.clone(),
-        ),
+        )
+        .with_look_tokens(look_tokens),
         config.domain.clone(),
     );
     tracing::info!(
