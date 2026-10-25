@@ -48,6 +48,18 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// One changed file: its status against the parent (or, with `--root`, the
+/// empty tree) and its added/removed line counts. `binary` files carry no
+/// line counts (`- -` in numstat output).
+#[derive(Debug, Clone)]
+pub struct FileStat {
+    pub path: String,
+    pub status: char,
+    pub added: u64,
+    pub removed: u64,
+    pub binary: bool,
+}
+
 /// A commit with its file list and unified patch.
 #[derive(Debug, Clone)]
 pub struct ShowResult {
@@ -469,8 +481,15 @@ pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
         GIT_TIMEOUT,
     )
     .await?;
-    let record = meta.trim_start_matches('\n').trim_end_matches('\x1e');
-    let mut parts = record.splitn(5, '\0');
+    // Git appends a newline after the format, so the record ends with
+    // `\n\x1e\n`: strip newlines and the separator together.
+    let record = meta
+        .trim_start_matches('\n')
+        .trim_end_matches(['\n', '\x1e']);
+    // The format emits the sha first (mirroring [`log`]); the caller
+    // already holds the resolved sha, so skip it before the metadata.
+    let mut parts = record.splitn(6, '\0');
+    let _emitted_sha = parts.next();
     let commit = LogEntry {
         sha: sha.clone(),
         author_name: parts.next().unwrap_or("").to_string(),
@@ -521,6 +540,227 @@ pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
         patch,
         truncated: patch_run.truncated || cut,
     })
+}
+/// The first parent of `sha`, or `None` for a root commit. Errors on an
+/// unknown sha, like [`show`].
+pub async fn parent_of(bare: &Path, sha: &str) -> anyhow::Result<Option<String>> {
+    validate_sha(sha)?;
+    let resolved = run_git(
+        &[
+            &git_dir(bare),
+            "rev-parse",
+            "--verify",
+            &format!("{sha}^{{commit}}"),
+        ],
+        &[],
+        GIT_TIMEOUT,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("unknown commit {sha:?}"))?;
+    let sha = resolved.trim().to_string();
+    let gd = git_dir(bare);
+    match run_git(
+        &[&gd, "rev-parse", "--verify", &format!("{sha}^")],
+        &[],
+        GIT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(out) => Ok(Some(out.trim().to_string())),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `sha`'s changed files vs its parent (vs the empty tree for a root
+/// commit), each with status and +/- counts.
+pub async fn show_stats(bare: &Path, sha: &str) -> anyhow::Result<Vec<FileStat>> {
+    validate_sha(sha)?;
+    let resolved = run_git(
+        &[
+            &git_dir(bare),
+            "rev-parse",
+            "--verify",
+            &format!("{sha}^{{commit}}"),
+        ],
+        &[],
+        GIT_TIMEOUT,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("unknown commit {sha:?}"))?;
+    stats_against_parent(bare, resolved.trim()).await
+}
+
+/// The changed files and unified patch between `from` and `to` (both shas,
+/// resolved to commits first). The patch is cut at [`MAX_PATCH_BYTES`].
+/// Returns the resolved shas, the per-file stats, the patch and whether the
+/// patch was cut.
+pub async fn diff_range(
+    bare: &Path,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<(String, String, Vec<FileStat>, String, bool)> {
+    for rev in [from, to] {
+        validate_sha(rev)?;
+    }
+    let gd = git_dir(bare);
+    let mut resolved = Vec::with_capacity(2);
+    for rev in [from, to] {
+        let out = run_git(
+            &[&gd, "rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+            &[],
+            GIT_TIMEOUT,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("unknown commit {rev:?}"))?;
+        resolved.push(out.trim().to_string());
+    }
+    let stats = stats_range(bare, &resolved[0], &resolved[1]).await?;
+    let patch_run = run_capped(
+        &[
+            &gd,
+            "diff",
+            "--no-ext-diff",
+            "--unified=3",
+            &resolved[0],
+            &resolved[1],
+        ],
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .await?;
+    if patch_run.failed() {
+        anyhow::bail!("git diff failed\n{}", patch_run.stderr);
+    }
+    let patch = String::from_utf8_lossy(&patch_run.stdout).into_owned();
+    let (patch, cut) = truncate_utf8(&patch, MAX_PATCH_BYTES);
+    Ok((
+        resolved[0].clone(),
+        resolved[1].clone(),
+        stats,
+        patch,
+        patch_run.truncated || cut,
+    ))
+}
+
+/// One commit's stats against its parent, or against the empty tree for a
+/// root commit (`diff-tree --root`).
+async fn stats_against_parent(bare: &Path, sha: &str) -> anyhow::Result<Vec<FileStat>> {
+    let gd = git_dir(bare);
+    let numstat = run_capped(
+        &[
+            &gd,
+            "diff-tree",
+            "--no-commit-id",
+            "--numstat",
+            "-r",
+            "--root",
+            sha,
+        ],
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .await?;
+    if numstat.failed() {
+        anyhow::bail!("git numstat failed\n{}", numstat.stderr);
+    }
+    let status = run_capped(
+        &[
+            &gd,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "--root",
+            sha,
+        ],
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .await?;
+    if status.failed() {
+        anyhow::bail!("git name-status failed\n{}", status.stderr);
+    }
+    Ok(join_stats(&numstat.stdout, &status.stdout))
+}
+
+/// A `from to` pair's stats through `git diff`.
+async fn stats_range(bare: &Path, from: &str, to: &str) -> anyhow::Result<Vec<FileStat>> {
+    let gd = git_dir(bare);
+    let numstat = run_capped(
+        &[&gd, "diff", "--no-ext-diff", "--numstat", from, to],
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .await?;
+    if numstat.failed() {
+        anyhow::bail!("git numstat failed\n{}", numstat.stderr);
+    }
+    let status = run_capped(
+        &[&gd, "diff", "--no-ext-diff", "--name-status", from, to],
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .await?;
+    if status.failed() {
+        anyhow::bail!("git name-status failed\n{}", status.stderr);
+    }
+    Ok(join_stats(&numstat.stdout, &status.stdout))
+}
+
+/// Join one `numstat` run (`added removed path`, `- -` for binary) with one
+/// `name-status` run (`STATUS path`, renames as `R100 old new`) by path.
+/// The listing follows `name-status` order; a stat without counts keeps
+/// zero counts rather than dropping the file.
+fn join_stats(numstat: &[u8], status: &[u8]) -> Vec<FileStat> {
+    let mut counts: std::collections::HashMap<String, (u64, u64, bool)> =
+        std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(numstat).lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if added == "-" || removed == "-" {
+            counts.insert(path.to_string(), (0, 0, true));
+        } else if let (Ok(added), Ok(removed)) = (added.parse(), removed.parse()) {
+            counts.insert(path.to_string(), (added, removed, false));
+        }
+    }
+    let mut stats = Vec::new();
+    for line in String::from_utf8_lossy(status).lines() {
+        let mut parts = line.split('\t');
+        let Some(code) = parts.next() else { continue };
+        let status = code.chars().next().unwrap_or('M');
+        // Renames carry `old new`: the change lands on the new path.
+        let path = parts.next_back().unwrap_or("").to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let (added, removed, binary) = counts.get(&path).copied().unwrap_or((0, 0, false));
+        stats.push(FileStat {
+            path,
+            status,
+            added,
+            removed,
+            binary,
+        });
+    }
+    stats
+}
+
+/// The blob size at `rev:path` without loading it, so callers can name the
+/// size when refusing an over-cap read.
+pub async fn blob_size(
+    bare: &Path,
+    rev: Option<&str>,
+    path: &str,
+) -> anyhow::Result<(String, u64)> {
+    validate_read_path(path)?;
+    let Some(sha) = resolve_rev(bare, rev).await? else {
+        anyhow::bail!("app has no commits yet");
+    };
+    let gd = git_dir(bare);
+    let spec = format!("{sha}:{path}");
+    let size_out = run_git(&[&gd, "cat-file", "-s", &spec], &[], GIT_TIMEOUT)
+        .await
+        .map_err(|_| anyhow::anyhow!("{path} not found"))?;
+    let size: u64 = size_out.trim().parse().unwrap_or(u64::MAX);
+    Ok((sha, size))
 }
 
 /// Cut `s` at `cap` bytes on a UTF-8 boundary.
@@ -631,6 +871,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(next, 1);
         let shown = show(&bare, &sha).await.unwrap();
+        assert_eq!(shown.commit.sha, sha);
+        assert_eq!(shown.commit.author_name, "ana");
+        assert_eq!(shown.commit.author_email, "id@example.com");
+        assert!(shown.commit.at > 0);
+        assert_eq!(shown.commit.message, "first");
         assert_eq!(shown.files.len(), 2);
         assert!(shown.patch.contains("Groceries"));
         assert!(!shown.truncated);
@@ -689,5 +934,137 @@ mod tests {
         assert!(validate_sha("xyz!!").is_err());
         assert!(validate_sha("-5").is_err());
         assert!(validate_sha("a3f2c91d5e7b4a6c8f0e2d4b6a8c0e2f4a6b8d0e1").is_ok());
+    }
+
+    async fn seed_two() -> (
+        tempfile::TempDir,
+        super::super::manifest::GitConfig,
+        Store,
+        GitSync,
+        String,
+        String,
+    ) {
+        let (dir, cfg, store, sync) = seed().await;
+        let second = CommitRequest {
+            message: "second".to_string(),
+            base: None,
+            writes: vec![write("pages/new.txt", "new\n")],
+            edits: vec![crate::git::commit::Edit {
+                path: "pages/index.tsx".to_string(),
+                old: "<h1>Groceries</h1>\n".to_string(),
+                new: "<h1>Groceries</h1>\n<p>fresh</p>\n".to_string(),
+                replace_all: false,
+            }],
+            deletes: vec!["pages/about.ts".to_string()],
+            moves: vec![],
+            author: author(),
+        };
+        let c2 = commit::commit(&store, &cfg, &sync, "grocery", second)
+            .await
+            .unwrap();
+        let (_, entries, _) = log(&manifest::mirror_path(&cfg, "grocery"), None, 1, 1)
+            .await
+            .unwrap();
+        (dir, cfg, store, sync, entries[0].sha.clone(), c2)
+    }
+
+    #[tokio::test]
+    async fn stats_count_add_modify_delete() {
+        let (dir, cfg, store, sync, c1, c2) = seed_two().await;
+        let bare = bare(&dir, &cfg, &store, &sync).await;
+        assert_eq!(
+            parent_of(&bare, &c2).await.unwrap().as_deref(),
+            Some(c1.as_str())
+        );
+        assert_eq!(parent_of(&bare, &c1).await.unwrap(), None);
+        let mut stats = show_stats(&bare, &c2).await.unwrap();
+        stats.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(stats.len(), 3);
+        let edited = stats.iter().find(|s| s.path == "pages/index.tsx").unwrap();
+        assert_eq!(edited.status, 'M');
+        assert_eq!((edited.added, edited.removed), (1, 0));
+        assert!(!edited.binary);
+        let deleted = stats.iter().find(|s| s.path == "pages/about.ts").unwrap();
+        assert_eq!(deleted.status, 'D');
+        assert_eq!((deleted.added, deleted.removed), (0, 1));
+        let added = stats.iter().find(|s| s.path == "pages/new.txt").unwrap();
+        assert_eq!(added.status, 'A');
+        assert_eq!((added.added, added.removed), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn diff_range_matches_commit_stats() {
+        let (dir, cfg, store, sync, c1, c2) = seed_two().await;
+        let bare = bare(&dir, &cfg, &store, &sync).await;
+        let (from, to, stats, patch, truncated) = diff_range(&bare, &c1, &c2).await.unwrap();
+        assert_eq!(from, c1);
+        assert_eq!(to, c2);
+        assert_eq!(stats.len(), 3);
+        assert!(patch.contains("pages/new.txt") && patch.contains("fresh"));
+        assert!(!truncated);
+        // The same commit against itself: nothing changed, empty patch.
+        let (_, _, same_stats, same_patch, _) = diff_range(&bare, &c2, &c2).await.unwrap();
+        assert!(same_stats.is_empty());
+        assert!(same_patch.is_empty());
+        let err = diff_range(&bare, &c1, "0123456789abcdef0123456789abcdef01234567")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown commit"));
+        let err = show_stats(&bare, "not-a-sha!!").await.unwrap_err();
+        assert!(err.to_string().contains("not a commit sha"));
+    }
+
+    #[tokio::test]
+    async fn binary_and_oversized_blobs_report_size() {
+        use base64::Engine as _;
+        let (dir, cfg, store, sync) = seed().await;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let small_bin = vec![0u8, 1, 2, 3, 255, 10];
+        let big = vec![b'x'; MAX_READ_BYTES + 1];
+        commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "blobs".to_string(),
+                base: None,
+                writes: vec![
+                    FileWrite {
+                        path: "img.bin".to_string(),
+                        body: WriteBody::Base64(engine.encode(&small_bin)),
+                    },
+                    FileWrite {
+                        path: "big.bin".to_string(),
+                        body: WriteBody::Base64(engine.encode(&big)),
+                    },
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let bare = bare(&dir, &cfg, &store, &sync).await;
+        let (sha, bytes) = read_blob(&bare, None, "img.bin").await.unwrap();
+        assert_eq!(bytes, small_bin);
+        assert!(bytes.contains(&0), "callers detect binary by the NUL byte");
+        let (_, size) = blob_size(&bare, Some(&sha), "img.bin").await.unwrap();
+        assert_eq!(size, small_bin.len() as u64);
+        let err = read_blob(&bare, None, "big.bin").await.unwrap_err();
+        assert!(
+            err.to_string().contains("over the"),
+            "over-cap reads refuse before loading, got: {err}"
+        );
+        let (_, size) = blob_size(&bare, None, "big.bin").await.unwrap();
+        assert_eq!(size, big.len() as u64);
+        let mut stats = show_stats(&bare, &sha).await.unwrap();
+        stats.sort_by(|a, b| a.path.cmp(&b.path));
+        let bin = stats.iter().find(|s| s.path == "img.bin").unwrap();
+        assert!(bin.binary && bin.status == 'A');
+        let missing = blob_size(&bare, None, "nope.bin").await.unwrap_err();
+        assert!(missing.to_string().contains("not found"));
     }
 }

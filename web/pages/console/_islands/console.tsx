@@ -25,6 +25,7 @@ import {
 import {
   ActionsIcon,
   CloseIcon,
+  CodeIcon,
   CollapseIcon,
   DatabaseIcon,
   DeploysIcon,
@@ -55,6 +56,7 @@ import {
   SecretsView,
   SettingsView,
 } from "./views.tsx";
+import { CodeView } from "./views/code.tsx";
 
 import { secretsActions } from "./actions/secrets.ts";
 
@@ -143,6 +145,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   metrics: "Metrics",
   actions: "Agent actions",
   deploys: "Deploys",
+  code: "Code",
   logs: "Logs",
   errors: "Errors",
   secrets: "Secrets",
@@ -207,6 +210,7 @@ export function Console() {
       case "actions":
         return ["actions"];
       case "deploys":
+      case "code":
         return [];
       case "logs":
         return ["logs"];
@@ -674,7 +678,7 @@ export function Console() {
         isAdmin={isAdmin()}
         onGenerate={(count, note) => generateCodes(count, note)}
         onRevoke={(code) => revokeCode(code)}
-        onMore={() => void loadMoreAdminCodes()}
+        onMoreCodes={() => void loadMoreAdminCodes()}
         onRetry={() => {
           epoch += 1;
           void loadAccountView("admin", epoch);
@@ -974,7 +978,7 @@ export function Console() {
                     role="tab"
                     aria-selected={r.view === v.id}
                     class={`tab shrink-0${r.view === v.id ? " tab-active" : ""}`}
-                    onclick={() => navigate({ view: v.id as ViewId })}
+                    onclick={() => navigate({ view: v.id as ViewId, codeTab: null })}
                   >
                     {v.label}
                   </button>
@@ -1023,6 +1027,9 @@ export function Console() {
                       });
                     }}
                     onLoadMore={loadMoreActions}
+                    onPickSha={(sha) => navigate({ sha }, true)}
+                    onShowChanges={(sha) => navigate({ view: "code", sha, codeTab: "changes" })}
+                    onSwitchCodeTab={(codeTab) => navigate({ codeTab }, true)}
                     onRefreshLogs={() => {
                       const slug = route().app;
                       if (!slug) {
@@ -1080,7 +1087,7 @@ export function Console() {
                       type="button"
                       class={r.view === v.id ? "menu-active min-w-0" : "min-w-0"}
                       aria-current={r.view === v.id ? "page" : undefined}
-                      onclick={() => navigate({ view: v.id as ViewId })}
+                      onclick={() => navigate({ view: v.id as ViewId, codeTab: null })}
                     >
                       <ViewIcon id={v.id as ViewId} />
                       <span class="min-w-0 flex-1 truncate">{v.label}</span>
@@ -1145,6 +1152,8 @@ function ViewIcon({ id }: { id: ViewId }) {
       return <ActionsIcon />;
     case "deploys":
       return <DeploysIcon />;
+    case "code":
+      return <CodeIcon />;
     case "logs":
       return <LogsIcon />;
     case "errors":
@@ -1173,6 +1182,9 @@ function ViewBody(props: {
   onToggleExpand: (id: string) => void;
   onLoadMore: () => void;
   onRefreshLogs: () => void;
+  onPickSha: (sha: string | null) => void;
+  onShowChanges: (sha: string) => void;
+  onSwitchCodeTab: (tab: "files" | "changes") => void;
   onRetry: () => void;
   onRefreshDetail: () => void;
   onRenamed: (slug: string) => void;
@@ -1209,6 +1221,19 @@ function ViewBody(props: {
           expanded={props.expanded}
           onToggle={props.onToggleExpand}
           onRolledBack={props.onRefreshDetail}
+          onShowChanges={props.onShowChanges}
+        />
+      );
+    case "code":
+      return (
+        <CodeView
+          key={props.route.sha ?? "live"}
+          slug={props.app.slug}
+          deploys={props.app.deploys}
+          initialSha={props.route.sha}
+          initialTab={props.route.codeTab ?? "files"}
+          onPickSha={props.onPickSha}
+          onSwitchTab={props.onSwitchCodeTab}
         />
       );
     case "logs":
