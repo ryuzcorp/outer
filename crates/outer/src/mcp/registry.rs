@@ -102,7 +102,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             ..Hints::WRITE
         },
         "remove_collaborator" => Hints::DESTRUCTIVE,
-        "set_visibility" => Hints {
+        "set_visibility" | "set_always_on" => Hints {
             idempotent: true,
             ..Hints::WRITE
         },
@@ -229,6 +229,11 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<app_inputs::SetVisibilityInput>(
             "set_visibility",
             "Set an app unlisted (default, kept out of search engines) or public (public is a Pro feature).",
+            Account, false,
+        ),
+        tool::<app_inputs::SetAlwaysOnInput>(
+            "set_always_on",
+            "Keep a Pro app warm {app, on}: on skips the idle sleep and restarts the fleet after restarts (up to the host cap); off lets it sleep on idle. On is a Pro feature; turning it off is always allowed.",
             Account, false,
         ),
         tool::<app_inputs::ShareAppInput>(
@@ -397,7 +402,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 43);
+        assert_eq!(tools.len(), 44);
     }
 }
 

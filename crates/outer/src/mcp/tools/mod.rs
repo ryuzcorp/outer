@@ -785,6 +785,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "set_visibility" => apps::set_visibility(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
+        "set_always_on" => apps::set_always_on(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
         "share_app" => apps::share_app(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),

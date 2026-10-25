@@ -1,5 +1,5 @@
-// Console settings actions: visibility, rename, delete. The UI calls
-// `run`; the later ⌘K and WebMCP layer imports every `actions/*.ts`
+// Console settings actions: visibility, keep-warm, rename, delete. The UI
+// calls `run`; the later ⌘K and WebMCP layer imports every `actions/*.ts`
 // registry.
 import { ConsoleApiError, request } from "./http.ts";
 import type { ConsoleApp } from "../api.ts";
@@ -42,6 +42,15 @@ export interface SetVisibilityOutput {
   visibility: string;
 }
 
+export interface SetAlwaysOnInput {
+  slug: string;
+  on: boolean;
+}
+
+export interface SetAlwaysOnOutput {
+  always_on: boolean;
+}
+
 export interface RenameAppInput {
   slug: string;
   newSlug: string;
@@ -51,7 +60,6 @@ export interface RenameAppOutput {
   slug: string;
   url: string;
 }
-
 export interface DeleteAppInput {
   slug: string;
   confirm: string;
@@ -85,6 +93,32 @@ const setVisibility: ConsoleAction<SetVisibilityInput, SetVisibilityOutput> = {
       "POST",
       `/api/console/apps/${encodeURIComponent(input.slug)}/visibility`,
       { visibility: input.visibility },
+      signal,
+    );
+  },
+};
+
+const setAlwaysOn: ConsoleAction<SetAlwaysOnInput, SetAlwaysOnOutput> = {
+  name: "set_always_on",
+  title: "Keep app warm",
+  description:
+    "Keep a Pro app warm: on skips the idle sleep and restarts the fleet after restarts (up to the host cap). On is a Pro feature: Free owners are refused with payment_required. Returns {always_on}.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      slug: { type: "string" },
+      on: { type: "boolean" },
+    },
+    required: ["slug", "on"],
+  },
+  readOnly: false,
+  consequential: false,
+  untrusted: false,
+  run(input, _ctx, signal) {
+    return request<SetAlwaysOnOutput>(
+      "POST",
+      `/api/console/apps/${encodeURIComponent(input.slug)}/always-on`,
+      { on: input.on },
       signal,
     );
   },
@@ -155,8 +189,9 @@ const deleteApp: ConsoleAction<DeleteAppInput, DeleteAppOutput> = {
 
 export const actions: ConsoleAction<unknown, unknown>[] = [
   setVisibility as ConsoleAction<unknown, unknown>,
+  setAlwaysOn as ConsoleAction<unknown, unknown>,
   renameApp as ConsoleAction<unknown, unknown>,
   deleteApp as ConsoleAction<unknown, unknown>,
 ];
 
-export const settingsActions = { setVisibility, renameApp, deleteApp };
+export const settingsActions = { setVisibility, setAlwaysOn, renameApp, deleteApp };

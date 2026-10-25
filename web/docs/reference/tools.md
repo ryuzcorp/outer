@@ -159,6 +159,18 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `visibility` | string | yes | unlisted (default, kept out of search engines) or public. |
 
+## `set_always_on`
+
+- **Access:** signed in
+- **Description:** Keep a Pro app warm {app, on}: on skips the idle sleep and restarts the fleet after restarts (up to the host cap); off lets it sleep on idle. On is a Pro feature; turning it off is always allowed.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `on` | boolean | yes | true keeps the fleet awake (Pro only); false lets it sleep on idle. |
+
 ## `share_app`
 
 - **Access:** signed in

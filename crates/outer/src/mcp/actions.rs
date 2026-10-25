@@ -19,6 +19,7 @@
 //!   replacement lengths; paths only, never contents)
 //! - `rollback`: `rollback to <sha>`
 //! - `set_visibility`: `set_visibility <value>`
+//! - `set_always_on`: `set_always_on <on|off>`
 //! - `share_app`: `share_app`
 //! - `get_app`: `get_app`
 //! - `list_files`: `list_files [prefix=<p>] [sha=<short>]`
@@ -52,6 +53,7 @@ const LOGGED_TOOLS: &[&str] = &[
     "rollback",
     "rename_app",
     "set_visibility",
+    "set_always_on",
     "share_app",
     "get_app",
     "list_files",
@@ -179,6 +181,13 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
         "set_visibility" => format!(
             "set_visibility {}",
             arg_str(args, "visibility").unwrap_or("?")
+        ),
+        "set_always_on" => format!(
+            "set_always_on {}",
+            args.get("on")
+                .and_then(serde_json::Value::as_bool)
+                .map(|b| if b { "on" } else { "off" })
+                .unwrap_or("?")
         ),
         "rename_app" => format!(
             "rename_app {} to {}",

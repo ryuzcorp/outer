@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 43);
+    assert_eq!(anon.len(), 44);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 41);
+    assert_eq!(authed.len(), 42);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -2774,6 +2774,7 @@ async fn collaborator_calls_allowed_tools_and_is_refused_owner_only_ones() {
             "set_visibility",
             json!({"app": "groceries", "visibility": "public"}),
         ),
+        ("set_always_on", json!({"app": "groceries", "on": true})),
         (
             "rename_app",
             json!({"app": "groceries", "slug": "brand-new"}),
@@ -3035,6 +3036,93 @@ async fn set_visibility_public_is_pro_gated() {
     )
     .await;
     assert_eq!(result(&public)["structuredContent"]["visibility"], "public");
+}
+
+/// `on` is a Pro feature, gated in the shared domain function: a Free
+/// owner is refused with `payment_required`, `off` is always allowed, and
+/// Pro flips the row. A collaborator is refused with `forbidden`.
+#[tokio::test]
+async fn set_always_on_is_pro_gated() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+
+    let (_, refused) = call(
+        &state,
+        Some(&ana),
+        "set_always_on",
+        json!({"app": "groceries", "on": true}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "payment_required");
+    assert!(
+        err["user_message"].as_str().unwrap().contains("Pro"),
+        "{err}"
+    );
+
+    let (_, off) = call(
+        &state,
+        Some(&ana),
+        "set_always_on",
+        json!({"app": "groceries", "on": false}),
+    )
+    .await;
+    assert_eq!(result(&off)["structuredContent"]["always_on"], false);
+
+    set_plan(&state, "ana@example.com", "pro").await;
+    let (_, on) = call(
+        &state,
+        Some(&ana),
+        "set_always_on",
+        json!({"app": "groceries", "on": true}),
+    )
+    .await;
+    assert_eq!(result(&on)["structuredContent"]["always_on"], true);
+    let flag: i64 = sqlx::query_scalar("SELECT always_on FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(flag, 1);
+}
+
+/// New Pro apps default to keep-warm; Free apps start cold.
+#[tokio::test]
+async fn new_pro_apps_default_to_keep_warm() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    let (_, warm) = call(&state, Some(&owner), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(result(&warm)["structuredContent"]["always_on"], true);
+
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &bob, "bobshop").await;
+    let (_, cold) = call(&state, Some(&bob), "get_app", json!({"app": "bobshop"})).await;
+    assert_eq!(result(&cold)["structuredContent"]["always_on"], false);
+}
+
+/// A failing keep-warm flag write must not orphan the app: creation still
+/// succeeds with the flag off (set it later), instead of erroring after
+/// the row exists.
+#[tokio::test]
+async fn create_app_survives_flag_write_failure() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    set_plan(&state, "ana@example.com", "pro").await;
+    sqlx::query(
+        "CREATE TRIGGER flag_fail BEFORE UPDATE OF always_on ON app \
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    create_app(&state, &token, "groceries").await;
+    let (_, body) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(result(&body)["structuredContent"]["always_on"], false);
+    let flag: i64 = sqlx::query_scalar("SELECT always_on FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(flag, 0, "row and response agree: the flag stays off");
 }
 
 #[tokio::test]

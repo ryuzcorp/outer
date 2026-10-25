@@ -180,6 +180,14 @@ pub struct RuntimeConfig {
     /// Per-fleet `memory.max` (`OUTER_FLEET_MEMORY_MB`) and `cpu.max` (`OUTER_FLEET_CPU_MAX`).
     pub fleet_memory_mb: u64,
     pub fleet_cpu_max: String,
+    /// At most this many always-on fleets stay awake at once
+    /// (`OUTER_ALWAYS_ON_MAX`, default 10). Past the cap the oldest-idle
+    /// flagged apps may still sleep, and the warm-up stops waking.
+    /// Memory math (spec §12.1): ~11 GB awake budget; a Pro leaf caps at
+    /// 1 GiB but idles near ~100 MB RSS, so 10 always-on fleets cost ~1 GB
+    /// idle and leave headroom for on-demand wakes. The operator lowers it
+    /// if M0 numbers say otherwise; 0 disables the protection entirely.
+    pub always_on_max: usize,
 }
 
 const DEFAULT_DOMAIN: &str = "outer.localhost";
@@ -402,6 +410,12 @@ impl Config {
             fleet_cpu_max: get("OUTER_FLEET_CPU_MAX")
                 .unwrap_or("50000 100000")
                 .to_string(),
+            always_on_max: parse_num(
+                get("OUTER_ALWAYS_ON_MAX"),
+                "OUTER_ALWAYS_ON_MAX",
+                10,
+                &mut problems,
+            ),
         };
 
         let config = Config {

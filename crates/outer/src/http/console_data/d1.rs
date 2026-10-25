@@ -2879,6 +2879,7 @@ exit 0
             credential_refresh_after: Duration::from_secs(86400),
             wake_timeout: Duration::from_secs(1),
             wake_concurrency: 1,
+            always_on_max: 10,
         });
         let base = McpState::for_tests(pool.clone(), auth.clone());
         let mcp = McpState {

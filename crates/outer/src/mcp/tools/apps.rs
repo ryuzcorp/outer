@@ -45,6 +45,13 @@ pub struct SetVisibilityInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetAlwaysOnInput {
+    /// The app slug.
+    pub app: String,
+    /// true keeps the fleet awake (Pro only); false lets it sleep on idle.
+    pub on: bool,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShareAppInput {
     /// The app slug.
     pub app: String,
@@ -85,7 +92,7 @@ async fn seed_app(
         .await
         .map_err(internal)?;
     let plan = super::plan_of(&ctx.state.pool, owner_id).await?;
-    let app = apps::create(
+    let mut app = apps::create(
         &ctx.state.pool,
         owner_id,
         slug,
@@ -95,6 +102,22 @@ async fn seed_app(
     )
     .await
     .map_err(|err| ToolError::from_create(err, &plan))?;
+    // New Pro apps default to keep-warm (feature #6); Free apps start
+    // cold. The flag is stored per app, so a later downgrade keeps the
+    // value but the sweep ignores it until the owner upgrades again. Best
+    // effort: the row already exists here, so a flag write that fails must
+    // not abort creation and orphan it (the app stays usable; the flag can
+    // be set later). Seeding failures below still remove the row.
+    if plan == "pro" {
+        match apps::always_on::set_always_on(&ctx.state.pool, &app.id, true, &plan).await {
+            Ok(()) => app.always_on = true,
+            Err(err) => tracing::warn!(
+                slug = %slug,
+                error = %format!("{err:#}"),
+                "pro default keep-warm flag not set; set it later"
+            ),
+        }
+    }
     let author = crate::ops::noreply_author(owner_id, owner_email, &ctx.state.domain);
     let seeded = async {
         // Claim-point wipe: a crashed delete can leave local orphans behind
@@ -210,6 +233,9 @@ pub async fn app_summary(ctx: &Ctx<'_>, app: &App, role: Role) -> Result<Value, 
             Role::Collaborator => "collaborator",
         },
         "visibility": app.visibility.as_str(),
+        // Pro keep-warm flag (feature #6); Free owners see it stored but
+        // ignored until they upgrade.
+        "always_on": app.always_on,
         "status": status,
     });
     if let Some(last) = last {
@@ -291,6 +317,42 @@ pub fn visibility_tool_error(slug: &str, err: crate::apps::VisibilityError) -> T
             "Public apps are Pro. Upgrade to Pro to make {slug} public; switching back to unlisted is always free.",
         )),
         crate::apps::VisibilityError::Internal(err) => internal(err),
+    }
+}
+
+/// Set the keep-warm flag (feature #6, owner only): `on` keeps the fleet
+/// awake on Pro (up to the host cap); a Free owner is refused with
+/// `payment_required`, and `off` is always allowed.
+pub async fn set_always_on(input: SetAlwaysOnInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let app = owner_app(ctx, &input.app).await?;
+    // The Pro gate lives in the shared domain function, so the console
+    // endpoint gating on the same function refuses identically.
+    let plan = super::plan_of(&ctx.state.pool, &app.owner_id).await?;
+    apps::always_on::set_always_on(&ctx.state.pool, &app.id, input.on, &plan)
+        .await
+        .map_err(|err| always_on_tool_error(&app.slug, err))?;
+    Ok(ok(
+        if input.on {
+            format!("{} stays awake from now on.", app.slug)
+        } else {
+            format!("{} sleeps on idle again.", app.slug)
+        },
+        json!({"always_on": input.on}),
+    ))
+}
+
+/// Map the shared keep-warm refusal to the error both surfaces return:
+/// Free owners get `payment_required`; turning the flag off never fails.
+pub fn always_on_tool_error(slug: &str, err: crate::apps::always_on::AlwaysOnError) -> ToolError {
+    match err {
+        crate::apps::always_on::AlwaysOnError::ProOnly { .. } => ToolError::new(
+            "payment_required",
+            format!("{slug} is on a Free account; keeping apps warm is a Pro feature"),
+        )
+        .with_user(format!(
+            "Keeping {slug} warm is Pro. Upgrade to Pro so it never sleeps; turning the flag off is always free.",
+        )),
+        crate::apps::always_on::AlwaysOnError::Internal(err) => internal(err),
     }
 }
 

@@ -3068,6 +3068,7 @@ mod tests {
             last_request_at: None,
             last_deploy_sha: None,
             created_at: 0,
+            always_on: false,
         }
     }
 
@@ -5528,6 +5529,7 @@ exit 0
             last_request_at: None,
             last_deploy_sha: None,
             created_at: 0,
+            always_on: false,
         };
 
         let data = tempfile::tempdir().unwrap();

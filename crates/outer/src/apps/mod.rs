@@ -8,6 +8,7 @@
 use anyhow::Context as _;
 use sqlx::SqlitePool;
 
+pub mod always_on;
 pub mod delete;
 pub mod domains;
 pub(crate) mod local;
@@ -184,6 +185,10 @@ pub struct App {
     pub last_request_at: Option<i64>,
     pub last_deploy_sha: Option<String>,
     pub created_at: i64,
+    /// Keep-warm flag (feature #6): the sweep skips the app while its owner
+    /// is Pro (up to the host cap) and the warm-up restarts it when stopped.
+    /// Stored for every plan; ignored on Free.
+    pub always_on: bool,
 }
 
 /// The free uid/port ranges one app takes its [`App::uid`], [`App::port`]
@@ -237,7 +242,7 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visibility, \
-    asleep_since, last_request_at, last_deploy_sha, created_at";
+    asleep_since, last_request_at, last_deploy_sha, created_at, always_on";
 
 #[derive(Debug, sqlx::FromRow)]
 struct AppRow {
@@ -253,6 +258,7 @@ struct AppRow {
     last_request_at: Option<i64>,
     last_deploy_sha: Option<String>,
     created_at: i64,
+    always_on: i64,
 }
 
 impl AppRow {
@@ -277,6 +283,7 @@ impl AppRow {
             last_request_at: self.last_request_at,
             last_deploy_sha: self.last_deploy_sha,
             created_at: self.created_at,
+            always_on: self.always_on != 0,
         })
     }
 }
@@ -441,6 +448,9 @@ pub async fn create(
         last_request_at: None,
         last_deploy_sha: None,
         created_at: now,
+        // New rows start cold; the MCP `create_app` path flips Pro apps
+        // on right after (the plan lives with the caller, not here).
+        always_on: false,
     })
 }
 

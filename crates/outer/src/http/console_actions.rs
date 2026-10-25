@@ -1,4 +1,4 @@
-//! Console mutating actions: visibility, delete, secrets, rollback, rename.
+//! Console mutating actions: visibility, keep-warm, delete, secrets, rollback, rename.
 //!
 //! One module per the wave-2 seam: `console.rs` only gains a
 //! `.merge(console_actions::routes())` line, so parallel console work lands
@@ -29,6 +29,7 @@ use crate::mcp::McpState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/console/apps/{slug}/visibility", post(api_visibility))
+        .route("/api/console/apps/{slug}/always-on", post(api_always_on))
         .route("/api/console/apps/{slug}/rename", post(api_rename))
         .route("/api/console/apps/{slug}/delete", post(api_delete))
         .route(
@@ -209,6 +210,43 @@ async fn set_app_visibility(
     let host = format!("{}.{}", app.slug, mcp.delete_cfg.apps_domain);
     crate::cloudflare::purge_host_cache(mcp.delete_cfg.cache_purge.as_ref(), &host).await;
     Ok(json!({"visibility": visibility.as_str()}))
+}
+
+#[derive(Debug, Deserialize)]
+struct AlwaysOnBody {
+    on: bool,
+}
+
+/// `POST /api/console/apps/:slug/always-on {on}`: the MCP `set_always_on`
+/// path, including the shared Pro gate (Free refuses `on` with
+/// `payment_required`; `off` is always allowed).
+async fn api_always_on(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Json(body): Json<AlwaysOnBody>,
+) -> Response {
+    let mcp = &state.mcp;
+    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+        Ok(pair) => pair,
+        Err(res) => return *res,
+    };
+    let summary = format!("set_always_on {}", if body.on { "on" } else { "off" });
+    let result = set_app_always_on(mcp, &app, body.on).await;
+    audited(mcp, &account, &app, "set_always_on", &summary, result).await
+}
+
+/// The domain call, shared by the always-on endpoint's single input.
+async fn set_app_always_on(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    on: bool,
+) -> Result<serde_json::Value, ToolError> {
+    let plan = plan_of(&mcp.pool, &app.owner_id).await?;
+    crate::apps::always_on::set_always_on(&mcp.pool, &app.id, on, &plan)
+        .await
+        .map_err(|err| crate::mcp::tools::apps::always_on_tool_error(&app.slug, err))?;
+    Ok(json!({"always_on": on}))
 }
 
 #[derive(Debug, Deserialize)]
