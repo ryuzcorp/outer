@@ -126,8 +126,14 @@ pub enum CommitError {
     NotFound { path: String },
     #[error("unknown base {base:?}; main is {current}")]
     UnknownBase { base: String, current: String },
+    #[error("unknown preview base {base:?}; preview is {current}")]
+    UnknownPreviewBase { base: String, current: String },
     #[error("tip moved under this commit: main is {current_sha}")]
     Conflict { current_sha: String },
+    #[error("tip moved under this preview commit: preview is {current_sha}")]
+    PreviewConflict { current_sha: String },
+    #[error("no live version on main to preview from yet")]
+    NoMainToPreview,
     #[error("cannot roll back to {target}: {reason}")]
     BadRollback {
         target: String,
@@ -193,6 +199,38 @@ pub async fn commit_with_outcome(
     slug: &str,
     req: CommitRequest,
 ) -> Result<CommitOutcome, CommitError> {
+    commit_to_ref(store, cfg, sync, slug, req, Target::Main).await
+}
+
+/// Commit `req` onto `slug`'s preview ref instead of main and publish it
+/// through the manifest WAL. The first preview commit parents on the main
+/// head (there must be a live version to preview from); later ones parent
+/// on the preview head, and `base` CASes against the preview head, not
+/// main — live commits never disturb a preview's CAS.
+pub async fn commit_preview(
+    store: &crate::store::Store,
+    cfg: &GitConfig,
+    sync: &GitSync,
+    slug: &str,
+    req: CommitRequest,
+) -> Result<CommitOutcome, CommitError> {
+    commit_to_ref(store, cfg, sync, slug, req, Target::Preview).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Main,
+    Preview,
+}
+
+async fn commit_to_ref(
+    store: &crate::store::Store,
+    cfg: &GitConfig,
+    sync: &GitSync,
+    slug: &str,
+    req: CommitRequest,
+    target: Target,
+) -> Result<CommitOutcome, CommitError> {
     if manifest::validate_slug(slug).is_err() {
         return Err(CommitError::BadSlug(slug.to_string()));
     }
@@ -200,35 +238,70 @@ pub async fn commit_with_outcome(
     let bare = manifest::ensure_synced(store, cfg, sync, slug)
         .await
         .map_err(CommitError::Internal)?;
-    let head = manifest::head_of(&bare)
+    let main_head = manifest::head_of(&bare)
         .await
         .map_err(CommitError::Internal)?;
-    if let Some(base) = &req.base {
-        let full = resolve_commit(&bare, base)
-            .await
-            .map_err(|_| CommitError::UnknownBase {
-                base: base.clone(),
-                current: head.clone().unwrap_or_else(|| "<unborn>".to_string()),
-            })?;
-        if head.as_deref() != Some(full.as_str()) {
-            return Err(CommitError::Conflict {
-                current_sha: head.clone().unwrap_or_else(|| "<unborn>".to_string()),
-            });
+    // The CAS head and the commit parent. Main commits parent on the main
+    // head. Preview commits parent on the preview head once it exists; the
+    // first preview commit parents on the main head, or on an explicit base
+    // (a fresh trial from any commit). An unborn preview ref takes any
+    // resolvable base without a CAS check — the publish's CAS (absent →
+    // new) serializes racing first commits.
+    let (cas_head, parent) = match target {
+        Target::Main => (main_head.clone(), main_head.clone()),
+        Target::Preview => {
+            let main = main_head.clone().ok_or(CommitError::NoMainToPreview)?;
+            let preview = manifest::head_of_ref(&bare, manifest::PREVIEW_REF)
+                .await
+                .map_err(CommitError::Internal)?;
+            match &req.base {
+                Some(base) => {
+                    let full = resolve_commit(&bare, base).await.map_err(|_| {
+                        CommitError::UnknownPreviewBase {
+                            base: base.clone(),
+                            current: preview.clone().unwrap_or_else(|| "<unborn>".to_string()),
+                        }
+                    })?;
+                    match preview {
+                        Some(head) if head == full => (Some(head), Some(full)),
+                        Some(head) => {
+                            return Err(CommitError::PreviewConflict { current_sha: head });
+                        }
+                        None => (None, Some(full)),
+                    }
+                }
+                None => (preview.clone(), Some(preview.unwrap_or(main))),
+            }
+        }
+    };
+    if target == Target::Main {
+        if let Some(base) = &req.base {
+            let full = resolve_commit(&bare, base)
+                .await
+                .map_err(|_| CommitError::UnknownBase {
+                    base: base.clone(),
+                    current: cas_head.clone().unwrap_or_else(|| "<unborn>".to_string()),
+                })?;
+            if cas_head.as_deref() != Some(full.as_str()) {
+                return Err(CommitError::Conflict {
+                    current_sha: cas_head.unwrap_or_else(|| "<unborn>".to_string()),
+                });
+            }
         }
     }
-    apply_edits(&bare, head.as_deref(), &req.edits, &mut files).await?;
+    apply_edits(&bare, parent.as_deref(), &req.edits, &mut files).await?;
     let outcome = super::format::format_committed_files(
         cfg.oxfmt_bin.as_deref(),
         &cfg.oxfmt_slots,
         &bare,
-        head.as_deref(),
+        parent.as_deref(),
         &mut files,
     )
     .await;
-    require_existing(&bare, head.as_deref(), &req.deletes, &req.moves).await?;
+    require_existing(&bare, parent.as_deref(), &req.deletes, &req.moves).await?;
     let sha = build_commit(
         &bare,
-        head.as_deref(),
+        parent.as_deref(),
         &req.author,
         &message,
         &files,
@@ -237,7 +310,15 @@ pub async fn commit_with_outcome(
     )
     .await
     .map_err(CommitError::Internal)?;
-    publish_mapped(store, cfg, sync, slug, &bare, head.as_deref(), &sha).await?;
+    match target {
+        Target::Main => {
+            publish_mapped(store, cfg, sync, slug, &bare, cas_head.as_deref(), &sha).await?;
+        }
+        Target::Preview => {
+            publish_preview_mapped(store, cfg, sync, slug, &bare, cas_head.as_deref(), &sha)
+                .await?;
+        }
+    }
     Ok(CommitOutcome {
         sha,
         formatted: outcome.formatted,
@@ -373,6 +454,32 @@ async fn publish_mapped(
                     .unwrap_or(None)
                     .unwrap_or_else(|| "<unborn>".to_string());
                 return Err(CommitError::Conflict {
+                    current_sha: current,
+                });
+            }
+            Err(CommitError::Internal(e))
+        }
+    }
+}
+
+async fn publish_preview_mapped(
+    store: &crate::store::Store,
+    cfg: &GitConfig,
+    sync: &GitSync,
+    slug: &str,
+    bare: &Path,
+    expected_old: Option<&str>,
+    sha: &str,
+) -> Result<String, CommitError> {
+    match manifest::publish_preview(store, cfg, sync, slug, expected_old, sha).await {
+        Ok(sha) => Ok(sha),
+        Err(e) => {
+            if format!("{e:#}").contains("tip moved") {
+                let current = manifest::head_of_ref(bare, manifest::PREVIEW_REF)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "<unborn>".to_string());
+                return Err(CommitError::PreviewConflict {
                     current_sha: current,
                 });
             }
@@ -2210,5 +2317,201 @@ mod tests {
             ]
         );
         assert!(outcome.format_skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_branches_from_main_and_promotes() {
+        let (_dir, cfg, store, sync) = setup("prev").await;
+        let mut live = req("live one");
+        live.writes.push(write("app.txt", "live"));
+        let main1 = commit(&store, &cfg, &sync, "prev", live).await.unwrap();
+
+        // The first preview commit parents on the main head.
+        let mut p1 = req("trial one");
+        p1.writes.push(write("app.txt", "trial"));
+        let t1 = commit_preview(&store, &cfg, &sync, "prev", p1)
+            .await
+            .unwrap()
+            .sha;
+        let bare = manifest::mirror_path(&cfg, "prev");
+        assert_eq!(
+            manifest::head_of_ref(&bare, manifest::PREVIEW_REF)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(t1.as_str())
+        );
+        assert_eq!(
+            manifest::head_of(&bare).await.unwrap().as_deref(),
+            Some(main1.as_str()),
+            "main is untouched by preview commits"
+        );
+        let manifest = manifest::read_manifest(&store, "prev")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.main.unwrap().sha, main1);
+        let preview_entry = manifest.preview.clone().unwrap();
+        assert_eq!(preview_entry.sha, t1);
+        assert!(
+            store.get(&preview_entry.bundle).await.unwrap().is_some(),
+            "preview bundle uploaded"
+        );
+        assert!(
+            !preview_entry.bundle.contains("/main/"),
+            "preview bundles live outside the main prefix"
+        );
+
+        // A second preview commit parents on the preview head; a live
+        // commit in between does not disturb it.
+        let mut live2 = req("live two");
+        live2.writes.push(write("other.txt", "live"));
+        let main2 = commit(&store, &cfg, &sync, "prev", live2).await.unwrap();
+        let mut p2 = req("trial two");
+        p2.writes.push(write("app.txt", "trial two"));
+        p2.base = Some(t1.clone());
+        let t2 = commit_preview(&store, &cfg, &sync, "prev", p2)
+            .await
+            .unwrap()
+            .sha;
+        assert_eq!(
+            manifest::head_of(&bare).await.unwrap().as_deref(),
+            Some(main2.as_str())
+        );
+        // A tip that no longer descends from main refuses the promote
+        // instead of superseding the live change; the agent remakes the
+        // preview from the new main (discard + fresh trial) and promotes
+        // that.
+        let moved = manifest::promote_preview(&store, &cfg, &sync, "prev", &t2).await;
+        assert!(
+            format!("{moved:#?}").contains("main moved"),
+            "got: {moved:#?}"
+        );
+        assert!(manifest::clear_preview(&store, &cfg, &sync, "prev")
+            .await
+            .unwrap());
+        let mut p3 = req("trial three");
+        p3.writes.push(write("app.txt", "trial three"));
+        p3.base = Some(main2.clone());
+        let t3 = commit_preview(&store, &cfg, &sync, "prev", p3)
+            .await
+            .unwrap()
+            .sha;
+        // Promote fast-forwards main onto the preview tip and clears it.
+        let promoted = manifest::promote_preview(&store, &cfg, &sync, "prev", &t3)
+            .await
+            .unwrap();
+        assert_eq!(promoted, t3);
+        assert_eq!(
+            manifest::head_of(&bare).await.unwrap().as_deref(),
+            Some(t3.as_str())
+        );
+        assert!(
+            manifest::head_of_ref(&bare, manifest::PREVIEW_REF)
+                .await
+                .unwrap()
+                .is_none(),
+            "the mirror preview ref is gone after promote"
+        );
+        let manifest = manifest::read_manifest(&store, "prev")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.main.unwrap().sha, t3);
+        assert!(manifest.preview.is_none());
+        assert!(
+            store.list("git/prev/preview/").await.unwrap().is_empty(),
+            "preview bundles deleted on promote"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_cas_and_promote_conflicts() {
+        let (_dir, cfg, store, sync) = setup("prevcas").await;
+        let mut live = req("live");
+        live.writes.push(write("app.txt", "live"));
+        let main1 = commit(&store, &cfg, &sync, "prevcas", live).await.unwrap();
+
+        // A preview on an empty main is refused: there is nothing to trial.
+        let (_dir2, cfg2, store2, sync2) = setup("prevempty").await;
+        let mut seedless = req("x");
+        seedless.writes.push(write("x.txt", "x"));
+        let err = commit_preview(&store2, &cfg2, &sync2, "prevempty", seedless)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CommitError::NoMainToPreview));
+
+        // Stale preview base conflicts against the preview head, naming it.
+        let mut p1 = req("trial");
+        p1.writes.push(write("app.txt", "trial"));
+        let t1 = commit_preview(&store, &cfg, &sync, "prevcas", p1)
+            .await
+            .unwrap()
+            .sha;
+        let mut stale = req("stale trial");
+        stale.writes.push(write("app.txt", "stale"));
+        stale.base = Some(main1.clone());
+        let err = commit_preview(&store, &cfg, &sync, "prevcas", stale)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CommitError::PreviewConflict { ref current_sha } if current_sha == &t1
+        ));
+
+        // A live commit after the preview branched refuses the promote:
+        // main is no longer an ancestor of the preview tip.
+        let mut live2 = req("live two");
+        live2.writes.push(write("other.txt", "live"));
+        commit(&store, &cfg, &sync, "prevcas", live2).await.unwrap();
+        let err = manifest::promote_preview(&store, &cfg, &sync, "prevcas", &t1)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("main moved"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn rehydrate_restores_both_refs_and_clear_drops_preview() {
+        let (_dir, cfg, store, sync) = setup("prevhyd").await;
+        let mut live = req("live");
+        live.writes.push(write("app.txt", "live"));
+        let main = commit(&store, &cfg, &sync, "prevhyd", live).await.unwrap();
+        let mut trial = req("trial");
+        trial.writes.push(write("app.txt", "trial"));
+        let tip = commit_preview(&store, &cfg, &sync, "prevhyd", trial)
+            .await
+            .unwrap()
+            .sha;
+
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh_cfg = GitConfig::new(fresh_dir.path().join("git"), None);
+        let fresh_sync = GitSync::default();
+        let got = manifest::rehydrate(&store, &fresh_cfg, &fresh_sync, "prevhyd")
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(main.as_str()));
+        let bare = manifest::mirror_path(&fresh_cfg, "prevhyd");
+        assert_eq!(
+            manifest::head_of_ref(&bare, manifest::PREVIEW_REF)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_str())
+        );
+
+        assert!(manifest::clear_preview(&store, &cfg, &sync, "prevhyd")
+            .await
+            .unwrap());
+        let manifest = manifest::read_manifest(&store, "prevhyd")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.main.unwrap().sha, main);
+        assert!(manifest.preview.is_none());
+        manifest::delete_preview_bundles(&store, "prevhyd").await;
+        // Clearing twice is quiet.
+        assert!(!manifest::clear_preview(&store, &cfg, &sync, "prevhyd")
+            .await
+            .unwrap());
     }
 }

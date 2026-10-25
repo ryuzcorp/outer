@@ -126,6 +126,23 @@ impl Deploys {
             DeploysInner::Fake(fake) => fake.deploy(pool, app, sha).await,
         }
     }
+
+    /// The preview counterpart: the row lands as `kind = 'preview'` and a
+    /// success never touches `last_deploy_sha`. `app` is the base app; the
+    /// fake resolves the preview row the same way the pipeline does.
+    pub async fn deploy_preview(
+        &self,
+        pool: &SqlitePool,
+        git: &GitConfig,
+        app: &App,
+        sha: &str,
+    ) -> anyhow::Result<DeployOutcome> {
+        match &*self.inner {
+            DeploysInner::Live(deployer) => deployer.deploy_preview(pool, git, app, sha).await,
+            #[cfg(test)]
+            DeploysInner::Fake(fake) => fake.deploy_preview(pool, app, sha).await,
+        }
+    }
 }
 /// What the fake deploy answers with.
 #[cfg(test)]
@@ -236,6 +253,37 @@ impl FakeDeploys {
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
+        self.deploy_inner(pool, app, sha, "main", true).await
+    }
+
+    async fn deploy_preview(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        sha: &str,
+    ) -> anyhow::Result<DeployOutcome> {
+        // The pipeline resolves the preview identity (ports, bucket prefix)
+        // from the row; a deploy without preview state is a caller bug, not
+        // a deploy failure. Pinning it here keeps the fake honest.
+        let preview: Option<String> =
+            sqlx::query_scalar("SELECT preview_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_optional(pool)
+                .await?;
+        if preview.is_none() {
+            return Err(anyhow::anyhow!("fake preview deploy without preview state"));
+        }
+        self.deploy_inner(pool, app, sha, "preview", false).await
+    }
+
+    async fn deploy_inner(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        sha: &str,
+        kind: &str,
+        touches_live: bool,
+    ) -> anyhow::Result<DeployOutcome> {
         let outcome = self.outcome.lock().expect("fake outcome poisoned").clone();
         if outcome.transport_error {
             return Err(anyhow::anyhow!("fake deploy transport failure"));
@@ -248,12 +296,13 @@ impl FakeDeploys {
         let steps_json = r#"[{"name":"fake","ms":1,"skipped":false}]"#;
         let findings_json = serde_json::to_string(&outcome.findings)?;
         sqlx::query(
-            "INSERT INTO deploy (id, app_id, sha, status, steps, error, findings, log_tail, created_at, finished_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'fake deploy ok', ?8, ?8)",
+            "INSERT INTO deploy (id, app_id, sha, kind, status, steps, error, findings, log_tail, created_at, finished_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'fake deploy ok', ?9, ?9)",
         )
         .bind(&deploy_id)
         .bind(&app.id)
         .bind(sha)
+        .bind(kind)
         .bind(outcome.status)
         .bind(steps_json)
         .bind(outcome.error)
@@ -261,7 +310,7 @@ impl FakeDeploys {
         .bind(now)
         .execute(pool)
         .await?;
-        if outcome.status == "success" {
+        if touches_live && outcome.status == "success" {
             crate::apps::set_last_deploy(pool, &app.id, sha).await?;
         }
         Ok(DeployOutcome {
@@ -438,6 +487,7 @@ impl McpState {
             wake_timeout: Duration::from_secs(30),
             wake_concurrency: 4,
             always_on_max: 10,
+            preview_max: 20,
         });
         Self {
             pool,

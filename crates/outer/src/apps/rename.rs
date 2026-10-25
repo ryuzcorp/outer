@@ -154,6 +154,13 @@ pub enum RenameError {
     Profanity(#[from] super::ProfanityError),
     #[error("slug is taken or quarantined; choose another slug")]
     Taken,
+    /// The app holds an active preview, whose fleet key, bucket prefix and
+    /// local dirs are derived from the old slug: discard it first, then
+    /// rename.
+    #[error(
+        "discard the preview before renaming {0:?}: trial state is slug-derived and does not move"
+    )]
+    PreviewActive(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -489,6 +496,13 @@ pub async fn rename_app_with_hooks(
             }
             CreateError::Internal(e) => RenameError::Internal(e),
         })?;
+
+    // A preview's fleet key, bucket prefix and local dirs all derive from
+    // the old slug and do not move: refuse while one is active instead of
+    // orphaning a fleet or stranding a bucket prefix.
+    if crate::preview::preview_of(&app).is_some() {
+        return Err(RenameError::PreviewActive(old_slug.to_string()));
+    }
 
     // 1. Stop the fleet first: nothing may serve or write while the bucket
     // prefixes and local dirs move. The cached scoped credentials for the

@@ -2927,6 +2927,7 @@ exit 0
             wake_timeout: Duration::from_secs(1),
             wake_concurrency: 1,
             always_on_max: 10,
+            preview_max: 20,
         });
         let base = McpState::for_tests(pool.clone(), auth.clone());
         let mcp = McpState {

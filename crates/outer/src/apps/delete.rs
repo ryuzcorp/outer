@@ -141,12 +141,23 @@ pub async fn delete_app(
             confirm.to_string(),
         ));
     }
-
+    // Clear the preview columns before stopping anything: a preview request
+    // that queued behind the stop re-reads the row under the preview wake
+    // lock and bails once no preview is named, instead of respawning the
+    // fleet from stale row data mid-delete. Independent of the fleet
+    // manager below (the CLI path has none); the row itself goes LAST.
+    crate::preview::clear_preview_row(pool, &app.id)
+        .await
+        .map_err(internal)?;
     // 1. Stop the fleet first: nothing may serve or write while its state
     // goes away. Missing is a no-op (already asleep or never woken); the
     // cached scoped credentials for the prefix go with it.
     if let Some(fleets) = fleets {
         fleets.stop_tracked(slug).await;
+        // The preview fleet (if any) tracks under its own key with its own
+        // cached prefix grant; the row (and its preview columns) goes away
+        // below, so stop it here while the slug still names it.
+        fleets.stop_preview(slug).await;
     }
 
     // 1b. Custom domains (spec §7.7): delete the Cloudflare custom
@@ -166,6 +177,14 @@ pub async fn delete_app(
         .delete_prefix(&format!("fleets/{slug}/"))
         .await
         .map_err(internal)?;
+    // The preview fleet's fresh namespace (`fleets/{slug}--preview/`): the
+    // trailing slash that protects `{slug}-2` would also protect this, so
+    // it is deleted explicitly. Preview bundles live under `git/{slug}/`
+    // and go away with the manifest purge below.
+    store
+        .delete_prefix(&format!("fleets/{}/", crate::preview::preview_key(slug)))
+        .await
+        .map_err(internal)?;
     store
         .delete_prefix(&format!("outer/exports/{slug}/"))
         .await
@@ -180,10 +199,19 @@ pub async fn delete_app(
 
     // 3. Local state: the mirror, the worktree and its sidecars, the
     // install cache, the fleet's state dir, the secret sidecars, and the
-    // fleet cgroup leaf. All idempotent (missing is done).
+    // fleet cgroup leaf. All idempotent (missing is done). The preview
+    // fleet owns the same shapes under its own key, removed the same way.
     crate::apps::local::remove_local_state(&cfg.data_dir, git, cfg.cgroups.as_deref(), slug)
         .await
         .map_err(internal)?;
+    crate::apps::local::remove_local_state(
+        &cfg.data_dir,
+        git,
+        cfg.cgroups.as_deref(),
+        &crate::preview::preview_key(slug),
+    )
+    .await
+    .map_err(internal)?;
 
     // 4. Rows: every app-scoped child explicitly, then the app row itself —
     // LAST, so a failure above keeps the row and a retry finishes the job.

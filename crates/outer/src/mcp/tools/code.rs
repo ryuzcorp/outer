@@ -96,8 +96,13 @@ pub struct CommitInput {
     /// File renames.
     pub moves: Option<Vec<MoveInput>>,
     /// Wait for the deploy (default true). False returns immediately;
-    /// poll deploy_status.
+    /// poll deploy_status (with preview: true for a preview commit).
     pub wait: Option<bool>,
+    /// Preview the change instead of shipping it (Pro): commits to the
+    /// preview ref, deploys to the `<slug>--preview` URL with a fresh,
+    /// empty data namespace, and leaves live untouched. Counts a code
+    /// change like a live commit.
+    pub preview: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -354,6 +359,9 @@ fn to_commit_request(
 }
 
 pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    if input.preview.unwrap_or(false) {
+        return commit_to_preview(input, ctx).await;
+    }
     let (app, _) = visible_app(ctx, &input.app).await?;
     let caller = authed(ctx)?;
     let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
@@ -386,34 +394,8 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     };
     let sha = outcome.sha;
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
-    // Quota threshold emails (alerts #2): the claim counted even when the
-    // deploy failed, so evaluate from the claim numbers. Never raises.
-    // Spawned: the mailer network call must not delay the commit response
-    // after the deploy is already done (deploy-failure mail already runs
-    // inside the spawned `run_deploy` task the same way).
-    {
-        let pool = ctx.state.pool.clone();
-        let sender = ctx.state.auth.config.email.clone();
-        let issuer = ctx.state.auth.config.issuer.clone();
-        let key = ctx.state.unsub_key.clone();
-        let owner = app.owner_id.clone();
-        let (used, limit) = (claim.used, claim.limit);
-        tokio::spawn(async move {
-            crate::alerts::notify_quota(
-                &crate::alerts::Ctx {
-                    pool: &pool,
-                    sender: &sender,
-                    issuer: &issuer,
-                    key: &key,
-                },
-                &owner,
-                used,
-                limit,
-                crate::auth::now_ms(),
-            )
-            .await;
-        });
-    }
+    // Quota threshold emails (alerts #2), off the critical path.
+    super::spawn_quota_email(ctx.state, &app.owner_id, claim.used, claim.limit);
     let quota =
         json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
     let mut summary = format!(
@@ -433,6 +415,164 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
             .collect::<Vec<_>>());
     }
     let structured = json!({"commit": commit, "deploy": deploy, "quota": quota});
+    Ok(ok_deploy(
+        summary,
+        &structured["deploy"].clone(),
+        structured,
+    ))
+}
+
+/// The `commit {preview: true}` path: the Pro gate, a host-cap fast check
+/// and the change claim all run BEFORE the git work (a refused preview burns
+/// no quota and writes nothing). The commit lands on the preview ref, the
+/// row names the fleet (reusing ports across refreshes of one preview
+/// lifetime; the cap is enforced again with the port reservation, rolling
+/// the git work back when a rival filled the last slot), and the deploy runs
+/// under the preview identity with a fresh data namespace. A failed deploy
+/// still counts the change, exactly like a live commit.
+async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let (app, _) = visible_app(ctx, &input.app).await?;
+    super::preview::require_pro(
+        ctx,
+        &app.owner_id,
+        &app.slug,
+        "preview deploys",
+        "are",
+        "try changes at a temporary URL before they go live",
+    )
+    .await?;
+    let caller = authed(ctx)?;
+    let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
+    let request = to_commit_request(&input, author)?;
+    if let Some(base) = input.base.as_deref() {
+        check_rev("base", base)?;
+    }
+    // One preview per app; the host cap bounds total preview fleets. A
+    // refresh of the existing preview needs no new slot.
+    if crate::preview::preview_of(&app).is_none() {
+        let max = ctx.state.fleets.preview_max();
+        let used = crate::preview::count_previews(&ctx.state.pool)
+            .await
+            .map_err(internal)?;
+        if used >= max as u64 {
+            let retry_after_s = crate::preview::oldest_preview_touch(&ctx.state.pool)
+                .await
+                .map_err(internal)?
+                .map(|oldest| {
+                    (oldest + crate::preview::PREVIEW_IDLE_TTL_MS - crate::apps::now_ms()).max(1)
+                        as u64
+                })
+                .unwrap_or(60);
+            return Err(ToolError::rate_limited(
+                format!("preview capacity is full ({used}/{max} active previews)"),
+                retry_after_s,
+            ));
+        }
+    }
+    let claim = claim_change(&ctx.state.pool, &app.owner_id).await?;
+    let outcome = match git::commit::commit_preview(
+        &ctx.state.store,
+        &ctx.state.git,
+        &ctx.state.sync,
+        &app.slug,
+        request,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            if let Err(refund) = refund_change(&ctx.state.pool, &app.owner_id).await {
+                tracing::warn!("commit refund failed: {refund:#}");
+            }
+            return Err(ToolError::from_commit(e));
+        }
+    };
+    let sha = outcome.sha;
+    // Ports are claimed once per preview lifetime and reused across
+    // refreshes, so a running preview fleet's ports never churn under it.
+    // The reservation runs after the commit (the sha is an input) under one
+    // lock: the second of two racing first-time commits already sees the
+    // first's ports, and a cap filled in between rolls the git work back.
+    let (port, internal_port) = match crate::preview::preview_of(&app) {
+        Some(existing) => (existing.port, existing.internal_port),
+        None => {
+            let max = ctx.state.fleets.preview_max();
+            match crate::apps::claim_preview_ports(&ctx.state.pool, &ctx.state.alloc, &app.id, max)
+                .await
+            {
+                Ok(ports) => ports,
+                Err(e) if e.is::<crate::apps::PreviewCapFull>() => {
+                    // A rival preview took the last slot after the
+                    // pre-commit check: drop the just-published ref (it
+                    // names no row) and refuse without burning quota.
+                    let _ = crate::git::manifest::clear_preview(
+                        &ctx.state.store,
+                        &ctx.state.git,
+                        &ctx.state.sync,
+                        &app.slug,
+                    )
+                    .await;
+                    if let Err(refund) = refund_change(&ctx.state.pool, &app.owner_id).await {
+                        tracing::warn!("commit refund failed: {refund:#}");
+                    }
+                    let retry_after_s = crate::preview::oldest_preview_touch(&ctx.state.pool)
+                        .await
+                        .map_err(internal)?
+                        .map(|oldest| {
+                            (oldest + crate::preview::PREVIEW_IDLE_TTL_MS - crate::apps::now_ms())
+                                .max(1) as u64
+                        })
+                        .unwrap_or(60);
+                    return Err(ToolError::rate_limited(e.to_string(), retry_after_s));
+                }
+                Err(e) => return Err(internal(e)),
+            }
+        }
+    };
+    let now = crate::apps::now_ms();
+    crate::preview::set_preview(&ctx.state.pool, &app.id, &sha, now, port, internal_port)
+        .await
+        .map_err(internal)?;
+    // Re-read: the deploy runs under the preview identity, which lives in
+    // the row this just wrote — the `app` above predates it.
+    let app = crate::apps::get_by_id(&ctx.state.pool, &app.id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| internal(anyhow::anyhow!("app {} vanished mid-commit", app.slug)))?;
+    let deploy =
+        super::run_preview_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
+    super::spawn_quota_email(ctx.state, &app.owner_id, claim.used, claim.limit);
+    let quota =
+        json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
+    let preview_url = crate::preview::preview_url(
+        &ctx.state.app_scheme,
+        &app.slug,
+        &ctx.state.apps_domain,
+        &ctx.state.app_port_suffix,
+    );
+    let mut summary = format!(
+        "Committed {} to the preview ({}). Live is untouched; try it at {}.",
+        &sha[..12.min(sha.len())],
+        deploy["status"].as_str().unwrap_or(""),
+        preview_url,
+    );
+    if !outcome.formatted.is_empty() {
+        summary.push_str(&format!(" Formatted {} file(s).", outcome.formatted.len()));
+    }
+    let mut commit = json!({"sha": sha, "formatted": outcome.formatted});
+    if !outcome.format_skipped.is_empty() {
+        commit["format_skipped"] = json!(outcome
+            .format_skipped
+            .iter()
+            .map(|s| json!({"path": s.path, "reason": s.reason}))
+            .collect::<Vec<_>>());
+    }
+    let structured = json!({
+        "commit": commit,
+        "deploy": deploy,
+        "quota": quota,
+        "preview_url": preview_url,
+    });
     Ok(ok_deploy(
         summary,
         &structured["deploy"].clone(),
@@ -547,7 +687,14 @@ pub async fn rollback_to(
     // new rollback commit. Report it (awaited or not) instead of building.
     if let Some(row) = super::latest_deploy(&state.pool, &app.id).await? {
         if !super::is_terminal(&row.status) {
-            let deploy = super::await_row(state, app, Some(&row.deploy_id), wait).await?;
+            let deploy = super::await_row(
+                state,
+                app,
+                Some(&row.deploy_id),
+                wait,
+                crate::deploy::DeployKind::Main,
+            )
+            .await?;
             let structured = json!({"commit": {"sha": row.sha}, "deploy": deploy});
             let summary = format!(
                 "A deploy is already running; reporting it instead of a new rollback ({}).",

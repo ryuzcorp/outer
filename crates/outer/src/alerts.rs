@@ -770,6 +770,10 @@ mod tests {
             last_deploy_sha: None,
             created_at: 0,
             always_on: false,
+            preview_sha: None,
+            preview_updated_at: None,
+            preview_port: None,
+            preview_internal_port: None,
         }
     }
 

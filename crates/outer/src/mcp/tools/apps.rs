@@ -8,8 +8,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    authed, check_app_quota, internal, latest_deploy, ok, owner_app, run_deploy, visible_app, Ctx,
-    NoArgs,
+    authed, check_app_quota, internal, latest_deploy, latest_preview_deploy, ok, owner_app,
+    run_deploy, visible_app, Ctx, NoArgs,
 };
 use crate::apps::{self, App, Visibility};
 use crate::collaborators::Role;
@@ -253,6 +253,23 @@ pub async fn app_summary(ctx: &Ctx<'_>, app: &App, role: Role) -> Result<Value, 
     });
     if let Some(last) = last {
         v["last_deploy"] = json!({"sha": last.sha, "status": last.status});
+    }
+    if let Some(preview) = crate::preview::preview_of(app) {
+        let preview_status = latest_preview_deploy(&ctx.state.pool, &app.id)
+            .await?
+            .map(|row| row.status)
+            .unwrap_or_else(|| "building".to_string());
+        v["preview"] = json!({
+            "url": crate::preview::preview_url(
+                &ctx.state.app_scheme,
+                &app.slug,
+                &ctx.state.apps_domain,
+                &ctx.state.app_port_suffix,
+            ),
+            "sha": preview.sha,
+            "status": preview_status,
+            "updated_at": preview.updated_at_ms,
+        });
     }
     Ok(v)
 }

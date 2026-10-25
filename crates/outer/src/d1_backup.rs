@@ -1575,6 +1575,7 @@ exit 0
             wake_timeout: Duration::from_secs(1),
             wake_concurrency: 1,
             always_on_max: 0,
+            preview_max: 0,
         });
         tick(&pool, &store, &fleets).await.unwrap();
         assert!(backups_for(&pool, "app-bad").await.unwrap().is_empty());

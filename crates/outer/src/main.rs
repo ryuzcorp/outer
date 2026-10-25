@@ -625,6 +625,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         wake_timeout: Duration::from_secs(30),
         wake_concurrency: rt.wake_concurrency,
         always_on_max: rt.always_on_max,
+        preview_max: rt.preview_max,
     });
     // A previous process may have died between a rename's commit and its
     // post-commit deletes: drain pending prefix cleanups before serving, so
@@ -634,9 +635,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     {
         tracing::warn!(error = %format!("{err:#}"), "startup prefix cleanup drain failed");
     }
+    let git = git_config(&config);
+    let git_sync = outer::git::GitSync::default();
     fleets.spawn_sleep_sweep(
         pool.clone(),
         store.clone(),
+        git.clone(),
+        git_sync.clone(),
         Duration::from_secs(60.min(rt.sleep_after_secs.max(1))),
     );
     outer::cron::spawn_cron_task(
@@ -687,8 +692,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         pool: pool.clone(),
         auth: auth.clone(),
         store: store.clone(),
-        git: git_config(&config),
-        sync: outer::git::GitSync::default(),
+        git: git.clone(),
+        sync: git_sync.clone(),
         deploys: outer::mcp::Deploys::live(deployer),
         fleets: fleets.clone(),
         alloc: outer::apps::Allocation {

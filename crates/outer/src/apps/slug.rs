@@ -80,6 +80,11 @@ pub fn validate_slug(slug: &str) -> Result<(), SlugError> {
     if RESERVED_SLUGS.contains(&slug) {
         return Err(SlugError::Reserved(slug.to_string()));
     }
+    // Preview hosts live at `<slug>--preview`: no app may claim that shape,
+    // or its live URL and its preview URL would collide on one hostname.
+    if slug.ends_with(crate::preview::PREVIEW_HOST_SUFFIX) {
+        return Err(SlugError::Reserved(slug.to_string()));
+    }
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         // Static invariant: a compile-time literal, so construction never fails.
         regex::Regex::new(r"^[a-z0-9]([a-z0-9\-]{0,46}[a-z0-9])?$").expect("slug re")

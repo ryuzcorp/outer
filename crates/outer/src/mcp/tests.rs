@@ -336,7 +336,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 47);
+    assert_eq!(anon.len(), 49);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -353,7 +353,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 45);
+    assert_eq!(authed.len(), 47);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -4775,4 +4775,409 @@ async fn export_prune_deletes_only_exports_older_than_a_day() {
         .await
         .unwrap();
     assert_eq!(keys, vec!["outer/exports/groceries/abc1234-bbbb.zip"]);
+}
+
+async fn make_pro(state: &McpState, email: &str) {
+    sqlx::query("UPDATE user SET plan = 'pro' WHERE email = ?1")
+        .bind(email)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn preview_commit_needs_pro_and_burns_nothing() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "trial",
+               "writes": [{"path": "t.txt", "content": "t"}],
+               "preview": true}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "payment_required");
+    assert!(err["message"].as_str().unwrap().contains("preview deploys"));
+    assert!(
+        err["user_message"]
+            .as_str()
+            .unwrap()
+            .contains("Preview deploys are a Pro feature"),
+        "relay word for word: {}",
+        err["user_message"]
+    );
+    // Refused before the claim: no quota burned, no preview state.
+    let used: i64 = sqlx::query_scalar("SELECT code_changes FROM usage_day")
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(used, 0, "the refused preview burned no quota");
+    let preview: Option<String> =
+        sqlx::query_scalar("SELECT preview_sha FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(preview.is_none());
+}
+
+#[tokio::test]
+async fn preview_commit_promote_discard_round_trip() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    make_pro(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // Trial the change: same gate, fresh namespace, live untouched.
+    let (_, trialed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "trial",
+               "writes": [{"path": "t.txt", "content": "t"}],
+               "preview": true}),
+    )
+    .await;
+    let structured = &result(&trialed)["structuredContent"];
+    assert!(result(&trialed).get("isError").is_none());
+    let sha = structured["commit"]["sha"].as_str().unwrap().to_string();
+    let preview_url = structured["preview_url"].as_str().unwrap();
+    assert_eq!(preview_url, "http://groceries--preview.outer.localhost");
+    assert_eq!(structured["deploy"]["url"], preview_url);
+    assert_eq!(structured["deploy"]["status"], "success");
+    assert_eq!(structured["quota"]["used"], 1);
+    // The preview row names the fleet; the live last-deploy is the seed.
+    let row: (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT preview_sha, preview_port, preview_internal_port FROM app WHERE slug = 'groceries'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_deref(), Some(sha.as_str()));
+    assert!(row.1.is_some() && row.2.is_some() && row.1 != row.2);
+    let live: Option<String> =
+        sqlx::query_scalar("SELECT last_deploy_sha FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(live.is_some() && live.as_deref() != Some(sha.as_str()));
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM deploy ORDER BY created_at")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+    assert!(kinds.contains(&"preview".to_string()), "kinds: {kinds:?}");
+
+    // Live history never sees the preview run.
+    let (_, status) = call(
+        &state,
+        Some(&token),
+        "deploy_status",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&status)["structuredContent"]["url"]
+        .as_str()
+        .unwrap()
+        .ends_with("groceries.outer.localhost"));
+    let (_, preview_status) = call(
+        &state,
+        Some(&token),
+        "deploy_status",
+        json!({"app": "groceries", "preview": true}),
+    )
+    .await;
+    assert_eq!(
+        result(&preview_status)["structuredContent"]["url"],
+        json!(preview_url)
+    );
+    let (_, log) = call(
+        &state,
+        Some(&token),
+        "deploy_log",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&log).get("isError").is_none());
+    let (_, get) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(
+        result(&get)["structuredContent"]["preview"]["url"],
+        json!(preview_url)
+    );
+
+    // Promote: main fast-forwards, preview clears, live deploys normally.
+    let (_, promoted) = call(
+        &state,
+        Some(&token),
+        "promote_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let pstructured = &result(&promoted)["structuredContent"];
+    assert!(result(&promoted).get("isError").is_none());
+    assert_eq!(pstructured["sha"], json!(sha));
+    assert_eq!(pstructured["deploy"]["status"], "success");
+    assert!(pstructured["deploy"]["url"]
+        .as_str()
+        .unwrap()
+        .ends_with("groceries.outer.localhost"));
+    let live_after: Option<String> =
+        sqlx::query_scalar("SELECT last_deploy_sha FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert_eq!(live_after.as_deref(), Some(sha.as_str()));
+    let cleared: Option<String> =
+        sqlx::query_scalar("SELECT preview_sha FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(cleared.is_none());
+    // A stale mirror ref cannot resurrect the preview.
+    let second = call(
+        &state,
+        Some(&token),
+        "promote_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&second.1)["error"], "not_found");
+
+    // Discard without a preview is a clean not_found.
+    let (_, missing) = call(
+        &state,
+        Some(&token),
+        "discard_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+}
+
+#[tokio::test]
+async fn preview_promote_resumes_a_cancelled_run() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    make_pro(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // Trial, then promote: main moves and the preview clears.
+    let (_, trialed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "trial",
+               "writes": [{"path": "t.txt", "content": "t"}],
+               "preview": true}),
+    )
+    .await;
+    let sha = result(&trialed)["structuredContent"]["commit"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, promoted) = call(
+        &state,
+        Some(&token),
+        "promote_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&promoted).get("isError").is_none());
+
+    // A cancelled promote strands the manifest ahead of the row: the fast
+    // forward landed, but the row cleanup and live deploy never ran.
+    // Rehearse it by restoring the preview row on the promoted tip.
+    sqlx::query(
+        "UPDATE app SET preview_sha = ?1, preview_updated_at = ?2, \
+         preview_port = 18001, preview_internal_port = 18002 WHERE slug = 'groceries'",
+    )
+    .bind(&sha)
+    .bind(crate::apps::now_ms())
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    // No successful preview deploy at this sha anymore (it was promoted),
+    // so plant one: the resumed run still requires the success check.
+    sqlx::query(
+        "INSERT INTO deploy (id, app_id, sha, kind, status, created_at, finished_at) \
+         SELECT 'preview-resume', id, ?1, 'preview', 'success', 2, 3 FROM app WHERE slug = 'groceries'",
+    )
+    .bind(&sha)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (_, resumed) = call(
+        &state,
+        Some(&token),
+        "promote_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&resumed).get("isError").is_none());
+    let cleared: Option<String> =
+        sqlx::query_scalar("SELECT preview_sha FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(cleared.is_none());
+}
+
+#[tokio::test]
+async fn preview_promote_needs_success_and_discard_cleans_up() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    make_pro(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // A blocked preview has no successful deploy: promotion refuses.
+    state.deploys.set_fake(FakeOutcome::blocked());
+    let (_, trialed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "trial",
+               "writes": [{"path": "t.txt", "content": "t"}],
+               "preview": true}),
+    )
+    .await;
+    assert_eq!(
+        result(&trialed)["structuredContent"]["deploy"]["status"],
+        "blocked"
+    );
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "promote_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("no successful deploy"));
+
+    // Back to success: discard clears the preview without touching live.
+    state.deploys.set_fake(FakeOutcome::success());
+    let (_, discarded) = call(
+        &state,
+        Some(&token),
+        "discard_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&discarded).get("isError").is_none());
+    let live: Option<String> =
+        sqlx::query_scalar("SELECT last_deploy_sha FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(live.is_some(), "discard never touches the live version");
+    let cleared: Option<String> =
+        sqlx::query_scalar("SELECT preview_sha FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(cleared.is_none());
+}
+
+#[tokio::test]
+async fn preview_capacity_refuses_with_retry() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    make_pro(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // Fill the host cap with preview rows (bypasses per-owner app limits).
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('owner-cap', 'cap@example.com', 0, 0, 0)")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    for i in 0..20 {
+        let id = format!("cap{i}");
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at, \
+             preview_sha, preview_updated_at, preview_port, preview_internal_port) \
+             VALUES (?1, ?2, 'owner-cap', ?3, ?4, ?5, 0, 0, 'abc', 1000, ?4, ?5)",
+        )
+        .bind(&id)
+        .bind(format!("cap-{i}"))
+        .bind(300000 + i)
+        .bind(19000 + 2 * i)
+        .bind(19001 + 2 * i)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "trial",
+               "writes": [{"path": "t.txt", "content": "t"}],
+               "preview": true}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "rate_limited");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("preview capacity is full (20/20 active previews)"));
+    assert!(err["retry_after_s"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn preview_guards_rename_and_slug_shape() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    make_pro(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // No app may claim a preview-shaped slug: it would collide with a URL.
+    let (_, taken) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "groceries--preview"}),
+    )
+    .await;
+    assert_eq!(is_error(&taken)["error"], "invalid_argument");
+
+    // Renaming with an active preview refuses instead of orphaning the fleet.
+    let (_, trialed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "trial",
+               "writes": [{"path": "t.txt", "content": "t"}],
+               "preview": true}),
+    )
+    .await;
+    assert!(result(&trialed).get("isError").is_none());
+    let (_, renamed) = call(
+        &state,
+        Some(&token),
+        "rename_app",
+        json!({"app": "groceries", "slug": "pantry"}),
+    )
+    .await;
+    let err = is_error(&renamed);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("discard the preview"));
 }

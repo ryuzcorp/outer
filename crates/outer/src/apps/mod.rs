@@ -196,6 +196,13 @@ pub struct App {
     /// is Pro (up to the host cap) and the warm-up restarts it when stopped.
     /// Stored for every plan; ignored on Free.
     pub always_on: bool,
+    /// The active preview deploy (Pro feature #7), if any: the commit on
+    /// the `preview` git ref, served at `<slug>--preview.<apps_domain>`
+    /// from a fresh data namespace. All four are set or cleared together.
+    pub preview_sha: Option<String>,
+    pub preview_updated_at: Option<i64>,
+    pub preview_port: Option<u16>,
+    pub preview_internal_port: Option<u16>,
 }
 
 /// The free uid/port ranges one app takes its [`App::uid`], [`App::port`]
@@ -249,7 +256,8 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visibility, \
-    asleep_since, last_request_at, last_deploy_sha, created_at, always_on";
+    asleep_since, last_request_at, last_deploy_sha, created_at, always_on, \
+    preview_sha, preview_updated_at, preview_port, preview_internal_port";
 
 #[derive(Debug, sqlx::FromRow)]
 struct AppRow {
@@ -266,6 +274,10 @@ struct AppRow {
     last_deploy_sha: Option<String>,
     created_at: i64,
     always_on: i64,
+    preview_sha: Option<String>,
+    preview_updated_at: Option<i64>,
+    preview_port: Option<i64>,
+    preview_internal_port: Option<i64>,
 }
 
 impl AppRow {
@@ -291,6 +303,18 @@ impl AppRow {
             last_deploy_sha: self.last_deploy_sha,
             created_at: self.created_at,
             always_on: self.always_on != 0,
+            preview_sha: self.preview_sha,
+            preview_updated_at: self.preview_updated_at,
+            preview_port: self
+                .preview_port
+                .map(u16::try_from)
+                .transpose()
+                .context("preview port out of range")?,
+            preview_internal_port: self
+                .preview_internal_port
+                .map(u16::try_from)
+                .transpose()
+                .context("preview port out of range")?,
         })
     }
 }
@@ -404,9 +428,14 @@ pub async fn create(
     uids.sort_unstable();
     let uid = lowest_free(&uids, alloc.uid_range.0 as i64, alloc.uid_range.1 as i64, 1)
         .ok_or(CreateError::Exhausted("uids"))?[0];
+    // Preview fleets take their ports from the same ranges, so their ports
+    // count here too: a create must never hand a live app a port a preview
+    // fleet is serving on (and vice versa in `claim_preview_ports`).
     let mut ports: Vec<i64> = sqlx::query_scalar(
         "SELECT port FROM app WHERE port IS NOT NULL \
-         UNION SELECT internal_port FROM app WHERE internal_port IS NOT NULL",
+         UNION SELECT internal_port FROM app WHERE internal_port IS NOT NULL \
+         UNION SELECT preview_port FROM app WHERE preview_port IS NOT NULL \
+         UNION SELECT preview_internal_port FROM app WHERE preview_internal_port IS NOT NULL",
     )
     .fetch_all(pool)
     .await
@@ -458,7 +487,67 @@ pub async fn create(
         // New rows start cold; the MCP `create_app` path flips Pro apps
         // on right after (the plan lives with the caller, not here).
         always_on: false,
+        preview_sha: None,
+        preview_updated_at: None,
+        preview_port: None,
+        preview_internal_port: None,
     })
+}
+
+/// The host preview cap filled between the commit path's pre-check and its
+/// reservation: the caller rolls back its git work and refuses with
+/// `rate_limited` instead of recording a preview past the cap.
+#[derive(Debug, thiserror::Error)]
+#[error("preview capacity is full ({used}/{max} active previews)")]
+pub struct PreviewCapFull {
+    /// Previews holding state when the reservation ran.
+    pub used: u64,
+    /// The host cap ([`crate::preview::DEFAULT_PREVIEW_MAX`]).
+    pub max: usize,
+}
+
+/// Claim two free loopback ports for an app's preview fleet and record them
+/// on the row: the same ranges and lowest-free rule as [`create`]. The host
+/// cap check, the port scan and the row write run under one process lock, so
+/// two concurrent first-time preview commits can neither take the same pair
+/// (the second claim already sees the first's row write) nor overshoot the
+/// host cap past its pre-check. The caller writes the sha alongside these
+/// same ports when it records the preview state. Errors when the cap is
+/// full ([`PreviewCapFull`]) or the ranges are exhausted.
+pub async fn claim_preview_ports(
+    pool: &SqlitePool,
+    alloc: &Allocation,
+    app_id: &str,
+    max: usize,
+) -> anyhow::Result<(u16, u16)> {
+    let _guard = CREATE_LOCK.lock().await;
+    let used = crate::preview::count_previews(pool).await?;
+    if used >= max as u64 {
+        anyhow::bail!(PreviewCapFull { used, max });
+    }
+    let mut ports: Vec<i64> = sqlx::query_scalar(
+        "SELECT port FROM app WHERE port IS NOT NULL \
+         UNION SELECT internal_port FROM app WHERE internal_port IS NOT NULL \
+         UNION SELECT preview_port FROM app WHERE preview_port IS NOT NULL \
+         UNION SELECT preview_internal_port FROM app WHERE preview_internal_port IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    ports.sort_unstable();
+    let free = lowest_free(
+        &ports,
+        alloc.port_range.0 as i64,
+        alloc.port_range.1 as i64,
+        2,
+    )
+    .ok_or_else(|| anyhow::anyhow!("no free ports left for a preview fleet"))?;
+    sqlx::query("UPDATE app SET preview_port = ?1, preview_internal_port = ?2 WHERE id = ?3")
+        .bind(free[0] as i64)
+        .bind(free[1] as i64)
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok((free[0] as u16, free[1] as u16))
 }
 
 /// Delete the app row and quarantine its slug for 30 days. Missing rows are a
@@ -851,5 +940,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, vec!["live-quar"]);
+    }
+    #[tokio::test]
+    async fn preview_port_claims_reserve_under_one_lock() {
+        let (_dir, pool, owner) = setup().await;
+        let wide = Allocation {
+            uid_range: (220000, 220010),
+            port_range: (18100, 18109),
+        };
+        let a = create(&pool, &owner, "aaa", None, &wide, 10).await.unwrap();
+        let b = create(&pool, &owner, "bbb", None, &wide, 10).await.unwrap();
+        // The ports land on the row inside the claim lock: a second claim
+        // already sees the first's pair and cannot take it again.
+        let first = claim_preview_ports(&pool, &wide, &a.id, 10).await.unwrap();
+        assert_eq!(first, (18104, 18105));
+        let second = claim_preview_ports(&pool, &wide, &b.id, 10).await.unwrap();
+        assert_ne!(
+            first, second,
+            "two first-time preview claims must not take the same ports"
+        );
+        assert_eq!(second, (18106, 18107));
+        // And the host cap is enforced in the same critical section: with
+        // one preview recorded, a cap of one refuses the second app.
+        crate::preview::set_preview(&pool, &a.id, &"c".repeat(40), 1000, first.0, first.1)
+            .await
+            .unwrap();
+        let err = claim_preview_ports(&pool, &wide, &b.id, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is::<PreviewCapFull>(),
+            "a full host cap refuses with PreviewCapFull: {err:#}"
+        );
     }
 }

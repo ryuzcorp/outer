@@ -124,6 +124,17 @@ impl ToolError {
                 format!("unknown base {base:?}; main is {current}"),
                 &current,
             ),
+            E::PreviewConflict { current_sha } => Self::conflict(
+                format!("tip moved under this preview commit: preview is {current_sha}"),
+                &current_sha,
+            )
+            .with_user(format!(
+                "Someone changed the preview since you read it. Read the latest files and retry with base {current_sha}."
+            )),
+            E::UnknownPreviewBase { base, current } => Self::conflict(
+                format!("unknown preview base {base:?}; preview is {current}"),
+                &current,
+            ),
             E::Internal(e) => {
                 tracing::warn!("commit internal: {e:#}");
                 Self::internal("the commit failed on our side; try again in a minute")
@@ -170,6 +181,9 @@ impl ToolError {
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
             E::Profanity(err) => Self::from_profanity(err),
             E::Taken => Self::invalid_argument("slug is taken or quarantined; choose another slug"),
+            E::PreviewActive(slug) => Self::invalid_argument(format!(
+                "discard the preview of {slug:?} before renaming it: trial state does not move"
+            )),
             E::Internal(e) => {
                 tracing::warn!("rename_app internal: {e:#}");
                 Self::internal("renaming the app failed on our side; try again in a minute")

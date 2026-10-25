@@ -188,6 +188,12 @@ pub struct RuntimeConfig {
     /// idle and leave headroom for on-demand wakes. The operator lowers it
     /// if M0 numbers say otherwise; 0 disables the protection entirely.
     pub always_on_max: usize,
+    /// At most this many apps hold preview state at once
+    /// (`OUTER_PREVIEW_MAX`, default 20). Preview fleets take the same
+    /// per-fleet `memory.max` as live fleets (same plan limits), so the
+    /// host cap is what bounds total preview memory; preview commits past
+    /// it refuse with a retryable error. 0 disables previews entirely.
+    pub preview_max: usize,
 }
 
 const DEFAULT_DOMAIN: &str = "outer.localhost";
@@ -207,7 +213,12 @@ impl Config {
         let domain = get("OUTER_DOMAIN")
             .unwrap_or(DEFAULT_DOMAIN)
             .to_ascii_lowercase();
-        let data_dir = PathBuf::from(get("OUTER_DATA").unwrap_or("./data"));
+        // Absolute from here: every downstream path (mirrors, worktrees,
+        // fleet state, sidecars) is built under it, and several steps run
+        // with a different cwd (the worktree, the sandbox root), where a
+        // relative dir would resolve against the wrong place. Production
+        // already passes an absolute dir, so this only changes localhost.
+        let data_dir = absolutize(PathBuf::from(get("OUTER_DATA").unwrap_or("./data")));
         let site_dir = PathBuf::from(get("OUTER_SITE_DIR").unwrap_or("./web/dist"));
         let listen = match get("OUTER_LISTEN").unwrap_or(DEFAULT_LISTEN).parse() {
             Ok(addr) => addr,
@@ -414,6 +425,12 @@ impl Config {
                 get("OUTER_ALWAYS_ON_MAX"),
                 "OUTER_ALWAYS_ON_MAX",
                 10,
+                &mut problems,
+            ),
+            preview_max: parse_num(
+                get("OUTER_PREVIEW_MAX"),
+                "OUTER_PREVIEW_MAX",
+                20,
                 &mut problems,
             ),
         };
@@ -630,6 +647,18 @@ where
     }
 }
 
+/// The process cwd joined in front of a relative dir, lexically (no
+/// filesystem touch: the dir may not exist yet, and symlinks stay as the
+/// operator wrote them). Absolute dirs pass through untouched.
+fn absolutize(dir: PathBuf) -> PathBuf {
+    if dir.is_absolute() {
+        return dir;
+    }
+    std::env::current_dir()
+        .unwrap_or(PathBuf::from("."))
+        .join(dir)
+}
+
 fn is_cpu_max(s: &str) -> bool {
     let mut parts = s.split_whitespace();
     let (Some(quota), Some(period), None) = (parts.next(), parts.next(), parts.next()) else {
@@ -753,9 +782,11 @@ mod tests {
         assert_eq!(cfg.store, StoreKind::Memory);
         assert_eq!(cfg.listen, "127.0.0.1:8080".parse().unwrap());
         assert!(!cfg.tls_enabled());
-        assert_eq!(cfg.db_path(), PathBuf::from("./data/outer.sqlite"));
+        assert_eq!(
+            cfg.db_path(),
+            std::env::current_dir().unwrap().join("data/outer.sqlite")
+        );
     }
-
     #[test]
     fn production_refuses_the_memory_store() {
         let err = Config::from_vars(&vars(&[
@@ -1006,6 +1037,31 @@ mod tests {
         .unwrap_err();
         assert!(err.iter().any(|p| p.starts_with("OUTER_LISTEN")), "{err:?}");
         assert!(err.iter().any(|p| p.starts_with("OUTER_DOMAIN")), "{err:?}");
+    }
+
+    #[test]
+    fn data_dir_is_absolute_from_here() {
+        // Steps run with a different cwd (worktree, sandbox root), so a
+        // relative dir would resolve against the wrong place mid-deploy.
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert!(cfg.data_dir.is_absolute(), "default ./data absolutized");
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_DATA", "rel/dir"),
+        ]))
+        .unwrap();
+        assert!(cfg.data_dir.is_absolute());
+        assert!(
+            cfg.data_dir.ends_with("rel/dir"),
+            "{}",
+            cfg.data_dir.display()
+        );
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_DATA", "/abs/dir"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.data_dir, std::path::PathBuf::from("/abs/dir"));
     }
 
     #[test]

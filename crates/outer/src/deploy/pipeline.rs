@@ -331,6 +331,27 @@ fn atomic_replace_no_follow(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Res
     }
     Ok(())
 }
+/// Which fleet a pipeline run serves: the live app, or its Pro preview.
+/// The kind rides the `deploy` row (`kind = 'main' | 'preview'`) so live
+/// history queries never see preview runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployKind {
+    Main,
+    Preview,
+}
+
+impl DeployKind {
+    pub fn sql(self) -> &'static str {
+        match self {
+            DeployKind::Main => "main",
+            DeployKind::Preview => "preview",
+        }
+    }
+
+    pub fn is_preview(self) -> bool {
+        matches!(self, DeployKind::Preview)
+    }
+}
 pub struct Deployer {
     settings: DeploySettings,
     semaphore: Arc<Semaphore>,
@@ -625,8 +646,42 @@ impl Deployer {
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
+        let slug = app.slug.clone();
+        self.deploy_inner(pool, git, app, &slug, DeployKind::Main, sha)
+            .await
+    }
+
+    /// Deploy `sha` to `app`'s preview fleet instead of live: the same
+    /// pipeline (build, pre-live gate, migrations into the fresh preview
+    /// namespace, upload), but the row is `kind = 'preview'`, `last_deploy_sha`
+    /// and cron rows are untouched, and the edge purge covers only the
+    /// preview host. `app` is the base app; the preview columns must already
+    /// name this fleet (the caller sets them before deploying).
+    pub async fn deploy_preview(
+        &self,
+        pool: &SqlitePool,
+        git: &GitConfig,
+        app: &App,
+        sha: &str,
+    ) -> anyhow::Result<DeployOutcome> {
+        let Some(preview) = crate::preview::preview_app(app) else {
+            anyhow::bail!("no preview fleet for {}", app.slug);
+        };
+        self.deploy_inner(pool, git, &preview, &app.slug, DeployKind::Preview, sha)
+            .await
+    }
+
+    async fn deploy_inner(
+        &self,
+        pool: &SqlitePool,
+        git: &GitConfig,
+        app: &App,
+        git_slug: &str,
+        kind: DeployKind,
+        sha: &str,
+    ) -> anyhow::Result<DeployOutcome> {
         let deploy_id = uuid::Uuid::new_v4().to_string();
-        insert_deploy_row(pool, &deploy_id, &app.id, sha, apps::now_ms()).await?;
+        insert_deploy_row(pool, &deploy_id, &app.id, sha, kind, apps::now_ms()).await?;
 
         // Both after the row: a queued deploy is visible while it waits.
         // App lock first, so deploys queued behind one app hold no build slot.
@@ -643,7 +698,16 @@ impl Deployer {
 
         let mut journal = Journal::default();
         let result = self
-            .run_steps(pool, &deploy_id, git, app, sha, &mut journal)
+            .run_steps(
+                pool,
+                &deploy_id,
+                git,
+                app,
+                git_slug,
+                kind,
+                sha,
+                &mut journal,
+            )
             .await;
         let Journal { steps, log } = journal;
         match result {
@@ -651,13 +715,23 @@ impl Deployer {
                 let log_tail = tail_cap(&log);
                 let steps_json = steps_json(&steps);
                 finish_success(pool, &deploy_id, &steps_json, &log_tail).await?;
-                apps::set_last_deploy(pool, &app.id, sha).await?;
-                cron::sync_app_crons(pool, &app.id, &crons, apps::now_ms()).await?;
+                match kind {
+                    DeployKind::Main => {
+                        apps::set_last_deploy(pool, &app.id, sha).await?;
+                        cron::sync_app_crons(pool, &app.id, &crons, apps::now_ms()).await?;
+                    }
+                    DeployKind::Preview => {
+                        // Live state is untouched, but the terminal deploy is
+                        // activity on the preview: the idle TTL measures from
+                        // the last finished run, not just requests.
+                        let _ = crate::preview::touch_preview(pool, &app.id, apps::now_ms()).await;
+                    }
+                }
                 // Switch an awake fleet first, then purge: purging while
                 // the old version still serves would let the edge re-cache
                 // its files. The purge runs off the critical path.
                 let reloaded = reload_if_awake(app).await;
-                self.spawn_edge_purge(pool, &app.id, &app.slug);
+                self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
                 Ok(DeployOutcome {
                     deploy_id,
                     sha: sha.to_string(),
@@ -730,15 +804,19 @@ impl Deployer {
     /// deploy response; `None` skips at debug, failures warn. Only
     /// successful deploys purge: failed and blocked deploys leave the
     /// previous version serving, and its cached files are still the right
-    /// ones.
-    fn spawn_edge_purge(&self, pool: &SqlitePool, app_id: &str, slug: &str) {
+    /// ones. A preview deploy purges only its own host: custom domains
+    /// serve the live app, and their cached files are still the right ones.
+    fn spawn_edge_purge(&self, pool: &SqlitePool, app_id: &str, slug: &str, kind: DeployKind) {
         let purge = self.settings.cache_purge.clone();
         let pool = pool.clone();
         let app_id = app_id.to_string();
         let hosts = vec![format!("{slug}.{}", self.settings.apps_domain)];
+        let include_custom = !kind.is_preview();
         self.purges.spawn(async move {
             let mut hosts = hosts;
-            hosts.extend(crate::apps::domains::active_hosts(&pool, &app_id).await);
+            if include_custom {
+                hosts.extend(crate::apps::domains::active_hosts(&pool, &app_id).await);
+            }
             for host in hosts {
                 crate::cloudflare::purge_host_cache(purge.as_ref(), &host).await;
             }
@@ -773,12 +851,18 @@ impl Deployer {
     /// ever serve new code against an unmigrated schema; for a first deploy
     /// (no successful deploy yet) the upload runs first because `celld d1`
     /// needs a running fleet and there is nothing to start one from yet.
+    // Nine params: the run identity (fleet app, mirror slug, kind) rides
+    // alongside the deploy identity. Splitting the struct would obscure
+    // the step order below, so the count stays.
+    #[allow(clippy::too_many_arguments)]
     async fn run_steps(
         &self,
         pool: &SqlitePool,
         deploy_id: &str,
         git: &GitConfig,
         app: &App,
+        git_slug: &str,
+        kind: DeployKind,
         sha: &str,
         journal: &mut Journal,
     ) -> Result<(Option<String>, Vec<String>), StepEnd> {
@@ -787,7 +871,7 @@ impl Deployer {
         // part of this step: it walks the whole tree (~0.3 s on the
         // template), and hiding it made `deploy.duration_ms` miss it.
         let started = Instant::now();
-        match self.materialize(git, app, sha).await {
+        match self.materialize(git, git_slug, app, sha).await {
             Ok(out) => {
                 // The worktree is outer-owned; the install, build and deploy
                 // steps run as the app uid, so hand it over before they write
@@ -913,10 +997,19 @@ impl Deployer {
         // snapshot: a previous deploy may have succeeded after the caller
         // loaded the app (the per-app lock serializes deploys, so the row
         // is current). `last_deploy_sha` NULL means no successful deploy yet.
-        let is_first_deploy = last_deploy_sha(pool, &app.id)
-            .await
-            .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?
-            .is_none();
+        // A preview deploy reads the preview signal instead: the first
+        // preview deploy (no successful preview run yet) uploads before
+        // migrating for the same lease reason, against the preview fleet.
+        let is_first_deploy = match kind {
+            DeployKind::Main => last_deploy_sha(pool, &app.id)
+                .await
+                .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?
+                .is_none(),
+            DeployKind::Preview => last_preview_success(pool, &app.id)
+                .await
+                .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?
+                .is_none(),
+        };
         set_status_blocking(pool, deploy_id)
             .await
             .map_err(StepEnd::Failed)?;
@@ -924,12 +1017,28 @@ impl Deployer {
             let version = self
                 .deploy_step(pool, app, deploy_id, &deploy_root, journal)
                 .await?;
-            self.migrate_step(pool, app, deploy_id, &deploy_root, is_first_deploy, journal)
-                .await?;
+            self.migrate_step(
+                pool,
+                app,
+                deploy_id,
+                &deploy_root,
+                is_first_deploy,
+                kind,
+                journal,
+            )
+            .await?;
             Ok((version, crons))
         } else {
-            self.migrate_step(pool, app, deploy_id, &deploy_root, is_first_deploy, journal)
-                .await?;
+            self.migrate_step(
+                pool,
+                app,
+                deploy_id,
+                &deploy_root,
+                is_first_deploy,
+                kind,
+                journal,
+            )
+            .await?;
             let version = self
                 .deploy_step(pool, app, deploy_id, &deploy_root, journal)
                 .await?;
@@ -984,6 +1093,8 @@ impl Deployer {
     /// visible to any fleet; for a first deploy it runs after the upload
     /// (which is what lets the woken fleet exist at all). No files (or no
     /// D1) skips the step without waking a sleeping fleet.
+    // The kind rides along for the wake target and the pin-record switch.
+    #[allow(clippy::too_many_arguments)]
     async fn migrate_step(
         &self,
         pool: &SqlitePool,
@@ -991,12 +1102,13 @@ impl Deployer {
         deploy_id: &str,
         deploy_root: &DeployRoot,
         is_first_deploy: bool,
+        kind: DeployKind,
         journal: &mut Journal,
     ) -> Result<(), StepEnd> {
         let Journal { steps, log } = journal;
         let started = Instant::now();
         match self
-            .migrate(pool, app, deploy_id, deploy_root, is_first_deploy)
+            .migrate(pool, app, deploy_id, deploy_root, is_first_deploy, kind)
             .await
         {
             Ok((skipped, out)) => {
@@ -1016,13 +1128,19 @@ impl Deployer {
     /// so `clean` knows what the last materialization tracked: `checkout
     /// --force` brings tracked files to `sha`, then `clean -ffdx -e
     /// node_modules` removes everything else (build output, stale files).
-    async fn materialize(&self, git: &GitConfig, app: &App, sha: &str) -> anyhow::Result<String> {
+    async fn materialize(
+        &self,
+        git: &GitConfig,
+        mirror_slug: &str,
+        app: &App,
+        sha: &str,
+    ) -> anyhow::Result<String> {
         if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
             anyhow::bail!("refusing to materialize {sha:?}: not a full commit sha");
         }
-        let mirror = manifest::mirror_path(git, &app.slug);
+        let mirror = manifest::mirror_path(git, mirror_slug);
         if !mirror.is_dir() {
-            anyhow::bail!("no mirror for {}", app.slug);
+            anyhow::bail!("no mirror for {mirror_slug}");
         }
         let work = self.work_dir(&app.slug);
         std::fs::create_dir_all(&work)?;
@@ -1364,6 +1482,7 @@ impl Deployer {
         deploy_id: &str,
         deploy_root: &DeployRoot,
         is_first_deploy: bool,
+        kind: DeployKind,
     ) -> Result<(bool, String), StepFailed> {
         let root = &deploy_root.root;
         let work = self.work_dir(&app.slug);
@@ -1415,7 +1534,9 @@ impl Deployer {
         // to wake a sleeping fleet.
         // A first deploy that never went live has no previous version: say
         // the app isn't live yet instead of naming one that keeps serving.
-        let live_line = if is_first_deploy {
+        let live_line = if kind.is_preview() {
+            "Your live app is untouched; only the preview failed to update."
+        } else if is_first_deploy {
             "Your app isn't live yet."
         } else {
             "Your app still shows the previous version."
@@ -1447,7 +1568,12 @@ impl Deployer {
                 }
             }
         }
-        if !any_pending {
+        // A preview database is disposable (fresh prefix per preview
+        // lineage), so "all already applied" against the live pins must not
+        // skip the apply: the preview database may never have seen these
+        // files. Preview applies are idempotent (celld's own `d1_migrations`
+        // journal) and never recorded.
+        if !any_pending && !kind.is_preview() {
             let total: usize = staged.iter().map(|(_, files)| files.len()).sum();
             return Ok((
                 true,
@@ -1455,9 +1581,18 @@ impl Deployer {
             ));
         }
         if let Some(wake) = &self.settings.wake {
-            wake.ensure_awake(pool, app)
-                .await
-                .map_err(|e| StepFailed::plain("migrate", &e))?;
+            match kind {
+                DeployKind::Main => {
+                    wake.ensure_awake(pool, app)
+                        .await
+                        .map_err(|e| StepFailed::plain("migrate", &e))?;
+                }
+                DeployKind::Preview => {
+                    wake.ensure_awake_preview(pool, app)
+                        .await
+                        .map_err(|e| StepFailed::plain("migrate", &e))?;
+                }
+            }
         }
         let mut journal = String::new();
         for (db, files) in &staged {
@@ -1522,16 +1657,18 @@ impl Deployer {
             if !out.ends_with('\n') {
                 journal.push('\n');
             }
-            migrate::record_applied(
-                pool,
-                &app.id,
-                &db.database_name,
-                db.effective_identity(),
-                files,
-                apps::now_ms(),
-            )
-            .await
-            .map_err(|e| StepFailed::plain("migrate", &e))?;
+            if !kind.is_preview() {
+                migrate::record_applied(
+                    pool,
+                    &app.id,
+                    &db.database_name,
+                    db.effective_identity(),
+                    files,
+                    apps::now_ms(),
+                )
+                .await
+                .map_err(|e| StepFailed::plain("migrate", &e))?;
+            }
         }
         Ok((
             false,
@@ -2664,14 +2801,16 @@ async fn insert_deploy_row(
     deploy_id: &str,
     app_id: &str,
     sha: &str,
+    kind: DeployKind,
     now: i64,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO deploy (id, app_id, sha, status, created_at) VALUES (?, ?, ?, 'queued', ?)",
+        "INSERT INTO deploy (id, app_id, sha, kind, status, created_at) VALUES (?, ?, ?, ?, 'queued', ?)",
     )
     .bind(deploy_id)
     .bind(app_id)
     .bind(sha)
+    .bind(kind.sql())
     .bind(now)
     .execute(pool)
     .await?;
@@ -2696,6 +2835,22 @@ async fn last_deploy_sha(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Opti
         .bind(app_id)
         .fetch_one(pool)
         .await?;
+    Ok(sha)
+}
+
+/// The app's latest successful preview deploy sha, if any: the first-deploy
+/// routing signal for preview runs (a preview fleet starts from the preview
+/// upload, not the live one). Scoped to the current lineage: discard and
+/// promote delete the app's preview rows, so a fresh preview always routes
+/// as a first deploy (upload before migrate) against its empty namespace.
+async fn last_preview_success(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<String>> {
+    let sha: Option<String> = sqlx::query_scalar(
+        "SELECT sha FROM deploy WHERE app_id = ?1 AND kind = 'preview' AND status = 'success' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(sha)
 }
 
@@ -3145,6 +3300,10 @@ mod tests {
             last_deploy_sha: None,
             created_at: 0,
             always_on: false,
+            preview_sha: None,
+            preview_updated_at: None,
+            preview_port: None,
+            preview_internal_port: None,
         }
     }
 
@@ -3155,7 +3314,10 @@ mod tests {
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
         let app = test_app(10000);
 
-        deployer.materialize(&cfg, &app, &sha_a).await.unwrap();
+        deployer
+            .materialize(&cfg, &app.slug.clone(), &app, &sha_a)
+            .await
+            .unwrap();
         let work = deployer.work_dir(&app.slug);
         assert_eq!(
             std::fs::read_to_string(work.join("index.ts")).unwrap(),
@@ -3167,7 +3329,10 @@ mod tests {
         std::fs::write(work.join("node_modules").join("keepme.js"), "x").unwrap();
         std::fs::write(work.join("old.ts"), "stale overwrite").unwrap();
 
-        deployer.materialize(&cfg, &app, &sha_b).await.unwrap();
+        deployer
+            .materialize(&cfg, &app.slug.clone(), &app, &sha_b)
+            .await
+            .unwrap();
         assert!(!work.join("old.ts").exists(), "a file deleted in B is gone");
         assert_eq!(
             std::fs::read_to_string(work.join("index.ts")).unwrap(),
@@ -3394,7 +3559,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        deployer.spawn_edge_purge(&pool, "app1", "grocery");
+        deployer.spawn_edge_purge(&pool, "app1", "grocery", DeployKind::Main);
         deployer.purges().drain().await;
         assert_eq!(fake.wait_for(2, std::time::Duration::from_secs(5)).await, 2);
         let recorded = fake.requests.lock().unwrap();
@@ -5606,6 +5771,10 @@ exit 0
             last_deploy_sha: None,
             created_at: 0,
             always_on: false,
+            preview_sha: None,
+            preview_updated_at: None,
+            preview_port: None,
+            preview_internal_port: None,
         };
 
         let data = tempfile::tempdir().unwrap();

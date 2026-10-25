@@ -17,6 +17,7 @@ export default defineMeta({
     "sandboxes",
     "look",
     "custom-domains",
+    "previews",
     "ilha",
     "void",
     "website",

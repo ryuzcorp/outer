@@ -1568,6 +1568,7 @@ mod tests {
             wake_timeout: std::time::Duration::from_secs(1),
             wake_concurrency: 1,
             always_on_max: 10,
+            preview_max: 20,
         });
         let lines = read_merged(&pool, &fleets, app_id, "ghost", None, 100).await;
         assert_eq!(lines.len(), 1);
@@ -1771,6 +1772,7 @@ mod tests {
             wake_timeout: std::time::Duration::from_secs(1),
             wake_concurrency: 1,
             always_on_max: 10,
+            preview_max: 20,
         })
     }
 
