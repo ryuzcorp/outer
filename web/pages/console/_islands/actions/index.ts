@@ -1,7 +1,8 @@
 // One registry for the whole console: the ⌘K palette and the WebMCP
-// layer register everything here. Adding a registry later is a one-line
-// change (the custom-domains branch adds its own line). Names must be
-// unique: a dev-time throw fails fast instead of silently shadowing.
+// layer register everything here. Adding a registry is a one-line change
+// (the custom-domains line below arrived on the rebase onto #55).
+// Names must be unique: a dev-time throw fails fast instead of silently
+// shadowing.
 import type { ConsoleAction } from "./settings.ts";
 
 import { actions as accountActions } from "./account.ts";
@@ -15,6 +16,7 @@ import { actions as deployActions } from "./deploys.ts";
 import { actions as observeActions } from "./observe.ts";
 import { actions as secretsActions } from "./secrets.ts";
 import { actions as settingsActions } from "./settings.ts";
+import { actions as domainActions } from "./domains.ts";
 
 export type { ConsoleAction };
 export type AnyAction = ConsoleAction<any, any>;
@@ -31,6 +33,7 @@ const registries: ConsoleAction<any, any>[][] = [
   codeActions as ConsoleAction<any, any>[],
   accountActions as ConsoleAction<any, any>[],
   collaboratorActions as ConsoleAction<any, any>[],
+  domainActions as ConsoleAction<any, any>[],
 ];
 
 function combine(): AnyAction[] {

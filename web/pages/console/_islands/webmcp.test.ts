@@ -342,7 +342,6 @@ describe("palette", () => {
     expect(isRunnable(findAction("set_secret")!)).toBe(false);
     expect(isRunnable(findAction("code_read_file")!)).toBe(false);
   });
-
   test("input-needing actions map to their views", () => {
     expect(actionView(findAction("rollback")!)).toBe("deploys");
     expect(actionView(findAction("set_secret")!)).toBe("secrets");
@@ -350,6 +349,14 @@ describe("palette", () => {
     expect(actionView(findAction("d1_rows")!)).toBe("d1");
   });
 
+  test("domains: refresh is runnable, add navigates to settings", () => {
+    expect(isRunnable(findAction("refresh_domains")!)).toBe(true);
+    expect(isRunnable(findAction("list_domains")!)).toBe(true);
+    expect(isRunnable(findAction("remove_domain")!)).toBe(true);
+    expect(isRunnable(findAction("add_domain")!)).toBe(false);
+    expect(actionView(findAction("add_domain")!)).toBe("settings");
+    expect(findAction("remove_domain")!.consequential).toBe(true);
+  });
   test("substring matching ranks title hits first", () => {
     expect(matchScore("Delete app delete_app", "del")).toBeGreaterThanOrEqual(0);
     expect(matchScore("Delete app delete_app", "zzz")).toBe(-1);

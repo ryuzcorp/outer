@@ -65,6 +65,7 @@ const ACTION_VIEWS: Record<string, ViewId> = {
   delete_app: "settings",
   add_collaborator: "settings",
   remove_collaborator: "settings",
+  add_domain: "settings",
   set_secret: "secrets",
   unset_secret: "secrets",
   rollback: "deploys",
@@ -137,8 +138,10 @@ const FOCUS: Record<string, { selectors: string[]; clickText?: string }> = {
     selectors: ['[role="dialog"][aria-label="Change name"] input'],
     clickText: "Change name",
   },
+  add_domain: {
+    selectors: ['section[aria-label="Custom domain"] input[placeholder="shop.example.com"]'],
+  },
 };
-
 /** Substring match on title + keywords; earlier title hits rank first. -1 misses. */
 export function matchScore(haystack: string, query: string): number {
   const text = haystack.toLowerCase();
