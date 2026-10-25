@@ -17,6 +17,9 @@ export const VIEWS = [
 ] as const;
 
 export const ACCOUNT_VIEWS = [
+  { id: "connections", label: "Connections & keys" },
+  { id: "usage", label: "Usage & plan" },
+  { id: "account", label: "Account" },
   { id: "invites", label: "Invite codes" },
   { id: "admin", label: "Admin" },
 ] as const;

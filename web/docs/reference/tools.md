@@ -105,6 +105,17 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `id` | string | yes | The grant id shown by `list_connections`. |
 
+## `delete_account`
+
+- **Access:** signed in
+- **Description:** Delete your account: pass confirm equal to your email. Deletes your apps, signs every session out.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `confirm` | string | yes | Type your account email again to confirm: must equal it exactly. |
+
 ## `create_app`
 
 - **Access:** signed in
