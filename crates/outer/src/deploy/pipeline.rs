@@ -592,6 +592,13 @@ impl Deployer {
         }
     }
 
+    /// The settings this deployer runs with (bucket, credentials, dirs,
+    /// celld binary). The console data panels reuse them for scoped storage
+    /// reads and celld calls, so they never mint their own credentials.
+    pub(crate) fn settings(&self) -> &DeploySettings {
+        &self.settings
+    }
+
     /// The in-flight edge purges, for the owner of the process to drain.
     pub fn purges(&self) -> PurgeTasks {
         self.purges.clone()
@@ -1889,7 +1896,7 @@ fn should_skip_install(stored: Option<&str>, current: &str, node_modules: bool) 
 /// of resolving through the link. `is_file` would follow links, so it is
 /// never used here. `Ok(None)` means no config exists; `Err` means a link
 /// (or an unreadable entry) refused the discovery.
-fn find_deploy_config(work: &Path) -> anyhow::Result<Option<PathBuf>> {
+pub(crate) fn find_deploy_config(work: &Path) -> anyhow::Result<Option<PathBuf>> {
     for candidate in [
         work.join("dist").join("wrangler.json"),
         work.join("wrangler.jsonc"),
@@ -1918,7 +1925,7 @@ fn find_deploy_config(work: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// Parse one wrangler file (JSON, or JSONC with comments stripped),
 /// opening with `O_NOFOLLOW` so a path swapped for a symlink between
 /// discovery and this read fails instead of handing over foreign bytes.
-fn read_config_file(config: &Path) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn read_config_file(config: &Path) -> anyhow::Result<serde_json::Value> {
     let (bytes, _) = read_no_follow(config)
         .map_err(|e| anyhow::anyhow!("reading deploy config {}: {e:#}", config.display()))?;
     let raw = String::from_utf8(bytes)

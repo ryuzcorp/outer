@@ -68,6 +68,33 @@ impl std::fmt::Display for S3NotFound {
 
 impl std::error::Error for S3NotFound {}
 
+/// One object a delimited LIST page names, with the fields a browser shows.
+#[derive(Debug, Clone)]
+pub struct S3Object {
+    pub key: String,
+    pub last_modified: String,
+    pub size: u64,
+    pub etag: String,
+}
+
+/// One delimited LIST page: the objects in this folder, the folders below
+/// it, and the token that continues the page (`None` when complete).
+#[derive(Debug, Clone, Default)]
+pub struct S3Page {
+    pub objects: Vec<S3Object>,
+    pub prefixes: Vec<String>,
+    pub next: Option<String>,
+}
+
+/// One object's record as a HEAD reports it: the size (a listing carries it
+/// too, but a single-key lookup has no listing) and the real `content-type`
+/// header the writer stored for the object.
+#[derive(Debug, Clone)]
+pub struct S3Head {
+    pub size: i64,
+    pub content_type: Option<String>,
+}
+
 /// S3/R2 backend: rusty-s3 signs presigned URLs, one pooled reqwest client
 /// sends them. Region `auto` and [`UrlStyle::Path`] are what R2 expects;
 /// a session token (R2 temporary credentials) is signed into every
@@ -386,6 +413,115 @@ impl S3Backend {
             }
         }
         Ok(keys)
+    }
+
+    /// One bounded LIST request with a delimiter: `prefixes` are the folders
+    /// below `prefix` and `objects` the files in it. The caller pages with
+    /// the returned token; `max_keys` is clamped to 1–1000.
+    pub async fn list_delimited_page(
+        &self,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: usize,
+        continuation: Option<&str>,
+    ) -> anyhow::Result<S3Page> {
+        with_s3_retry("list", prefix, || {
+            self.list_delimited_once(prefix, delimiter, max_keys, continuation)
+        })
+        .await
+    }
+
+    async fn list_delimited_once(
+        &self,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: usize,
+        continuation: Option<&str>,
+    ) -> Result<S3Page, S3Fail> {
+        let mut action = self.bucket.list_objects_v2(Some(&self.creds));
+        action.with_prefix(prefix.to_string());
+        action.with_delimiter(delimiter.to_string());
+        action.with_max_keys(max_keys.clamp(1, 1000));
+        if let Some(t) = continuation {
+            action.with_continuation_token(t.to_string());
+        }
+        let url = action.sign(Duration::from_secs(300));
+        let resp = match self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(S3Fail::Retryable(anyhow::anyhow!(
+                    "s3 list {prefix} transport: {e:#}"
+                )));
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
+            return Err(classify_status("list", prefix, status, &body));
+        }
+        let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
+            .await
+            .map_err(S3Fail::Final)?;
+        let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&text)
+            .map_err(|e| S3Fail::Final(anyhow::anyhow!("s3 LIST XML parse: {e:#}")))?;
+        Ok(S3Page {
+            objects: parsed
+                .contents
+                .into_iter()
+                .map(|o| S3Object {
+                    key: o.key,
+                    last_modified: o.last_modified,
+                    size: o.size,
+                    etag: o.etag,
+                })
+                .collect(),
+            prefixes: parsed
+                .common_prefixes
+                .into_iter()
+                .map(|p| p.prefix)
+                .collect(),
+            next: parsed.next_continuation_token,
+        })
+    }
+
+    /// `HEAD` one object: `None` when it does not exist. Any other failure
+    /// is an error, so a refused credential never reads as "missing".
+    pub async fn head(&self, key: &str) -> anyhow::Result<Option<S3Head>> {
+        let url = self
+            .bucket
+            .head_object(Some(&self.creds), key)
+            .sign(Duration::from_secs(300));
+        let resp = self
+            .client
+            .head(url)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .with_context(|| format!("s3 HEAD {key}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(s3_err("head", key, resp, Duration::from_secs(20)).await);
+        }
+        let size = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        Ok(Some(S3Head { size, content_type }))
     }
 
     /// Recursive delete of one prefix, which must be a whole slug scope
