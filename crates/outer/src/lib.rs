@@ -6,6 +6,7 @@
 pub mod accounts;
 pub mod apps;
 pub mod auth;
+pub mod browser;
 pub mod cloudflare;
 pub mod collaborators;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod deploy;
 pub mod fleet;
 pub mod git;
 pub mod http;
+pub mod look_tokens;
 pub mod mcp;
 pub mod moderation;
 pub mod observe;

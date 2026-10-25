@@ -18,11 +18,12 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::apps;
+use crate::browser::MAX_LOOK_HTML_BYTES;
 use crate::fleet::manager::FleetManager;
 use crate::http::client_ip::{cf_connecting_ip, client_ip};
+use crate::look_tokens::{LookTokens, LOOK_HEADER};
 use crate::observe::metrics::{MetricsAgg, RequestRecord};
 
-/// State the integration owner mounts as the fallback for every `Host`
 /// other than the platform host.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -42,8 +43,11 @@ pub struct ProxyState {
     /// Per-app request metrics (spec §13): owned here, flushed to SQLite by
     /// the sweep task. Cloning shares the same counters, never global.
     pub metrics: MetricsAgg,
+    /// Single-use console-capture tokens `look_at_app` mints: only a live
+    /// token for the request's own host arms the recorder injection below.
+    /// Shared with the MCP state, never global.
+    pub look_tokens: LookTokens,
 }
-
 impl ProxyState {
     /// Build the per-state upstream client and the per-state touch-throttle
     /// map alongside the state the integration owner already mounts.
@@ -67,7 +71,15 @@ impl ProxyState {
             client,
             last_touch_ms: Arc::new(Mutex::new(HashMap::new())),
             metrics,
+            look_tokens: LookTokens::new(),
         }
+    }
+
+    /// Share one console-capture token table with the MCP state (the
+    /// integration owner calls this once; tests that need tokens do too).
+    pub fn with_look_tokens(mut self, look_tokens: LookTokens) -> Self {
+        self.look_tokens = look_tokens;
+        self
     }
 }
 
@@ -247,6 +259,287 @@ fn from_upstream(res: hyper::Response<hyper::body::Incoming>, is_unlisted: bool)
     out.body(Body::new(body)).unwrap()
 }
 
+/// Console capture for `look_at_app`: Cloudflare's REST render cannot stream
+/// console logs, so when the navigation carries a live [`LOOK_HEADER`]
+/// token for this host the proxy injects a tiny inline recorder as the
+/// first child of `<head>` (or prepends it when the page has none). The
+/// recorder mirrors `window.onerror`, `unhandledrejection`,
+/// `console.error`/`console.warn`, resource load failures and failed
+/// `fetch`/XHR into a `<script type="application/json" id="__outer_look">`
+/// data element, which Cloudflare's returned HTML carries back to the tool.
+/// Without a valid token this whole path is skipped and the response is
+/// byte-for-byte what the upstream sent.
+///
+/// Skip markers (HTML comments, so no CSP can block them) tell the tool why
+/// a tokened page carries no recorder. Only tokened requests ever gain one.
+/// `csp` means an enforced policy blocks inline scripts; `oversize` means
+/// the HTML exceeded [`MAX_LOOK_HTML_BYTES`].
+const LOOK_SKIP_CSP: &[u8] = b"<!--__outer_look:csp-->";
+const LOOK_SKIP_OVERSIZE: &[u8] = b"<!--__outer_look:oversize-->";
+
+/// The page-side recorder: no external `src`, no dependencies. At most 50
+/// console entries and 50 failed requests, each at most 500 chars, mirrored
+/// into `#__outer_look` on every record so the serialized DOM Cloudflare
+/// returns carries the log.
+const LOOK_RECORDER_JS: &str = "!function(){if(window.__outerLook)return;window.__outerLook=1;var N=null,C=[],F=[];function T(s){s=String(s);return s.length>500?s.slice(0,500):s}function S(){try{var I=\"__outer_look\";N=document.getElementById(I);if(!N){N=document.createElement(\"script\");N.type=\"application/json\";N.id=I;(document.body||document.documentElement).appendChild(N)}N.textContent=JSON.stringify({console:C,failed:F})}catch(e){}}function c(l,m,s){if(C.length>=50)return;var o={level:l,message:T(m)};if(s)o.source=T(s);C.push(o);S()}function f(u,st,er){if(F.length>=50)return;var o={url:T(u||\"(unknown)\")};if(st)o.status=st;else o.error=T(er||\"failed\");F.push(o);S()}window.addEventListener(\"error\",function(e){var t=e.target;if(t&&t!==window){f(t.src||t.href||\"\",0,\"load failed\");return}c(\"error\",e.message||\"script error\",e.filename)},true);window.addEventListener(\"unhandledrejection\",function(e){var r=e.reason,m=r&&r.stack?String(r.stack).split(\"\\n\")[0]:(r&&r.message?r.message:String(r));c(\"error\",\"unhandled rejection: \"+m)});[\"error\",\"warn\"].forEach(function(k){try{var o=console[k];console[k]=function(){try{c(k,Array.prototype.map.call(arguments,function(a){try{return typeof a===\"string\"?a:JSON.stringify(a)}catch(_){return String(a)}}).join(\" \"))}catch(_){}return o.apply(console,arguments)}}catch(_){}});if(window.fetch){var of=window.fetch;window.fetch=function(u,o){var s=typeof u===\"string\"?u:(u&&u.url)||\"\";return of(u,o).then(function(r){if(!r.ok)f(s,r.status,\"failed\");return r},function(e){f(s,0,\"fetch failed\");throw e})}}if(window.XMLHttpRequest){try{var op=XMLHttpRequest.prototype.open,sd=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this._olu=u;return op.apply(this,arguments)};XMLHttpRequest.prototype.send=function(b){var x=this;try{x.addEventListener(\"loadend\",function(){try{var s=x.status;if((s<200||s>=300||s===0)&&x._olu!==undefined)f(x._olu,s,\"request failed\")}catch(_){}})}catch(_){}return sd.call(this,b)}}catch(_){}}S()}();";
+
+/// The injected head: the recorder plus the data element it mirrors into.
+fn look_snippet() -> Vec<u8> {
+    let mut out = Vec::with_capacity(LOOK_RECORDER_JS.len() + 128);
+    out.extend_from_slice(b"<script>");
+    out.extend_from_slice(LOOK_RECORDER_JS.as_bytes());
+    out.extend_from_slice(
+        b"</script><script type=\"application/json\" id=\"__outer_look\">{\"console\":[],\"failed\":[]}</script>",
+    );
+    out
+}
+
+/// Insert the recorder as the first child of `<head>` (case-insensitive,
+/// attributes allowed, never matching `<header>`), or prepend it when the
+/// page has no head element.
+fn inject_look_snippet(html: &[u8]) -> Vec<u8> {
+    let snippet = look_snippet();
+    let mut out = Vec::with_capacity(html.len() + snippet.len());
+    if html.len() > 6 {
+        let mut i = 0;
+        while i + 5 < html.len() {
+            let is_head = html[i] == b'<'
+                && (html[i + 1] == b'h' || html[i + 1] == b'H')
+                && (html[i + 2] == b'e' || html[i + 2] == b'E')
+                && (html[i + 3] == b'a' || html[i + 3] == b'A')
+                && (html[i + 4] == b'd' || html[i + 4] == b'D')
+                && matches!(html[i + 5], b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/');
+            if is_head {
+                if let Some(rel) = html[i..].iter().position(|&byte| byte == b'>') {
+                    let end = i + rel + 1;
+                    out.extend_from_slice(&html[..end]);
+                    out.extend_from_slice(&snippet);
+                    out.extend_from_slice(&html[end..]);
+                    return out;
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&snippet);
+    out.extend_from_slice(html);
+    out
+}
+
+/// Whether any enforced content-security-policy on this response would block
+/// the recorder's inline script, in which case injection is skipped. The
+/// first of `script-src-elem`, `script-src`, `default-src` wins; without
+/// `'unsafe-inline'` our script cannot run (no nonce or hash can cover a
+/// proxy-injected script), so the tool reports `csp-blocked` instead.
+fn csp_blocks_inline(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("content-security-policy")
+        .iter()
+        .any(|value| value.to_str().is_ok_and(csp_policy_blocks_inline))
+}
+
+fn csp_policy_blocks_inline(policy: &str) -> bool {
+    let mut script_src = None;
+    let mut script_elem = None;
+    let mut default_src = None;
+    for directive in policy.split(';') {
+        let mut words = directive.split_whitespace();
+        match words.next().map(str::to_ascii_lowercase).as_deref() {
+            Some("script-src-elem") => script_elem = Some(directive),
+            Some("script-src") => script_src = Some(directive),
+            Some("default-src") => default_src = Some(directive),
+            _ => {}
+        }
+    }
+    let Some(active) = script_elem.or(script_src).or(default_src) else {
+        return false;
+    };
+    !active
+        .split_whitespace()
+        .skip(1)
+        .any(|token| token == "'unsafe-inline'")
+}
+
+/// Copy end-to-end response headers onto a rebuilt look response: the same
+/// hop-by-hop filtering as [`from_upstream`] (look responses never upgrade,
+/// so no 101 pair is kept). `content-length` must already be removed by the
+/// caller when the body changes; oversize streams set their own.
+fn copy_response_headers(
+    out: http::response::Builder,
+    headers: &mut HeaderMap,
+    is_unlisted: bool,
+) -> http::response::Builder {
+    let nominated = connection_tokens(headers);
+    let mut rebuilt = out;
+    let mut last_name: Option<HeaderName> = None;
+    for (name, value) in headers.drain() {
+        if let Some(name) = name {
+            last_name = Some(name);
+        }
+        let name = last_name.clone().expect("header value without a name");
+        if is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()) {
+            continue;
+        }
+        rebuilt = rebuilt.header(name, value);
+    }
+    if is_unlisted {
+        rebuilt = rebuilt.header("x-robots-tag", "noindex, nofollow");
+    }
+    rebuilt
+}
+
+/// Rebuild a buffered look response: same end-to-end headers, fresh
+/// `Content-Length` for the new body.
+fn rebuild_look_body(mut parts: http::response::Parts, is_unlisted: bool, body: &[u8]) -> Response {
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    let out = copy_response_headers(
+        Response::builder().status(parts.status),
+        &mut parts.headers,
+        is_unlisted,
+    );
+    out.header("content-length", body.len())
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+/// Prepend `prefix` (a skip marker, plus any bytes already read) to the
+/// still-open remainder: the oversize path never holds a huge page fully in
+/// memory. The caller drops `content-length` so the body chunks.
+fn prepend_look_stream(
+    prefix: Vec<u8>,
+    rest: http_body_util::combinators::BoxBody<bytes::Bytes, hyper::Error>,
+) -> Body {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    let head = futures::stream::iter([Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(
+        prefix,
+    ))]);
+    let tail = http_body_util::BodyDataStream::new(rest).map_err(std::io::Error::other);
+    Body::from_stream(head.chain(tail))
+}
+
+/// Buffer the upstream body up to one byte past [`MAX_LOOK_HTML_BYTES`]:
+/// the bytes plus `None` fit; the bytes plus `Some` overflowed and carry
+/// the still-open remainder for the streaming oversize path. `Err` means
+/// the upstream broke mid-body.
+async fn read_look_body(
+    body: hyper::body::Incoming,
+) -> Result<
+    (
+        Vec<u8>,
+        Option<http_body_util::combinators::BoxBody<bytes::Bytes, hyper::Error>>,
+    ),
+    hyper::Error,
+> {
+    use http_body_util::BodyExt as _;
+    let mut body = body.boxed();
+    let mut buf = Vec::new();
+    loop {
+        match body.frame().await {
+            None => return Ok((buf, None)),
+            Some(Err(err)) => return Err(err),
+            Some(Ok(frame)) => match frame.into_data() {
+                // Trailers carry no document bytes; the loop ends next.
+                Err(_) => {}
+                Ok(data) => {
+                    buf.extend_from_slice(&data);
+                    if buf.len() > MAX_LOOK_HTML_BYTES + 1 {
+                        return Ok((buf, Some(body)));
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// The look-token path: buffer HTML (bounded), inject the recorder or a
+/// skip marker, and fix `Content-Length`. Non-HTML and unexpectedly encoded
+/// bodies pass through untouched with the normal header filtering; oversize
+/// HTML streams with a marker prepended.
+async fn look_response(
+    upstream: hyper::Response<hyper::body::Incoming>,
+    is_unlisted: bool,
+) -> Response {
+    let (mut parts, body) = upstream.into_parts();
+    let is_html = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/html"))
+        });
+    // The tokened request asks for identity below; anything else here means
+    // upstream encoded anyway, and encoded bytes must never be edited.
+    let encoded = parts
+        .headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|encoding| {
+            !encoding.is_empty() && !encoding.trim().eq_ignore_ascii_case("identity")
+        });
+    if !is_html || encoded {
+        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted);
+    }
+    // Everything below rewrites the page for one browser render. The edge
+    // must never store it: Cloudflare's cache key ignores the look header,
+    // so a cached copy would serve the recorder to real visitors.
+    parts.headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, private"),
+    );
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse::<usize>().ok());
+    if declared.is_some_and(|len| len > MAX_LOOK_HTML_BYTES) {
+        // Oversize on paper: never buffer, stream the body with the marker
+        // in front and a corrected length.
+        use http_body_util::BodyExt as _;
+        let total = declared.unwrap_or(0) + LOOK_SKIP_OVERSIZE.len();
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        let out = copy_response_headers(
+            Response::builder().status(parts.status),
+            &mut parts.headers,
+            is_unlisted,
+        );
+        return out
+            .header("content-length", total)
+            .body(prepend_look_stream(
+                LOOK_SKIP_OVERSIZE.to_vec(),
+                body.boxed(),
+            ))
+            .unwrap();
+    }
+    match read_look_body(body).await {
+        Err(_) => text(StatusCode::BAD_GATEWAY, "app unavailable"),
+        Ok((buf, None)) => {
+            if csp_blocks_inline(&parts.headers) {
+                let mut marked = LOOK_SKIP_CSP.to_vec();
+                marked.extend_from_slice(&buf);
+                rebuild_look_body(parts, is_unlisted, &marked)
+            } else {
+                rebuild_look_body(parts, is_unlisted, &inject_look_snippet(&buf))
+            }
+        }
+        Ok((buf, Some(rest))) => {
+            // Overflow discovered mid-read: marker, what was read, the rest.
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            let out = copy_response_headers(
+                Response::builder().status(parts.status),
+                &mut parts.headers,
+                is_unlisted,
+            );
+            let mut prefix = LOOK_SKIP_OVERSIZE.to_vec();
+            prefix.extend_from_slice(&buf);
+            out.body(prepend_look_stream(prefix, rest)).unwrap()
+        }
+    }
+}
+
 /// The host a request is for: the `Host` header (HTTP/1.1), else the URI
 /// authority, which is where HTTP/2 carries it (`:authority`, no `Host`
 /// header). Cloudflare speaks HTTP/2 to the origin.
@@ -423,6 +716,14 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // Collected up front: every name this request's `Connection` nominates
     // is hop-by-hop for this hop, alongside the fixed list.
     let nominated = connection_tokens(&parts.headers);
+    // Console capture: consume a live token for this host, if present. The
+    // header never reaches upstream either way; a live token additionally
+    // asks for an identity body so the recorder can be injected below.
+    let look_armed = parts
+        .headers
+        .get(LOOK_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| state.look_tokens.claim(bare, token));
     for (name, value) in parts.headers.iter() {
         if *name == axum::http::header::HOST {
             continue;
@@ -433,6 +734,15 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         // Spoofable off origin pull, attested on it (re-added below only
         // when valid): never forward what the client sent.
         if name.as_str() == "cf-connecting-ip" {
+            continue;
+        }
+        // The console-capture token is ours: never forward it, valid or not.
+        if name.as_str() == LOOK_HEADER {
+            continue;
+        }
+        // With a live token the recorder needs plain HTML below, so the
+        // client's encoding preference is replaced by identity.
+        if look_armed && name == axum::http::header::ACCEPT_ENCODING {
             continue;
         }
         if (is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()))
@@ -459,6 +769,9 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         "x-forwarded-proto",
         if state.origin_locked { "https" } else { "http" },
     );
+    if look_armed {
+        outbound = outbound.header(axum::http::header::ACCEPT_ENCODING, "identity");
+    }
     let outbound = match outbound.body(body) {
         Ok(req) => req,
         Err(_) => return text(StatusCode::BAD_GATEWAY, "app unavailable"),
@@ -497,6 +810,17 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             );
             return from_upstream(upstream, is_unlisted);
         }
+    }
+    if look_armed {
+        // A 101 took the upgrade branch above, so this is a plain response:
+        // buffer it bounded, inject the recorder or a skip marker, fix the
+        // length. The body only ever changes on this tokened request.
+        let status = upstream.status();
+        let bytes_out = response_bytes(&upstream);
+        let latency_ms = upstream_start.elapsed().as_millis() as u64;
+        let response = look_response(upstream, is_unlisted).await;
+        meter(status.as_u16(), latency_ms, bytes_out);
+        return response;
     }
     let status = upstream.status();
     let bytes_out = response_bytes(&upstream);
@@ -541,6 +865,82 @@ mod tests {
                         .header("connection", "x-resp-secret")
                         .header("x-resp-secret", "leak")
                         .body(Body::from("nominated"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/look-html",
+                axum::routing::get(|req: Request| async move {
+                    // Tells the test what the proxy forwarded: the encoding
+                    // it asked for, and whether the capture token leaked.
+                    let encoding = req
+                        .headers()
+                        .get(axum::http::header::ACCEPT_ENCODING)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("");
+                    let leaked = req.headers().contains_key(LOOK_HEADER);
+                    let page = format!(
+                        "<html><head><title>T</title></head><body>hi<!--ae:{encoding} leaked:{leaked}--></body></html>"
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .body(Body::from(page))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/look-csp",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .header("content-security-policy", "script-src 'self'")
+                        .body(Body::from("<html><head></head><body>csp</body></html>"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/look-csp-ok",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .header(
+                            "content-security-policy",
+                            "script-src 'self' 'unsafe-inline'",
+                        )
+                        .body(Body::from("<html><head></head><body>csp</body></html>"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/look-big",
+                axum::routing::get(|| async {
+                    let mut page =
+                        String::with_capacity(MAX_LOOK_HTML_BYTES + 1024);
+                    page.push_str("<html><head></head><body>");
+                    while page.len() < MAX_LOOK_HTML_BYTES + 1000 {
+                        page.push('x');
+                    }
+                    page.push_str("</body></html>");
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .body(Body::from(page))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/look-gzip",
+                axum::routing::get(|| async {
+                    // Opaque bytes under a content-encoding: the proxy must
+                    // never edit encoded bodies, only pass them through.
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .header("content-encoding", "gzip")
+                        .body(Body::from("opaque-not-really-gzip"))
                         .unwrap()
                 }),
             )
@@ -1445,5 +1845,337 @@ mod tests {
             1,
             "only the active host forwards"
         );
+    }
+    /// One proxy state whose token table the test also holds: mint here,
+    /// the proxy claims on the request.
+    fn look_state(
+        pool: sqlx::SqlitePool,
+        dir: &std::path::Path,
+        tokens: crate::look_tokens::LookTokens,
+    ) -> ProxyState {
+        ProxyState::new(
+            pool,
+            manager(dir),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        )
+        .with_look_tokens(tokens)
+    }
+
+    fn look_html_request(token: Option<&str>) -> Request {
+        let mut req = Request::builder()
+            .uri("/look-html")
+            .header("host", "shop.outer.test");
+        if let Some(token) = token {
+            req = req.header(LOOK_HEADER, token);
+        }
+        req.body(Body::empty()).unwrap()
+    }
+
+    /// A live token injects the recorder right after `<head>`, asks
+    /// upstream for identity, and never leaks the token upstream.
+    #[tokio::test]
+    async fn look_token_injects_recorder_and_hides_token_upstream() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let token = tokens.mint("shop.outer.test");
+        let state = look_state(fix.pool.clone(), fix._dir.path(), tokens);
+
+        let (status, headers, body) = body_text(
+            router(state)
+                .oneshot(look_html_request(Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut expected = String::from("<html><head>");
+        expected.push_str(&String::from_utf8(look_snippet()).unwrap());
+        expected.push_str(
+            "<title>T</title></head><body>hi<!--ae:identity leaked:false--></body></html>",
+        );
+        assert_eq!(
+            body, expected,
+            "recorder injected, token stripped, identity asked"
+        );
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|text| text.parse::<usize>().ok()),
+            Some(body.len()),
+            "content-length fixed for the injected body"
+        );
+        assert!(body.contains("id=\"__outer_look\""), "{body}");
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store, private"),
+            "the edge must never cache the recorder page"
+        );
+    }
+
+    /// What Cloudflare returns is the page's serialized DOM: the injected
+    /// recorder script followed by the log element it filled. The parser
+    /// must read the log element, never text inside the recorder itself.
+    #[test]
+    fn serialized_recorder_page_parses_to_the_recorded_log() {
+        let page =
+            inject_look_snippet(b"<html><head><title>T</title></head><body>hi</body></html>");
+        let recorded = String::from_utf8(page).unwrap().replace(
+            "{\"console\":[],\"failed\":[]}",
+            "{\"console\":[{\"level\":\"error\",\"message\":\"boom\"}],\"failed\":[{\"url\":\"/x.png\",\"error\":\"load failed\"}]}",
+        );
+        let capture = crate::browser::parse_look_capture(&recorded).expect("log element found");
+        assert_eq!(capture.console.len(), 1);
+        assert_eq!(capture.console[0].message, "boom");
+        assert_eq!(capture.failed.len(), 1);
+    }
+
+    /// Without any token the proxy path is byte-for-byte what upstream
+    /// sent: the recorder never runs for real visitors.
+    #[tokio::test]
+    async fn look_without_token_leaves_bytes_untouched() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = look_state(
+            fix.pool.clone(),
+            fix._dir.path(),
+            crate::look_tokens::LookTokens::new(),
+        );
+
+        let (status, headers, body) = body_text(
+            router(state)
+                .oneshot(look_html_request(None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            "<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>"
+        );
+        assert_eq!(
+            headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|text| text.parse::<usize>().ok()),
+            Some(body.len())
+        );
+    }
+
+    /// Tokens are single-use and host-bound: a replay or a token minted for
+    /// another host injects nothing.
+    #[tokio::test]
+    async fn look_token_replays_and_foreign_hosts_inject_nothing() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let token = tokens.mint("shop.outer.test");
+        let foreign = tokens.mint("other.outer.test");
+        let state = look_state(fix.pool.clone(), fix._dir.path(), tokens);
+        let (_, _, first) = body_text(
+            router(state.clone())
+                .oneshot(look_html_request(Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            first.contains("id=\"__outer_look\""),
+            "live token injects: {first}"
+        );
+        // Replay of the consumed token and a token minted for another host
+        // both inject nothing.
+        for attempt in [token, foreign] {
+            let (_, _, body) = body_text(
+                router(state.clone())
+                    .oneshot(look_html_request(Some(&attempt)))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(
+                !body.contains("__outer_look"),
+                "no recorder, no marker: {body}"
+            );
+        }
+    }
+
+    /// An expired token is exactly like no token: the response is the
+    /// upstream page untouched.
+    #[tokio::test]
+    async fn look_expired_token_leaves_bytes_untouched() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let stale = tokens.mint_expired("shop.outer.test");
+        let state = look_state(fix.pool.clone(), fix._dir.path(), tokens);
+
+        let (status, _, body) = body_text(
+            router(state)
+                .oneshot(look_html_request(Some(&stale)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            "<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>"
+        );
+    }
+
+    /// A CSP blocking inline scripts skips the recorder but leaves a marker
+    /// the tool reports; `'unsafe-inline'` allows the injection.
+    #[tokio::test]
+    async fn look_csp_block_skips_with_marker_and_allowance_injects() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let state = look_state(fix.pool.clone(), fix._dir.path(), tokens.clone());
+
+        let blocked = tokens.mint("shop.outer.test");
+        let req = Request::builder()
+            .uri("/look-csp")
+            .header("host", "shop.outer.test")
+            .header(LOOK_HEADER, blocked)
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("id=\"__outer_look\""), "no recorder: {body}");
+        assert!(
+            body.starts_with("<!--__outer_look:csp-->"),
+            "skip marker first: {body}"
+        );
+        assert_eq!(
+            headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|text| text.parse::<usize>().ok()),
+            Some(body.len())
+        );
+
+        let allowed = tokens.mint("shop.outer.test");
+        let req = Request::builder()
+            .uri("/look-csp-ok")
+            .header("host", "shop.outer.test")
+            .header(LOOK_HEADER, allowed)
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert!(body.contains("id=\"__outer_look\""), "injected: {body}");
+        assert!(!body.contains("__outer_look:csp"), "{body}");
+    }
+
+    /// An oversize page streams with the marker prepended instead of
+    /// sitting fully in memory, and the tail still arrives intact.
+    #[tokio::test]
+    async fn look_oversize_page_streams_with_marker() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let token = tokens.mint("shop.outer.test");
+        let state = look_state(fix.pool.clone(), fix._dir.path(), tokens);
+
+        let req = Request::builder()
+            .uri("/look-big")
+            .header("host", "shop.outer.test")
+            .header(LOOK_HEADER, token)
+            .body(Body::empty())
+            .unwrap();
+        // Past `body_text`'s 1 MiB helper cap: read the whole streamed page.
+        let response = router(state).oneshot(req).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let status = parts.status;
+        let headers = parts.headers;
+        let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.starts_with("<!--__outer_look:oversize-->"),
+            "marker first"
+        );
+        assert!(body.ends_with("</body></html>"), "tail intact");
+        assert!(
+            !body.contains("id=\"__outer_look\""),
+            "no recorder: oversize"
+        );
+        assert!(
+            body.len() > MAX_LOOK_HTML_BYTES,
+            "page still whole: {} bytes",
+            body.len()
+        );
+        assert_eq!(
+            headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|text| text.parse::<usize>().ok()),
+            Some(body.len())
+        );
+    }
+
+    /// Encoded bodies and non-HTML responses pass through untouched with a
+    /// live token: only plain HTML is ever edited.
+    #[tokio::test]
+    async fn look_encoded_and_non_html_bodies_pass_through() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let state = look_state(fix.pool.clone(), fix._dir.path(), tokens.clone());
+
+        let token = tokens.mint("shop.outer.test");
+        let req = Request::builder()
+            .uri("/look-gzip")
+            .header("host", "shop.outer.test")
+            .header(LOOK_HEADER, token)
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "opaque-not-really-gzip");
+        assert!(!body.contains("__outer_look"), "{body}");
+        assert_eq!(
+            headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+
+        // The JSON echo fallback is not HTML: identical to the untokened
+        // render of the same request shape.
+        let token = tokens.mint("shop.outer.test");
+        let req = Request::builder()
+            .uri("/items?page=2")
+            .header("host", "shop.outer.test")
+            .header(LOOK_HEADER, token)
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, tokened) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        let req = Request::builder()
+            .uri("/items?page=2")
+            .header("host", "shop.outer.test")
+            .header("accept-encoding", "identity")
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, plain) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(tokened, plain, "non-HTML untouched");
+        assert!(!tokened.contains("__outer_look"), "{tokened}");
     }
 }

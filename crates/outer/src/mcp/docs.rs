@@ -53,6 +53,7 @@ pub const TOPICS: &[(&str, &str)] = &[
         "sandboxes",
         include_str!("../../../../web/docs/guides/sandboxes.md"),
     ),
+    ("look", include_str!("../../../../web/docs/guides/look.md")),
 ];
 
 /// Strip one leading `---` YAML frontmatter block, if present. Anything else
@@ -94,7 +95,7 @@ mod tests {
 
     #[test]
     fn every_topic_is_nonempty() {
-        assert_eq!(TOPICS.len(), 17);
+        assert_eq!(TOPICS.len(), 18);
         for (name, md) in TOPICS {
             let stripped = strip_frontmatter(md);
             assert!(stripped.trim().len() > 200, "{name} is suspiciously short");
