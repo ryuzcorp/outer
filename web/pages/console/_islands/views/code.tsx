@@ -157,7 +157,6 @@ function TreeNodes({
                 class="min-w-0 cursor-pointer truncate rounded-field px-2 py-1 text-[13px] font-medium hover:bg-base-200"
                 title={node.path}
               >
-                <span aria-hidden="true">▸ </span>
                 {node.name}/
               </summary>
               <TreeNodes nodes={node.children} depth={depth + 1} selected={selected} onSelect={onSelect} />
