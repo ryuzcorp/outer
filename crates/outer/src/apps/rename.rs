@@ -207,15 +207,17 @@ async fn copy_prefix(store: &Store, from_prefix: &str, to_prefix: &str) -> anyho
         .list(from_prefix)
         .await
         .with_context(|| format!("listing {from_prefix} for the rename copy"))?;
-    if keys.is_empty() {
-        return Ok(0);
-    }
-    // Wipe-first (see above): retrying a crashed copy restarts from empty
-    // instead of mixing stale bytes with fresh ones.
+    // Wipe-first (see above) even when the source is empty: a crashed
+    // attempt can leave an abandoned copy under the target — adopted by our
+    // own target-claim rows — and an empty source must still clear it, or
+    // the stale bytes ride along under the new slug with no cleanup row.
     store
         .delete_prefix(to_prefix)
         .await
         .with_context(|| format!("clearing {to_prefix} for the rename copy"))?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
     let tmp = tempfile::tempdir().context("staging the rename copy")?;
     let mut copied = 0u64;
     for key in &keys {
@@ -241,6 +243,24 @@ async fn copy_prefix(store: &Store, from_prefix: &str, to_prefix: &str) -> anyho
         copied += 1;
     }
     Ok(copied)
+}
+
+/// Post-commit bucket cleanup for one prefix: delete the objects, then the
+/// cleanup row — but only after the delete succeeds. A failed delete keeps
+/// its row, so the maintenance drain still knows about the leftover objects
+/// and retries their deletion.
+async fn delete_prefix_and_row(pool: &SqlitePool, store: &Store, prefix: &str) {
+    if let Err(err) = store.delete_prefix(prefix).await {
+        tracing::warn!(error = %format!("{err:#}"), prefix, "rename post-commit prefix delete failed; the maintenance drain retries it");
+        return;
+    }
+    if let Err(err) = sqlx::query("DELETE FROM prefix_cleanup WHERE prefix = ?1")
+        .bind(prefix)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(error = %format!("{err:#}"), prefix, "rename post-commit cleanup row delete failed; the maintenance drain retries it");
+    }
 }
 
 /// Move one local path for the rename, wiping the target first — but only
@@ -710,6 +730,29 @@ pub async fn rename_app_with_hooks(
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+    // The D1 dumps copied buckets above; their rows move slugs in the same
+    // transaction, or download/restore read stale keys (and post-commit
+    // cleanup removes the objects those keys name).
+    let backup_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, store_key FROM d1_backup WHERE app_id = ?1")
+            .bind(&app.id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal)?;
+    for (id, store_key) in &backup_rows {
+        let Some(suffix) = store_key.strip_prefix(&from_backups) else {
+            // Backup rows always live under the slug prefix; a foreign key
+            // (impossible via `backup_binding`) must not block the rename.
+            continue;
+        };
+        let new_key = format!("{to_backups}{suffix}");
+        sqlx::query("UPDATE d1_backup SET store_key = ?1 WHERE id = ?2")
+            .bind(&new_key)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+    }
     let now = now_ms();
     for (prefix, reason) in [
         (&old_fleets, "rename-old"),
@@ -755,26 +798,8 @@ pub async fn rename_app_with_hooks(
     // the rename, so any error above means "never happened" and the caller
     // refunds the quota.
     if hooks.fail_at != Some(RenameFailStep::SkipCleanup) {
-        if let Err(err) = store.delete_prefix(&from_git).await {
-            tracing::warn!(error = %format!("{err:#}"), "rename post-commit git prefix delete failed; the maintenance drain retries it");
-        }
-        if let Err(err) = store.delete_prefix(&from_fleets).await {
-            tracing::warn!(error = %format!("{err:#}"), "rename post-commit fleets prefix delete failed; the maintenance drain retries it");
-        }
-        if let Err(err) = store.delete_prefix(&old_exports).await {
-            tracing::warn!(error = %format!("{err:#}"), "rename post-commit exports prefix delete failed; the maintenance drain retries it");
-        }
-        if let Err(err) = store.delete_prefix(&from_backups).await {
-            tracing::warn!(error = %format!("{err:#}"), "rename post-commit backups prefix delete failed; the maintenance drain retries it");
-        }
         for prefix in [&from_git, &from_fleets, &old_exports, &from_backups] {
-            if let Err(err) = sqlx::query("DELETE FROM prefix_cleanup WHERE prefix = ?1")
-                .bind(prefix)
-                .execute(pool)
-                .await
-            {
-                tracing::warn!(error = %format!("{err:#}"), "rename post-commit cleanup row delete failed; the maintenance drain retries it");
-            }
+            delete_prefix_and_row(pool, store, prefix).await;
         }
     }
     crate::cloudflare::purge_host_cache(cache_purge, &format!("{old_slug}.{apps_domain}")).await;
@@ -953,6 +978,117 @@ mod tests {
                 .unwrap();
         assert_eq!(target.as_deref(), Some("pantry"));
         assert!(!claimable(&fx, "groceries").await);
+    }
+
+    #[tokio::test]
+    async fn rename_rewrites_backup_store_keys() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        let app = super::super::get_by_slug(&fx.pool, "groceries")
+            .await
+            .unwrap()
+            .unwrap();
+        fx.store
+            .put(
+                "outer/backups/groceries/123-DB.sql",
+                b"CREATE TABLE t (id);".to_vec(),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO d1_backup (id, app_id, binding, store_key, created_at, size_bytes) \
+             VALUES ('b1', ?1, 'DB', 'outer/backups/groceries/123-DB.sql', 123, 19)",
+        )
+        .bind(&app.id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let out = run(&fx, "groceries", "pantry", RenameHooks::default())
+            .await
+            .unwrap();
+        assert_eq!(out.app.slug, "pantry");
+        // The row follows the bucket: restore reads the new key.
+        let key: String = sqlx::query_scalar("SELECT store_key FROM d1_backup WHERE id = 'b1'")
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(key, "outer/backups/pantry/123-DB.sql");
+        assert_eq!(
+            fx.store
+                .get("outer/backups/pantry/123-DB.sql")
+                .await
+                .unwrap(),
+            Some(b"CREATE TABLE t (id);".to_vec())
+        );
+        assert!(fx
+            .store
+            .list("outer/backups/groceries/")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(cleanup_rows(&fx).await.is_empty(), "no jobs left behind");
+    }
+
+    #[tokio::test]
+    async fn rename_clears_an_orphaned_target_prefix_when_source_is_empty() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        // The source app has no backups, but a crashed earlier attempt left
+        // bytes under the target. The rename must still clear the target,
+        // or the stale dump rides along under the new slug.
+        fx.store
+            .put("outer/backups/pantry/stale.sql", b"stale".to_vec())
+            .await
+            .unwrap();
+        let out = run(&fx, "groceries", "pantry", RenameHooks::default())
+            .await
+            .unwrap();
+        assert_eq!(out.app.slug, "pantry");
+        assert!(fx
+            .store
+            .list("outer/backups/pantry/")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_prefix_delete_keeps_its_cleanup_row_for_the_drain() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        fx.store
+            .put("outer/backups/groceries/dump.sql", b"dump".to_vec())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO prefix_cleanup (prefix, reason, created_at) \
+             VALUES ('outer/backups/groceries/', 'rename-old', 1)",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        // The prefix delete fails: the row stays, so the drain retries it.
+        fx.store.fail_next(1, "r2 is down");
+        delete_prefix_and_row(&fx.pool, &fx.store, "outer/backups/groceries/").await;
+        assert_eq!(
+            cleanup_rows(&fx).await,
+            vec!["outer/backups/groceries/".to_string()]
+        );
+        assert!(fx
+            .store
+            .get("outer/backups/groceries/dump.sql")
+            .await
+            .unwrap()
+            .is_some());
+        // The retry converges: bytes gone, row gone.
+        delete_prefix_and_row(&fx.pool, &fx.store, "outer/backups/groceries/").await;
+        assert!(cleanup_rows(&fx).await.is_empty());
+        assert!(fx
+            .store
+            .list("outer/backups/groceries/")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Abandoned local state under the target (a crashed delete's orphans):

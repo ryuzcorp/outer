@@ -97,6 +97,12 @@ pub const ROW_PAGE: i64 = 500;
 /// headroom for celld's own wrapping.
 pub const MAX_STATEMENT_BYTES: usize = 90_000;
 
+/// The hard D1 statement limit
+/// (<https://celld.dev/docs/services/d1>): a single row bigger than this
+/// can never be restored, so the dump refuses it at backup time instead of
+/// storing an unrestorable dump.
+pub const D1_STATEMENT_LIMIT: usize = 100_000;
+
 /// A dump bigger than this fails instead of filling R2: D1 apps are small
 /// config-plus-content databases, and an unbounded dump would wedge the
 /// daily sweep on one app.
@@ -336,9 +342,13 @@ pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<Stri
         "-- Outer D1 backup: database {binding:?}\n\
          -- Restore with Console → D1 → Backups, or the restore_backup MCP tool.\n"
     );
+    // Statements are separated by `;` on its own line, not by a bare `;`: a
+    // DDL line ending in a `--` comment would otherwise eat the terminator
+    // (the `;` lands on the comment's line), merging two statements into one
+    // syntax error at restore time.
     let push = |dump: &mut String, stmt: &str| {
         dump.push_str(stmt);
-        dump.push_str(";\n");
+        dump.push_str("\n;\n");
     };
     for table in &ordered {
         push(&mut dump, &table.sql);
@@ -379,6 +389,17 @@ pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<Stri
             );
             let page_len = rows.len();
             for stmt in pack_inserts(&prefix, cols, &rows) {
+                // A single row bigger than D1's statement limit can never be
+                // restored (the replay batch would fail at the celld limit
+                // after the tables were already dropped), so the backup
+                // fails here and stores nothing.
+                if stmt.len() > D1_STATEMENT_LIMIT {
+                    return Err(D1Error::TooLarge(format!(
+                        "a row in table {:?} is too large to restore ({} bytes)",
+                        table.name,
+                        stmt.len()
+                    )));
+                }
                 bytes += stmt.len() + 2;
                 if bytes > MAX_DUMP_BYTES {
                     return Err(D1Error::TooLarge(format!(
@@ -466,8 +487,8 @@ fn is_blob_literal(decltype: &str, rendered: &str) -> bool {
 
 /// Pack one page's rows into multi-row `INSERT` statements of at most
 /// [`MAX_STATEMENT_BYTES`] bytes. One row per statement worst case (a single
-/// row bigger than the cap fails loudly at restore time instead of silently
-/// truncating here).
+/// row bigger than [`D1_STATEMENT_LIMIT`] is left whole for `dump_database`
+/// to reject at backup time instead of silently truncating here).
 fn pack_inserts(
     prefix: &str,
     cols: &[(String, String)],
@@ -504,46 +525,137 @@ fn pack_inserts(
     stmts
 }
 
-/// Split dump SQL back into statements, respecting single-quoted strings
-/// (`''` escapes) and `--` line comments. Returns statements without their
-/// trailing `;`.
+/// Split dump SQL back into statements, without their trailing `;`.
+///
+/// The scanner understands the lexical pieces a `;` can hide inside:
+/// single-quoted strings (`''` escapes), double-quoted/backtick/bracket
+/// quoted identifiers, `--` line comments, and `/* … */` block comments.
+/// A `CREATE [TEMP] TRIGGER` body holds `;`-terminated statements between
+/// `BEGIN` and its matching `END`, so once the statement's first words
+/// name a trigger the splitter counts `BEGIN`/`END` depth (with `CASE`
+/// counted alongside, so a `CASE … END` inside the body nets out) and only
+/// ends the statement at a `;` back at depth zero.
 fn split_sql(dump: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut current = String::new();
     let mut chars = dump.chars().peekable();
-    let mut in_string = false;
+    // First three word tokens of the statement being scanned, uppercased,
+    // to spot `CREATE [TEMP|TEMPORARY] TRIGGER`.
+    let mut words: Vec<String> = Vec::new();
+    // `Some(depth)` while scanning a trigger body; the statement ends at
+    // a `;` with depth zero.
+    let mut trigger_depth: Option<i32> = None;
+    // Record a word token: the first three decide trigger-ness, and every
+    // word inside a trigger body moves the BEGIN/END depth.
+    let word = |words: &mut Vec<String>,
+                trigger_depth: &mut Option<i32>,
+                current: &mut String,
+                raw: &str| {
+        current.push_str(raw);
+        let upper = raw.to_ascii_uppercase();
+        if trigger_depth.is_some() {
+            match upper.as_str() {
+                "BEGIN" | "CASE" => *trigger_depth = Some(trigger_depth.unwrap_or(0) + 1),
+                "END" => *trigger_depth = Some(trigger_depth.unwrap_or(0) - 1),
+                _ => {}
+            }
+        } else if words.len() < 3 {
+            words.push(upper.clone());
+            let seen: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+            let is_trigger = matches!(
+                seen.as_slice(),
+                ["CREATE", "TRIGGER"]
+                    | ["CREATE", "TEMP", "TRIGGER"]
+                    | ["CREATE", "TEMPORARY", "TRIGGER"]
+            );
+            if is_trigger {
+                *trigger_depth = Some(0);
+            }
+        }
+    };
     while let Some(c) = chars.next() {
-        if in_string {
+        // Quoted strings and identifiers: a `;` inside is data, and a
+        // doubled quote is an escape, not the end.
+        if c == '\'' || c == '"' || c == '`' {
+            let quote = c;
             current.push(c);
-            if c == '\'' {
-                if chars.peek() == Some(&'\'') {
-                    current.push(chars.next().expect("split: peeked quote"));
-                } else {
-                    in_string = false;
+            while let Some(c) = chars.next() {
+                current.push(c);
+                if c == quote {
+                    // A doubled quote is an escape, not the end; only the
+                    // matching quote can close, so a `'` inside `"…"` is
+                    // just a character.
+                    if chars.peek() == Some(&quote) {
+                        current.push(chars.next().expect("split: peeked quote"));
+                    } else {
+                        break;
+                    }
                 }
             }
             continue;
         }
-        if c == '\'' {
-            in_string = true;
+        if c == '[' {
             current.push(c);
+            while let Some(c) = chars.next() {
+                current.push(c);
+                if c == ']' {
+                    if chars.peek() == Some(&']') {
+                        current.push(chars.next().expect("split: peeked bracket"));
+                    } else {
+                        break;
+                    }
+                }
+            }
             continue;
         }
         if c == '-' && chars.peek() == Some(&'-') {
-            // A `--` comment runs to the end of the line.
+            // A `--` comment runs to the end of the line; the newline stays
+            // so the next line still tokenizes separately.
+            chars.next();
             for c in chars.by_ref() {
                 if c == '\n' {
+                    current.push(c);
                     break;
                 }
             }
             continue;
         }
-        if c == ';' {
+        if c == '/' && chars.peek() == Some(&'*') {
+            // A block comment is whitespace to the tokenizer: it separates
+            // tokens (`a/**/b` is two words), so leave one space behind.
+            chars.next();
+            let mut prev_star = false;
+            for c in chars.by_ref() {
+                if prev_star && c == '/' {
+                    break;
+                }
+                prev_star = c == '*';
+            }
+            current.push(' ');
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+            let mut raw = String::new();
+            raw.push(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphanumeric() || next == '_' || next == '$' {
+                    raw.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            word(&mut words, &mut trigger_depth, &mut current, &raw);
+            continue;
+        }
+        if c == ';' && trigger_depth.is_none_or(|depth| depth <= 0) {
+            trigger_depth = None;
             let stmt = current.trim().to_string();
             if !stmt.is_empty() {
                 stmts.push(stmt);
             }
             current.clear();
+            words.clear();
             continue;
         }
         current.push(c);
@@ -567,6 +679,15 @@ pub async fn restore_database(
 ) -> Result<RestoreReport, D1Error> {
     let (identity, project) = d1::ready_backup(ctx, app, binding).await?;
     let statements = split_sql(sql);
+
+    // Validate before anything is dropped: an unrestorable statement must
+    // fail here, with the live tables still in place — not after the drops.
+    if let Some(oversized) = statements.iter().find(|s| s.len() > D1_STATEMENT_LIMIT) {
+        return Err(D1Error::TooLarge(format!(
+            "a restore statement exceeds the D1 statement limit ({} bytes)",
+            oversized.len()
+        )));
+    }
 
     // Views first (they may name tables about to go), then the tables the
     // panel itself shows — which already hides `d1_migrations`, so the
@@ -593,36 +714,40 @@ pub async fn restore_database(
         ));
     }
     if !drops.is_empty() {
-        exec_one(
-            ctx,
-            &app.slug,
-            &identity,
-            project.path(),
-            &drops.join(";\n"),
-        )
-        .await?;
+        // D1 enforces foreign keys by default, so dropping a populated
+        // parent before its child fails. `PRAGMA defer_foreign_keys` cannot
+        // be changed mid-transaction by user queries — D1 runs every query
+        // in an implicit transaction — but celld brackets this whole exec
+        // in its own transaction, so deferring at its start covers every
+        // drop in the batch (<https://developers.cloudflare.com/d1/sql-api/foreign-keys/>).
+        let drop_sql = format!("PRAGMA defer_foreign_keys = ON;\n{}", drops.join(";\n"));
+        exec_one(ctx, &app.slug, &identity, project.path(), &drop_sql).await?;
     }
 
-    let mut batch = String::new();
+    // Statements rejoin with `;` on its own line (matching the dump
+    // separator): a replayed DDL line ending in a `--` comment must not eat
+    // its terminator.
+    let mut batch: Vec<String> = Vec::new();
+    let mut batch_bytes = 0usize;
     let mut statements_applied = 0usize;
     let mut bytes_applied = 0usize;
-    for stmt in &statements {
-        if !batch.is_empty() && batch.len() + 2 + stmt.len() + 1 > RESTORE_BATCH_BYTES {
-            exec_one(ctx, &app.slug, &identity, project.path(), &batch).await?;
-            statements_applied += batch.matches(';').count();
-            bytes_applied += batch.len();
+    for stmt in statements {
+        if !batch.is_empty() && batch_bytes + stmt.len() + 3 > RESTORE_BATCH_BYTES {
+            let sql = batch.join("\n;\n") + "\n;";
+            exec_one(ctx, &app.slug, &identity, project.path(), &sql).await?;
+            statements_applied += batch.len();
+            bytes_applied += sql.len();
             batch.clear();
+            batch_bytes = 0;
         }
-        if !batch.is_empty() {
-            batch.push_str(";\n");
-        }
-        batch.push_str(stmt);
-        batch.push(';');
+        batch_bytes += stmt.len() + 3;
+        batch.push(stmt);
     }
-    if !batch.trim().is_empty() {
-        exec_one(ctx, &app.slug, &identity, project.path(), &batch).await?;
-        statements_applied += batch.matches(';').count();
-        bytes_applied += batch.len();
+    if !batch.is_empty() {
+        let sql = batch.join("\n;\n") + "\n;";
+        exec_one(ctx, &app.slug, &identity, project.path(), &sql).await?;
+        statements_applied += batch.len();
+        bytes_applied += sql.len();
     }
     Ok(RestoreReport {
         fresh_backup_id: String::new(),
@@ -646,7 +771,30 @@ pub async fn backup_binding(
     let sql = dump_database(ctx, app, binding).await?;
     let bytes = sql.into_bytes();
     let size_bytes = bytes.len() as i64;
-    let key = backup_key(&app.slug, now_ms, binding);
+    // The store write and its row commit together under the slug's wake
+    // lock, which a rename (and a delete) holds across copy, commit and
+    // post-commit delete: a backup racing either one waits, then re-reads
+    // the slug, so its bytes and its row always agree on the prefix.
+    // `lock_owned` moves the `Arc` into the guard (a plain `lock` would
+    // borrow a temporary).
+    let _wake_guard = match &ctx.wake {
+        Some(wake) => Some(wake.wake_lock(&app.slug).await.lock_owned().await),
+        // Operation tests never wake; nothing else contends there.
+        None => None,
+    };
+    let slug = match crate::apps::get_by_id(pool, &app.id).await {
+        Ok(Some(current)) => current.slug,
+        // No wake lock, no contenders: the app is ours.
+        Ok(None) if ctx.wake.is_none() => app.slug.clone(),
+        Ok(None) => {
+            return Err(unavailable(anyhow::anyhow!(
+                "app {} was deleted during its backup",
+                app.id
+            )));
+        }
+        Err(err) => return Err(unavailable(err)),
+    };
+    let key = backup_key(&slug, now_ms, binding);
     store.put(&key, bytes).await.map_err(unavailable)?;
     let row = BackupRow {
         id: uuid::Uuid::new_v4().to_string(),
@@ -737,8 +885,14 @@ pub async fn backup_due_apps(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<V
     .await?;
     let mut out = Vec::with_capacity(ids.len());
     for id in &ids {
-        if let Some(app) = crate::apps::get_by_id(pool, id).await? {
-            out.push(app);
+        match crate::apps::get_by_id(pool, id).await {
+            Ok(Some(app)) => out.push(app),
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                app_id = %id,
+                error = %format!("{err:#}"),
+                "d1 backup: loading app failed; skipping app"
+            ),
         }
     }
     Ok(out)
@@ -751,7 +905,17 @@ pub async fn backup_due_apps(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<V
 pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> anyhow::Result<()> {
     let now = crate::apps::now_ms();
     for app in backup_due_apps(pool, now).await? {
-        let bindings = d1::database_bindings(store, &app.slug).await?;
+        let bindings = match d1::database_bindings(store, &app.slug).await {
+            Ok(bindings) => bindings,
+            Err(err) => {
+                tracing::warn!(
+                    slug = %app.slug,
+                    error = %format!("{err:#}"),
+                    "d1 backup: reading bindings failed; skipping app"
+                );
+                continue;
+            }
+        };
         if bindings.is_empty() {
             continue;
         }
@@ -762,7 +926,17 @@ pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> an
             store: store.clone(),
             wake: Some(fleets.clone()),
         };
-        let plan = owner_plan(pool, &app.owner_id).await?;
+        let plan = match owner_plan(pool, &app.owner_id).await {
+            Ok(plan) => plan,
+            Err(err) => {
+                tracing::warn!(
+                    slug = %app.slug,
+                    error = %format!("{err:#}"),
+                    "d1 backup: reading owner plan failed; skipping app"
+                );
+                continue;
+            }
+        };
         for binding in &bindings {
             match backup_due(pool, &app.id, binding, now).await {
                 Ok(false) => {}
@@ -932,6 +1106,37 @@ mod tests {
     }
 
     #[test]
+    fn split_sql_keeps_trigger_bodies_whole() {
+        let dump = "CREATE TABLE t (id INTEGER PRIMARY KEY);\n\
+                    CREATE TRIGGER trg AFTER INSERT ON t BEGIN UPDATE t SET id = 1; UPDATE t SET id = 2; END;\n\
+                    INSERT INTO \"t\" (\"id\") VALUES (1);\n";
+        let stmts = split_sql(dump);
+        assert_eq!(stmts.len(), 3, "{stmts:?}");
+        assert!(stmts[1].contains("BEGIN UPDATE t SET id = 1; UPDATE t SET id = 2; END"));
+    }
+
+    #[test]
+    fn split_sql_counts_case_end_inside_triggers() {
+        // The CASE … END nets out, so the final END still closes the body.
+        let dump = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN UPDATE t SET id = CASE WHEN NEW.id > 0 THEN 1 ELSE 2 END; END;\n\
+                    INSERT INTO t (id) VALUES (1);\n";
+        let stmts = split_sql(dump);
+        assert_eq!(stmts.len(), 2, "{stmts:?}");
+        assert!(stmts[0].trim_end().ends_with("END"));
+    }
+
+    #[test]
+    fn split_sql_sees_all_quoted_idents_and_block_comments() {
+        let dump = "CREATE TABLE \"we;ird\" (\"id\" INTEGER);\n\
+                    CREATE TABLE `tick;` (`id` INTEGER);\n\
+                    CREATE TABLE [brack;et] ([id] INTEGER);\n\
+                    CREATE TABLE t (id INTEGER /* ; not a terminator */);\n";
+        let stmts = split_sql(dump);
+        assert_eq!(stmts.len(), 4, "{stmts:?}");
+        assert!(stmts[0].contains("\"we;ird\""));
+    }
+
+    #[test]
     fn pack_inserts_stays_under_the_statement_cap() {
         let prefix = "INSERT INTO \"t\" (\"note\") VALUES ";
         let cols = vec![("note".to_string(), "TEXT".to_string())];
@@ -988,7 +1193,7 @@ case "$sql" in
     exit 1
     ;;
   "SELECT type, name, tbl_name, sql"*)
-    printf '%s\n' '{{"type":"table","name":"users","tbl_name":"users","sql":"CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT, \"avatar\" BLOB)"}}' '{{"type":"table","name":"orders","tbl_name":"orders","sql":"CREATE TABLE \"orders\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER REFERENCES \"users\" (\"id\"))"}}' '{{"type":"table","name":"d1_migrations","tbl_name":"d1_migrations","sql":"CREATE TABLE d1_migrations (id TEXT)"}}' '{{"type":"table","name":"_litestream_seq","tbl_name":"_litestream_seq","sql":"CREATE TABLE _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER)"}}' '{{"type":"index","name":"idx_orders_user","tbl_name":"orders","sql":"CREATE INDEX \"idx_orders_user\" ON \"orders\" (\"user_id\")"}}' '{{"type":"view","name":"big","tbl_name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\""}}'
+    printf '%s\n' '{{"type":"table","name":"users","tbl_name":"users","sql":"CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT, \"avatar\" BLOB)"}}' '{{"type":"table","name":"orders","tbl_name":"orders","sql":"CREATE TABLE \"orders\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER REFERENCES \"users\" (\"id\"))"}}' '{{"type":"table","name":"d1_migrations","tbl_name":"d1_migrations","sql":"CREATE TABLE d1_migrations (id TEXT)"}}' '{{"type":"table","name":"_litestream_seq","tbl_name":"_litestream_seq","sql":"CREATE TABLE _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER)"}}' '{{"type":"index","name":"idx_orders_user","tbl_name":"orders","sql":"CREATE INDEX \"idx_orders_user\" ON \"orders\" (\"user_id\")"}}' '{{"type":"trigger","name":"trg_users","tbl_name":"users","sql":"CREATE TRIGGER \"trg_users\" AFTER INSERT ON \"users\" BEGIN UPDATE \"users\" SET \"name\" = CASE WHEN NEW.\"id\" > 0 THEN '"'"'touched'"'"' ELSE '"'"'kept'"'"' END WHERE \"id\" = NEW.\"id\"; END"}}' '{{"type":"view","name":"big","tbl_name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\""}}'
     ;;
   'PRAGMA foreign_key_list("orders")')
     printf '%s\n' '{{"table":"users","from":"user_id","to":"id"}}'
@@ -1017,6 +1222,10 @@ case "$sql" in
     printf '%s\n' '{{"t":"users","n":2}}' '{{"t":"orders","n":1}}'
     ;;
   # Drop and replay batches: logged for order assertions, then accepted.
+  # The drop batch opens with the deferred-FK pragma (one exec, one
+  # transaction), so it matches on the pragma, not on DROP.
+  'PRAGMA defer_foreign_keys'*)
+    ;;
   'DROP '* | 'CREATE '* | 'INSERT '*)
     ;;
   *) echo "unexpected command: $sql" >&2; exit 1;;
@@ -1129,6 +1338,21 @@ exit 0
         assert!(dump.contains("CREATE INDEX \"idx_orders_user\""));
         assert!(dump.contains("CREATE VIEW \"big\""));
         assert!(!dump.contains("d1_migrations"), "bookkeeping stays out");
+        // The trigger body holds `;`-terminated statements: the dump keeps it
+        // whole, and the splitter must too (a fragment each side of the
+        // body's `;` would replay as a syntax error).
+        assert!(dump.contains(
+            "CREATE TRIGGER \"trg_users\" AFTER INSERT ON \"users\" BEGIN UPDATE \"users\""
+        ));
+        let stmts = split_sql(&dump);
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("CREATE TRIGGER \"trg_users\"")
+                    && s.contains("CASE WHEN")
+                    && s.trim_end().ends_with("END")),
+            "trigger replays as one statement: {stmts:?}"
+        );
         assert!(
             dump.contains(
                 "INSERT INTO \"users\" (\"id\", \"name\", \"avatar\") VALUES (1, 'ada', NULL), (2, 'o''brien; -- x', x'dead')"
@@ -1165,6 +1389,11 @@ exit 0
         assert!(report.statements_applied > 0, "{report:?}");
         assert!(!report.fresh_backup_id.is_empty());
         let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
+        // The drop batch defers foreign keys first (D1 enforces them by
+        // default, so dropping a populated parent before its child fails).
+        let defer = calls
+            .find("PRAGMA defer_foreign_keys = ON")
+            .expect("defers foreign keys for the drops");
         let drop_view = calls
             .find("DROP VIEW IF EXISTS \"big\"")
             .expect("drops the view");
@@ -1174,9 +1403,181 @@ exit 0
         let replay = calls
             .find("CREATE TABLE \"users\"")
             .expect("replays the dump");
-        assert!(drop_view < drop_tables && drop_tables < replay);
+        assert!(defer < drop_view && drop_view < drop_tables && drop_tables < replay);
+        // The trigger replays whole, body semicolon and CASE included.
+        assert!(calls.contains("CREATE TRIGGER \"trg_users\""));
+        assert!(calls.contains("ELSE 'kept' END"));
         // Fresh backup + restore target coexist: nothing pruned within retention.
         assert_eq!(backups_for(&pool, &app.id).await.unwrap().len(), 2);
+    }
+
+    /// A fake `celld` serving one table with one row bigger than the D1
+    /// statement limit: the dump must refuse it at backup time.
+    fn install_huge_row_celld(state: &std::path::Path) -> std::path::PathBuf {
+        let script = state.join("fake-celld-huge");
+        let tmp = script.with_extension("tmp");
+        let log = state.join("calls.log").to_string_lossy().into_owned();
+        std::fs::write(
+            &tmp,
+            format!(
+                r#"#!/bin/sh
+command_of() {{
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--command" ]; then printf '%s' "$a"; return 0; fi
+    prev="$a"
+  done
+}}
+sql=$(command_of "$@")
+printf '%s\n' "$sql" >> "{log}"
+case "$sql" in
+  "SELECT type, name, tbl_name, sql"*)
+    printf '%s\n' '{{"type":"table","name":"big","tbl_name":"big","sql":"CREATE TABLE \"big\" (\"c\" TEXT)"}}'
+    ;;
+  'PRAGMA foreign_key_list("big")')
+    ;;
+  'PRAGMA table_info("big")')
+    printf '%s\n' '{{"cid":0,"name":"c","type":"TEXT"}}'
+    ;;
+  'SELECT * FROM "big"'*)
+    printf '{{"c":"%s"}}\n' "$(head -c 120000 /dev/zero | tr '\0' 'x')"
+    ;;
+  *) echo "unexpected command: $sql" >&2; exit 1;;
+esac
+exit 0
+"#,
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::rename(&tmp, &script).unwrap();
+        script
+    }
+
+    #[tokio::test]
+    async fn dump_rejects_a_row_bigger_than_the_d1_statement_limit() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_huge_row_celld(state.path());
+        let store = Store::memory();
+        let now = crate::apps::now_ms();
+        seed_backup_app(&pool, &store, now).await;
+        let ctx = backup_ctx(&pool, &state, &script, store);
+        let app = crate::apps::get_by_slug(&pool, "acme")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = dump_database(&ctx, &app, "DB").await.unwrap_err();
+        assert!(matches!(err, D1Error::TooLarge(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_an_oversized_statement_before_dropping_anything() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let store = Store::memory();
+        let now = crate::apps::now_ms();
+        seed_backup_app(&pool, &store, now).await;
+        let ctx = backup_ctx(&pool, &state, &script, store);
+        let app = crate::apps::get_by_slug(&pool, "acme")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let huge = "x".repeat(120_000);
+        let sql = format!(
+            "CREATE TABLE \"t\" (\"c\" TEXT);\nINSERT INTO \"t\" (\"c\") VALUES ('{huge}');\n"
+        );
+        let err = restore_database(&ctx, &app, "DB", &sql).await.unwrap_err();
+        assert!(matches!(err, D1Error::TooLarge(_)), "{err:?}");
+        // Nothing dropped: the live tables are still in place (no exec ran at
+        // all, so the log may not exist yet).
+        let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap_or_default();
+        assert!(!calls.contains("DROP"), "{calls}");
+    }
+
+    #[tokio::test]
+    async fn tick_skips_an_app_whose_manifest_wont_parse() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let store = Store::memory();
+        let now = crate::apps::now_ms();
+        // A due app whose deployed manifest has non-array bindings: reading
+        // its bindings fails on every pass, and the sweep must warn and
+        // move on instead of aborting the whole tick.
+        sqlx::query(
+            "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) \
+             VALUES ('acct-bad', 'bad@example.com', ?1, ?1, ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_request_at, last_activity_at, created_at) \
+             VALUES ('app-bad', 'bad', 'acct-bad', 300002, 18003, 18004, ?1, ?1, ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        store
+            .put(
+                "fleets/bad/deploy/current.json",
+                br#"{"script_name":"outer-app","version":"v1","prefix":"deploy/outer-app/v1"}"#
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                "fleets/bad/deploy/outer-app/v1/manifest.json",
+                serde_json::json!({
+                    "schema_version": 2,
+                    "script_name": "outer-app",
+                    "main_module": "index.js",
+                    "raw_metadata": {
+                        "bindings": {"d1": "not-an-array"},
+                        "compatibility_date": "2026-09-01",
+                        "compatibility_flags": ["nodejs_als"],
+                        "main_module": "index.js"
+                    }
+                })
+                .to_string()
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        let fleets = FleetManager::new(crate::fleet::manager::ManagerSettings {
+            data_dir: state.path().join("data"),
+            celld_bin: script.to_string_lossy().into_owned(),
+            storage: FleetStorage {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                region: "test-region".to_string(),
+                bucket: state.path().to_string_lossy().into_owned(),
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: "outeraccess".to_string(),
+                    secret_access_key: "outersecretoutersecretoutersecret12".to_string(),
+                },
+            },
+            cgroups: None,
+            memory_max_bytes: 0,
+            cpu_max: "MAX 100000".to_string(),
+            sleep_after: Duration::from_secs(3600),
+            credential_refresh_after: Duration::from_secs(86400 * 30),
+            wake_timeout: Duration::from_secs(1),
+            wake_concurrency: 1,
+            always_on_max: 0,
+        });
+        tick(&pool, &store, &fleets).await.unwrap();
+        assert!(backups_for(&pool, "app-bad").await.unwrap().is_empty());
     }
 
     #[tokio::test]

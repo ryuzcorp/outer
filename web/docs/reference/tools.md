@@ -531,7 +531,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated �
 ## `list_backups`
 
 - **Access:** signed in
-- **Description:** An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic (7 days kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.
+- **Description:** An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.
 
 **Input:**
 

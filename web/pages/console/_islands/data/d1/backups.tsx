@@ -67,22 +67,16 @@ const RestoreDialog = ({
   };
 
   return (
-    <>
-      <ConfirmModal
-        busy={busy()}
-        busyLabel="Restoring…"
-        confirmLabel="Restore backup"
-        title="Restore this backup?"
-        consequence={`This replaces the live ${binding} tables with the dump from ${formatDateTime(new Date(backup.created_at))} (${formatBytes(backup.size_bytes)}). A fresh backup is taken first, so a bad restore is itself restorable.`}
-        onCancel={onClose}
-        onConfirm={restore}
-      />
-      {error() === "" ? null : (
-        <div class="alert alert-error alert-soft text-sm" role="alert">
-          <span>{error()}</span>
-        </div>
-      )}
-    </>
+    <ConfirmModal
+      busy={busy()}
+      busyLabel="Restoring…"
+      confirmLabel="Restore backup"
+      title="Restore this backup?"
+      consequence={`This replaces the live ${binding} tables with the dump from ${formatDateTime(new Date(backup.created_at))} (${formatBytes(backup.size_bytes)}). A fresh backup is taken first, so a bad restore is itself restorable.`}
+      error={error()}
+      onCancel={onClose}
+      onConfirm={restore}
+    />
   );
 };
 /** The Backups tab for one binding: dump list, download, back up now, restore. */
@@ -149,7 +143,7 @@ export const BackupsPanel = ({
     <div class="flex min-h-0 flex-col gap-3 p-4">
       <div class="flex flex-wrap items-center gap-2">
         <p class="m-0 text-sm opacity-60">
-          Daily dumps, kept 7 days (Pro: 30 days). Downloads are full .sql restores.
+          Daily dumps for active apps (a request or deploy in the last 24 h), kept 7 days (Pro: 30 days). Downloads are full .sql restores.
         </p>
         {canWrite ? (
           <button

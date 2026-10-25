@@ -136,6 +136,7 @@ export function ConfirmModal({
   busyLabel,
   confirmLabel,
   consequence,
+  error,
   onCancel,
   onConfirm,
   title,
@@ -146,6 +147,8 @@ export function ConfirmModal({
   /** Confirm button text; defaults to "Delete". */
   confirmLabel?: string;
   consequence: string;
+  /** Failure from the confirmed action, rendered inside the dialog. */
+  error?: string;
   onCancel: () => void;
   onConfirm: () => void;
   title: string;
@@ -155,6 +158,11 @@ export function ConfirmModal({
       <div class="modal-box min-w-0">
         <h3 class="m-0 text-base font-bold">{title}</h3>
         <p class="m-0 py-3 text-sm opacity-80">{consequence}</p>
+        {error === undefined || error === "" ? null : (
+          <div class="alert alert-error alert-soft mb-3 text-sm" role="alert">
+            <span>{error}</span>
+          </div>
+        )}
         <div class="modal-action">
           <button
             type="button"

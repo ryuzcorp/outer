@@ -206,41 +206,86 @@ function D1DatabaseView({
   slug: string;
 }) {
   const tab = atom<"tables" | "backups">("tables");
+  // Backups are owner-only (the list and download routes 404 for
+  // collaborators), so collaborators get no Backups tab at all.
+  const tabs: readonly ("tables" | "backups")[] = canWrite ? ["tables", "backups"] : ["tables"];
+  const selectTab = (next: "tables" | "backups") => {
+    tab.set(next);
+    document.getElementById(`d1-tab-${next}`)?.focus();
+  };
 
   return (
     <div class="flex min-h-0 min-w-0 flex-1 flex-col">
       <div class="border-base-300 overflow-x-auto border-b px-4 pt-2">
-        <div role="tablist" class="tabs tabs-border w-max flex-nowrap" aria-label="D1 views">
+        <div
+          role="tablist"
+          class="tabs tabs-border w-max flex-nowrap"
+          aria-label="D1 views"
+          onkeydown={(event) => {
+            const current = tabs.indexOf(tab());
+            if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+              event.preventDefault();
+              const delta = event.key === "ArrowRight" ? 1 : -1;
+              selectTab(tabs[(current + delta + tabs.length) % tabs.length]);
+            } else if (event.key === "Home") {
+              event.preventDefault();
+              selectTab(tabs[0]);
+            } else if (event.key === "End") {
+              event.preventDefault();
+              selectTab(tabs[tabs.length - 1]);
+            }
+          }}
+        >
           <button
             type="button"
             role="tab"
+            id="d1-tab-tables"
+            aria-controls="d1-panel-tables"
             aria-selected={tab() === "tables" ? "true" : "false"}
             class={`tab whitespace-nowrap ${tab() === "tables" ? "tab-active" : ""}`}
             onclick={() => tab.set("tables")}
           >
             Tables
           </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab() === "backups" ? "true" : "false"}
-            class={`tab whitespace-nowrap ${tab() === "backups" ? "tab-active" : ""}`}
-            onclick={() => tab.set("backups")}
-          >
-            Backups
-          </button>
+          {canWrite ? (
+            <button
+              type="button"
+              role="tab"
+              id="d1-tab-backups"
+              aria-controls="d1-panel-backups"
+              aria-selected={tab() === "backups" ? "true" : "false"}
+              class={`tab whitespace-nowrap ${tab() === "backups" ? "tab-active" : ""}`}
+              onclick={() => tab.set("backups")}
+            >
+              Backups
+            </button>
+          ) : null}
         </div>
       </div>
-      {tab() === "tables" ? (
-        <D1Editor
-          binding={binding}
-          canWrite={canWrite}
-          route={route}
-          setRoute={setRoute}
-          slug={slug}
-        />
+      {tab() === "backups" && canWrite ? (
+        <div
+          role="tabpanel"
+          id="d1-panel-backups"
+          aria-labelledby="d1-tab-backups"
+          class="flex min-h-0 min-w-0 flex-1 flex-col"
+        >
+          <BackupsPanel binding={binding} canWrite={canWrite} slug={slug} />
+        </div>
       ) : (
-        <BackupsPanel binding={binding} canWrite={canWrite} slug={slug} />
+        <div
+          role="tabpanel"
+          id="d1-panel-tables"
+          aria-labelledby="d1-tab-tables"
+          class="flex min-h-0 min-w-0 flex-1 flex-col"
+        >
+          <D1Editor
+            binding={binding}
+            canWrite={canWrite}
+            route={route}
+            setRoute={setRoute}
+            slug={slug}
+          />
+        </div>
       )}
     </div>
   );

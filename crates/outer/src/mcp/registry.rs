@@ -110,7 +110,13 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             ..Hints::WRITE
         },
         "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
-        | "unset_secret" | "remove_domain" | "restore_backup" => Hints::DESTRUCTIVE,
+        | "unset_secret" | "remove_domain" => Hints::DESTRUCTIVE,
+        // Repeating a restore takes another fresh backup, so one call is
+        // never a no-op repeat of the last: not idempotent.
+        "restore_backup" => Hints {
+            idempotent: false,
+            ..Hints::DESTRUCTIVE
+        },
         _ => return None,
     })
 }
@@ -376,7 +382,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<backup_inputs::ListBackupsInput>(
             "list_backups",
-            "An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic (7 days kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.",
+            "An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.",
             Account, false,
         ),
         tool::<backup_inputs::BackupDatabaseInput>(
@@ -455,6 +461,9 @@ mod hint_tests {
         }
         assert!(hints_for("commit").is_some_and(|h| !h.read_only && !h.destructive));
         assert!(hints_for("list_apps").is_some_and(|h| h.read_only));
+        // Every restore takes a fresh backup first, so a retry is never a
+        // no-op: destructive but not idempotent.
+        assert!(hints_for("restore_backup").is_some_and(|h| h.destructive && !h.idempotent));
         assert_eq!(title_of("create_app"), "Create app");
     }
 }

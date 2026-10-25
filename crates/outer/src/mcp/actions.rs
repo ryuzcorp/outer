@@ -201,7 +201,15 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             tool.to_string()
         }
         "backup_database" | "restore_backup" => {
-            format!("{} {}", tool, arg_str(args, "app").unwrap_or("?"))
+            let mut s = format!("{} {}", tool, arg_str(args, "app").unwrap_or("?"));
+            // Two restores of one app must be distinguishable in the log.
+            if tool == "restore_backup" {
+                s.push_str(&format!(
+                    " backup {}",
+                    arg_str(args, "backup_id").unwrap_or("?")
+                ));
+            }
+            s
         }
         "add_domain" => format!("add_domain {}", arg_str(args, "hostname").unwrap_or("?")),
         "add_collaborator" | "remove_collaborator" => {

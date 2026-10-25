@@ -129,10 +129,10 @@ async fn api_backup_now(
         crate::apps::now_ms(),
     )
     .await;
-    let (summary, result) = match &outcome {
+    let (summary, result) = match outcome {
         Ok(row) => (
             format!("d1 backup now {binding} ({} bytes)", row.size_bytes),
-            Ok(json!({"backup": backup_json(row)})),
+            Ok(json!({"backup": backup_json(&row)})),
         ),
         Err(D1Error::UnknownDatabase(_)) => (
             format!("refused d1 backup on unknown database {binding:?}"),
@@ -142,10 +142,7 @@ async fn api_backup_now(
             format!("refused d1 backup on {binding}: never deployed"),
             Err(D1Error::NoConfig),
         ),
-        Err(err) => (
-            format!("failed d1 backup on {binding}"),
-            Err(D1Error::Celld(format!("{err:#}"))),
-        ),
+        Err(err) => (format!("failed d1 backup on {binding}"), Err(err)),
     };
     let (o, code) = audit_outcome(&result);
     crate::mcp::actions::record_console(
@@ -250,14 +247,14 @@ async fn api_restore(
         crate::apps::now_ms(),
     )
     .await;
-    let (summary, result) = match &outcome {
+    let (summary, result) = match outcome {
         Ok((fresh, report)) => (
             format!(
                 "d1 restore {binding} from backup {} (fresh backup {}, {} tables, {} statements)",
                 id, fresh.id, report.tables_dropped, report.statements_applied,
             ),
             Ok(json!({
-                "backup": backup_json(fresh),
+                "backup": backup_json(&fresh),
                 "restore": {
                     "tables_dropped": report.tables_dropped,
                     "statements_applied": report.statements_applied,
@@ -269,10 +266,7 @@ async fn api_restore(
             format!("refused d1 restore on {binding}: unknown backup"),
             Err(D1Error::UnknownBackup(id.clone())),
         ),
-        Err(err) => (
-            format!("failed d1 restore on {binding}"),
-            Err(D1Error::Celld(format!("{err:#}"))),
-        ),
+        Err(err) => (format!("failed d1 restore on {binding}"), Err(err)),
     };
     let (o, code) = audit_outcome(&result);
     crate::mcp::actions::record_console(
