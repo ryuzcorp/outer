@@ -767,6 +767,15 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "app_errors" => runtime::app_errors(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
+        "resolve_error" => runtime::resolve_error(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "ignore_error" => runtime::ignore_error(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "reopen_error" => runtime::reopen_error(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
         "list_secrets" => secrets::list_secrets(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),

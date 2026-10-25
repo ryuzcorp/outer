@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{await_row, deploy_by, latest_deploy, ok_untrusted, owned_app, Ctx};
+use super::{await_row, deploy_by, latest_deploy, ok, ok_untrusted, owned_app, Ctx};
 use crate::mcp::error::ToolError;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -203,4 +203,86 @@ pub async fn app_errors(input: AppErrorsInput, ctx: &Ctx<'_>) -> Result<Value, T
         },
         json!({"issues": items, "s5xx_last_hour": s5xx}),
     ))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveErrorInput {
+    /// The app slug.
+    pub app: String,
+    /// The issue fingerprint from `app_errors`.
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IgnoreErrorInput {
+    /// The app slug.
+    pub app: String,
+    /// The issue fingerprint from `app_errors`.
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReopenErrorInput {
+    /// The app slug.
+    pub app: String,
+    /// The issue fingerprint from `app_errors`.
+    pub fingerprint: String,
+}
+
+/// Move one grouped error issue to a new status. Shared with the console
+/// triage buttons: the same [`crate::observe::logs::set_status`] domain
+/// function, so MCP and console agree on the rules (resolve/ignore stamp
+/// `resolved_at`; a resolved issue that recurs reopens automatically;
+/// reopen clears the stamp). The answer carries no message or frame
+/// text, so the tool stays trusted (`Hints::WRITE`): read the issue
+/// through `app_errors` instead.
+async fn set_issue_status(
+    ctx: &Ctx<'_>,
+    app_slug: &str,
+    fingerprint: &str,
+    status: &'static str,
+) -> Result<Value, ToolError> {
+    let app = owned_app(ctx, app_slug).await?;
+    if fingerprint.is_empty() || fingerprint.len() > 64 {
+        return Err(ToolError::invalid_argument(format!(
+            "bad fingerprint {fingerprint:?}: expected the app_errors fingerprint"
+        )));
+    }
+    let updated = crate::observe::logs::set_status(
+        &ctx.state.pool,
+        &app.id,
+        &[fingerprint],
+        status,
+        crate::apps::now_ms(),
+    )
+    .await
+    .map_err(super::internal)?;
+    if updated == 0 {
+        return Err(ToolError::not_found(format!(
+            "no such error {fingerprint:?}"
+        )));
+    }
+    Ok(ok(
+        format!("error {status}: {fingerprint}"),
+        json!({"fingerprint": fingerprint, "status": status}),
+    ))
+}
+
+/// Mark one grouped runtime error resolved: it leaves the open list, and
+/// a new event for the same fingerprint reopens it automatically as a
+/// regression.
+pub async fn resolve_error(input: ResolveErrorInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    set_issue_status(ctx, &input.app, &input.fingerprint, "resolved").await
+}
+
+/// Ignore one grouped runtime error: it keeps counting but stays out of
+/// the open list. Ignored issues never reopen automatically.
+pub async fn ignore_error(input: IgnoreErrorInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    set_issue_status(ctx, &input.app, &input.fingerprint, "ignored").await
+}
+
+/// Reopen one resolved or ignored error issue: it returns to the open
+/// list as a fresh triage, not a regression.
+pub async fn reopen_error(input: ReopenErrorInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    set_issue_status(ctx, &input.app, &input.fingerprint, "open").await
 }

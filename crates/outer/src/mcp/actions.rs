@@ -29,6 +29,7 @@
 //! - `deploy_status` / `deploy_log`: `<tool> [deploy <id-short>]`
 //! - `app_logs`: `app_logs [limit=<n>] [since=<seq>]`
 //! - `app_errors`: `app_errors [status=<s>]`
+//! - `resolve_error` / `ignore_error` / `reopen_error`: `<tool> <fp-short>`
 //! - `list_secrets`: `list_secrets`
 //! - `set_secret` / `unset_secret`: `<tool> <name>` (never the value)
 
@@ -61,6 +62,9 @@ const LOGGED_TOOLS: &[&str] = &[
     "deploy_log",
     "app_logs",
     "app_errors",
+    "resolve_error",
+    "ignore_error",
+    "reopen_error",
     "list_secrets",
     "set_secret",
     "unset_secret",
@@ -249,6 +253,13 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             }
             s
         }
+        "resolve_error" | "ignore_error" | "reopen_error" => {
+            format!(
+                "{} {}",
+                tool,
+                prefix_chars(arg_str(args, "fingerprint").unwrap_or("?"), 12)
+            )
+        }
         _ => return None,
     };
     Some(summary)
@@ -350,6 +361,36 @@ pub async fn record(
     .await
     {
         tracing::warn!(app = %app_id, tool, error = %format!("{err:#}"), "agent_action insert failed");
+    }
+}
+/// Write one `agent_action` row for a console mutation: same shape as an
+/// MCP call, but with the MCP tool's name and NULL consent + NULL key, so
+/// the action log labels the client **Console**. Failures warn and the
+/// caller's response is returned anyway, like [`record`].
+pub async fn record_console(
+    pool: &SqlitePool,
+    account_id: &str,
+    app_id: &str,
+    tool: &str,
+    summary: &str,
+    outcome: &str,
+) {
+    if let Err(err) = sqlx::query(
+        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
+         tool, summary, outcome, error_code, duration_ms, created_at) \
+         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, NULL, 0, ?7)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(app_id)
+    .bind(account_id)
+    .bind(tool)
+    .bind(truncate(summary, MAX_SUMMARY_CHARS))
+    .bind(outcome)
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(app = %app_id, tool, error = %format!("{err:#}"), "console agent_action insert failed");
     }
 }
 
@@ -485,11 +526,13 @@ pub async fn list(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
     );
     let rows: Vec<Row> = match before {
         Some((before_ts, before_id)) => sqlx::query_as(
             "SELECT a.id, a.tool, a.summary, a.outcome, a.error_code, a.duration_ms, a.created_at, \
-             g.clientName, c.name, c.host, k.name, k.prefix \
+             g.clientName, c.name, c.host, k.name, k.prefix, a.consent_id, a.apikey_id \
              FROM agent_action AS a \
              LEFT JOIN oauthConsent AS g ON g.id = a.consent_id \
              LEFT JOIN oauthClient AS c ON c.clientId = g.clientId \
@@ -505,7 +548,7 @@ pub async fn list(
         .await?,
         None => sqlx::query_as(
             "SELECT a.id, a.tool, a.summary, a.outcome, a.error_code, a.duration_ms, a.created_at, \
-             g.clientName, c.name, c.host, k.name, k.prefix \
+             g.clientName, c.name, c.host, k.name, k.prefix, a.consent_id, a.apikey_id \
              FROM agent_action AS a \
              LEFT JOIN oauthConsent AS g ON g.id = a.consent_id \
              LEFT JOIN oauthClient AS c ON c.clientId = g.clientId \
@@ -534,7 +577,15 @@ pub async fn list(
                 client_host,
                 key_name,
                 key_prefix,
+                consent_id,
+                apikey_id,
             )| {
+                // Console mutations record NULL consent + NULL key: the
+                // label join shows those as "Console" (contract).
+                let client_label = match (consent_id, apikey_id) {
+                    (None, None) => "Console".to_string(),
+                    _ => client_label(grant_name, client_name, client_host, key_name, key_prefix),
+                };
                 ActionRow {
                     id,
                     tool,
@@ -543,13 +594,7 @@ pub async fn list(
                     error_code,
                     duration_ms,
                     created_at,
-                    client_label: client_label(
-                        grant_name,
-                        client_name,
-                        client_host,
-                        key_name,
-                        key_prefix,
-                    ),
+                    client_label,
                 }
             },
         )

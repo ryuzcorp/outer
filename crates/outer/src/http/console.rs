@@ -85,6 +85,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .merge(super::console_actions::routes())
         .merge(super::console_code::routes())
         .route("/api/console/sign-out", post(api_sign_out))
+        .merge(super::console_observe::routes())
         .with_state(state)
 }
 
@@ -108,7 +109,7 @@ pub(crate) fn not_found() -> Response {
 /// `true` only when the request is a same-origin browser fetch. Browsers set
 /// this header themselves; a cross-site page cannot spoof it, which is what
 /// keeps the cookie-only API safe from CSRF.
-fn fetch_ok(headers: &HeaderMap) -> bool {
+pub(crate) fn fetch_ok(headers: &HeaderMap) -> bool {
     headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("same-origin")
 }
 
@@ -559,6 +560,84 @@ async fn api_app(
         .into_response()
 }
 
+/// Parse the console logs query into a validated [`LogFilter`](crate::observe::logs::LogFilter)
+/// plus cursor. Bounds: `q` at most 200 chars, `limit` 1–500, `stream` one
+/// of `stdout|stderr`, `level` one of `error|warn|info`, `from`/`to` unix
+/// milliseconds, `before` a seq cursor for `Load older`. Anything else is
+/// a 400 — the filters shape SQL-adjacent reads, so unknown values refuse
+/// loudly instead of silently returning everything.
+pub(crate) fn logs_query(
+    query: &HashMap<String, String>,
+) -> Result<
+    (
+        crate::observe::logs::LogFilter,
+        crate::observe::logs::LogCursor,
+        usize,
+    ),
+    Box<Response>,
+> {
+    use crate::observe::logs::{LogCursor, LogFilter};
+    let bad =
+        |message: &str| Box::new(nostore_json(StatusCode::BAD_REQUEST, "bad_filter", message));
+    let q = match query.get("q") {
+        Some(q) if q.chars().count() > 200 => return Err(bad("q is at most 200 characters")),
+        Some(q) if q.is_empty() => None,
+        Some(q) => Some(q.clone()),
+        None => None,
+    };
+    let stream = match query.get("stream").map(String::as_str) {
+        None | Some("") => None,
+        Some("stdout") | Some("stderr") => query.get("stream").cloned(),
+        Some(_) => return Err(bad("stream is stdout or stderr")),
+    };
+    let level = match query.get("level").map(String::as_str) {
+        None | Some("") => None,
+        Some("error") | Some("warn") | Some("info") => query.get("level").cloned(),
+        Some(_) => return Err(bad("level is error, warn or info")),
+    };
+    let parse_ms = |key: &str| -> Result<Option<i64>, Box<Response>> {
+        let Some(raw) = query.get(key) else {
+            return Ok(None);
+        };
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        raw.parse::<i64>()
+            .map(Some)
+            .map_err(|_| bad("from/to are unix milliseconds"))
+    };
+    let from = parse_ms("from")?;
+    let to = parse_ms("to")?;
+    if let (Some(from), Some(to)) = (from, to) {
+        if from > to {
+            return Err(bad("from is past to"));
+        }
+    }
+    let since = query.get("since").and_then(|s| s.parse::<u64>().ok());
+    let before = query.get("before").and_then(|s| s.parse::<u64>().ok());
+    let cursor = match (since, before) {
+        (Some(seq), _) => LogCursor::Since(seq),
+        (None, Some(seq)) => LogCursor::Before(seq),
+        (None, None) => LogCursor::Tail,
+    };
+    let limit = query
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    Ok((
+        LogFilter {
+            q,
+            stream,
+            level,
+            from,
+            to,
+        },
+        cursor,
+        limit,
+    ))
+}
+
 async fn api_logs(
     State(state): State<super::AppState>,
     headers: HeaderMap,
@@ -581,24 +660,22 @@ async fn api_logs(
             );
         }
     };
-    let since = query.get("since").and_then(|s| s.parse::<u64>().ok());
-    let limit = query
-        .get("limit")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100)
-        .clamp(1, 500);
-    let lines = crate::mcp::tools::runtime::log_lines(
+    let (filter, cursor, limit) = match logs_query(&query) {
+        Ok(parsed) => parsed,
+        Err(res) => return *res,
+    };
+    let lines = crate::observe::logs::read_filtered(
         &mcp.pool,
         &mcp.fleets,
         &app.id,
         &app.slug,
-        since,
+        &filter,
+        cursor,
         limit,
     )
     .await;
-    let next_since = lines
-        .last()
-        .and_then(|l| l.get("seq").and_then(|s| s.as_u64()));
+    let next_since = lines.last().map(|l| l.seq);
+    let lines: Vec<serde_json::Value> = lines.iter().map(|l| l.to_json()).collect();
     (
         StatusCode::OK,
         [
@@ -668,6 +745,17 @@ async fn api_errors(
             );
         }
     };
+    let (open, resolved, ignored) =
+        match crate::observe::logs::status_counts(&mcp.pool, &app.id).await {
+            Ok(counts) => counts,
+            Err(_) => {
+                return nostore_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unavailable",
+                    "could not load errors right now",
+                );
+            }
+        };
     ok_json(json!({
         "issues": found.iter().map(|issue| json!({
             "fingerprint": issue.fingerprint,
@@ -677,7 +765,10 @@ async fn api_errors(
             "first_seen": issue.first_seen,
             "last_seen": issue.last_seen,
             "status": issue.status,
+            "resolved_at": issue.resolved_at,
+            "regressed": crate::observe::logs::is_regressed(issue),
         })).collect::<Vec<_>>(),
+        "counts": {"open": open, "resolved": resolved, "ignored": ignored},
         "s5xx_last_hour": s5xx,
     }))
 }
@@ -1998,6 +2089,10 @@ mod tests {
         assert_eq!(headers["cache-control"], "no-store");
         let body: serde_json::Value = body.parse().unwrap();
         assert_eq!(body["s5xx_last_hour"], 2);
+        assert_eq!(
+            body["counts"],
+            serde_json::json!({"open": 1, "resolved": 0, "ignored": 0})
+        );
         let found = body["issues"].as_array().unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["fingerprint"], "fp1");
@@ -2005,6 +2100,8 @@ mod tests {
         assert_eq!(found[0]["frame"], "at handler (x:1:2)");
         assert_eq!(found[0]["count"], 3);
         assert_eq!(found[0]["status"], "open");
+        assert!(found[0]["resolved_at"].is_null());
+        assert_eq!(found[0]["regressed"], false);
         let (open_status, _, open_body) = send(
             &app,
             authed("/api/console/apps/groceries/errors?status=open", &session),
@@ -2038,6 +2135,418 @@ mod tests {
             "bad_status"
         );
     }
+
+    async fn seed_issue(
+        pool: &SqlitePool,
+        fp: &str,
+        status: &str,
+        resolved_at: Option<i64>,
+        now: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status, resolved_at) \
+             VALUES ('app-groceries', ?1, 'Error: kaboom', 'at handler (x:1:2)', 2, ?2, ?3, ?4, ?5)",
+        )
+        .bind(fp)
+        .bind(now - 60_000)
+        .bind(now - 1_000)
+        .bind(status)
+        .bind(resolved_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_log(pool: &SqlitePool, seq: i64, ts_secs: i64, stream: &str, line: &str) {
+        sqlx::query(
+            "INSERT INTO app_log (app_id, seq, ts, stream, line) \
+             VALUES ('app-groceries', ?1, ?2, ?3, ?4)",
+        )
+        .bind(seq)
+        .bind(ts_secs)
+        .bind(stream)
+        .bind(line)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn errors_tabs_carry_counts_and_regressed_flags() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_issue(&pool, "fp-open", "open", None, now).await;
+        seed_issue(&pool, "fp-regressed", "open", Some(now - 30_000), now).await;
+        seed_issue(&pool, "fp-resolved", "resolved", Some(now - 30_000), now).await;
+        seed_issue(&pool, "fp-ignored", "ignored", Some(now - 30_000), now).await;
+        let session = login(&pool, "ana@example.com").await;
+        let (_, _, body) = send(&app, authed("/api/console/apps/groceries/errors", &session)).await;
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(
+            body["counts"],
+            serde_json::json!({"open": 2, "resolved": 1, "ignored": 1}),
+            "tabs count every status, not just the 50-issue page"
+        );
+        let by_fp = |fp: &str| {
+            body["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["fingerprint"] == fp)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by_fp("fp-open")["regressed"], false);
+        assert_eq!(
+            by_fp("fp-regressed")["regressed"],
+            true,
+            "open with a stamp is a regression"
+        );
+        assert_eq!(by_fp("fp-resolved")["regressed"], false);
+        assert_eq!(by_fp("fp-ignored")["regressed"], false);
+        assert_eq!(by_fp("fp-regressed")["resolved_at"], now - 30_000);
+    }
+
+    #[tokio::test]
+    async fn errors_triage_moves_issues_and_audits_console() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "ben@example.com", "benblog", now).await;
+        seed_issue(&pool, "fp1", "open", None, now).await;
+        let session = login(&pool, "ana@example.com").await;
+        // Resolve moves the issue out of the open tab.
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/errors/fp1/resolve",
+                &session,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"fingerprint": "fp1", "status": "resolved", "updated": 1})
+        );
+        let (_, _, open) = send(
+            &app,
+            authed("/api/console/apps/groceries/errors?status=open", &session),
+        )
+        .await;
+        assert!(open.parse::<serde_json::Value>().unwrap()["issues"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        // Ignore then reopen round-trips the stamp.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/errors/fp1/ignore",
+                &session,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/errors/fp1/reopen",
+                &session,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.parse::<serde_json::Value>().unwrap()["status"], "open");
+        // Unknown fingerprints 404, exactly like a missing app.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/errors/nope/resolve",
+                &session,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // A foreign slug answers exactly like a missing one.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/benblog/errors/fp1/resolve",
+                &session,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // No session: 401 even with the right shape.
+        let (status, _, _) = send(
+            &app,
+            same_origin(Request::post(
+                "/api/console/apps/groceries/errors/fp1/resolve",
+            ))
+            .body(Body::from("{}"))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // The console mutation is an agent_action row under the MCP tool
+        // name, and the action log labels its client Console.
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT tool, consent_id, apikey_id FROM agent_action WHERE app_id = 'app-groceries' ORDER BY rowid DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "reopen_error");
+        assert_eq!((row.1, row.2), (None, None));
+        let (_, _, actions) = send(
+            &app,
+            authed("/api/console/apps/groceries/actions", &session),
+        )
+        .await;
+        let actions: serde_json::Value = actions.parse().unwrap();
+        let reopened = actions["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["tool"] == "reopen_error")
+            .expect("console triage is in the action log");
+        assert_eq!(reopened["by"], "Console");
+    }
+
+    #[tokio::test]
+    async fn errors_bulk_moves_a_selection_with_bounds() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        for fp in ["fp1", "fp2", "fp3"] {
+            seed_issue(&pool, fp, "open", None, now).await;
+        }
+        let session = login(&pool, "ana@example.com").await;
+        let bulk = |action: &str, fps: serde_json::Value| {
+            post_json(
+                "/api/console/apps/groceries/errors/bulk",
+                &session,
+                serde_json::json!({"action": action, "fingerprints": fps}),
+            )
+        };
+        let (status, _, body) = send(
+            &app,
+            bulk("resolve", serde_json::json!(["fp1", "fp2", "fpX"])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"action": "resolve", "status": "resolved", "updated": 2})
+        );
+        // Unknown action, empty list and oversize lists refuse loudly.
+        for (action, fps) in [
+            ("explode", serde_json::json!(["fp1"])),
+            ("resolve", serde_json::json!([])),
+            ("resolve", serde_json::json!(vec!["fp1"; 101])),
+        ] {
+            let (status, _, error) = send(&app, bulk(action, fps)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "action {action}");
+            assert!(error.contains("bad_"), "error code, got: {error}");
+        }
+        // Unknown fingerprints match nothing but still audit zero moves.
+        let (status, _, body) = send(&app, bulk("ignore", serde_json::json!(["fpX"]))).await;
+        assert_eq!(status, StatusCode::OK);
+        // Unknown fingerprints match nothing and audit nothing.
+        assert_eq!(body.parse::<serde_json::Value>().unwrap()["updated"], 0);
+    }
+
+    #[tokio::test]
+    async fn error_detail_serves_sparkline_and_recent_lines() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        // Seed through the real flush, so the stored fingerprint is the
+        // one the log lines group to.
+        let mut ring = LogRing::new(10);
+        ring.push(LogStream::Stdout, "serving on :8080".to_string());
+        ring.push(LogStream::Stderr, "Error: kaboom".to_string());
+        ring.push(LogStream::Stderr, "    at handler (x:1:2)".to_string());
+        crate::observe::logs::flush_fleet(&pool, "app-groceries", &ring.tail(10))
+            .await
+            .unwrap();
+        let fp = crate::observe::logs::issues(&pool, "app-groceries", None)
+            .await
+            .unwrap()[0]
+            .fingerprint
+            .clone();
+        let session = login(&pool, "ana@example.com").await;
+        let (status, _, body) = send(
+            &app,
+            authed(
+                &format!("/api/console/apps/groceries/errors/{fp}"),
+                &session,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["issue"]["fingerprint"], fp);
+        assert_eq!(body["issue"]["count"], 1);
+        assert_eq!(body["issue"]["status"], "open");
+        assert_eq!(body["issue"]["regressed"], false);
+        let sparkline = body["sparkline"].as_array().unwrap();
+        assert_eq!(sparkline.len(), 24, "24 hourly buckets");
+        assert_eq!(
+            sparkline
+                .iter()
+                .map(|b| b["count"].as_i64().unwrap())
+                .sum::<i64>(),
+            1,
+            "the one retained event lands in the window"
+        );
+        let recent = body["recent"].as_array().unwrap();
+        assert_eq!(recent.len(), 2, "the event's own lines");
+        assert!(recent[0]["line"].as_str().unwrap().contains("kaboom"));
+        assert_eq!(recent[0]["fingerprint"], fp);
+        let (status, _, _) = send(
+            &app,
+            authed("/api/console/apps/groceries/errors/nope", &session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn logs_filters_page_and_reject_bad_shapes() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let ts = now / 1000;
+        seed_log(&pool, 0, ts, "stdout", "INFO serving on :8080").await;
+        seed_log(&pool, 1, ts, "stdout", "console.log hello visitor").await;
+        seed_log(&pool, 2, ts, "stderr", "ERROR disk full on vol-9").await;
+        seed_log(&pool, 3, ts, "stderr", "WARN retrying fetch").await;
+        let session = login(&pool, "ana@example.com").await;
+        let get = |qs: &str| authed(&format!("/api/console/apps/groceries/logs{qs}"), &session);
+        // Substring search is case-insensitive; stream and level filter.
+        let (_, _, body) = send(&app, get("?q=DISK")).await;
+        let lines = body.parse::<serde_json::Value>().unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]["fingerprint"].as_str().unwrap().len(),
+            64,
+            "error lines link to their issue"
+        );
+        let (_, _, body) = send(&app, get("?stream=stderr&level=warn")).await;
+        let lines = body.parse::<serde_json::Value>().unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0]["line"].as_str().unwrap().contains("retrying"));
+        // Time range in unix ms; a window ending an hour ago is empty.
+        let (_, _, body) = send(
+            &app,
+            get(&format!("?from={}&to={}", now - 3_600_000, now + 60_000)),
+        )
+        .await;
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["lines"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let (_, _, body) = send(&app, get(&format!("?to={}", now - 3_600_000))).await;
+        assert!(body.parse::<serde_json::Value>().unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        // `Load older`: the newest lines strictly older than the seq.
+        let (_, _, body) = send(&app, get("?limit=2")).await;
+        let tail = body.parse::<serde_json::Value>().unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(tail[1]["line"].as_str().unwrap(), "WARN retrying fetch");
+        let before = tail[0]["seq"].as_u64().unwrap();
+        let (_, _, body) = send(&app, get(&format!("?limit=2&before={before}"))).await;
+        let older = body.parse::<serde_json::Value>().unwrap()["lines"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(older.len(), 2);
+        assert!(older[0]["line"].as_str().unwrap().contains("serving"));
+        // Bad shapes refuse loudly instead of silently returning everything.
+        for qs in [
+            "?stream=bogus",
+            "?level=bogus",
+            "?from=nope",
+            "?from=5&to=4",
+        ] {
+            let (status, _, error) = send(&app, get(qs)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "query {qs}");
+            let error: serde_json::Value = error.parse().unwrap();
+            assert!(
+                error["error"].as_str().unwrap().starts_with("bad_"),
+                "query {qs}"
+            );
+        }
+        let long_q = "q=".to_string() + &"x".repeat(201);
+        let (status, _, _) = send(&app, get(&format!("?{long_q}"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn logs_stream_emits_the_live_tail() {
+        use http_body_util::BodyExt as _;
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_log(&pool, 0, now / 1000, "stdout", "hello persisted").await;
+        let session = login(&pool, "ana@example.com").await;
+        let res = app
+            .clone()
+            .oneshot(peer(authed(
+                "/api/console/apps/groceries/logs/stream",
+                &session,
+            )))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["cache-control"], "no-store");
+        assert!(
+            res.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream"),
+            "SSE content type"
+        );
+        let mut body = res.into_body();
+        // The first tick always emits (possibly empty), so a few seconds
+        // of waiting proves the stream is live without hanging the suite.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), body.frame())
+            .await
+            .expect("first SSE tick")
+            .expect("frame ok")
+            .expect("first frame");
+        let chunk = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(chunk.starts_with("data: "), "SSE data frame, got: {chunk}");
+        assert!(
+            chunk.contains("\"lines\""),
+            "log page payload, got: {chunk}"
+        );
+    }
+
     #[tokio::test]
     async fn secrets_need_session_and_same_origin() {
         let (app, pool, _, _) = test_app().await;
