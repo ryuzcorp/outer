@@ -8,6 +8,7 @@ pub mod console_actions;
 pub mod console_code;
 pub mod console_collaborators;
 pub mod console_data;
+pub mod console_domains;
 pub mod console_observe;
 pub mod proxy;
 pub mod site;

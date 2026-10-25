@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::mcp::tools::{
     account, apps as app_inputs, code as code_inputs, collaborators as collab_inputs,
-    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
+    domains as domain_inputs, runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -88,9 +88,11 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
         | "get_app" | "share_app" | "list_files" | "read_file" | "search_code" | "history"
         | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors"
-        | "list_secrets" | "list_collaborators" => Hints::READ,
+        | "list_secrets" | "list_collaborators" | "list_domains" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
-        | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" => Hints::WRITE,
+        | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain" => {
+            Hints::WRITE
+        }
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -107,7 +109,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             ..Hints::WRITE
         },
         "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
-        | "unset_secret" => Hints::DESTRUCTIVE,
+        | "unset_secret" | "remove_domain" => Hints::DESTRUCTIVE,
         _ => return None,
     })
 }
@@ -158,7 +160,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<account::DocsInput>(
             "docs",
-            "Read an Outer guide: quickstart, ilha, void, celld, d1, storage, limits or moderation. Read the ilha guide before writing any code.",
+            "Read an Outer guide: quickstart, ilha, void, celld, d1, storage, limits, moderation or custom-domains. Read the ilha guide before writing any code.",
             Public, false,
         ),
         tool::<account::SignInInput>(
@@ -254,6 +256,21 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<collab_inputs::ListCollaboratorsInput>(
             "list_collaborators",
             "List your app's collaborators: email, joined or pending status, and when each was added. Owner only.",
+            Account, false,
+        ),
+        tool::<domain_inputs::AddDomainInput>(
+            "add_domain",
+            "Give an app a custom domain (Pro, one per app): registers it as a Cloudflare custom hostname and returns the CNAME/TXT records to create at your DNS. The domain serves the app once its status turns active; poll list_domains.",
+            Account, false,
+        ),
+        tool::<domain_inputs::RemoveDomainInput>(
+            "remove_domain",
+            "Remove an app's custom domain: deletes the Cloudflare custom hostname and the local row, and purges its cached pages.",
+            Account, false,
+        ),
+        tool::<domain_inputs::ListDomainsInput>(
+            "list_domains",
+            "An app's custom domain: hostname, live status (pending, active or failed with a reason), and the DNS records to create.",
             Account, false,
         ),
         tool::<code_inputs::ListFilesInput>(
@@ -367,7 +384,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 38);
+        assert_eq!(tools.len(), 41);
     }
 }
 
@@ -393,6 +410,7 @@ mod hint_tests {
                     | "delete_account"
                     | "unset_secret"
                     | "remove_collaborator"
+                    | "remove_domain"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);
             // Untrusted tools return app content; they must never change state.

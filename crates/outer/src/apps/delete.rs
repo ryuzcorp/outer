@@ -1,16 +1,20 @@
-//! Delete an app (spec §7.6): stop the fleet, wipe its bucket prefixes
-//! and local state, drop its rows (quarantining the slug for 30 days), and
-//! purge its edge cache.
+//! Delete an app (spec §7.6): stop the fleet, drop its custom domains at
+//! Cloudflare (spec §7.7), wipe its bucket prefixes and local state, drop
+//! its rows (quarantining the slug for 30 days), and purge its edge cache
+//! (app host plus every custom hostname).
 //!
-//! One function serves the MCP `delete_app` tool and the operator CLI, so
-//! both delete exactly the same way. The caller holds the app's deploy lock
+//! One function serves the MCP `delete_app` tool, `delete_account` (which
+//! deletes owned apps through this same path) and the operator CLI, so all
+//! three delete exactly the same way. The caller holds the app's deploy lock
 //! (and, on the MCP path, the rollback and wake locks) across the call: the
 //! [`DeleteLocks`] references prove it. The row goes LAST, after every
 //! bucket and local step, and every earlier step is idempotent — a failure
 //! keeps the row, so a retried `delete_app` finishes the job.
 //!
-//! Custom domains (M3) and collaborator notices (Pro, M2) don't exist yet:
-//! there is nothing to remove or notify.
+//! Custom domains delete best-effort at Cloudflare (a failure warns and the
+//! row drops anyway — a dangling hostname can never serve, since the proxy
+//! only routes rows, and re-adding surfaces the conflict); collaborator
+//! notices (Pro, M2) don't exist yet: there is nothing to notify.
 
 use std::path::PathBuf;
 
@@ -143,6 +147,13 @@ pub async fn delete_app(
         fleets.stop_tracked(slug).await;
     }
 
+    // 1b. Custom domains (spec §7.7): delete the Cloudflare custom
+    // hostnames, drop the rows, and purge each host's edge cache — before
+    // the app row goes, while the app id still resolves them. Best effort
+    // at Cloudflare (see [`super::domains::remove_all_for_app`]).
+    let custom = crate::cloudflare::CustomHostnames::from_purge(cfg.cache_purge.as_ref());
+    super::domains::remove_all_for_app(pool, custom.as_ref(), cfg.cache_purge.as_ref(), &app.id)
+        .await;
     // 2. Bucket: the repo WAL under `git/{slug}/`, and deploys, D1 data and
     // assets under `fleets/{slug}/`. Trailing slashes keep a sibling slug
     // (`{slug}-2`) out of the prefix. `manifest::purge` also drops the local

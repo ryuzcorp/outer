@@ -20,6 +20,7 @@ import {
   type AppDetail,
   type CollaboratorsSummary,
   type ConsoleDeploy,
+  type DomainsSummary,
   type ErrorsSummary,
   type InviteEntry,
   type InvitesSummary,
@@ -1512,6 +1513,228 @@ export function SecretsView({
   );
 }
 
+// --- Custom domain -------------------------------------------------------------
+// Settings → Custom domain card (spec §7.7): Pro-gated add form, the DNS
+// records with copy buttons while pending, live status badges, refresh,
+// and remove behind a confirm modal. Server data rides the `panel` from
+// console.tsx; input text and the modal are local atoms. Owner-only: the
+// card renders only for the app owner.
+
+function domainBadge(status: string): string {
+  if (status === "active") {
+    return "badge-success";
+  }
+  if (status === "failed") {
+    return "badge-error";
+  }
+  return "badge-warning";
+}
+
+// `tooltip-left` on the copy buttons: they sit flush against the card's
+// right edge, and a centered bubble would widen the scrollable overflow
+// area past the card and draw a page scrollbar.
+const copyLeftClass = "btn btn-ghost btn-square btn-xs tooltip tooltip-left shrink-0";
+
+export function DomainsCard({
+  slug,
+  panel,
+  onAdd,
+  onRefresh,
+  onRemove,
+  onRetry,
+}: {
+  slug: string;
+  panel: Panel<DomainsSummary>;
+  onAdd: (hostname: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onRemove: () => Promise<void>;
+  onRetry: () => void;
+}) {
+  const hostname = atom("");
+  const busy = atom<null | "add" | "refresh" | "remove">(null);
+  const failure = atom<string | null>(null);
+  const confirmRemove = atom(false);
+
+  async function run(kind: "add" | "refresh" | "remove", fn: () => Promise<void>) {
+    busy.set(kind);
+    failure.set(null);
+    try {
+      await fn();
+    } catch (err: unknown) {
+      failure.set(String(err).replace(/^Error: /, ""));
+    } finally {
+      busy.set(null);
+    }
+  }
+
+  if (panel.kind === "loading") {
+    return <Loading label="Loading custom domain" />;
+  }
+  if (panel.kind === "error") {
+    return <Err message={panel.message} onRetry={onRetry} />;
+  }
+  const summary = panel.value;
+  const isPro = summary.plan === "pro";
+  const domain = summary.domains[0] ?? null;
+  const working = busy() !== null;
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Custom domain">
+      <div class="card-body min-w-0">
+        <div class="flex min-w-0 items-center gap-2">
+          <h2 class="card-title m-0 min-w-0 flex-1 truncate text-base">Custom domain</h2>
+          {!isPro && <span class="badge badge-soft badge-info shrink-0">Pro</span>}
+        </div>
+        {failure() && (
+          <div class="alert alert-error alert-soft mt-3" role="alert">
+            <span class="min-w-0 break-words">{failure()}</span>
+          </div>
+        )}
+        {!domain && (
+          <div class="mt-3 min-w-0">
+            {isPro ? (
+              <form
+                class="flex min-w-0 flex-col gap-2"
+                onsubmit={(e: Event) => {
+                  e.preventDefault();
+                  const name = hostname().trim();
+                  if (!name || working) {
+                    return;
+                  }
+                  void run("add", () => onAdd(name));
+                }}
+              >
+                <label class="form-control min-w-0">
+                  <span class="label-text mb-1 block text-[13px] opacity-60">
+                    One per app, e.g. shop.example.com. Point a CNAME at the
+                    target shown after adding, then wait for validation.
+                  </span>
+                  <input
+                    type="text"
+                    class="input input-bordered w-full min-w-0"
+                    placeholder="shop.example.com"
+                    value={hostname()}
+                    oninput={(e: Event) => hostname.set((e.target as HTMLInputElement).value)}
+                    disabled={working}
+                  />
+                </label>
+                <button
+                  type="submit"
+                  class="btn btn-primary btn-sm w-fit"
+                  disabled={working || !hostname().trim()}
+                >
+                  {busy() === "add" ? "Adding…" : "Add domain"}
+                </button>
+              </form>
+            ) : (
+              <p class="m-0 min-w-0 break-words text-[13px] opacity-60">
+                Custom domains need Outer Pro — one per app. Upgrade in
+                billing, then add your hostname here (or ask your agent to
+                call `add_domain`).
+              </p>
+            )}
+          </div>
+        )}
+        {domain && (
+          <div class="mt-3 flex min-w-0 flex-col gap-3">
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
+              <span class="min-w-0 flex-1 truncate font-mono text-[15px]" title={domain.hostname}>
+                {domain.hostname}
+              </span>
+              <span class={`badge badge-soft shrink-0 ${domainBadge(domain.status)}`} title={domain.ssl_status ? `certificate: ${domain.ssl_status}` : domain.status}>
+                {domain.status}
+              </span>
+            </div>
+            {domain.status === "failed" && domain.reason && (
+              <p class="m-0 min-w-0 break-words text-[13px] opacity-70">{domain.reason}</p>
+            )}
+            {domain.status !== "active" && (
+              <dl class="m-0 flex min-w-0 flex-col gap-2 rounded-lg bg-base-200 p-3">
+                <div class="flex min-w-0 gap-3 text-[13px]">
+                  <dt class="w-[52px] shrink-0 font-mono opacity-60">CNAME</dt>
+                  <dd class="m-0 flex min-w-0 flex-1 items-center gap-2">
+                    <span class="min-w-0 flex-1 truncate font-mono" title={`${domain.hostname} → ${domain.cname_target}`}>
+                      {domain.hostname} → {domain.cname_target}
+                    </span>
+                    <CopyButton value={domain.cname_target} label="Copy CNAME target" class={copyLeftClass} />
+                  </dd>
+                </div>
+                {domain.txt_records.map((rec) => (
+                  <div class="flex min-w-0 gap-3 text-[13px]" key={rec.name}>
+                    <dt class="w-[52px] shrink-0 font-mono opacity-60">TXT</dt>
+                    <dd class="m-0 flex min-w-0 flex-1 items-center gap-2">
+                      <span class="min-w-0 flex-1 truncate font-mono" title={`${rec.name}: ${rec.value}`}>
+                        {rec.name}: {rec.value}
+                      </span>
+                      <CopyButton value={rec.value} label={`Copy TXT value for ${rec.name}`} class={copyLeftClass} />
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                class="btn btn-sm"
+                disabled={working}
+                onclick={() => void run("refresh", onRefresh)}
+              >
+                {busy() === "refresh" ? "Refreshing…" : "Refresh status"}
+              </button>
+              <button
+                type="button"
+                class="btn btn-sm btn-error btn-soft"
+                disabled={working}
+                onclick={() => confirmRemove.set(true)}
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        )}
+        {confirmRemove() && domain && (
+          <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Remove custom domain">
+            <div class="modal-box min-w-0">
+              <h3 class="m-0 min-w-0 truncate text-base font-semibold" title={domain.hostname}>
+                Remove {domain.hostname}?
+              </h3>
+              <p class="min-w-0 break-words text-[13px] opacity-70">
+                The hostname stops serving {slug} immediately, its Cloudflare
+                certificate is deleted, and cached pages are purged.
+              </p>
+              <div class="modal-action">
+                <button
+                  type="button"
+                  class="btn btn-sm"
+                  disabled={busy() === "remove"}
+                  onclick={() => confirmRemove.set(false)}
+                >
+                  Keep
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-error"
+                  disabled={busy() === "remove"}
+                  onclick={() => {
+                    void run("remove", onRemove).then(() => {
+                      if (!failure()) {
+                        confirmRemove.set(false);
+                        hostname.set("");
+                      }
+                    });
+                  }}
+                >
+                  {busy() === "remove" ? "Removing…" : "Remove domain"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 // --- Settings --------------------------------------------------------------------
 
 function collaboratorAction(name: "list_collaborators" | "add_collaborator" | "remove_collaborator") {
@@ -1758,6 +1981,11 @@ export function SettingsView({
   collaborators,
   onCollaboratorsRetry,
   onCollaboratorsChanged,
+  domains,
+  onAddDomain,
+  onRefreshDomains,
+  onRemoveDomain,
+  onRetryDomains,
 }: {
   app: AppDetail;
   plan: string;
@@ -1767,6 +1995,11 @@ export function SettingsView({
   collaborators: Panel<CollaboratorsSummary>;
   onCollaboratorsRetry: () => void;
   onCollaboratorsChanged: () => void;
+  domains: Panel<DomainsSummary>;
+  onAddDomain: (hostname: string) => Promise<void>;
+  onRefreshDomains: () => Promise<void>;
+  onRemoveDomain: () => Promise<void>;
+  onRetryDomains: () => void;
 }) {
   return (
     <div class="flex min-w-0 flex-col gap-3">
@@ -1811,6 +2044,16 @@ export function SettingsView({
         </div>
       </section>
       {app.role === "owner" && <VisibilityCard app={app} plan={plan} onRefresh={onRefresh} />}
+      {app.role === "owner" && (
+        <DomainsCard
+          slug={app.slug}
+          panel={domains}
+          onAdd={onAddDomain}
+          onRefresh={onRefreshDomains}
+          onRemove={onRemoveDomain}
+          onRetry={onRetryDomains}
+        />
+      )}
       <CollaboratorsCard
         app={app}
         panel={collaborators}

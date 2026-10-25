@@ -258,37 +258,83 @@ pub fn request_host(req: &Request) -> Option<String> {
         .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()))
 }
 
-/// Route `<slug>.<apps_domain>` to the app's fleet on loopback.
+/// What a visitor sees on a custom domain that isn't serving yet: pending
+/// (create the DNS records, then wait for validation) vs failed (fix DNS,
+/// refresh in the console). Never proxied, never metered: the caller
+/// returns before the metering closure exists.
+fn domain_setup_page(host: &str, status: &str) -> Response {
+    let body = if status == "failed" {
+        format!(
+            "this custom domain ({host}) failed validation — check its DNS records, \
+             then refresh it in the console (Settings → Custom domain)"
+        )
+    } else {
+        format!(
+            "this custom domain ({host}) is verifying — create its CNAME and TXT records, \
+             then wait a little and refresh"
+        )
+    };
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("retry-after", "30")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Route `<slug>.<apps_domain>` — and Pro custom hostnames from `app_domain`
+/// (spec §7.7) — to the app's fleet on loopback. Only `active` custom
+/// domains forward; a `pending`/`failed` one gets a setup page explaining
+/// what to do at its DNS provider, and an unknown host gets a 404.
 pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     let Some(raw_host) = request_host(&req) else {
         return text(StatusCode::NOT_FOUND, "no such app");
     };
-    let Some(slug) = slug_for(strip_port(&raw_host), &state.apps_domain) else {
-        return text(StatusCode::NOT_FOUND, "no such app");
-    };
-    let app = match apps::get_by_slug(&state.pool, &slug).await {
-        Ok(Some(app)) => app,
-        Ok(None) => match apps::quarantine_lookup(&state.pool, &slug).await {
-            // A renamed-away slug redirects only while its quarantine holds
-            // (`until` in the future — the same live-set definition as
-            // `prune_quarantine`); past expiry it 404s exactly like a
-            // plain-deleted (or never-existing) slug.
-            Ok(Some(quarantine)) => match quarantine.renamed_to {
-                Some(target) if quarantine.until > apps::now_ms() => {
-                    return redirect_to_slug(&state, &raw_host, &target, &req);
+    let bare = strip_port(&raw_host);
+    let app = match slug_for(bare, &state.apps_domain) {
+        Some(slug) => match apps::get_by_slug(&state.pool, &slug).await {
+            Ok(Some(app)) => app,
+            Ok(None) => match apps::quarantine_lookup(&state.pool, &slug).await {
+                // A renamed-away slug redirects only while its quarantine holds
+                // (`until` in the future — the same live-set definition as
+                // `prune_quarantine`); past expiry it 404s exactly like a
+                // plain-deleted (or never-existing) slug.
+                Ok(Some(quarantine)) => match quarantine.renamed_to {
+                    Some(target) if quarantine.until > apps::now_ms() => {
+                        return redirect_to_slug(&state, &raw_host, &target, &req);
+                    }
+                    _ => return text(StatusCode::NOT_FOUND, "no such app"),
+                },
+                Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
+                Err(err) => {
+                    tracing::warn!(slug = %slug, error = %err, "quarantine lookup failed");
+                    return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                 }
-                _ => return text(StatusCode::NOT_FOUND, "no such app"),
             },
-            Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
             Err(err) => {
-                tracing::warn!(slug = %slug, error = %err, "quarantine lookup failed");
+                tracing::warn!(slug = %slug, error = %err, "app lookup failed");
                 return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
             }
         },
-        Err(err) => {
-            tracing::warn!(slug = %slug, error = %err, "app lookup failed");
-            return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
-        }
+        // Not an app host: maybe a Pro custom domain.
+        None => match crate::apps::domains::resolve_active(&state.pool, bare).await {
+            Ok(Some(app)) => app,
+            Ok(None) => {
+                // A known-but-not-active domain gets a setup page; anything
+                // else is exactly like a missing app host (spec §8.2).
+                match crate::apps::domains::pending_status(&state.pool, bare).await {
+                    Ok(Some(status)) => return domain_setup_page(bare, &status),
+                    Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
+                    Err(err) => {
+                        tracing::warn!(host = %bare, error = %format!("{err:#}"), "domain lookup failed");
+                        return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(host = %bare, error = %format!("{err:#}"), "domain lookup failed");
+                return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
+        },
     };
     // No successful deploy yet: never forward. A first deploy uploads before
     // its migrations apply, so a fleet can be awake on unmigrated code while
@@ -1324,5 +1370,80 @@ mod tests {
         let (status, _, body) = get(&state, "stale.outer.test", "/items/42").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, "no such app");
+    }
+
+    #[tokio::test]
+    async fn custom_domains_route_only_when_active() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "unlisted").await;
+        async fn add(pool: &sqlx::SqlitePool, host: &str, status: &str) {
+            sqlx::query(
+                "INSERT INTO app_domain (hostname, app_id, cf_custom_hostname_id, status, created_at) \
+                 VALUES (?1, 'app-shop', 'cf-1', ?2, 0)",
+            )
+            .bind(host)
+            .bind(status)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        add(&fix.pool, "shop.example.com", "active").await;
+        add(&fix.pool, "soon.example.com", "pending").await;
+        add(&fix.pool, "dead.example.com", "failed").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        // Active: forwards to the fleet, with the unlisted robots header.
+        let req = Request::builder()
+            .uri("/items")
+            .header("host", "shop.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("x-robots-tag").and_then(|v| v.to_str().ok()),
+            Some("noindex, nofollow"),
+            "custom hosts keep the app's visibility headers"
+        );
+        assert_eq!(echo(&body)["path"], "/items");
+        // Pending: a setup page, never the fleet.
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "soon.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("verifying"), "{body}");
+        // Failed: names the fix and the console card.
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "dead.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("failed validation"), "{body}");
+        // Unknown: exactly like a missing app host.
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "nope.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "no such app");
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            1,
+            "only the active host forwards"
+        );
     }
 }

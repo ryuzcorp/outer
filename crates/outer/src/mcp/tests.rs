@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 38);
+    assert_eq!(anon.len(), 41);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 36);
+    assert_eq!(authed.len(), 39);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -3521,4 +3521,245 @@ async fn rename_app_waits_for_the_deploy_lock() {
     drop(guard);
     let body = handle.await.unwrap();
     assert_eq!(result(&body)["structuredContent"]["slug"], "pantry");
+}
+
+/// Point `state`'s zone client at the SaaS fake, so custom-hostname calls
+/// never touch the network.
+fn point_zone_at_fake(state: &mut McpState, fake: &crate::cloudflare::fake_saas::FakeSaaS) {
+    state.delete_cfg.cache_purge = Some(
+        crate::cloudflare::CachePurge::new("zone-1".to_string(), "token-1".to_string())
+            .with_api_base(fake.base_url.clone()),
+    );
+}
+
+/// The `add_domain` tool against the scripted Cloudflare for SaaS fake:
+/// the Pro gate, hostname validation, and the pending → active → removed
+/// flow with the DNS setup in the summary.
+#[tokio::test]
+async fn add_list_remove_domain_round_trip() {
+    let (mut state, _) = setup().await;
+    let fake = crate::cloudflare::fake_saas::FakeSaaS::start().await;
+    point_zone_at_fake(&mut state, &fake);
+    let token = pro_app(&state, "ana@example.com", "groceries").await;
+    // Free callers never reach Cloudflare.
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &bob, "deli").await;
+    let (_, body) = call(
+        &state,
+        Some(&bob),
+        "add_domain",
+        json!({"app": "deli", "hostname": "shop.example.com"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "payment_required");
+    assert!(err["user_message"].as_str().unwrap().contains("Outer Pro"));
+    assert!(fake.calls("POST").is_empty(), "Pro gate fires first");
+    // Bad hostnames are the caller's bug, before any app checks.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "add_domain",
+        json!({"app": "groceries", "hostname": "not a host!!"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "invalid_argument");
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "add_domain",
+        json!({"app": "groceries", "hostname": "groceries.outer.localhost"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "invalid_argument");
+    // Pro add: pending + the DNS setup relayed to the agent.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "add_domain",
+        json!({"app": "groceries", "hostname": "shop.example.com"}),
+    )
+    .await;
+    let added = &result(&body)["structuredContent"];
+    assert_eq!(added["domains"][0]["hostname"], "shop.example.com");
+    assert_eq!(added["domains"][0]["status"], "pending");
+    assert_eq!(
+        added["domains"][0]["cname_target"],
+        "domains.outer.localhost"
+    );
+    assert!(
+        result(&body)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("CNAME"),
+        "summary carries the DNS setup: {}",
+        result(&body)["content"][0]["text"]
+    );
+    // One per app: the second add is refused without a new POST.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "add_domain",
+        json!({"app": "groceries", "hostname": "other.example.com"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "invalid_argument");
+    assert_eq!(fake.calls("POST").len(), 1);
+    // list_domains refreshes live: still pending until Cloudflare finishes.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "list_domains",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&body)["structuredContent"]["domains"][0]["status"],
+        "pending"
+    );
+    fake.state.lock().unwrap().status.insert(
+        "cf-shop.example.com".to_string(),
+        ("active".to_string(), "active".to_string()),
+    );
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "list_domains",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&body)["structuredContent"]["domains"][0]["status"],
+        "active"
+    );
+    // Removal drops the row and deletes the Cloudflare hostname. A wrong
+    // hostname is refused first, without touching anything.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "remove_domain",
+        json!({"app": "groceries", "hostname": "other.example.com"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "invalid_argument");
+    assert!(fake.calls("DELETE").is_empty());
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "remove_domain",
+        json!({"app": "groceries", "hostname": "shop.example.com"}),
+    )
+    .await;
+    assert_eq!(
+        result(&body)["structuredContent"]["removed"],
+        "shop.example.com"
+    );
+    assert_eq!(fake.calls("DELETE").len(), 1);
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "list_domains",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(result(&body)["structuredContent"]["domains"], json!([]));
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "remove_domain",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "not_found");
+    // Foreign slugs answer exactly like missing ones.
+    let (_, body) = call(
+        &state,
+        Some(&bob),
+        "list_domains",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "not_found");
+}
+
+/// Deleting an app removes its domain at Cloudflare too (spec §7.7): the
+/// row goes and the DELETE reaches the fake.
+#[tokio::test]
+async fn delete_app_removes_the_custom_hostname() {
+    let (mut state, _) = setup().await;
+    let fake = crate::cloudflare::fake_saas::FakeSaaS::start().await;
+    point_zone_at_fake(&mut state, &fake);
+    let token = pro_app(&state, "ana@example.com", "groceries").await;
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "add_domain",
+        json!({"app": "groceries", "hostname": "shop.example.com"}),
+    )
+    .await;
+    assert_eq!(
+        result(&body)["structuredContent"]["domains"][0]["status"],
+        "pending"
+    );
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "delete_app",
+        json!({"app": "groceries", "confirm": "groceries"}),
+    )
+    .await;
+    assert_eq!(result(&body)["structuredContent"]["deleted"], true);
+    assert_eq!(
+        fake.calls("DELETE").len(),
+        1,
+        "the custom hostname goes with the app"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_domain")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+/// `delete_account` deletes owned apps through the `delete_app` path, so
+/// their custom hostnames go at Cloudflare too — not just the local rows.
+#[tokio::test]
+async fn delete_account_removes_custom_hostnames() {
+    let (mut state, _) = setup().await;
+    let fake = crate::cloudflare::fake_saas::FakeSaaS::start().await;
+    point_zone_at_fake(&mut state, &fake);
+    let token = pro_app(&state, "ana@example.com", "groceries").await;
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "add_domain",
+        json!({"app": "groceries", "hostname": "shop.example.com"}),
+    )
+    .await;
+    assert_eq!(
+        result(&body)["structuredContent"]["domains"][0]["hostname"],
+        "shop.example.com"
+    );
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "delete_account",
+        json!({"confirm": "ana@example.com"}),
+    )
+    .await;
+    assert_eq!(result(&body)["structuredContent"]["deleted"], true);
+    assert_eq!(
+        result(&body)["structuredContent"]["deleted_apps"],
+        json!(["groceries"])
+    );
+    assert_eq!(
+        fake.calls("DELETE").len(),
+        1,
+        "the custom hostname goes with the account's app"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_domain")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }

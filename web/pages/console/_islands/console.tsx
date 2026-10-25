@@ -19,6 +19,7 @@ import {
   type CollaboratorsSummary,
   type ConnectionsSummary,
   type ConsoleApp,
+  type DomainsSummary,
   type ErrorsSummary,
   type InvitesSummary,
   type LogLine,
@@ -63,6 +64,7 @@ import {
 import { CodeView } from "./views/code.tsx";
 import { D1Nav, D1View } from "./views/d1.tsx";
 
+import { domainActions } from "./actions/domains.ts";
 import { secretsActions } from "./actions/secrets.ts";
 import { ErrorsView } from "./views/errors.tsx";
 import { LogsView } from "./views/logs.tsx";
@@ -206,6 +208,7 @@ export function Console() {
   const apiKeys = atom<Panel<ApiKeysSummary>>({ kind: "loading" });
   const accountSummary = atom<Panel<AccountSummary>>({ kind: "loading" });
   const collaborators = atom<Panel<CollaboratorsSummary>>({ kind: "loading" });
+  const domains = atom<Panel<DomainsSummary>>({ kind: "loading" });
   const ui = atom<Ui>({
     collapsed: readCollapsed(),
     drawer: false,
@@ -227,7 +230,7 @@ export function Console() {
           : "Console · Outer";
   }
 
-  function loadersFor(view: ViewId): Array<"metrics" | "actions" | "errors" | "logs" | "secrets" | "collaborators"> {
+  function loadersFor(view: ViewId): Array<"metrics" | "actions" | "errors" | "logs" | "secrets" | "collaborators" | "domains"> {
     switch (view) {
       case "overview":
         return ["metrics", "actions", "errors"];
@@ -246,7 +249,7 @@ export function Console() {
       case "secrets":
         return ["secrets"];
       case "settings":
-        return ["collaborators"];
+        return ["collaborators", "domains"];
       case "connections":
       case "usage":
       case "account":
@@ -383,6 +386,23 @@ export function Console() {
           .catch((err: unknown) => {
             if (!quiet) {
               put(collaborators, { kind: "error", message: String(err) });
+            }
+          }),
+      );
+    }
+    if (loadersFor(view).includes("domains")) {
+      if (!quiet) {
+        domains.set({ kind: "loading" });
+      }
+      jobs.push(
+        domainActions.listDomains
+          .run({ app: slug })
+          .then((summary) => {
+            put(domains, { kind: "ready", value: summary });
+          })
+          .catch((err: unknown) => {
+            if (!quiet) {
+              put(domains, { kind: "error", message: String(err) });
             }
           }),
       );
@@ -535,6 +555,7 @@ export function Console() {
     logs.set({ kind: "loading" });
     secrets.set({ kind: "loading" });
     collaborators.set({ kind: "loading" });
+    domains.set({ kind: "loading" });
     try {
       const app = await api<AppDetail>(
         `/api/console/apps/${encodeURIComponent(r.app)}`,
@@ -1178,6 +1199,7 @@ export function Console() {
                     logs={logs()}
                     secrets={secrets()}
                     collaborators={collaborators()}
+                    domains={domains()}
                     expanded={ui().expanded}
                     onToggleExpand={(id) => {
                       const cur = ui().expanded;
@@ -1223,6 +1245,44 @@ export function Console() {
                       if (rr.app) {
                         void loadViewData(rr.app, "settings", rr.range, epoch, true);
                       }
+                    }}
+                    onAddDomain={async (hostname: string) => {
+                      const slug = route().app;
+                      if (!slug) {
+                        return;
+                      }
+                      await domainActions.addDomain.run({ app: slug, hostname });
+                      const summary = await domainActions.listDomains.run({ app: slug });
+                      domains.set({ kind: "ready", value: summary });
+                    }}
+                    onRefreshDomains={async () => {
+                      const slug = route().app;
+                      if (!slug) {
+                        return;
+                      }
+                      const res = await domainActions.refreshDomains.run({ app: slug });
+                      const summary = await domainActions.listDomains.run({ app: slug });
+                      // Refresh carries the live domain; `null` means removed.
+                      if (res.domain) {
+                        const current = domains();
+                        if (current.kind === "ready") {
+                          domains.set({
+                            kind: "ready",
+                            value: { ...summary, domains: [res.domain] },
+                          });
+                          return;
+                        }
+                      }
+                      domains.set({ kind: "ready", value: summary });
+                    }}
+                    onRemoveDomain={async () => {
+                      const slug = route().app;
+                      if (!slug) {
+                        return;
+                      }
+                      await domainActions.removeDomain.run({ app: slug });
+                      const summary = await domainActions.listDomains.run({ app: slug });
+                      domains.set({ kind: "ready", value: summary });
                     }}
                   />
                 )}
@@ -1382,6 +1442,7 @@ function ViewBody(props: {
   logs: Panel<LogLine[]>;
   secrets: Panel<SecretsSummary>;
   collaborators: Panel<CollaboratorsSummary>;
+  domains: Panel<DomainsSummary>;
   expanded: string[];
   onToggleExpand: (id: string) => void;
   onLoadMore: () => void;
@@ -1391,6 +1452,9 @@ function ViewBody(props: {
   onSwitchCodeTab: (tab: "files" | "changes") => void;
   onJumpToIssue: (fingerprint: string) => void;
   onCollaboratorsChanged: () => void;
+  onAddDomain: (hostname: string) => Promise<void>;
+  onRefreshDomains: () => Promise<void>;
+  onRemoveDomain: () => Promise<void>;
   onRetry: () => void;
   onRefreshDetail: () => void;
   onRenamed: (slug: string) => void;
@@ -1476,6 +1540,11 @@ function ViewBody(props: {
           collaborators={props.collaborators}
           onCollaboratorsRetry={props.onRetry}
           onCollaboratorsChanged={props.onCollaboratorsChanged}
+          domains={props.domains}
+          onAddDomain={props.onAddDomain}
+          onRefreshDomains={props.onRefreshDomains}
+          onRemoveDomain={props.onRemoveDomain}
+          onRetryDomains={props.onRetry}
         />
       );
     case "d1":

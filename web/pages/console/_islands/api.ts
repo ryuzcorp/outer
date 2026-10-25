@@ -199,6 +199,30 @@ export interface SecretsSummary {
   secrets: SecretEntry[];
 }
 
+export interface DomainTxtRecord {
+  name: string;
+  value: string;
+}
+
+export interface DomainEntry {
+  hostname: string;
+  status: "pending" | "active" | "failed" | string;
+  ssl_status: string;
+  reason: string | null;
+  cname_target: string;
+  txt_records: DomainTxtRecord[];
+}
+
+export interface DomainsSummary {
+  plan: string;
+  role: string;
+  domains: DomainEntry[];
+}
+
+export interface DomainResult {
+  domain: DomainEntry | null;
+}
+
 export interface CollaboratorEntry {
   email: string;
   status: "joined" | "pending";
