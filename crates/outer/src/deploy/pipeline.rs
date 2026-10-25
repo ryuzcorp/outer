@@ -2827,6 +2827,82 @@ mod tests {
         });
         validate_config_keys(&full).unwrap();
     }
+    #[test]
+    fn astro_website_config_passes_key_validation() {
+        // The shape the website template's `celld-config` integration derives
+        // into `dist/wrangler.json` from the Cloudflare adapter's
+        // `dist/server/wrangler.json` (verbatim from a real `bun run build`):
+        // `main` rewrites to `server/…`, assets to `client`, `vars` to `{}`.
+        // Every key must stay inside ACCEPTED_CONFIG_KEYS, so an adapter
+        // addition fails loudly here instead of slipping into a deploy.
+        let config = serde_json::json!({
+            "name": "outer-website",
+            "main": "server/entry.mjs",
+            "compatibility_date": "2026-09-01",
+            "compatibility_flags": ["nodejs_als"],
+            "durable_objects": {"bindings": []},
+            "migrations": [],
+            "assets": {"binding": "ASSETS", "directory": "client"},
+            "services": [],
+            "triggers": {},
+            "vars": {},
+            "d1_databases": [{"binding": "DB", "database_name": "site-db", "migrations_dir": "db/migrations"}],
+            "kv_namespaces": [],
+            "queues": {"producers": [], "consumers": []},
+            "workflows": [],
+            "r2_buckets": [],
+        });
+        validate_config_keys(&config).unwrap();
+        let databases = crate::deploy::migrate::d1_databases(&config).unwrap();
+        assert_eq!(databases.len(), 1);
+        assert_eq!(databases[0].binding, "DB");
+        assert_eq!(
+            crate::deploy::migrate::migrations_dir_name(&databases[0]),
+            "db/migrations"
+        );
+    }
+
+    #[tokio::test]
+    async fn astro_website_layout_selects_dist_and_stages_migrations() {
+        // The website template's build output layout: `dist/wrangler.json`
+        // wins discovery (over a root config, of which there is none), and
+        // the repo's `db/migrations` stages into the deploy root for celld.
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let app = test_app(10013);
+        let work = deployer.work_dir(&app.slug);
+        let dist = work.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("wrangler.json"),
+            r#"{"name":"outer-website","main":"server/entry.mjs","compatibility_date":"2026-09-01","compatibility_flags":["nodejs_als"],"assets":{"binding":"ASSETS","directory":"client"},"vars":{},"d1_databases":[{"binding":"DB","database_name":"site-db","migrations_dir":"db/migrations"}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(work.join("db/migrations")).unwrap();
+        std::fs::write(
+            work.join("db/migrations/0001_newsletter.sql"),
+            "CREATE TABLE IF NOT EXISTS newsletter (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE);\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_deploy_config(&work).unwrap().unwrap(),
+            dist.join("wrangler.json")
+        );
+        let (root, crons, _) = deployer.deploy_root(&app).unwrap();
+        assert_eq!(root.root, dist);
+        assert!(crons.is_empty(), "a website ships no cron schedules");
+        let staged = crate::deploy::migrate::stage_migrations(&root.root, &work, "db/migrations")
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].name, "0001_newsletter.sql");
+        assert!(
+            root.root
+                .join("db/migrations/0001_newsletter.sql")
+                .is_file(),
+            "reviewed worktree bytes reach the deploy root"
+        );
+    }
 
     #[test]
     fn second_d1_database_fails_with_the_cap_message() {

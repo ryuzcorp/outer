@@ -25,6 +25,12 @@ pub struct CreateAppInput {
     /// Display name (defaults to the slug). Checked by the same content
     /// check as the slug.
     pub name: Option<String>,
+    /// Which starter to seed from: "app" (interactive Ilha + Void app) or
+    /// "website" (Astro + Ilha-islands content site). Defaults to "app";
+    /// any other value is refused. Pick "website" for landing pages,
+    /// portfolios, blogs and event pages; "app" for anything with accounts,
+    /// live state or dashboards.
+    pub template: Option<String>,
     /// Wait for the first deploy (default true). False returns immediately;
     /// poll deploy_status.
     pub wait: Option<bool>,
@@ -85,10 +91,11 @@ async fn seed_app(
     owner_email: &str,
     slug: &str,
     name: Option<&str>,
+    template: crate::templates::Template,
 ) -> Result<(App, String), ToolError> {
     let scratch = tempfile::tempdir().map_err(internal)?;
     let tree = scratch.path().join("tree");
-    let template = crate::templates::materialize(&ctx.state.store, &tree)
+    let reference = crate::templates::materialize(&ctx.state.store, template, &tree)
         .await
         .map_err(internal)?;
     let plan = super::plan_of(&ctx.state.pool, owner_id).await?;
@@ -136,10 +143,7 @@ async fn seed_app(
         ctx.state.sync.forget(slug).await;
         crate::git::manifest::init_repo(&ctx.state.store, &ctx.state.git, &ctx.state.sync, slug)
             .await?;
-        let message = format!(
-            "Start from the Ilha + Void template ({})",
-            &template.sha[..12.min(template.sha.len())]
-        );
+        let message = template.seed_message(&reference.sha);
         crate::git::commit::import_dir(
             &ctx.state.store,
             &ctx.state.git,
@@ -183,6 +187,14 @@ async fn seed_app(
 pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let caller = authed(ctx)?;
     apps::validate_slug(&input.slug).map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    let template = match input.template.as_deref() {
+        None => crate::templates::Template::App,
+        Some(id) => crate::templates::Template::from_id(id).ok_or_else(|| {
+            ToolError::invalid_argument(format!(
+                "unknown template {id:?}: want \"app\" or \"website\""
+            ))
+        })?,
+    };
     check_app_quota(&ctx.state.pool, &caller.account_id).await?;
     // The name check runs before any row exists and before the quota claim,
     // so refused names cost nothing and Jev never sees a name the cheap
@@ -196,6 +208,7 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         &caller.email,
         &input.slug,
         input.name.as_deref(),
+        template,
     )
     .await?;
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;

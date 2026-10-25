@@ -119,7 +119,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `create_app`
 
 - **Access:** signed in
-- **Description:** Create your Ilha + Void app and deploy it: {slug, name?, wait?}. Waits for the first deploy by default.
+- **Description:** Create an app and deploy it: {slug, name?, template?, wait?}. Template "app" is an interactive Ilha + Void app, "website" an Astro content site (default "app"). Waits for the first deploy by default.
 
 **Input:**
 
@@ -127,6 +127,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `name` | string | no | Display name (defaults to the slug). Checked by the same content check as the slug. |
 | `slug` | string | yes | URL name: lowercase letters, digits and dashes, 1-48 chars. Brand and account-page names (paypal, apple, bank, login, â€¦) and flagged names are refused; without a Jev client (localhost dev) the content check is skipped. |
+| `template` | string | no | Which starter to seed from: "app" (interactive Ilha + Void app) or "website" (Astro + Ilha-islands content site). Defaults to "app"; any other value is refused. Pick "website" for landing pages, portfolios, blogs and event pages; "app" for anything with accounts, live state or dashboards. |
 | `wait` | boolean | no | Wait for the first deploy (default true). False returns immediately; poll deploy_status. |
 
 ## `list_apps`

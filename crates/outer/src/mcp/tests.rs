@@ -67,9 +67,11 @@ async fn vendor_template(store: &Store) {
         &src,
         &["bundle", "create", bundle.to_str().unwrap(), "main"],
     );
-    crate::templates::put_test_template(store, sha.trim(), &bundle)
-        .await
-        .unwrap();
+    for template in crate::templates::Template::ALL {
+        crate::templates::put_test_template(store, template, sha.trim(), &bundle)
+            .await
+            .unwrap();
+    }
 }
 
 fn git(dir: &tempfile::TempDir, args: &[&str]) {
@@ -732,6 +734,40 @@ async fn free_plan_caps_apps_at_one() {
     assert_eq!(who["plan"], "free");
     assert_eq!(who["usage"]["apps_owned"], 1);
     assert!(who["resets_at"].as_str().unwrap().ends_with('Z'));
+}
+
+#[tokio::test]
+async fn create_app_template_selects_the_starter() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    // An unknown id fails naming both options, before any row exists.
+    let (_, unknown) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "nope", "template": "blog"}),
+    )
+    .await;
+    let err = is_error(&unknown);
+    assert_eq!(err["error"], "invalid_argument");
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("\"app\"") && message.contains("\"website\""),
+        "names both templates: {message}"
+    );
+    // The website starter seeds and deploys like the app one.
+    let (_, site) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "site", "template": "website"}),
+    )
+    .await;
+    assert_eq!(
+        result(&site)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+    assert_eq!(result(&site)["structuredContent"]["app"]["slug"], "site");
 }
 
 #[tokio::test]

@@ -677,9 +677,14 @@ mod tests {
             &src,
             &["bundle", "create", bundle.to_str().unwrap(), "main"],
         );
-        crate::templates::put_test_template(store, sha.trim(), &bundle)
-            .await
-            .unwrap();
+        crate::templates::put_test_template(
+            store,
+            crate::templates::Template::App,
+            sha.trim(),
+            &bundle,
+        )
+        .await
+        .unwrap();
     }
 
     fn git(dir: &tempfile::TempDir, args: &[&str]) {

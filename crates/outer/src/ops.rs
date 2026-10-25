@@ -37,7 +37,7 @@ pub fn noreply_author(account_id: &str, email: &str, domain: &str) -> Author {
     }
 }
 
-/// Create `slug` for `owner_email` from the vendored Ilha + Void template and
+/// Create `slug` for `owner_email` from the vendored `template` starter and
 /// deploy it. The template is materialized before the app row exists, so a
 /// missing `outer templates sync` fails without leaving anything behind; a
 /// failure after the row exists removes the row and the repo again (without
@@ -47,10 +47,11 @@ pub async fn create_app(
     owner_email: &str,
     slug: &str,
     name: Option<&str>,
+    template: templates::Template,
 ) -> anyhow::Result<(App, DeployOutcome)> {
     let scratch = tempfile::tempdir().context("template scratch dir")?;
     let tree = scratch.path().join("tree");
-    let template = templates::materialize(&p.store, &tree).await?;
+    let reference = templates::materialize(&p.store, template, &tree).await?;
     // Cheap checks first (shape, reserved, brand), then the Jev name check:
     // Jev never runs for a name the wordlists already refused, and a
     // missing client on localhost dev logs a warning and passes — exactly
@@ -97,10 +98,7 @@ pub async fn create_app(
             .await?;
         p.sync.forget(slug).await;
         manifest::init_repo(&p.store, &p.git, &p.sync, slug).await?;
-        let message = format!(
-            "Start from the Ilha + Void template ({})",
-            &template.sha[..12.min(template.sha.len())]
-        );
+        let message = template.seed_message(&reference.sha);
         let sha = crate::git::commit::import_dir(
             &p.store, &p.git, &p.sync, slug, &tree, &message, &author,
         )
@@ -222,9 +220,14 @@ mod tests {
         let sha = git_out(&["rev-parse", "HEAD"]);
         let bundle = src.path().join("template.bundle");
         git_out(&["bundle", "create", bundle.to_str().unwrap(), "main"]);
-        crate::templates::put_test_template(&store, sha.trim(), &bundle)
-            .await
-            .unwrap();
+        crate::templates::put_test_template(
+            &store,
+            crate::templates::Template::App,
+            sha.trim(),
+            &bundle,
+        )
+        .await
+        .unwrap();
 
         // A fake celld that answers the upload; no other step runs celld.
         let state = tempfile::tempdir().unwrap();
@@ -279,9 +282,15 @@ mod tests {
             cgroups: None,
             domain: "outer.localhost".to_string(),
         };
-        let (app, outcome) = create_app(&p, "pro@example.com", "warmshop", None)
-            .await
-            .unwrap();
+        let (app, outcome) = create_app(
+            &p,
+            "pro@example.com",
+            "warmshop",
+            None,
+            crate::templates::Template::App,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         assert!(app.always_on, "a Pro owner's new app keeps warm");
         let flag: i64 = sqlx::query_scalar("SELECT always_on FROM app WHERE id = ?1")
