@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 44);
+        assert_eq!(tools.len(), 47);
     }
 }
 
