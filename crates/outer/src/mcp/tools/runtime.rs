@@ -5,8 +5,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{await_row, deploy_by, latest_deploy, ok, ok_untrusted, owned_app, Ctx};
-use crate::mcp::error::ToolError;
+use super::{await_row, deploy_by, latest_deploy, ok, ok_untrusted, visible_app, Ctx};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeployStatusInput {
@@ -37,7 +36,7 @@ pub struct AppLogsInput {
 }
 
 pub async fn deploy_status(input: DeployStatusInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     if let Some(deploy_id) = input.deploy_id.as_deref() {
         if deploy_by(&ctx.state.pool, &app.id, Some(deploy_id))
             .await?
@@ -62,7 +61,7 @@ pub async fn deploy_status(input: DeployStatusInput, ctx: &Ctx<'_>) -> Result<Va
 }
 
 pub async fn deploy_log(input: DeployLogInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     let row = deploy_by(&ctx.state.pool, &app.id, input.deploy_id.as_deref()).await?;
     let Some(row) = row else {
         return Err(ToolError::not_found("no deploys for this app yet"));
@@ -99,7 +98,7 @@ pub async fn log_lines(
 }
 
 pub async fn app_logs(input: AppLogsInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     let limit = input.limit.unwrap_or(100).clamp(1, 500) as usize;
     let lines: Vec<Value> = log_lines(
         &ctx.state.pool,
@@ -142,7 +141,7 @@ pub struct AppErrorsInput {
 /// from `metric_minute`, never counted twice). Untrusted like `app_logs`:
 /// messages and frames can hold app or visitor text.
 pub async fn app_errors(input: AppErrorsInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     if let Some(status) = input.status.as_deref() {
         if !matches!(status, "open" | "resolved" | "ignored") {
             return Err(ToolError::invalid_argument(format!(
@@ -242,7 +241,7 @@ async fn set_issue_status(
     fingerprint: &str,
     status: &'static str,
 ) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, app_slug).await?;
+    let (app, _) = visible_app(ctx, app_slug).await?;
     if fingerprint.is_empty() || fingerprint.len() > 64 {
         return Err(ToolError::invalid_argument(format!(
             "bad fingerprint {fingerprint:?}: expected the app_errors fingerprint"

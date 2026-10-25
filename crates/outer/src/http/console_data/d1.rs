@@ -22,8 +22,46 @@ use sqlx::SqlitePool;
 
 use crate::deploy::migrate::{self, D1Database};
 use crate::fleet::manager::{FleetManager, FleetStorage};
-use crate::http::console::{guard, owned_app};
+use crate::http::console::{guard, visible_app};
 use crate::store::Store;
+
+/// D1 is owner-only in v1 (spec §7.4): the shared role-scoped lookup, then
+/// the owner check. A slug the caller has no role on answers 404 exactly
+/// like a missing one (spec §8.2); a collaborator reads 403 with a user
+/// message, the same shape the owner-only MCP tools answer.
+async fn owner_app(
+    mcp: &crate::mcp::McpState,
+    account: &crate::auth::AccountRow,
+    slug: &str,
+) -> Result<crate::apps::App, Box<Response>> {
+    match visible_app(mcp, account, slug).await {
+        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok(app),
+        Ok(Some(_)) => Err(crate::http::console_data::data_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only the app owner may open this database",
+            Some(
+                "Only the app owner can open this database. D1 editing stays owner-only."
+                    .to_string(),
+            ),
+        )
+        .into()),
+        Ok(None) => Err(crate::http::console_data::data_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such app",
+            None,
+        )
+        .into()),
+        Err(_) => Err(crate::http::console_data::data_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not load the app right now",
+            None,
+        )
+        .into()),
+    }
+}
 
 /// Filters are AND-ed and bounded so a query can't grow without limit.
 pub const MAX_FILTERS: usize = 10;
@@ -1451,24 +1489,9 @@ async fn api_databases(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
-        Ok(None) => {
-            return crate::http::console_data::data_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no such app",
-                None,
-            );
-        }
-        Err(_) => {
-            return crate::http::console_data::data_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-                None,
-            );
-        }
+    let app = match owner_app(mcp, &account, &slug).await {
+        Ok(app) => app,
+        Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
     let result = async {
@@ -1494,24 +1517,9 @@ async fn api_tables(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
-        Ok(None) => {
-            return crate::http::console_data::data_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no such app",
-                None,
-            );
-        }
-        Err(_) => {
-            return crate::http::console_data::data_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-                None,
-            );
-        }
+    let app = match owner_app(mcp, &account, &slug).await {
+        Ok(app) => app,
+        Err(res) => return *res,
     };
     if binding.len() > 128 {
         return d1_response(Err(D1Error::UnknownDatabase(binding)));
@@ -1539,24 +1547,9 @@ async fn api_schema(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
-        Ok(None) => {
-            return crate::http::console_data::data_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no such app",
-                None,
-            );
-        }
-        Err(_) => {
-            return crate::http::console_data::data_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-                None,
-            );
-        }
+    let app = match owner_app(mcp, &account, &slug).await {
+        Ok(app) => app,
+        Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
     let result = async {
@@ -1585,24 +1578,9 @@ async fn api_rows(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
-        Ok(None) => {
-            return crate::http::console_data::data_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no such app",
-                None,
-            );
-        }
-        Err(_) => {
-            return crate::http::console_data::data_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-                None,
-            );
-        }
+    let app = match owner_app(mcp, &account, &slug).await {
+        Ok(app) => app,
+        Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
     let result = async {
@@ -1631,24 +1609,9 @@ async fn api_write(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
-        Ok(None) => {
-            return crate::http::console_data::data_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no such app",
-                None,
-            );
-        }
-        Err(_) => {
-            return crate::http::console_data::data_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-                None,
-            );
-        }
+    let app = match owner_app(mcp, &account, &slug).await {
+        Ok(app) => app,
+        Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
     let started = Instant::now();
@@ -1719,24 +1682,9 @@ async fn api_delete_rows(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
-        Ok(None) => {
-            return crate::http::console_data::data_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no such app",
-                None,
-            );
-        }
-        Err(_) => {
-            return crate::http::console_data::data_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-                None,
-            );
-        }
+    let app = match owner_app(mcp, &account, &slug).await {
+        Ok(app) => app,
+        Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
     let started = Instant::now();
@@ -2932,6 +2880,67 @@ exit 0
         assert_eq!(body["error"], "not_found");
         // Unknown slug: same 404.
         let (status, _) = authed_get(&app, "/api/console/apps/nope/data/d1/DB/tables", &ana).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn d1_stays_owner_only_for_collaborators() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let (app, _health) = router_app(&pool, &state).await;
+        // Collaborators count only while the owner is Pro (spec §7.4): the
+        // 403 below is the owner check, not a missing role.
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = crate::auth::now_ms();
+        sqlx::query(
+            "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("acct-bruno@example.com")
+        .bind("bruno@example.com")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("acct-stranger@example.com")
+        .bind("stranger@example.com")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+             VALUES ('app-acme', 'bruno@example.com', 'acct-bruno@example.com', ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bruno = login(&pool, "bruno@example.com").await;
+        let stranger = login(&pool, "stranger@example.com").await;
+
+        // D1 writes and reads are owner-only in v1: a collaborator reads
+        // 403 with a user message, before any fleet work runs.
+        let (status, body) =
+            authed_get(&app, "/api/console/apps/acme/data/d1/databases", &bruno).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "forbidden");
+        assert!(
+            body["user_message"].as_str().is_some_and(|m| !m.is_empty()),
+            "{body}"
+        );
+        // A stranger's slug still reads 404 exactly like a missing one.
+        let (status, _) =
+            authed_get(&app, "/api/console/apps/acme/data/d1/databases", &stranger).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

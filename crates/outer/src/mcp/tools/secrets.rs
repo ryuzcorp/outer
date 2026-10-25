@@ -1,7 +1,7 @@
-//! The secret tools: `list_secrets`, `set_secret`, `unset_secret` (spec
-//! §8.2, §17). Owner only in M1 (collaborators are Pro/M2): [`owned_app`]
-//! refuses anything else as `not_found`, so the spec's owner/collaborator
-//! table lands automatically when roles do.
+//! The secret tools: `list_secrets` (owners and collaborators, spec §8.2
+//! table), `set_secret` and `unset_secret` (owner only). Owner-only calls
+//! from a collaborator answer `forbidden`; a slug with no role answers
+//! `not_found`, exactly like a missing one.
 //!
 //! Values are never returned, logged or put in an action-log summary: only
 //! names travel. What a set changes takes effect at the next deploy, when
@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{internal, ok, owned_app, Ctx};
+use super::{internal, ok, owner_app, visible_app, Ctx};
 use crate::mcp::error::ToolError;
 use crate::secrets;
 
@@ -50,7 +50,7 @@ pub struct UnsetSecretInput {
 }
 
 pub async fn list_secrets(input: ListSecretsInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     let metas = secrets::list(&ctx.state.pool, &app.id)
         .await
         .map_err(internal)?;
@@ -65,7 +65,7 @@ pub async fn list_secrets(input: ListSecretsInput, ctx: &Ctx<'_>) -> Result<Valu
 }
 
 pub async fn set_secret(input: SetSecretInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let app = owner_app(ctx, &input.app).await?;
     secrets::check_name(&input.key).map_err(ToolError::invalid_argument)?;
     secrets::check_reserved(&input.key).map_err(ToolError::invalid_argument)?;
     if input.value.len() > secrets::MAX_VALUE_BYTES {
@@ -107,7 +107,7 @@ pub async fn set_secret(input: SetSecretInput, ctx: &Ctx<'_>) -> Result<Value, T
 }
 
 pub async fn unset_secret(input: UnsetSecretInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let app = owner_app(ctx, &input.app).await?;
     secrets::check_name(&input.key).map_err(ToolError::invalid_argument)?;
     let removed = secrets::unset(&ctx.state.pool, &app.id, &input.key)
         .await

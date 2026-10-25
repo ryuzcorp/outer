@@ -3,10 +3,12 @@
 //! One module per the wave-2 seam: `console.rs` only gains a
 //! `.merge(console_actions::routes())` line, so parallel console work lands
 //! without touching this file. Every endpoint reuses `console.rs`'s `guard`
-//! and `fetch_ok` rules (session cookie only, same-origin, owner-scoped
+//! and `fetch_ok` rules (session cookie only, same-origin, role-scoped
 //! 404s), calls the SAME domain functions the MCP tools call, records the
 //! mutation in `agent_action` under the MCP tool name (client "Console"),
 //! and answers `{error, message, user_message?}` with the MCP codes.
+//! Visibility, delete and secret writes stay owner-only (spec §7.4: a
+//! collaborator reads 403); rollback admits collaborators like the MCP tool.
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -16,7 +18,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::console::{guard, nostore_json, not_found, ok_json, owned_app};
+use super::console::{guard, nostore_json, not_found, ok_json, visible_app};
 use super::AppState;
 use crate::auth::AccountRow;
 use crate::mcp::error::ToolError;
@@ -71,7 +73,7 @@ pub(crate) fn tool_response(err: &ToolError) -> Response {
         .into_response()
 }
 
-/// The session plus the owned app, or the error response. Every mutating
+/// The session plus the visible app, or the error response. Every mutating
 /// console endpoint starts here: a foreign or missing slug answers 404
 /// exactly like a missing one (spec §8.2), and cross-site requests never
 /// reach the mutation (the same-origin check inside [`guard`]).
@@ -84,8 +86,40 @@ async fn mutation_app(
         Ok(account) => account,
         Err(res) => return Err(res),
     };
-    match owned_app(mcp, &account, slug).await {
-        Ok(Some(app)) => Ok((account, app)),
+    match visible_app(mcp, &account, slug).await {
+        Ok(Some((app, _))) => Ok((account, app)),
+        Ok(None) => Err(not_found().into()),
+        Err(_) => Err(nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not load the app right now",
+        )
+        .into()),
+    }
+}
+
+/// [`mutation_app`] plus the owner check: visibility, delete and secret
+/// writes stay owner-only (spec §7.4), so a collaborator reads 403 with the
+/// same code and user message the MCP tool answers — never 404 (spec §8.2
+/// reserves 404 for slugs the caller has no role on).
+async fn owner_mutation_app(
+    mcp: &McpState,
+    headers: &HeaderMap,
+    slug: &str,
+) -> Result<(AccountRow, crate::apps::App), Box<Response>> {
+    let account = match guard(&mcp.auth, headers).await {
+        Ok(account) => account,
+        Err(res) => return Err(res),
+    };
+    match visible_app(mcp, &account, slug).await {
+        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok((account, app)),
+        Ok(Some(_)) => Err(tool_response(
+            &ToolError::forbidden(format!(
+                "only the app owner may change {slug:?} this way"
+            ))
+            .with_user("Only the app owner can do that. Collaborators can read and deploy, but not change these settings."),
+        )
+        .into()),
         Ok(None) => Err(not_found().into()),
         Err(_) => Err(nostore_json(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,7 +178,7 @@ async fn api_visibility(
     Json(body): Json<VisibilityBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -193,7 +227,7 @@ async fn api_delete(
     Json(body): Json<DeleteBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (_, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (_, app) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -266,7 +300,7 @@ async fn api_secret_put(
     Json(body): Json<SecretValueBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -313,7 +347,7 @@ async fn api_secret_delete(
     Path((slug, name)): Path<(String, String)>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -394,12 +428,13 @@ async fn api_rename(
 ) -> Response {
     let started = std::time::Instant::now();
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
     // One audit row whatever the outcome (mirrors the MCP path, which logs
-    // refused calls too): the app is owned, so the row always resolves.
+    // refused calls too): the app is owner-gated above, so the row always
+    // resolves.
     let audit = |summary: &str, outcome: &str, error_code: Option<&str>| {
         let pool = mcp.pool.clone();
         let app_id = app.id.clone();

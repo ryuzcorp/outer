@@ -1,7 +1,7 @@
 //! Console observe endpoints, wave 2 (spec §13.1): error triage and the
 //! live log tail. New endpoints live here (not in `console.rs`), which
 //! only gains the one `.merge(routes())` line; the session guard, the
-//! same-origin check and the owner-scoped 404 come from `console.rs` as
+//! same-origin check and the role-scoped 404 come from `console.rs` as
 //! `pub(crate)` helpers.
 //!
 //! Follow is server-sent events, not long-poll: one connection streams a
@@ -25,7 +25,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::console::{guard, logs_query, nostore_json, not_found, ok_json, owned_app};
+use super::console::{guard, logs_query, nostore_json, not_found, ok_json, visible_app};
 
 /// Seconds between follow polls; each tick emits at most one page.
 const FOLLOW_POLL_SECS: u64 = 2;
@@ -75,8 +75,8 @@ async fn api_logs_stream(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let app = match visible_app(mcp, &account, &slug).await {
+        Ok(Some((app, _))) => app,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -113,23 +113,33 @@ async fn api_logs_stream(
             mcp.pool.clone(),
             mcp.fleets.clone(),
             account.id.clone(),
+            account.email.clone(),
             app.id.clone(),
             app.slug.clone(),
             filter,
             seed,
             true,
         ),
-        move |(pool, fleets, account_id, app_id, slug, filter, mut cursor, mut first)| async move {
-            // The ownership check runs every tick: an app deleted or
-            // transferred mid-follow ends the stream instead of leaking
-            // another owner's lines.
+        move |(pool, fleets, account_id, account_email, app_id, slug, filter, mut cursor, mut first)| async move {
+            // The visibility check runs every tick: an app deleted,
+            // transferred, or unshared mid-follow ends the stream
+            // instead of leaking lines to a caller with no role left.
             loop {
                 tokio::time::sleep(Duration::from_secs(FOLLOW_POLL_SECS)).await;
                 let visible = crate::apps::get_by_slug(&pool, &slug).await.ok()?;
-                if visible
-                    .as_ref()
-                    .is_none_or(|app| app.owner_id != account_id)
-                {
+                let Some(app) = visible.as_ref() else {
+                    return None;
+                };
+                let role = crate::collaborators::role(
+                    &pool,
+                    &app.id,
+                    &app.owner_id,
+                    &account_id,
+                    &account_email,
+                )
+                .await
+                .ok()?;
+                if role.is_none() {
                     return None;
                 }
                 let lines = crate::observe::logs::read_filtered(
@@ -152,7 +162,8 @@ async fn api_logs_stream(
                     })
                     .to_string();
                     let state = (
-                        pool, fleets, account_id, app_id, slug, filter, cursor, first,
+                        pool, fleets, account_id, account_email, app_id, slug, filter, cursor,
+                        first,
                     );
                     return Some((Ok::<Event, Infallible>(Event::default().data(data)), state));
                 }
@@ -182,8 +193,8 @@ async fn api_error_detail(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let app = match visible_app(mcp, &account, &slug).await {
+        Ok(Some((app, _))) => app,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -318,8 +329,8 @@ async fn api_error_triage_one(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let app = match visible_app(mcp, &account, &slug).await {
+        Ok(Some((app, _))) => app,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -361,8 +372,8 @@ async fn api_errors_bulk(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let app = match visible_app(mcp, &account, &slug).await {
+        Ok(Some((app, _))) => app,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(

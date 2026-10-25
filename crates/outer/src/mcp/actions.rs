@@ -68,9 +68,11 @@ const LOGGED_TOOLS: &[&str] = &[
     "list_secrets",
     "set_secret",
     "unset_secret",
+    "add_collaborator",
+    "remove_collaborator",
+    "list_collaborators",
 ];
 
-/// Truncate to `n` chars on a char boundary, marking the cut.
 /// Ceiling on one stored summary, in chars.
 const MAX_SUMMARY_CHARS: usize = 2000;
 
@@ -179,7 +181,10 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             arg_str(args, "slug").unwrap_or("?")
         ),
         "share_app" | "get_app" => tool.to_string(),
-        "list_secrets" => tool.to_string(),
+        "list_secrets" | "list_collaborators" => tool.to_string(),
+        "add_collaborator" | "remove_collaborator" => {
+            format!("{} {}", tool, arg_str(args, "email").unwrap_or("?"))
+        }
         "set_secret" | "unset_secret" => {
             format!("{} {}", tool, arg_str(args, "key").unwrap_or("?"),)
         }
@@ -326,7 +331,14 @@ pub async fn record(
     let Some((app_id, owner_id)) = found else {
         return;
     };
-    if owner_id != caller.account_id {
+    // Owners and collaborators both leave rows here (the console shows the
+    // log to both); a slug with no role writes nothing, so `not_found`
+    // probes leave no trace.
+    let role =
+        crate::collaborators::role(pool, &app_id, &owner_id, &caller.account_id, &caller.email)
+            .await
+            .unwrap_or(None);
+    if role.is_none() {
         return;
     }
     // Recompute: `summary_for` returned Some above, so this is Some too.
@@ -472,7 +484,7 @@ fn client_label(
 }
 
 /// The app's action log, newest first. The caller must have checked that the
-/// signed-in account may see `app_id` (e.g. the console's `owned_app`): this
+/// signed-in account may see `app_id` (e.g. the console's `visible_app`): this
 /// filters by app only. `before` is the `(created_at, id)`
 /// cursor of the last row on the previous page; `limit` is clamped to
 /// 1–100.

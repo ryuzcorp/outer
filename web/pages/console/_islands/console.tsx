@@ -16,6 +16,7 @@ import {
   type AdminInvitesPage,
   type ApiKeysSummary,
   type AppDetail,
+  type CollaboratorsSummary,
   type ConnectionsSummary,
   type ConsoleApp,
   type ErrorsSummary,
@@ -198,6 +199,7 @@ export function Console() {
   const connections = atom<Panel<ConnectionsSummary>>({ kind: "loading" });
   const apiKeys = atom<Panel<ApiKeysSummary>>({ kind: "loading" });
   const accountSummary = atom<Panel<AccountSummary>>({ kind: "loading" });
+  const collaborators = atom<Panel<CollaboratorsSummary>>({ kind: "loading" });
   const ui = atom<Ui>({
     collapsed: readCollapsed(),
     drawer: false,
@@ -219,7 +221,7 @@ export function Console() {
           : "Console · Outer";
   }
 
-  function loadersFor(view: ViewId): Array<"metrics" | "actions" | "errors" | "logs" | "secrets"> {
+  function loadersFor(view: ViewId): Array<"metrics" | "actions" | "errors" | "logs" | "secrets" | "collaborators"> {
     switch (view) {
       case "overview":
         return ["metrics", "actions", "errors"];
@@ -238,6 +240,8 @@ export function Console() {
       case "secrets":
         return ["secrets"];
       case "settings":
+      case "settings":
+        return ["collaborators"];
       case "connections":
       case "usage":
       case "account":
@@ -354,6 +358,24 @@ export function Console() {
           .catch((err: unknown) => {
             if (!quiet) {
               put(secrets, { kind: "error", message: String(err) });
+            }
+          }),
+      );
+    }
+    if (loadersFor(view).includes("collaborators")) {
+      if (!quiet) {
+        collaborators.set({ kind: "loading" });
+      }
+      jobs.push(
+        api<CollaboratorsSummary>(
+          `/api/console/apps/${encodeURIComponent(slug)}/collaborators`,
+        )
+          .then((summary) => {
+            put(collaborators, { kind: "ready", value: summary });
+          })
+          .catch((err: unknown) => {
+            if (!quiet) {
+              put(collaborators, { kind: "error", message: String(err) });
             }
           }),
       );
@@ -505,6 +527,7 @@ export function Console() {
     errors.set({ kind: "loading" });
     logs.set({ kind: "loading" });
     secrets.set({ kind: "loading" });
+    collaborators.set({ kind: "loading" });
     try {
       const app = await api<AppDetail>(
         `/api/console/apps/${encodeURIComponent(r.app)}`,
@@ -871,9 +894,9 @@ export function Console() {
               type="button"
               role="listitem"
               class={`rail-tile tooltip tooltip-right${a.slug === r.app ? " is-active" : ""}`}
-              data-tip={`${a.slug} · ${a.status}`}
-              title={`${a.slug} · ${a.status}`}
-              aria-label={`${a.slug}, ${a.status}`}
+              data-tip={a.role === "collaborator" ? `${a.slug} · ${a.status} · Shared` : `${a.slug} · ${a.status}`}
+              title={a.role === "collaborator" ? `${a.slug} · ${a.status} · Shared` : `${a.slug} · ${a.status}`}
+              aria-label={a.role === "collaborator" ? `${a.slug}, ${a.status}, shared with you` : `${a.slug}, ${a.status}`}
               aria-current={a.slug === r.app ? "page" : undefined}
               onclick={() => {
                 if (a.slug !== r.app) {
@@ -1147,6 +1170,7 @@ export function Console() {
                     errors={errors()}
                     logs={logs()}
                     secrets={secrets()}
+                    collaborators={collaborators()}
                     expanded={ui().expanded}
                     onToggleExpand={(id) => {
                       const cur = ui().expanded;
@@ -1185,6 +1209,14 @@ export function Console() {
                     onRenamed={afterRename}
                     onDeleted={afterDelete}
                     plan={plan()}
+                    onCollaboratorsChanged={() => {
+                      const rr = route();
+                      // Refresh the card through the same quiet path as the
+                      // 10 s poll: no skeleton flash, epoch-guarded.
+                      if (rr.app) {
+                        void loadViewData(rr.app, "settings", rr.range, epoch, true);
+                      }
+                    }}
                   />
                 )}
               </div>
@@ -1203,6 +1235,9 @@ export function Console() {
                   </p>
                 </div>
                 <span class={`badge badge-soft ${statusBadge(active.status)} shrink-0`} title={active.status}>{active.status}</span>
+                {active.role === "collaborator" && (
+                  <span class="badge badge-soft badge-info shrink-0" title="Shared with you — you can change this app, but only the owner manages it">Shared</span>
+                )}
                 <button
                   type="button"
                   class="btn btn-ghost btn-square btn-sm hidden shrink-0 md:inline-flex"
@@ -1327,6 +1362,7 @@ function ViewBody(props: {
   errors: Panel<ErrorsSummary>;
   logs: Panel<LogLine[]>;
   secrets: Panel<SecretsSummary>;
+  collaborators: Panel<CollaboratorsSummary>;
   expanded: string[];
   onToggleExpand: (id: string) => void;
   onLoadMore: () => void;
@@ -1335,6 +1371,7 @@ function ViewBody(props: {
   onShowChanges: (sha: string) => void;
   onSwitchCodeTab: (tab: "files" | "changes") => void;
   onJumpToIssue: (fingerprint: string) => void;
+  onCollaboratorsChanged: () => void;
   onRetry: () => void;
   onRefreshDetail: () => void;
   onRenamed: (slug: string) => void;
@@ -1416,6 +1453,9 @@ function ViewBody(props: {
           onRefresh={props.onRefreshDetail}
           onRenamed={props.onRenamed}
           onDeleted={props.onDeleted}
+          collaborators={props.collaborators}
+          onCollaboratorsRetry={props.onRetry}
+          onCollaboratorsChanged={props.onCollaboratorsChanged}
         />
       );
     case "d1":

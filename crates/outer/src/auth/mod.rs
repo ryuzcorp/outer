@@ -158,7 +158,7 @@ pub fn normalize_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
 }
 
-fn valid_email(email: &str) -> bool {
+pub(crate) fn valid_email(email: &str) -> bool {
     let parts = email.split('@').collect::<Vec<_>>();
     parts.len() == 2 && !parts[0].is_empty() && parts[1].contains('.') && !parts[1].is_empty()
 }
@@ -493,6 +493,17 @@ pub async fn verify_code_core(
                     });
                 }
             }
+            // A collaborator invite for this address links here: the row's
+            // userId names the new account (spec §7.4). Invites to addresses
+            // that already had accounts linked in `collaborators::add`.
+            sqlx::query(
+                "UPDATE app_collaborator SET userId = ?1 WHERE email = ?2 AND userId IS NULL",
+            )
+            .bind(&id)
+            .bind(&email)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
             // Only people who joined with an invite get codes to pass on
             // (owner, 2026-10-24): not admins, not allowlisted emails, and
             // not app collaborators, who are admitted through the allowlist.

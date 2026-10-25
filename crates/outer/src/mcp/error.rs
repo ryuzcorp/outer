@@ -50,6 +50,9 @@ impl ToolError {
         Self::new("forbidden", message)
     }
 
+    pub fn payment_required(message: impl Into<String>, user_message: impl Into<String>) -> Self {
+        Self::new("payment_required", message).with_user(user_message)
+    }
     pub fn conflict(message: impl Into<String>, current_sha: &str) -> Self {
         Self::new("conflict", message).with_extra("current_sha", json!(current_sha))
     }

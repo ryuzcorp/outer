@@ -44,6 +44,7 @@ import {
   Ticket,
   TriangleAlert,
   UserRound,
+  Users,
   X,
   type IconNode,
 } from "lucide";
@@ -229,4 +230,8 @@ export function KeyIcon({ size = 14 }: { size?: number }) {
 
 export function AccountIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={UserRound} size={size} />;
+}
+
+export function UsersIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={Users} size={size} />;
 }

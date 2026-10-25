@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    authed, check_rev, claim_change, internal, ok, ok_deploy, ok_untrusted, owned_app,
-    refund_change, run_deploy, Ctx,
+    authed, check_rev, claim_change, internal, ok, ok_deploy, ok_untrusted, refund_change,
+    run_deploy, visible_app, Ctx,
 };
 use crate::apps::App;
 use crate::git::{self, CommitError};
@@ -137,7 +137,7 @@ async fn mirror(ctx: &Ctx<'_>, slug: &str) -> Result<std::path::PathBuf, ToolErr
 }
 
 pub async fn list_files(input: ListFilesInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     // Validate before git runs: bad shape is `invalid_argument` with a
     // message built only from agent input, so no server path can leak.
     // Anything the mirror itself reports after that is `internal`.
@@ -175,7 +175,7 @@ pub async fn read_file(input: ReadFileInput, ctx: &Ctx<'_>) -> Result<Value, Too
             ));
         }
     }
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     if let Some(rev) = input.sha.as_deref() {
         check_rev("sha", rev)?;
     }
@@ -258,7 +258,7 @@ pub async fn read_file(input: ReadFileInput, ctx: &Ctx<'_>) -> Result<Value, Too
 }
 
 pub async fn search_code(input: SearchCodeInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     let bare = mirror(ctx, &app.slug).await?;
     let (sha, hits, truncated) = crate::git::local::grep(
         &bare,
@@ -354,7 +354,7 @@ fn to_commit_request(
 }
 
 pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     let caller = authed(ctx)?;
     let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
     let request = to_commit_request(&input, author)?;
@@ -364,7 +364,9 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     // Claimed before the git work: a commit that never happens (bad base,
     // moved head) gives the change back; a created commit counts even when
     // its deploy fails or is blocked.
-    let claim = claim_change(&ctx.state.pool, &caller.account_id).await?;
+    // Charged to the app owner whoever calls (spec §3): a collaborator's
+    // commit counts against the owner's daily changes.
+    let claim = claim_change(&ctx.state.pool, &app.owner_id).await?;
     let outcome = match git::commit::commit_with_outcome(
         &ctx.state.store,
         &ctx.state.git,
@@ -376,7 +378,7 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     {
         Ok(outcome) => outcome,
         Err(e) => {
-            if let Err(refund) = refund_change(&ctx.state.pool, &caller.account_id).await {
+            if let Err(refund) = refund_change(&ctx.state.pool, &app.owner_id).await {
                 tracing::warn!("commit refund failed: {refund:#}");
             }
             return Err(ToolError::from_commit(e));
@@ -411,7 +413,7 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
 }
 
 pub async fn history(input: HistoryInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     if let Some(path) = input.path.as_deref() {
         crate::git::local::validate_read_path(path)
             .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
@@ -440,7 +442,7 @@ pub async fn history(input: HistoryInput, ctx: &Ctx<'_>) -> Result<Value, ToolEr
 }
 
 pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     check_rev("sha", &input.sha)?;
     let bare = mirror(ctx, &app.slug).await?;
     let shown = crate::git::local::show(&bare, &input.sha)
@@ -477,7 +479,7 @@ pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value,
 }
 
 pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let app = owned_app(ctx, &input.app).await?;
+    let (app, _) = visible_app(ctx, &input.app).await?;
     let caller = authed(ctx)?;
     rollback_to(
         ctx.state,
@@ -493,8 +495,9 @@ pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, Tool
 /// The shared rollback path: the MCP tool and the console endpoint both run
 /// here, so the target checks, the daily quota and the
 /// new-commit-then-deploy shape are identical. `app` must already be
-/// ownership-checked by the caller (MCP's `owned_app` refuses foreign slugs
-/// as `not_found`; the console answers 404 the same way).
+/// role-checked by the caller (MCP's `visible_app` and the console's
+/// `mutation_app` refuse role-less slugs as `not_found`; owner-only callers
+/// answer 403 before reaching here).
 pub async fn rollback_to(
     state: &McpState,
     app: &App,

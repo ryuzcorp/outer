@@ -87,6 +87,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/sign-out", post(api_sign_out))
         .merge(super::console_observe::routes())
         .merge(super::console_account::routes())
+        .merge(super::console_collaborators::routes())
         .with_state(state)
 }
 
@@ -103,6 +104,26 @@ pub(crate) fn nostore_json(status: StatusCode, error: &str, message: &str) -> Re
         .into_response()
 }
 
+/// The `user_message` variant (contract): the UI shows `user_message` in an
+/// `alert`, and agents relay it word for word. Same codes as the MCP tools.
+pub(crate) fn nostore_json_user(
+    status: StatusCode,
+    error: &str,
+    message: impl Into<String>,
+    user_message: impl Into<String>,
+) -> Response {
+    (
+        status,
+        [
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+            ("content-type", "application/json"),
+        ],
+        json!({"error": error, "message": message.into(), "user_message": user_message.into()})
+            .to_string(),
+    )
+        .into_response()
+}
 pub(crate) fn not_found() -> Response {
     nostore_json(StatusCode::NOT_FOUND, "not_found", "no such app")
 }
@@ -156,16 +177,26 @@ pub(crate) async fn guard(
     Ok(account)
 }
 
-/// The app `slug` names, owned by `account`. Anything else — missing, or
-/// owned by someone else — is `None`, and the caller answers 404 (spec §8.2).
-/// Shared with `console_data`.
-pub(crate) async fn owned_app(
+/// The app `slug` names, visible to `account` as owner or collaborator
+/// (Pro-gated: a downgrade hides the app again). Anything else is `None`,
+/// and the caller answers 404 (spec §8.2).
+pub(crate) async fn visible_app(
     mcp: &McpState,
     account: &AccountRow,
     slug: &str,
-) -> anyhow::Result<Option<crate::apps::App>> {
-    let app = crate::apps::get_by_slug(&mcp.pool, slug).await?;
-    Ok(app.filter(|app| app.owner_id == account.id))
+) -> anyhow::Result<Option<(crate::apps::App, crate::collaborators::Role)>> {
+    let Some(app) = crate::apps::get_by_slug(&mcp.pool, slug).await? else {
+        return Ok(None);
+    };
+    let role = crate::collaborators::role(
+        &mcp.pool,
+        &app.id,
+        &app.owner_id,
+        &account.id,
+        &account.email,
+    )
+    .await?;
+    Ok(role.map(|role| (app, role)))
 }
 
 async fn api_me(State(state): State<super::AppState>, headers: HeaderMap) -> Response {
@@ -427,14 +458,38 @@ async fn api_apps(State(state): State<super::AppState>, headers: HeaderMap) -> R
         }
     };
     let mut out = Vec::new();
-    for app in apps.iter().filter(|a| a.owner_id == account.id) {
+    for app in &apps {
+        // Owners match inline; collaborators read their row (Pro-gated, so
+        // a downgrade hides the app from the rail again).
+        let role = match crate::collaborators::role(
+            &mcp.pool,
+            &app.id,
+            &app.owner_id,
+            &account.id,
+            &account.email,
+        )
+        .await
+        {
+            Ok(role) => role,
+            Err(_) => {
+                return nostore_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unavailable",
+                    "could not list apps right now",
+                );
+            }
+        };
+        let Some(role) = role else { continue };
         let last = latest_deploy(&mcp.pool, &app.id).await.unwrap_or(None);
         let status =
             crate::mcp::tools::apps::app_status(app, last.as_ref().map(|r| r.status.as_str()));
         let mut v = json!({
             "slug": app.slug,
             "url": mcp.app_url(&app.slug),
-            "role": "owner",
+            "role": match role {
+                crate::collaborators::Role::Owner => "owner",
+                crate::collaborators::Role::Collaborator => "collaborator",
+            },
             "visibility": app.visibility.as_str(),
             "status": status,
             "last_request_at": app.last_request_at,
@@ -487,8 +542,8 @@ async fn api_app(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let (app, role) = match visible_app(mcp, &account, &slug).await {
+        Ok(Some(found)) => found,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -550,7 +605,10 @@ async fn api_app(
         json!({
             "slug": app.slug,
             "url": mcp.app_url(&app.slug),
-            "role": "owner",
+            "role": match role {
+                crate::collaborators::Role::Owner => "owner",
+                crate::collaborators::Role::Collaborator => "collaborator",
+            },
             "visibility": app.visibility.as_str(),
             "status": status,
             "last_request_at": app.last_request_at,
@@ -650,8 +708,8 @@ async fn api_logs(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let (app, _role) = match visible_app(mcp, &account, &slug).await {
+        Ok(Some(found)) => found,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -703,8 +761,8 @@ async fn api_errors(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let (app, _role) = match visible_app(mcp, &account, &slug).await {
+        Ok(Some(found)) => found,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -775,7 +833,7 @@ async fn api_errors(
 }
 /// `GET /api/console/apps/:slug/secrets`: the app's secret names plus
 /// `updated_at`, ordered by name. Values never leave the server. The caller
-/// MUST own the app (see `owned_app`): anything else answers 404 exactly
+/// must see the app (see `visible_app`): anything else answers 404 exactly
 /// like a missing app.
 async fn api_secrets(
     State(state): State<super::AppState>,
@@ -787,8 +845,8 @@ async fn api_secrets(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let (app, _role) = match visible_app(mcp, &account, &slug).await {
+        Ok(Some(found)) => found,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -817,8 +875,8 @@ async fn api_secrets(
 /// newest first. `before` is the opaque `<created_at>:<id>` cursor of the
 /// last row on the previous page; `limit` defaults to 20 and clamps to
 /// 1–100. Answers `{actions, next?}` where `next` is the cursor for the
-/// following page. The caller MUST own the app (see `owned_app`): anything
-/// else answers 404 exactly like a missing app.
+/// following page. The caller must see the app (see `visible_app`):
+/// anything else answers 404 exactly like a missing app.
 async fn api_actions(
     State(state): State<super::AppState>,
     headers: HeaderMap,
@@ -830,8 +888,8 @@ async fn api_actions(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let (app, _role) = match visible_app(mcp, &account, &slug).await {
+        Ok(Some(found)) => found,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -924,8 +982,8 @@ async fn api_metrics(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owned_app(mcp, &account, &slug).await {
-        Ok(Some(app)) => app,
+    let (app, _role) = match visible_app(mcp, &account, &slug).await {
+        Ok(Some(found)) => found,
         Ok(None) => return not_found(),
         Err(_) => {
             return nostore_json(
@@ -3308,5 +3366,268 @@ mod tests {
                 && *code == Some("invalid_argument".to_string())),
             "{rows:?}"
         );
+    }
+
+    async fn seed_pro_app(pool: &SqlitePool, owner: &str, slug: &str, now: i64) {
+        // seed_app inserts the account row too; the plan flips after.
+        seed_app(pool, owner, slug, now).await;
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = ?1")
+            .bind(owner)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn console_collaborators_owner_invite_and_remove_flow() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_pro_app(&pool, "ana@example.com", "groceries", now).await;
+        let owner = login(&pool, "ana@example.com").await;
+
+        let (status, _, body) = send(
+            &app,
+            authed("/api/console/apps/groceries/collaborators", &owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = body.parse().unwrap();
+        assert_eq!(list["role"], "owner");
+        assert_eq!(list["owner_plan"], "pro");
+        assert!(list["collaborators"].as_array().unwrap().is_empty());
+
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators",
+                &owner,
+                serde_json::json!({"email": "bruno@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let added: serde_json::Value = body.parse().unwrap();
+        assert_eq!(added["collaborator"]["email"], "bruno@example.com");
+        assert_eq!(added["collaborator"]["status"], "pending");
+
+        // The mutation is audited as the MCP tool with client "Console".
+        let rows = crate::mcp::actions::list(&pool, "app-groceries", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "add_collaborator");
+        assert_eq!(rows[0].client_label, "Console");
+
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators/remove",
+                &owner,
+                serde_json::json!({"email": "bruno@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let removed: serde_json::Value = body.parse().unwrap();
+        assert_eq!(removed["removed"], true);
+        let (status, _, body) = send(
+            &app,
+            authed("/api/console/apps/groceries/collaborators", &owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = body.parse().unwrap();
+        assert!(list["collaborators"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn console_collaborators_are_scoped_like_the_tools() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_pro_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_account(&pool, "bruno@example.com").await;
+        seed_account(&pool, "stranger@example.com").await;
+        sqlx::query(
+            "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+             VALUES ('app-groceries', 'bruno@example.com', 'acct-bruno@example.com', ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bruno = login(&pool, "bruno@example.com").await;
+        let stranger = login(&pool, "stranger@example.com").await;
+
+        // The app shows in the collaborator's rail and detail as Shared.
+        let (status, _, body) = send(&app, authed("/api/console/apps", &bruno)).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = body.parse().unwrap();
+        let apps = list["apps"].as_array().unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0]["slug"], "groceries");
+        assert_eq!(apps[0]["role"], "collaborator");
+        let (status, _, body) = send(&app, authed("/api/console/apps/groceries", &bruno)).await;
+        assert_eq!(status, StatusCode::OK);
+        let detail: serde_json::Value = body.parse().unwrap();
+        assert_eq!(detail["role"], "collaborator");
+
+        // Collaborator reads (list, secrets) but never invites.
+        let (status, _, _) = send(
+            &app,
+            authed("/api/console/apps/groceries/collaborators", &bruno),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) =
+            send(&app, authed("/api/console/apps/groceries/secrets", &bruno)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators",
+                &bruno,
+                serde_json::json!({"email": "x@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let refused: serde_json::Value = body.parse().unwrap();
+        assert_eq!(refused["error"], "forbidden");
+        assert!(refused["user_message"].as_str().unwrap().contains("owner"));
+
+        // No role reads exactly like a missing app.
+        let (status, _, _) = send(&app, authed("/api/console/apps/groceries", &stranger)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators",
+                &stranger,
+                serde_json::json!({"email": "x@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn console_collaborator_invite_needs_a_pro_owner() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let owner = login(&pool, "ana@example.com").await;
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators",
+                &owner,
+                serde_json::json!({"email": "bruno@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let refused: serde_json::Value = body.parse().unwrap();
+        assert_eq!(refused["error"], "payment_required");
+        assert!(refused["user_message"].as_str().unwrap().contains("Pro"));
+    }
+
+    #[tokio::test]
+    async fn console_mutations_scope_collaborators_like_the_tools() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_account(&pool, "bruno@example.com").await;
+        seed_account(&pool, "stranger@example.com").await;
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+             VALUES ('app-groceries', 'bruno@example.com', 'acct-bruno@example.com', ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bruno = login(&pool, "bruno@example.com").await;
+        let stranger = login(&pool, "stranger@example.com").await;
+
+        // Rollback admits collaborators like the MCP tool: the scope gate
+        // passes and the unknown sha refuses as `invalid_argument`.
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/rollback",
+                &bruno,
+                serde_json::json!({"sha": "0123456789abcdef0123456789abcdef01234567"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["error"],
+            "invalid_argument"
+        );
+
+        // Visibility, secret writes and delete stay owner-only: a
+        // collaborator reads 403 with the MCP code and a user message.
+        for (path, body) in [
+            (
+                "/api/console/apps/groceries/visibility",
+                serde_json::json!({"visibility": "unlisted"}),
+            ),
+            (
+                "/api/console/apps/groceries/delete",
+                serde_json::json!({"confirm": "groceries"}),
+            ),
+        ] {
+            let (status, _, body) = send(&app, post_json(path, &bruno, body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            let refused: serde_json::Value = body.parse().unwrap();
+            assert_eq!(refused["error"], "forbidden", "{path}");
+            assert!(
+                refused["user_message"].as_str().unwrap().contains("owner"),
+                "{path}: {refused}"
+            );
+        }
+        let (status, _, body) = send(
+            &app,
+            put_json(
+                "/api/console/apps/groceries/secrets/API_KEY",
+                &bruno,
+                serde_json::json!({"value": "x"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let refused: serde_json::Value = body.parse().unwrap();
+        assert_eq!(refused["error"], "forbidden");
+        assert!(
+            refused["user_message"].as_str().unwrap().contains("owner"),
+            "{refused}"
+        );
+
+        // A stranger's slug reads 404 exactly like a missing one.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/visibility",
+                &stranger,
+                serde_json::json!({"visibility": "unlisted"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/rollback",
+                &stranger,
+                serde_json::json!({"sha": "0123456789abcdef0123456789abcdef01234567"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

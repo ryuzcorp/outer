@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 35);
+    assert_eq!(anon.len(), 38);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,7 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 33);
+    assert_eq!(authed.len(), 36);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
 
@@ -2515,6 +2515,396 @@ async fn secrets_cap_counts_distinct_names_and_values_stay_out_of_logs() {
     assert!(tools.contains(&"set_secret".to_string()), "{tools:?}");
 }
 
+/// Flip an account's plan by email.
+async fn set_plan(state: &McpState, email: &str, plan: &str) {
+    sqlx::query("UPDATE user SET plan = ?1 WHERE email = ?2")
+        .bind(plan)
+        .bind(email)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+}
+
+/// A Pro owner's app, returning the owner's token.
+async fn pro_app(state: &McpState, owner_email: &str, slug: &str) -> String {
+    let token = api_key_for(state, owner_email).await;
+    set_plan(state, owner_email, "pro").await;
+    create_app(state, &token, slug).await;
+    token
+}
+
+async fn invite(state: &McpState, token: &str, slug: &str, email: &str) -> Value {
+    let (_, body) = call(
+        state,
+        Some(token),
+        "add_collaborator",
+        json!({"app": slug, "email": email}),
+    )
+    .await;
+    body
+}
+
+#[tokio::test]
+async fn collaborator_invite_needs_a_pro_owner() {
+    let (state, codes) = setup().await;
+    let owner = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &owner, "groceries").await;
+
+    // A Free owner is refused with payment_required, pointing at Pro.
+    let refused = invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "payment_required");
+    assert!(err["user_message"].as_str().unwrap().contains("Pro"));
+
+    set_plan(&state, "ana@example.com", "pro").await;
+    let added = result(&invite(&state, &owner, "groceries", "Bruno@Example.com").await)
+        ["structuredContent"]
+        .clone();
+    assert_eq!(added["collaborator"]["email"], "bruno@example.com");
+    assert_eq!(added["collaborator"]["status"], "pending");
+
+    // The invite allowlists the email and emails the spec wording.
+    let allowlisted: Option<String> =
+        sqlx::query_scalar("SELECT email FROM beta_allowlist WHERE email = 'bruno@example.com'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(allowlisted.as_deref(), Some("bruno@example.com"));
+    let mail = codes
+        .lock()
+        .unwrap()
+        .get("bruno@example.com")
+        .cloned()
+        .expect("invite email sent");
+    assert!(mail.contains("groceries"), "{mail}");
+    assert!(mail.contains("/mcp"), "{mail}");
+
+    // Inviting twice, inviting the owner, and inviting junk all refuse.
+    let dup_body = invite(&state, &owner, "groceries", "bruno@example.com").await;
+    assert_eq!(is_error(&dup_body)["error"], "invalid_argument");
+    let self_body = invite(&state, &owner, "groceries", "ana@example.com").await;
+    assert_eq!(is_error(&self_body)["error"], "invalid_argument");
+    let bad_body = invite(&state, &owner, "groceries", "not-an-email").await;
+    assert_eq!(is_error(&bad_body)["error"], "invalid_argument");
+}
+
+#[tokio::test]
+async fn collaborator_cap_is_ten_per_app() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    for n in 0..10 {
+        let body = invite(
+            &state,
+            &owner,
+            "groceries",
+            &format!("friend{n}@example.com"),
+        )
+        .await;
+        assert!(result(&body).get("isError").is_none(), "{body}");
+    }
+    let capped = invite(&state, &owner, "groceries", "extra@example.com").await;
+    let err = is_error(&capped);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "collaborators");
+    assert_eq!(err["limit"], 10);
+    assert_eq!(err["used"], 10);
+
+    let (_, list) = call(
+        &state,
+        Some(&owner),
+        "list_collaborators",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let collaborators = result(&list)["structuredContent"]["collaborators"]
+        .as_array()
+        .unwrap();
+    assert_eq!(collaborators.len(), 10);
+    assert!(collaborators.iter().all(|c| c["status"] == "pending"));
+}
+
+#[tokio::test]
+async fn collaborator_joins_through_the_closed_beta_without_invite_codes() {
+    let (mut state, codes) = setup().await;
+    state.auth.config.signup_open = false;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+
+    // A non-allowlisted stranger is still refused a code (the auth layer's
+    // `closed_beta` maps to `forbidden` on the wire).
+    let (_, refused) = call(
+        &state,
+        None,
+        "sign_in",
+        json!({"email": "stranger@example.com"}),
+    )
+    .await;
+    assert_eq!(is_error(&refused)["error"], "forbidden");
+
+    // The invited email signs straight in: no invite code involved.
+    let (_, sent) = call(
+        &state,
+        None,
+        "sign_in",
+        json!({"email": "bruno@example.com"}),
+    )
+    .await;
+    assert_eq!(result(&sent)["structuredContent"]["sent"], true);
+    let code = auth_ts::captured(&codes, "bruno@example.com");
+    let (_, verified) = call(
+        &state,
+        None,
+        "verify_code",
+        json!({"email": "bruno@example.com", "code": code, "accept_terms": true}),
+    )
+    .await;
+    let key = result(&verified)["structuredContent"]["api_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The row links to the new account: joined, visible in list_apps.
+    let linked: Option<String> =
+        sqlx::query_scalar("SELECT userId FROM app_collaborator WHERE email = 'bruno@example.com'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(linked.is_some());
+    let (_, listed) = call(
+        &state,
+        Some(&owner),
+        "list_collaborators",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&listed)["structuredContent"]["collaborators"][0]["status"],
+        "joined"
+    );
+    let (_, apps) = call(&state, Some(&key), "list_apps", json!({})).await;
+    let apps = result(&apps)["structuredContent"]["apps"].clone();
+    assert_eq!(apps.as_array().unwrap().len(), 1);
+    assert_eq!(apps[0]["slug"], "groceries");
+    assert_eq!(apps[0]["role"], "collaborator");
+}
+
+#[tokio::test]
+async fn collaborator_calls_allowed_tools_and_is_refused_owner_only_ones() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+
+    // Reads, changes and deploys all answer: none of these is owner-only.
+    for (name, args) in [
+        ("get_app", json!({"app": "groceries"})),
+        ("share_app", json!({"app": "groceries"})),
+        ("list_files", json!({"app": "groceries"})),
+        (
+            "read_file",
+            json!({"app": "groceries", "path": "pages/index.tsx"}),
+        ),
+        (
+            "search_code",
+            json!({"app": "groceries", "query": "Groceries"}),
+        ),
+        ("history", json!({"app": "groceries"})),
+        ("deploy_status", json!({"app": "groceries"})),
+        ("app_logs", json!({"app": "groceries"})),
+        ("app_errors", json!({"app": "groceries"})),
+        ("list_secrets", json!({"app": "groceries"})),
+    ] {
+        let (_, body) = call(&state, Some(&bruno), name, args).await;
+        assert!(result(&body).get("isError").is_none(), "{name}: {body}");
+    }
+    let (_, commit) = call(
+        &state,
+        Some(&bruno),
+        "commit",
+        json!({"app": "groceries", "message": "bruno was here",
+               "writes": [{"path": "note.txt", "content": "hi\n"}]}),
+    )
+    .await;
+    assert!(result(&commit).get("isError").is_none(), "{commit}");
+    let first = result(&commit)["structuredContent"]["commit"]["sha"].clone();
+    // A second commit moves the head, so the rollback has a target.
+    let (_, second) = call(
+        &state,
+        Some(&bruno),
+        "commit",
+        json!({"app": "groceries", "message": "bruno again",
+               "writes": [{"path": "note.txt", "content": "hi again\n"}]}),
+    )
+    .await;
+    assert!(result(&second).get("isError").is_none(), "{second}");
+    let (_, rollback) = call(
+        &state,
+        Some(&bruno),
+        "rollback",
+        json!({"app": "groceries", "sha": first}),
+    )
+    .await;
+    assert!(result(&rollback).get("isError").is_none(), "{rollback}");
+
+    // Owner-only tools refuse a collaborator with forbidden.
+    for (name, args) in [
+        (
+            "set_visibility",
+            json!({"app": "groceries", "visibility": "public"}),
+        ),
+        (
+            "set_secret",
+            json!({"app": "groceries", "key": "K", "value": "v"}),
+        ),
+        ("unset_secret", json!({"app": "groceries", "key": "K"})),
+        (
+            "delete_app",
+            json!({"app": "groceries", "confirm": "groceries"}),
+        ),
+        (
+            "add_collaborator",
+            json!({"app": "groceries", "email": "x@example.com"}),
+        ),
+        (
+            "remove_collaborator",
+            json!({"app": "groceries", "email": "bruno@example.com"}),
+        ),
+        ("list_collaborators", json!({"app": "groceries"})),
+    ] {
+        let (_, body) = call(&state, Some(&bruno), name, args).await;
+        assert_eq!(is_error(&body)["error"], "forbidden", "{name}: {body}");
+    }
+
+    // A slug with no role reads exactly like a missing one.
+    let (_, missing) = call(&state, Some(&bruno), "get_app", json!({"app": "nope"})).await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+}
+
+#[tokio::test]
+async fn collaborator_removal_takes_effect_on_the_next_call() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let (_, before) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert!(result(&before).get("isError").is_none());
+
+    let (_, removed) = call(
+        &state,
+        Some(&owner),
+        "remove_collaborator",
+        json!({"app": "groceries", "email": "bruno@example.com"}),
+    )
+    .await;
+    assert_eq!(result(&removed)["structuredContent"]["removed"], true);
+    let (_, after) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(is_error(&after)["error"], "not_found");
+    let (_, apps) = call(&state, Some(&bruno), "list_apps", json!({})).await;
+    assert_eq!(
+        result(&apps)["structuredContent"]["apps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    // Removing someone who isn't there is the caller's bug.
+    let (_, again) = call(
+        &state,
+        Some(&owner),
+        "remove_collaborator",
+        json!({"app": "groceries", "email": "bruno@example.com"}),
+    )
+    .await;
+    assert_eq!(is_error(&again)["error"], "invalid_argument");
+}
+
+#[tokio::test]
+async fn collaborator_commit_counts_against_the_owner_quota() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let owner_id: String =
+        sqlx::query_scalar("SELECT id FROM user WHERE email = 'ana@example.com'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    let bruno_id: String =
+        sqlx::query_scalar("SELECT id FROM user WHERE email = 'bruno@example.com'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+    let (_, commit) = call(
+        &state,
+        Some(&bruno),
+        "commit",
+        json!({"app": "groceries", "message": "bruno's change",
+               "writes": [{"path": "note.txt", "content": "hi\n"}]}),
+    )
+    .await;
+    assert!(result(&commit).get("isError").is_none(), "{commit}");
+    // create_app seeds git directly (no claim); the one commit lands on the
+    // owner, and nothing lands on the collaborator.
+    let owner_used: Option<i64> =
+        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
+            .bind(&owner_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(owner_used, Some(1));
+    let bruno_used: Option<i64> =
+        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
+            .bind(&bruno_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(bruno_used, None);
+}
+
+#[tokio::test]
+async fn collaborator_access_follows_the_owner_plan() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let (_, seen) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert!(result(&seen).get("isError").is_none());
+
+    // Downgrade: the rows stay, but the app reads as missing.
+    set_plan(&state, "ana@example.com", "free").await;
+    let (_, hidden) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(is_error(&hidden)["error"], "not_found");
+    let (_, apps) = call(&state, Some(&bruno), "list_apps", json!({})).await;
+    assert_eq!(
+        result(&apps)["structuredContent"]["apps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    // The invite list itself stays put through the downgrade.
+    let (_, listed) = call(
+        &state,
+        Some(&owner),
+        "list_collaborators",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&listed)["structuredContent"]["collaborators"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Re-upgrade: access is back with no re-invite.
+    set_plan(&state, "ana@example.com", "pro").await;
+    let (_, back) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert!(result(&back).get("isError").is_none());
+}
 /// `public` is a Pro feature, gated in the shared domain function: a Free
 /// owner is refused with `payment_required` (and a user message pointing to
 /// Pro), `unlisted` is always allowed, and Pro flips the row.

@@ -137,59 +137,16 @@ impl EmailSender {
     }
 
     /// Send one sign-in code. The code itself goes in the body; failures
-    /// name the reason, never the token.
+    /// name the reason, never the token. The test sender captures the bare
+    /// code (existing sign-in tests verify with it), while [`send_text`]
+    /// captures subject plus body.
     pub async fn send_code(&self, to: &str, code: &str) -> Result<(), EmailError> {
+        let subject = format!("Your Outer sign-in code is {code}");
+        let text = format!(
+            "Your Outer sign-in code is {code}. It expires in 10 minutes.\n\nIf you didn't ask for this, ignore this email."
+        );
         match self {
-            Self::Cloudflare {
-                client,
-                api_base,
-                account_id,
-                api_token,
-                from,
-            } => {
-                let url = format!("{api_base}/client/v4/accounts/{account_id}/email/sending/send");
-                let subject = format!("Your Outer sign-in code is {code}");
-                let text = format!(
-                    "Your Outer sign-in code is {code}. It expires in 10 minutes.\n\nIf you didn't ask for this, ignore this email."
-                );
-                let response = client
-                    .post(&url)
-                    .bearer_auth(api_token)
-                    .json(&serde_json::json!({
-                        "to": to,
-                        "from": { "address": from.address, "name": from.name },
-                        "subject": subject,
-                        "text": text,
-                    }))
-                    .send()
-                    .await
-                    .map_err(|err| EmailError::Retryable(scrubbed(&err.to_string())))?;
-                let status = response.status();
-                let body: serde_json::Value = response.json().await.map_err(|err| {
-                    EmailError::Retryable(format!("email API returned an unreadable body: {err}"))
-                })?;
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    || error_code(&body) == Some(10004)
-                {
-                    return Err(EmailError::Retryable(
-                        "email provider is rate limited, try again shortly".to_string(),
-                    ));
-                }
-                if !status.is_success()
-                    || body.get("success").and_then(|v| v.as_bool()) != Some(true)
-                {
-                    let detail = first_error(&body).unwrap_or_else(|| status.to_string());
-                    return Err(EmailError::Permanent(format!(
-                        "email provider refused the message ({detail})"
-                    )));
-                }
-                if permanent_bounce(&body, to) {
-                    return Err(EmailError::Permanent(format!(
-                        "email to {to} permanently bounced"
-                    )));
-                }
-                Ok(())
-            }
+            Self::Cloudflare { .. } => self.post(to, &subject, &text).await,
             Self::Log => {
                 tracing::info!(email = %to, code = %code, "sign-in code (localhost log sender)");
                 Ok(())
@@ -203,6 +160,75 @@ impl EmailSender {
                 Ok(())
             }
         }
+    }
+
+    /// Send one free-form message (collaborator invites). Same transport,
+    /// same failure contract as [`send_code`].
+    pub async fn send_text(&self, to: &str, subject: &str, text: &str) -> Result<(), EmailError> {
+        match self {
+            Self::Cloudflare { .. } => self.post(to, subject, text).await,
+            Self::Log => {
+                tracing::info!(email = %to, subject = %subject, "outbound email (localhost log sender)");
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Capture { codes } => {
+                codes
+                    .lock()
+                    .unwrap()
+                    .insert(to.to_string(), format!("{subject}\n\n{text}"));
+                Ok(())
+            }
+        }
+    }
+
+    /// The Cloudflare Email Sending POST behind [`send_code`] and
+    /// [`send_text`].
+    async fn post(&self, to: &str, subject: &str, text: &str) -> Result<(), EmailError> {
+        let Self::Cloudflare {
+            client,
+            api_base,
+            account_id,
+            api_token,
+            from,
+        } = self
+        else {
+            unreachable!("post is only called on the Cloudflare sender");
+        };
+        let url = format!("{api_base}/client/v4/accounts/{account_id}/email/sending/send");
+        let response = client
+            .post(&url)
+            .bearer_auth(api_token)
+            .json(&serde_json::json!({
+                "to": to,
+                "from": { "address": from.address, "name": from.name },
+                "subject": subject,
+                "text": text,
+            }))
+            .send()
+            .await
+            .map_err(|err| EmailError::Retryable(scrubbed(&err.to_string())))?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.map_err(|err| {
+            EmailError::Retryable(format!("email API returned an unreadable body: {err}"))
+        })?;
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || error_code(&body) == Some(10004) {
+            return Err(EmailError::Retryable(
+                "email provider is rate limited, try again shortly".to_string(),
+            ));
+        }
+        if !status.is_success() || body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            let detail = first_error(&body).unwrap_or_else(|| status.to_string());
+            return Err(EmailError::Permanent(format!(
+                "email provider refused the message ({detail})"
+            )));
+        }
+        if permanent_bounce(&body, to) {
+            return Err(EmailError::Permanent(format!(
+                "email to {to} permanently bounced"
+            )));
+        }
+        Ok(())
     }
 }
 
