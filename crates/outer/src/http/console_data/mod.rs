@@ -1,19 +1,19 @@
-//! Console data panels: browse app storage (D1, R2, Durable Objects) from
-//! the web console (spec §13.1 "Later (data panels)", DATA-PANELS.md).
+//! Console data panels: D1, R2 and Durable Objects (spec §13.1 "Later").
 //!
 //! Routes live under `/api/console/apps/{slug}/data/…` with the same guard
-//! as the other console APIs: session cookie, `Sec-Fetch-Site:
-//! same-origin`, and an owner-scoped 404 for foreign or unknown slugs.
-//! Reads use server-held scoped credentials (`fleets/{slug}/`), never
-//! exposed to the browser; writes go through celld (never plain S3 PUT, so
-//! the stored record is what a worker would write) and are recorded in
-//! `agent_action` with both ids NULL (client "Console").
+//! as the other console APIs: `__Host-outer_sid` session,
+//! `Sec-Fetch-Site: same-origin`, and an owner-scoped 404 for apps the
+//! caller can't see. Owner-only in v1.
 //!
-//! Each panel lives in its own file (`r2.rs`, `durable.rs`, and the D1
-//! agent's `d1.rs`); this file only declares the modules, merges the
-//! routers, and holds the helpers they share, so panel changes never
-//! conflict with each other.
+//! Isolation: every panel takes only `(app slug, scoped credentials for
+//! `fleets/{slug}/`)`, so a cross-app path is unconstructable. Database and
+//! bucket names are validated against the app's declared bindings; a typo'd
+//! name opens an empty namespace in *this* fleet, never another app's data
+//! (see `deploy::migrate` for the same argument). R2 writes go through
+//! celld (never plain S3 PUT) and are recorded in `agent_action` via
+//! `mcp::actions::record_console` with both ids NULL (client "Console").
 
+pub mod d1;
 pub mod durable;
 pub mod r2;
 
@@ -22,20 +22,56 @@ use std::time::Duration;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use serde_json::json;
 
-use super::console::{guard, nostore_json, not_found, ok_json, owned_app};
+use super::console::{guard, nostore_json, not_found, owned_app};
 
-pub fn router(state: super::AppState) -> Router<super::AppState> {
-    Router::new()
-        .merge(r2::router())
-        .merge(durable::router())
-        .with_state(state)
+/// Routes for every data panel.
+pub fn routes() -> Router<super::AppState> {
+    d1::routes().merge(r2::routes()).merge(durable::routes())
 }
 
 /// The HTTP state, re-exported under the name the panel modules see it as:
 /// from `r2.rs`/`durable.rs`, `super` is this module, so `super::AppState`
 /// would not resolve without this alias.
 pub(crate) type AppState = super::AppState;
+
+/// A console-data error: `{error, message, user_message}` with
+/// `Cache-Control: no-store`, matching the console-actions contract. The UI
+/// shows `user_message` when present, else `message`.
+pub(crate) fn data_error(
+    status: StatusCode,
+    error: &str,
+    message: impl Into<String>,
+    user_message: Option<String>,
+) -> Response {
+    let message = message.into();
+    let user_message = user_message.unwrap_or_else(|| message.clone());
+    (
+        status,
+        [
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+            ("content-type", "application/json"),
+        ],
+        json!({"error": error, "message": message, "user_message": user_message}).to_string(),
+    )
+        .into_response()
+}
+
+/// Success JSON with `Cache-Control: no-store`.
+pub(crate) fn data_json(status: StatusCode, value: serde_json::Value) -> Response {
+    (
+        status,
+        [
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+            ("content-type", "application/json"),
+        ],
+        value.to_string(),
+    )
+        .into_response()
+}
 
 /// Session + same-origin + owner-scoped app lookup. Foreign or unknown
 /// slugs answer 404 exactly like a missing one (spec §8.2).
@@ -77,58 +113,57 @@ pub(crate) fn deploy_settings(
         .ok_or_else(|| anyhow::anyhow!("storage panels are unavailable in this build"))
 }
 
-/// The authoritative deployed manifest, read from the bucket at request
-/// time: `fleets/{slug}/deploy/current.json` names the live deploy's
-/// `prefix`, and `fleets/{slug}/{prefix}/manifest.json` carries celld's own
-/// record of it — `raw_metadata.bindings` (R2/D1/…) plus top-level
-/// `do_classes`/`sqlite_classes`. The local `work/{slug}/dist/wrangler.json`
-/// is only a build artifact (wiped by sleeps and failed builds), so it is
-/// just the fallback when the manifest is missing.
+/// The deploy pointer celld publishes per upload: `deploy/current.json`
+/// carries the versioned `prefix`, and the authoritative deployed config is
+/// the manifest at `fleets/{slug}/{prefix}/manifest.json`. There is no
+/// `fleets/{slug}/wrangler.json` in the bucket, and the worktree
+/// `dist/wrangler.json` is a wipeable build artifact — so the manifest is
+/// the only source of truth. This is the ONE manifest reader for every
+/// data panel: D1 parses `raw_metadata.bindings` type-d1 entries out of
+/// it, R2 parses `r2_bucket` entries, DO parses top-level
+/// `do_classes`/`sqlite_classes`. `vars` — which may carry injected secret
+/// values — is never read here and never lands in a response.
 ///
-/// Only binding shapes are parsed out (see the panel parsers); `vars` and
-/// everything else in the manifest are never read, logged or returned.
-pub(crate) async fn deploy_manifest(
-    state: &super::AppState,
+/// A missing pointer or manifest means never-deployed (`None`: D1 answers
+/// `NoConfig`, R2/DO fall back to the local build artifact); malformed JSON
+/// or an unsafe prefix is an error.
+pub(crate) async fn deployed_manifest(
+    store: &crate::store::Store,
     slug: &str,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    let prefix = format!("fleets/{slug}/");
-    let current_key = format!("{prefix}deploy/current.json");
-    let Some(current_bytes) = state.mcp.store.get(&current_key).await? else {
+    let pointer_key = format!("fleets/{slug}/deploy/current.json");
+    let Some(pointer) = store.get(&pointer_key).await? else {
         return Ok(None);
     };
-    let current: serde_json::Value = match serde_json::from_slice(&current_bytes) {
-        Ok(value) => value,
-        Err(e) => {
-            tracing::warn!(slug, error = %format!("{e:#}"), "deploy current.json does not parse; falling back to the local config");
-            return Ok(None);
-        }
-    };
-    let Some(deploy_prefix) = current.get("prefix").and_then(|v| v.as_str()) else {
-        tracing::warn!(
-            slug,
-            "deploy current.json names no prefix; falling back to the local config"
-        );
+    let pointer: serde_json::Value = serde_json::from_slice(&pointer)
+        .map_err(|e| anyhow::anyhow!("parsing deploy pointer: {e:#}"))?;
+    let prefix = pointer
+        .get("prefix")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("deploy pointer has no prefix"))?;
+    validate_prefix(prefix)?;
+    let key = format!("fleets/{slug}/{prefix}/manifest.json");
+    let Some(manifest) = store.get(&key).await? else {
         return Ok(None);
     };
-    if deploy_prefix.is_empty() || deploy_prefix.starts_with('/') || deploy_prefix.contains("..") {
-        anyhow::bail!("deploy current.json names an unsafe prefix");
-    }
-    let manifest_key = format!("{prefix}{deploy_prefix}/manifest.json");
-    let Some(manifest_bytes) = state.mcp.store.get(&manifest_key).await? else {
-        tracing::warn!(
-            slug,
-            "deploy manifest is missing; falling back to the local config"
-        );
-        return Ok(None);
-    };
-    let manifest: serde_json::Value = match serde_json::from_slice(&manifest_bytes) {
-        Ok(value) => value,
-        Err(e) => {
-            tracing::warn!(slug, error = %format!("{e:#}"), "deploy manifest does not parse; falling back to the local config");
-            return Ok(None);
-        }
-    };
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest)
+        .map_err(|e| anyhow::anyhow!("parsing deployed manifest: {e:#}"))?;
     Ok(Some(manifest))
+}
+
+/// The deploy pointer's versioned prefix must stay a relative deploy path:
+/// it becomes a store key suffix, so anything absolute or escaping fails the
+/// read instead of probing an unintended key.
+pub(crate) fn validate_prefix(prefix: &str) -> anyhow::Result<()> {
+    if prefix.is_empty()
+        || prefix.starts_with('/')
+        || prefix.contains("..")
+        || prefix.contains('\\')
+        || prefix.contains('\0')
+    {
+        anyhow::bail!("deploy pointer prefix {prefix:?} is not a relative deploy path");
+    }
+    Ok(())
 }
 
 /// The deploy work dir the built wrangler config is read from at request
@@ -233,66 +268,22 @@ pub(crate) async fn run_celld(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Record a console mutation in `agent_action` with both ids NULL, which the
-/// action log labels client "Console" (CONSOLE-ACTIONS-CONTRACT.md). Unknown
-/// or foreign apps write nothing — callers only reach here past `owned_app`,
-/// so the lookup below always hits.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_console_action(
-    pool: &sqlx::SqlitePool,
-    app_id: &str,
-    account_id: &str,
-    tool: &str,
-    summary: &str,
-    outcome: &str,
-    error_code: Option<&str>,
-    duration_ms: i64,
-) {
-    let summary: String = summary.chars().take(2000).collect();
-    if let Err(err) = sqlx::query(
-        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
-         tool, summary, outcome, error_code, duration_ms, created_at) \
-         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(app_id)
-    .bind(account_id)
-    .bind(tool)
-    .bind(&summary)
-    .bind(outcome)
-    .bind(error_code)
-    .bind(duration_ms)
-    .bind(crate::auth::now_ms())
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(tool, error = %format!("{err:#}"), "console agent_action insert failed");
-    }
-}
-
-/// Error shape for data endpoints: `{error, message, user_message}` per the
-/// console-actions contract. `message` and `user_message` carry the same
-/// text here: every message is built to be safe to show (callers pass
-/// validation failures and celld/S3 failure tails — env values and
-/// credentials never enter them), and the panels surface the detail the
-/// owner needs to act on.
-fn data_error(status: StatusCode, error: &str, message: String) -> Response {
-    (
-        status,
-        [
-            ("cache-control", "no-store"),
-            ("content-type", "application/json"),
-        ],
-        serde_json::json!({"error": error, "message": message, "user_message": message})
-            .to_string(),
-    )
-        .into_response()
-}
+// Console writes audit through `mcp::actions::record_console` (both ids
+// NULL, which the action log labels client "Console"): there is exactly one
+// audit path for every console mutation.
+//
+// Error shape for data endpoints: `{error, message, user_message}` per the
+// console-actions contract. `message` and `user_message` carry the same
+// text here: every message is built to be safe to show (callers pass
+// validation failures and celld/S3 failure tails — env values and
+// credentials never enter them), and the panels surface the detail the
+// owner needs to act on. The shorthands below delegate to [`data_error`] /
+// [`data_json`] above; they are not a second error path.
 
 /// A 400 for a bad bucket, key, prefix or body: the caller's input, so the
 /// message is safe to show.
 pub(crate) fn bad_request(message: impl Into<String>) -> Response {
-    data_error(StatusCode::BAD_REQUEST, "bad_request", message.into())
+    data_error(StatusCode::BAD_REQUEST, "bad_request", message.into(), None)
 }
 
 /// A 500 for a celld/S3 failure: the message carries the failure's tail
@@ -302,22 +293,28 @@ pub(crate) fn unavailable(message: impl Into<String>) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "unavailable",
         message.into(),
+        None,
     )
 }
 
 /// A 404 for a missing object or undeclared bucket/class.
 pub(crate) fn missing(message: impl Into<String>) -> Response {
-    data_error(StatusCode::NOT_FOUND, "not_found", message.into())
+    data_error(StatusCode::NOT_FOUND, "not_found", message.into(), None)
 }
 
 /// A 413 for an object or upload over the cap.
 pub(crate) fn too_large(message: impl Into<String>) -> Response {
-    data_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", message.into())
+    data_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "too_large",
+        message.into(),
+        None,
+    )
 }
 
 /// A 200 JSON answer with the console's `no-store` rules.
 pub(crate) fn ok(body: serde_json::Value) -> Response {
-    ok_json(body).into_response()
+    data_json(StatusCode::OK, body)
 }
 
 #[cfg(test)]

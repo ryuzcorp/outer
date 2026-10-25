@@ -23,9 +23,7 @@ use axum::Router;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use super::{
-    celld_env, console_app, record_console_action, run_celld, scoped_creds, scoped_s3, unavailable,
-};
+use super::{celld_env, console_app, run_celld, scoped_creds, scoped_s3, unavailable};
 
 /// R2's own key bound (1..=1024 bytes).
 const R2_MAX_KEY_BYTES: usize = 1024;
@@ -60,7 +58,7 @@ const SANDBOXED_R2_TYPES: &[&str] = &[
     "text/xml",
 ];
 
-pub fn router() -> Router<super::AppState> {
+pub fn routes() -> Router<super::AppState> {
     Router::new()
         .route("/api/console/apps/{slug}/data/r2/buckets", get(api_buckets))
         .route("/api/console/apps/{slug}/data/r2/list", get(api_list))
@@ -550,7 +548,7 @@ pub(crate) fn parse_manifest_r2(manifest: &serde_json::Value) -> Vec<R2Bucket> {
 async fn declared_buckets(state: &super::AppState, slug: &str) -> anyhow::Result<Vec<R2Bucket>> {
     // The bucket manifest is authoritative whenever present; the local
     // build artifact is only the fallback when it is missing.
-    if let Some(manifest) = super::deploy_manifest(state, slug).await? {
+    if let Some(manifest) = super::deployed_manifest(&state.mcp.store, slug).await? {
         return Ok(parse_manifest_r2(&manifest));
     }
     let Some(value) = super::built_config_value(state, slug)? else {
@@ -772,14 +770,13 @@ async fn api_put(
         Ok(pair) => pair,
         Err(res) => return res,
     };
-    let started = std::time::Instant::now();
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     match put_inner(&state, &app.slug, &query, content_type.as_deref(), body).await {
         Ok(size) => {
-            record_console_action(
+            crate::mcp::actions::record_console(
                 &state.mcp.pool,
                 &app.id,
                 &account.id,
@@ -787,14 +784,13 @@ async fn api_put(
                 &format!("r2_put {} {} ({} bytes)", query.bucket, query.key, size),
                 "ok",
                 None,
-                started.elapsed().as_millis() as i64,
             )
             .await;
             super::ok(serde_json::json!({"key": query.key, "size": size}))
         }
         Err(err) => {
             let msg = format!("{err:#}");
-            record_console_action(
+            crate::mcp::actions::record_console(
                 &state.mcp.pool,
                 &app.id,
                 &account.id,
@@ -802,7 +798,6 @@ async fn api_put(
                 &format!("r2_put {} {}", query.bucket, query.key),
                 "error",
                 None,
-                started.elapsed().as_millis() as i64,
             )
             .await;
             status_for(&msg)
@@ -864,10 +859,9 @@ async fn api_delete(
         Ok(pair) => pair,
         Err(res) => return res,
     };
-    let started = std::time::Instant::now();
     match delete_inner(&state, &app.slug, &body).await {
         Ok(count) => {
-            record_console_action(
+            crate::mcp::actions::record_console(
                 &state.mcp.pool,
                 &app.id,
                 &account.id,
@@ -875,14 +869,13 @@ async fn api_delete(
                 &format!("r2_delete {} ({} keys)", body.bucket, count),
                 "ok",
                 None,
-                started.elapsed().as_millis() as i64,
             )
             .await;
             super::ok(serde_json::json!({"deleted": count}))
         }
         Err(err) => {
             let msg = format!("{err:#}");
-            record_console_action(
+            crate::mcp::actions::record_console(
                 &state.mcp.pool,
                 &app.id,
                 &account.id,
@@ -890,7 +883,6 @@ async fn api_delete(
                 &format!("r2_delete {}", body.bucket),
                 "error",
                 None,
-                started.elapsed().as_millis() as i64,
             )
             .await;
             status_for(&msg)

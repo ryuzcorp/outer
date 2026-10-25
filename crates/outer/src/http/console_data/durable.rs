@@ -36,7 +36,7 @@ const PROBE_MAX_CHARS: usize = 2000;
 /// cannot grow the response without limit.
 const MAX_INSTANCES: usize = 2000;
 
-pub fn router() -> Router<super::AppState> {
+pub fn routes() -> Router<super::AppState> {
     Router::new()
         .route("/api/console/apps/{slug}/data/do/classes", get(api_classes))
         .route(
@@ -236,7 +236,7 @@ pub(crate) fn parse_manifest_do(manifest: &serde_json::Value) -> Vec<DoBinding> 
 async fn declared_classes(state: &super::AppState, slug: &str) -> anyhow::Result<Vec<DoBinding>> {
     // The bucket manifest is authoritative whenever present; the local
     // build artifact is only the fallback when it is missing.
-    if let Some(manifest) = super::deploy_manifest(state, slug).await? {
+    if let Some(manifest) = super::deployed_manifest(&state.mcp.store, slug).await? {
         return Ok(parse_manifest_do(&manifest));
     }
     let Some(value) = super::built_config_value(state, slug)? else {

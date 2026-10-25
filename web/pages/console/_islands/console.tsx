@@ -75,6 +75,7 @@ import {
 
 import {
   CopyButton,
+  DATA_VIEWS,
   RANGES,
   VIEWS,
   readRoute,
@@ -84,6 +85,8 @@ import {
   type Route,
   type ViewId,
 } from "./common.tsx";
+import { DoView } from "./data/do/view.tsx";
+import { R2View } from "./data/r2/view.tsx";
 
 // --- Shared bits -------------------------------------------------------------
 
@@ -169,6 +172,8 @@ const VIEW_TITLES: Record<ViewId, string> = {
   connections: "Connections & keys",
   usage: "Usage & plan",
   account: "Account",
+  r2: "R2",
+  do: "Durable Objects",
 };
 
 /** Shell UI state: sidebar collapse, mobile drawer, popovers, expanded deploy rows. */
@@ -247,6 +252,8 @@ export function Console() {
       case "account":
       case "invites":
       case "admin":
+      case "r2":
+      case "do":
         return [];
     }
   }
@@ -1269,22 +1276,33 @@ export function Console() {
                   </li>
                 ))}
                 <li class="menu-title text-xs font-medium uppercase tracking-wider">Data</li>
-                {/* D1 is owner-only in v1 (every endpoint 403s for collaborators). */}
+                {/* R2, Durable Objects and D1 are owner-only in v1 (every endpoint 403s for collaborators). */}
                 {active.role === "owner" && (
-                  <D1Nav
-                    active={r.view === "d1"}
-                    route={r}
-                    setRoute={(next) => navigate(next)}
-                    slug={active.slug}
-                  />
+                  <>
+                    <D1Nav
+                      active={r.view === "d1"}
+                      route={r}
+                      setRoute={(next) => navigate(next)}
+                      slug={active.slug}
+                    />
+                    {DATA_VIEWS.map((v) => (
+                      <li key={v.id} class="min-w-0">
+                        <button
+                          type="button"
+                          class={r.view === v.id ? "menu-active min-w-0" : "min-w-0"}
+                          aria-current={r.view === v.id ? "page" : undefined}
+                          onclick={() => navigate({ view: v.id })}
+                        >
+                          <DatabaseIcon />
+                          <span class="min-w-0 flex-1 truncate">{v.label}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </>
                 )}
-                {(["R2", "Durable Objects"] as const).map((name) => (
-                  <li key={name} class="menu-disabled min-w-0" title="Coming later">
-                    <span class="min-w-0">
                       <DatabaseIcon />
-                      <span class="truncate">{name}</span>
-                      <span class="badge badge-soft badge-sm ml-auto shrink-0">Soon</span>
-                    </span>
+                      <span class="min-w-0 flex-1 truncate">{v.label}</span>
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -1352,6 +1370,9 @@ function ViewIcon({ id }: { id: ViewId }) {
       return <MetricsIcon />;
     case "account":
       return <AccountIcon />;
+    case "r2":
+    case "do":
+      return <DatabaseIcon />;
   }
 }
 
@@ -1477,5 +1498,9 @@ function ViewBody(props: {
       />
       )
       );
+    case "r2":
+      return <R2View slug={props.app.slug} />;
+    case "do":
+      return <DoView slug={props.app.slug} />;
   }
 }

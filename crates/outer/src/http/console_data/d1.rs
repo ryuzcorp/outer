@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path as FsPath;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -74,15 +74,6 @@ pub const MIN_PAGE_SIZE: i64 = 1;
 pub const MAX_PAGE_SIZE: i64 = 100;
 /// `celld d1 execute` budget, matching Noite's 30 s.
 pub const D1_TIMEOUT: Duration = Duration::from_secs(30);
-/// The deploy pointer celld publishes per upload: `deploy/current.json` carries
-/// the versioned `prefix`, and the authoritative deployed config is the manifest
-/// at `fleets/{slug}/{prefix}/manifest.json`. There is no
-/// `fleets/{slug}/wrangler.json` in the bucket, and the worktree
-/// `dist/wrangler.json` is a wipeable build artifact — so the manifest is the
-/// only source of truth. A missing pointer or manifest means never-deployed.
-fn deploy_pointer_key(slug: &str) -> String {
-    format!("fleets/{slug}/deploy/current.json")
-}
 
 // ---------------------------------------------------------------------------
 // Wire types (snake_case, matching the console's other APIs)
@@ -752,21 +743,6 @@ fn synthesize_config(manifest: &serde_json::Value, dbs: &[D1Database]) -> anyhow
     Ok(serde_json::to_vec(&serde_json::Value::Object(config))?)
 }
 
-/// The deploy pointer's versioned prefix must stay a relative deploy path:
-/// it becomes a store key suffix, so anything absolute or escaping fails the
-/// read instead of probing an unintended key.
-fn validate_prefix(prefix: &str) -> anyhow::Result<()> {
-    if prefix.is_empty()
-        || prefix.starts_with('/')
-        || prefix.contains("..")
-        || prefix.contains('\\')
-        || prefix.contains('\0')
-    {
-        anyhow::bail!("deploy pointer prefix {prefix:?} is not a relative deploy path");
-    }
-    Ok(())
-}
-
 /// Declared databases plus the synthesized cwd config, read from the live
 /// manifest via the scoped store. A missing pointer or manifest means
 /// never-deployed (`NoConfig`: the existing "not deployed yet" answer);
@@ -777,31 +753,12 @@ struct DeployedState {
 }
 
 async fn deployed_state(ctx: &D1Ctx, slug: &str) -> Result<DeployedState, D1Error> {
-    let pointer = ctx
-        .store
-        .get(&deploy_pointer_key(slug))
+    let manifest = super::deployed_manifest(&ctx.store, slug)
         .await
-        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("reading deploy pointer: {e:#}")))?;
-    let Some(pointer) = pointer else {
-        return Err(D1Error::NoConfig);
-    };
-    let pointer: serde_json::Value = serde_json::from_slice(&pointer)
-        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing deploy pointer: {e:#}")))?;
-    let prefix = pointer
-        .get("prefix")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| D1Error::Unavailable(anyhow::anyhow!("deploy pointer has no prefix")))?;
-    validate_prefix(prefix).map_err(D1Error::Unavailable)?;
-    let key = format!("fleets/{slug}/{prefix}/manifest.json");
-    let manifest =
-        ctx.store.get(&key).await.map_err(|e| {
-            D1Error::Unavailable(anyhow::anyhow!("reading deployed manifest: {e:#}"))
-        })?;
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("reading deployed manifest: {e:#}")))?;
     let Some(manifest) = manifest else {
         return Err(D1Error::NoConfig);
     };
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest)
-        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing deployed manifest: {e:#}")))?;
     let dbs = manifest_dbs(&manifest)
         .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("parsing d1 bindings: {e:#}")))?;
     let config = synthesize_config(&manifest, &dbs).map_err(|e| {
@@ -1350,43 +1307,10 @@ pub async fn delete_rows(
 // Audit
 // ---------------------------------------------------------------------------
 
-/// Record a console D1 write in `agent_action` like an MCP call, with NULL
-/// consent and API key IDs so the action log labels it client "Console".
-/// Summaries never carry values — only the op, table and key count.
-struct ConsoleAudit {
-    tool: &'static str,
-    summary: String,
-    outcome: &'static str,
-    error_code: Option<&'static str>,
-    duration_ms: i64,
-}
-
-async fn record_console_action(
-    pool: &SqlitePool,
-    app_id: &str,
-    user_id: &str,
-    audit: ConsoleAudit,
-) {
-    if let Err(err) = sqlx::query(
-        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
-         tool, summary, outcome, error_code, duration_ms, created_at) \
-         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(app_id)
-    .bind(user_id)
-    .bind(audit.tool)
-    .bind(audit.summary)
-    .bind(audit.outcome)
-    .bind(audit.error_code)
-    .bind(audit.duration_ms)
-    .bind(crate::auth::now_ms())
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(app = %app_id, tool = audit.tool, error = %format!("{err:#}"), "agent_action insert failed");
-    }
-}
+// Console D1 writes audit through `mcp::actions::record_console` (both ids
+// NULL, which the action log labels client "Console"): one audit path for
+// every console mutation. Summaries never carry values — only the op, table
+// and key count.
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -1614,7 +1538,6 @@ async fn api_write(
         Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
-    let started = Instant::now();
     let outcome = write_row(&ctx, &app, &binding, &table, &body).await;
     let op = match body.op {
         D1WriteOp::Insert => "insert",
@@ -1655,17 +1578,14 @@ async fn api_write(
         | Err(D1Error::UnknownDatabase(_)) => ("error", Some("invalid_argument")),
         Err(_) => ("error", Some("d1_unavailable")),
     };
-    record_console_action(
+    crate::mcp::actions::record_console(
         &ctx.pool,
         &app.id,
         &account.id,
-        ConsoleAudit {
-            tool: "d1_write",
-            summary,
-            outcome: o,
-            error_code: code,
-            duration_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-        },
+        "d1_write",
+        &summary,
+        o,
+        code,
     )
     .await;
     d1_response(result)
@@ -1687,7 +1607,6 @@ async fn api_delete_rows(
         Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
-    let started = Instant::now();
     let keys = body.keys.len();
     let outcome = delete_rows(&ctx, &app, &binding, &table, &body.keys).await;
     let (summary, result) = match &outcome {
@@ -1722,17 +1641,14 @@ async fn api_delete_rows(
         | Err(D1Error::UnknownDatabase(_)) => ("error", Some("invalid_argument")),
         Err(_) => ("error", Some("d1_unavailable")),
     };
-    record_console_action(
+    crate::mcp::actions::record_console(
         &ctx.pool,
         &app.id,
         &account.id,
-        ConsoleAudit {
-            tool: "d1_delete_rows",
-            summary,
-            outcome: o,
-            error_code: code,
-            duration_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-        },
+        "d1_delete_rows",
+        &summary,
+        o,
+        code,
     )
     .await;
     d1_response(result)
