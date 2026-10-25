@@ -772,12 +772,17 @@ async fn deployed_state(ctx: &D1Ctx, slug: &str) -> Result<DeployedState, D1Erro
     Ok(DeployedState { dbs, config })
 }
 
-/// The celld identity for `binding`: the declared `database_id` when present,
-/// else `database_name` (the same resolution `celld d1 --help` documents).
+/// The argv name celld gets for `binding`: always the `database_name`, exactly
+/// as `deploy::migrate` passes it. celld resolves the real identity
+/// (`database_id` when declared) from the synthesized cwd config. Only the
+/// name reaches argv because only the name is validated against option
+/// injection (`migrate::validate_database_name` refuses a leading `-`); a
+/// `database_id` is app-authored and merely length-checked, and celld 0.6.2
+/// honors no `--` separator.
 fn identity_for(dbs: &[D1Database], binding: &str) -> Result<String, D1Error> {
     dbs.iter()
         .find(|db| db.binding == binding)
-        .map(|db| db.effective_identity().to_string())
+        .map(|db| db.database_name.clone())
         .ok_or_else(|| D1Error::UnknownDatabase(binding.to_string()))
 }
 
@@ -2090,8 +2095,15 @@ mod tests {
     }
 
     #[test]
-    fn identity_prefers_database_id() {
-        assert_eq!(identity_for(&dbs(), "DB").unwrap(), "abc-123");
+    fn argv_identity_is_always_the_validated_name() {
+        // `DB` declares a database_id; argv still carries the name, never the id.
+        let name = dbs()
+            .into_iter()
+            .find(|d| d.binding == "DB")
+            .unwrap()
+            .database_name;
+        assert_eq!(identity_for(&dbs(), "DB").unwrap(), name);
+        assert_ne!(identity_for(&dbs(), "DB").unwrap(), "abc-123");
         assert_eq!(identity_for(&dbs(), "PLAIN").unwrap(), "plain-db");
     }
 
@@ -2458,7 +2470,7 @@ exit 0
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let (identity, tables) = list_tables(&ctx, &app, "DB").await.unwrap();
-        assert_eq!(identity, "abc-123");
+        assert_eq!(identity, "app-db");
         // Only the visible table survives; internals and views are dropped.
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "users");
@@ -2467,7 +2479,7 @@ exit 0
         // Exact command line: scoped bucket, endpoint, region, JSON.
         assert!(
             first.starts_with(&format!(
-                "d1 execute abc-123 --command PRAGMA table_list --json --bucket s3://{}/fleets/acme --endpoint http://127.0.0.1:1 --region test-region",
+                "d1 execute app-db --command PRAGMA table_list --json --bucket s3://{}/fleets/acme --endpoint http://127.0.0.1:1 --region test-region",
                 state.path().display()
             )),
             "{first}"
