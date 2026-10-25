@@ -18,6 +18,7 @@
 // - Errors reject with an Error carrying the server's `user_message`.
 // - Untrusted results pass through as-is, flagged via the annotation.
 import { allActions, type AnyAction } from "./actions/index.ts";
+import type { ActionContext } from "./actions/settings.ts";
 
 export interface WebMcpAnnotations {
   readOnlyHint: boolean;
@@ -146,19 +147,66 @@ export type ConfirmFn = (
   signal?: AbortSignal,
 ) => Promise<void>;
 
-let confirmHandler: ConfirmFn | null = null;
+/** One consequential run waiting on the console's Confirm/Cancel modal. */
+export interface ConfirmEntry {
+  action: AnyAction;
+  input: Record<string, unknown>;
+  resolve: () => void;
+  reject: (err: Error) => void;
+}
 
-/** The Console island sets the daisyUI-modal confirm handler on mount. */
-export function setWebMcpConfirm(fn: ConfirmFn | null): void {
-  confirmHandler = fn;
+/**
+ * Build the daisyUI-modal confirm handler the Console island puts in its
+ * execute context: shows the modal, resolves on Confirm, rejects on
+ * Cancel/abort. A second request while one is pending is rejected so the
+ * first never orphans; abort clears the entry only while it is still this
+ * request's.
+ */
+export function createConfirmHandler(
+  read: () => ConfirmEntry | null,
+  write: (next: ConfirmEntry | null) => void,
+): ConfirmFn {
+  return (action, input, signal) =>
+    new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error("The tool call was aborted before confirmation."));
+        return;
+      }
+      if (read() !== null) {
+        reject(new Error("Another action is waiting for confirmation in the console."));
+        return;
+      }
+      const onAbort = (): void => {
+        if (read() === entry) {
+          write(null);
+        }
+        reject(new Error("The tool call was aborted."));
+      };
+      const entry: ConfirmEntry = {
+        action,
+        input,
+        resolve: () => {
+          signal?.removeEventListener("abort", onAbort);
+          write(null);
+          resolve();
+        },
+        reject: (err: Error) => {
+          signal?.removeEventListener("abort", onAbort);
+          write(null);
+          reject(err);
+        },
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      write(entry);
+    });
 }
 
 function confirmWithAbort(
   action: AnyAction,
   input: Record<string, unknown>,
+  confirm: ConfirmFn | null | undefined,
   signal?: AbortSignal,
 ): Promise<void> {
-  const confirm = confirmHandler;
   if (!confirm) {
     return Promise.reject(
       new Error(
@@ -194,8 +242,10 @@ function abortedError(): Error {
   return new Error("The tool call was aborted.");
 }
 
-export interface ExecuteContext {
+export interface ExecuteContext extends ActionContext {
   getSlug: () => string | null;
+  /** The console modal gate for consequential runs; absent outside the island. */
+  confirm?: ConfirmFn | null;
 }
 
 /**
@@ -213,10 +263,10 @@ export async function executeAction(
   }
   const input = applyDefaults(action, rawInput, ctx.getSlug());
   if (action.consequential) {
-    await confirmWithAbort(action, input, signal);
+    await confirmWithAbort(action, input, ctx.confirm, signal);
   }
   try {
-    return await action.run(input, signal);
+    return await action.run(input, ctx, signal);
   } catch (err: unknown) {
     // The console `run` helpers already throw the server's
     // `user_message` as the message; pass it through unchanged.

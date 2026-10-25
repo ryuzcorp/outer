@@ -3,6 +3,7 @@
 // `actions/*.ts` modules so the later ⌘K and WebMCP layer can import it
 // as-is. Log and error content is app/user text, so every entry that
 // returns it sets `untrusted: true`.
+import type { ActionContext } from "./settings.ts";
 import type {
   ErrorCounts,
   ErrorIssue,
@@ -21,23 +22,12 @@ export interface ConsoleAction<I, O> {
   readOnly: boolean;
   consequential: boolean;
   untrusted: boolean;
-  run(input: I, signal?: AbortSignal): Promise<O>;
+  run(input: I, ctx?: ActionContext, signal?: AbortSignal): Promise<O>;
 }
 
-// A fingerprint picked in Logs ("View issue"): the Errors view consumes it
-// on mount and expands it. A plain variable, not an atom: Ilha primitives
-// only run inside components.
-let pendingJump: string | null = null;
-
-export function setJumpToIssue(fingerprint: string): void {
-  pendingJump = fingerprint;
-}
-
-export function consumeJumpToIssue(): string | null {
-  const jump = pendingJump;
-  pendingJump = null;
-  return jump;
-}
+// The Logs→Errors "View issue" handoff carries no module state: the
+// Console island owns the pending fingerprint and passes it to the
+// Errors view as props (see console.tsx).
 
 function slugSchema(extra: Record<string, unknown> = {}): object {
   return {
@@ -127,7 +117,7 @@ const query_logs: ConsoleAction<QueryLogsInput, LogsPage> = {
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run({ slug, ...filter }: QueryLogsInput, signal?: AbortSignal): Promise<LogsPage> {
+  run({ slug, ...filter }: QueryLogsInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<LogsPage> {
     return request<LogsPage>(logsPath(slug, filter), undefined, signal);
   },
 };
@@ -148,7 +138,7 @@ const list_errors: ConsoleAction<ListErrorsInput, ErrorsSummary> = {
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run(input: ListErrorsInput, signal?: AbortSignal): Promise<ErrorsSummary> {
+  run(input: ListErrorsInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<ErrorsSummary> {
     const qs = input.status ? `?status=${encodeURIComponent(input.status)}` : "";
     return request<ErrorsSummary>(`/api/console/apps/${encodeURIComponent(input.slug)}/errors${qs}`, undefined, signal);
   },
@@ -170,7 +160,7 @@ const error_detail: ConsoleAction<ErrorDetailInput, IssueDetail> = {
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run(input: ErrorDetailInput, signal?: AbortSignal): Promise<IssueDetail> {
+  run(input: ErrorDetailInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<IssueDetail> {
     return request<IssueDetail>(
       `/api/console/apps/${encodeURIComponent(input.slug)}/errors/${encodeURIComponent(input.fingerprint)}`,
       undefined,
@@ -208,7 +198,7 @@ function triageAction(
     consequential: false,
     // The answer echoes only the fingerprint and status, never app text.
     untrusted: false,
-    run(input: TriageInput, signal?: AbortSignal): Promise<TriageResult> {
+    run(input: TriageInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<TriageResult> {
       return request<TriageResult>(
         `/api/console/apps/${encodeURIComponent(input.slug)}/errors/${encodeURIComponent(input.fingerprint)}/${segment}`,
         { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
@@ -241,7 +231,7 @@ const bulk_triage: ConsoleAction<BulkTriageInput, BulkTriageResult> = {
   readOnly: false,
   consequential: false,
   untrusted: false,
-  run(input: BulkTriageInput, signal?: AbortSignal): Promise<BulkTriageResult> {
+  run(input: BulkTriageInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<BulkTriageResult> {
     return request<BulkTriageResult>(`/api/console/apps/${encodeURIComponent(input.slug)}/errors/bulk`, {
       method: "POST",
       headers: { "content-type": "application/json" },

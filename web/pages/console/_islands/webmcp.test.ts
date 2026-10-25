@@ -5,20 +5,23 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { allActions, findAction, type AnyAction } from "./actions/index.ts";
-import { consoleActions, setConsoleBridge } from "./actions/console.ts";
+import { consoleActions } from "./actions/console.ts";
+import type { ActionContext, ConsoleBridge } from "./actions/settings.ts";
 import type { ConsoleApp } from "./api.ts";
 import type { Route } from "./common.tsx";
-import { actionView, isRunnable, matchScore } from "./palette.tsx";
+import { actionView, isRunnable, matchScore, searchEntries, type ItemGroup } from "./palette.tsx";
 import {
   applyDefaults,
+  createConfirmHandler,
   executeAction,
   registerAllWebMcp,
   resetWebMcpSync,
-  setWebMcpConfirm,
   syncWebMcp,
   toAnnotations,
   webMcpDescription,
   webMcpSchema,
+  type ConfirmEntry,
+  type ExecuteContext,
 } from "./webmcp.ts";
 
 function fakeAction(overrides: Partial<AnyAction> = {}): AnyAction {
@@ -54,8 +57,6 @@ function unstub(): void {
 afterEach(() => {
   unstub();
   resetWebMcpSync();
-  setWebMcpConfirm(null);
-  setConsoleBridge(null);
 });
 
 describe("registry", () => {
@@ -159,18 +160,23 @@ describe("confirm gate", () => {
         return input;
       },
     });
-    const ctx = { getSlug: () => "groceries" };
-    setWebMcpConfirm(null);
-    await expect(executeAction(action, {}, ctx)).rejects.toThrow();
+    const noConfirm: ExecuteContext = { getSlug: () => "groceries" };
+    await expect(executeAction(action, {}, noConfirm)).rejects.toThrow();
     expect(ran).toBe(0);
-    setWebMcpConfirm(async () => {});
-    const out = await executeAction(action, {}, ctx);
+    const autoConfirm: ExecuteContext = {
+      getSlug: () => "groceries",
+      confirm: async () => {},
+    };
+    const out = await executeAction(action, {}, autoConfirm);
     expect(ran).toBe(1);
     expect(out).toEqual({ slug: "groceries" });
-    setWebMcpConfirm(async () => {
-      throw new Error('"fake_action" was cancelled — nothing ran.');
-    });
-    await expect(executeAction(action, {}, ctx)).rejects.toThrow("cancelled");
+    const deny: ExecuteContext = {
+      getSlug: () => "groceries",
+      confirm: async () => {
+        throw new Error('"fake_action" was cancelled — nothing ran.');
+      },
+    };
+    await expect(executeAction(action, {}, deny)).rejects.toThrow("cancelled");
     expect(ran).toBe(1);
   });
 
@@ -184,13 +190,16 @@ describe("confirm gate", () => {
         return {};
       },
     });
-    setWebMcpConfirm(async () => {
-      confirmed = true;
-    });
+    const ctx: ExecuteContext = {
+      getSlug: () => "groceries",
+      confirm: async () => {
+        confirmed = true;
+      },
+    };
     const controller = new AbortController();
     controller.abort();
     await expect(
-      executeAction(action, {}, { getSlug: () => "groceries" }, controller.signal),
+      executeAction(action, {}, ctx, controller.signal),
     ).rejects.toThrow("abort");
     expect(ran).toBe(0);
     expect(confirmed).toBe(false);
@@ -213,6 +222,74 @@ describe("confirm gate", () => {
     const required: unknown = "required" in presented ? presented.required : [];
     expect(Array.isArray(required) && !required.includes("slug")).toBe(true);
     expect(action.inputSchema).toMatchObject({ required: ["slug", "sha"] });
+  });
+});
+
+describe("confirm handler", () => {
+  function store(): {
+    current: ConfirmEntry | null;
+    confirm: (
+      action: AnyAction,
+      input: Record<string, unknown>,
+      signal?: AbortSignal,
+    ) => Promise<void>;
+    write: (next: ConfirmEntry | null) => void;
+  } {
+    const box: { current: ConfirmEntry | null } = { current: null };
+    const confirm = createConfirmHandler(
+      () => box.current,
+      (next) => {
+        box.current = next;
+      },
+    );
+    return {
+      get current() {
+        return box.current;
+      },
+      confirm,
+      write: (next) => {
+        box.current = next;
+      },
+    };
+  }
+
+  test("a second request rejects while one is pending", async () => {
+    const s = store();
+    const action = fakeAction({ consequential: true });
+    const first = s.confirm(action, { slug: "groceries" });
+    expect(s.current).not.toBeNull();
+    await expect(s.confirm(action, { slug: "groceries" })).rejects.toThrow(
+      "Another action is waiting",
+    );
+    s.current!.resolve();
+    await first;
+    expect(s.current).toBeNull();
+  });
+
+  test("abort clears the entry only while it is still this request's", async () => {
+    const s = store();
+    const action = fakeAction({ consequential: true });
+    const controller = new AbortController();
+    const pending = s.confirm(action, { slug: "groceries" }, controller.signal);
+    // A newer entry takes the slot; aborting the old signal must not clear it.
+    const newer: ConfirmEntry = {
+      action,
+      input: {},
+      resolve: () => {},
+      reject: () => {},
+    };
+    s.write(newer);
+    controller.abort();
+    await expect(pending).rejects.toThrow("aborted");
+    expect(s.current).toBe(newer);
+    // Aborting while current clears the slot.
+    s.write(null);
+    const controller2 = new AbortController();
+    const pending2 = s.confirm(action, { slug: "groceries" }, controller2.signal);
+    expect(s.current).not.toBe(newer);
+    controller2.abort();
+    await expect(pending2).rejects.toThrow("aborted");
+    expect(s.current).toBeNull();
   });
 });
 
@@ -297,39 +374,68 @@ describe("console bridge", () => {
     dview: "",
   };
 
-  test("actions reject before the island mounts", async () => {
-    await expect(consoleActions.consoleState.run({} as never)).rejects.toThrow(
-      "not ready",
-    );
-  });
-
-  test("state, open_app and open_view drive the island", async () => {
-    const navigated: Partial<Route>[] = [];
-    setConsoleBridge({
+  function bridgeCtx(navigated: Partial<Route>[]): ExecuteContext & { bridge: ConsoleBridge } {
+    const bridge: ConsoleBridge = {
       getEmail: () => "ana@example.com",
       getRoute: () => route,
       getApps: () => apps,
       navigate: (next) => {
         navigated.push(next);
       },
-    });
-    const state = await consoleActions.consoleState.run({} as never);
+    };
+    return { getSlug: () => route.app, bridge };
+  }
+
+  test("actions reject without a bridge", async () => {
+    await expect(
+      consoleActions.consoleState.run({} as never, undefined),
+    ).rejects.toThrow("not ready");
+    await expect(
+      executeAction(consoleActions.consoleState, {}, { getSlug: () => null }),
+    ).rejects.toThrow("not ready");
+  });
+
+  test("state, open_app and open_view drive the island", async () => {
+    const navigated: Partial<Route>[] = [];
+    const ctx = bridgeCtx(navigated);
+    const state = await consoleActions.consoleState.run({} as never, ctx);
     expect(state.email).toBe("ana@example.com");
     expect(state.slug).toBe("groceries");
     expect(state.apps).toEqual([
       { slug: "groceries", role: "owner", status: "running" },
     ]);
-    const opened = await consoleActions.openApp.run({});
+    const opened = await consoleActions.openApp.run({}, ctx);
     expect(opened).toEqual({ slug: "groceries", view: "overview" });
     expect(navigated.at(-1)).toEqual({ app: "groceries", view: "overview" });
-    await expect(consoleActions.openApp.run({ slug: "nope" })).rejects.toThrow(
+    await expect(consoleActions.openApp.run({ slug: "nope" }, ctx)).rejects.toThrow(
       'Unknown app "nope"',
     );
-    const viewed = await consoleActions.openView.run({ view: "deploys" });
+    const viewed = await consoleActions.openView.run({ view: "deploys" }, ctx);
     expect(viewed).toEqual({ slug: "groceries", view: "deploys" });
-    await expect(consoleActions.openView.run({ view: "nope" })).rejects.toThrow(
+    await expect(consoleActions.openView.run({ view: "nope" }, ctx)).rejects.toThrow(
       "Unknown view",
     );
+  });
+
+  test("open_view rejects values outside the schema", async () => {
+    const ctx = bridgeCtx([]);
+    await expect(
+      consoleActions.openView.run({ view: "code", codeTab: "foo" } as never, ctx),
+    ).rejects.toThrow('Unknown codeTab "foo"');
+    await expect(
+      consoleActions.openView.run({ view: "code", sha: 42 } as never, ctx),
+    ).rejects.toThrow("sha must be a string");
+    await expect(
+      consoleActions.openView.run({ view: "d1", db: 7 } as never, ctx),
+    ).rejects.toThrow("db must be a string");
+    await expect(
+      consoleActions.openView.run({ view: "d1", table: null } as never, ctx),
+    ).rejects.toThrow("table must be a string");
+    const viewed = await consoleActions.openView.run(
+      { view: "code", codeTab: null, sha: null },
+      ctx,
+    );
+    expect(viewed).toEqual({ slug: "groceries", view: "code" });
   });
 });
 
@@ -364,5 +470,46 @@ describe("palette", () => {
     const atStart = matchScore("Logs query", "logs");
     const later = matchScore("Query logs", "logs");
     expect(atStart).toBeLessThan(later);
+  });
+  test("search keeps group order so headers don't repeat", () => {
+    const groups: ItemGroup[] = [
+      {
+        title: "Apps",
+        items: [
+          { kind: "app", key: "app:my-code", title: "my code app", sub: "running" },
+          { kind: "app", key: "app:code", title: "code", sub: "running" },
+        ],
+      },
+      {
+        title: "Views",
+        items: [
+          {
+            kind: "view",
+            key: "view:code",
+            title: "code",
+            sub: "Go to code",
+            view: "code",
+          },
+        ],
+      },
+      {
+        title: "Actions",
+        items: [
+          {
+            kind: "action",
+            key: "action:code_read_file",
+            title: "code read file",
+            sub: "Open code",
+            action: findAction("code_read_file")!,
+            runnable: false,
+          },
+        ],
+      },
+    ];
+    const entries = searchEntries(groups, "code");
+    // Group order first, even though the action title starts with the query.
+    expect(entries.map((e) => e.group)).toEqual(["Apps", "Apps", "Views", "Actions"]);
+    // Score still ranks within the group: the title-start hit leads.
+    expect(entries[0].item.title).toBe("code");
   });
 });

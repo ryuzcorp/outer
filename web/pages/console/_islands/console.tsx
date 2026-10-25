@@ -65,19 +65,18 @@ import {
 import { CodeView } from "./views/code.tsx";
 import { D1Nav, D1View } from "./views/d1.tsx";
 
-import { setConsoleBridge } from "./actions/console.ts";
+import type { ConsoleBridge } from "./actions/settings.ts";
 import { domainActions } from "./actions/domains.ts";
-import type { AnyAction } from "./actions/index.ts";
 import { Palette } from "./palette.tsx";
 import {
-  setWebMcpConfirm,
+  createConfirmHandler,
   syncWebMcp,
+  type ConfirmEntry,
   type ExecuteContext,
 } from "./webmcp.ts";
 import { secretsActions } from "./actions/secrets.ts";
 import { ErrorsView } from "./views/errors.tsx";
 import { LogsView } from "./views/logs.tsx";
-import { setJumpToIssue } from "./actions/observe.ts";
 import {
   AccountView,
   ConnectionsView,
@@ -197,14 +196,6 @@ interface Ui {
   paletteOpen: boolean;
 }
 
-/** A consequential WebMCP/palette run waiting on Confirm/Cancel in the daisyUI modal below. */
-interface PendingConfirm {
-  action: AnyAction;
-  input: Record<string, unknown>;
-  resolve: () => void;
-  reject: (err: Error) => void;
-}
-
 /** The modal names the target, not just the action: first concrete input wins. */
 function confirmTargetOf(input: Record<string, unknown>): string {
   const keys = ["slug", "app", "email", "name", "prefix", "id", "fingerprint", "sha", "bucket", "table"];
@@ -247,8 +238,27 @@ export function Console() {
     expanded: [],
     paletteOpen: false,
   });
-  const pendingConfirm = atom<PendingConfirm | null>(null);
-  const webmcpCtx: ExecuteContext = { getSlug: () => route().app };
+  const pendingConfirm = atom<ConfirmEntry | null>(null);
+  // A fingerprint picked in Logs ("View issue"): the Errors view consumes
+  // it on mount and expands it. Owned here, passed down as props.
+  const pendingJump = atom<string | null>(null);
+  const bridge: ConsoleBridge = {
+    getEmail: () => email(),
+    getRoute: () => route(),
+    getApps: () => {
+      const panel = apps();
+      return panel.kind === "ready" ? panel.value : [];
+    },
+    navigate,
+  };
+  const webmcpCtx: ExecuteContext = {
+    getSlug: () => route().app,
+    bridge,
+    confirm: createConfirmHandler(
+      () => pendingConfirm(),
+      (next) => pendingConfirm.set(next),
+    ),
+  };
 
   // One generation per navigation: late responses from the previous app
   // never repaint the new one (Noite keys its cards per app id instead).
@@ -755,43 +765,10 @@ export function Console() {
         }
         detail.set({ kind: "error", message: String(err) });
       });
-    // ⌘K + WebMCP wiring: the bridge for the navigation actions, the
-    // daisyUI confirm gate for consequential tools, and identity-keyed
-    // registration (re-register on identity change, abort on unload).
-    setConsoleBridge({
-      getEmail: () => email(),
-      getRoute: () => route(),
-      getApps: () => {
-        const panel = apps();
-        return panel.kind === "ready" ? panel.value : [];
-      },
-      navigate,
-    });
-    setWebMcpConfirm((action, input, signal) => new Promise<void>((resolve, reject) => {
-      if (signal?.aborted) {
-        reject(new Error("The tool call was aborted before confirmation."));
-        return;
-      }
-      const onAbort = (): void => {
-        pendingConfirm.set(null);
-        reject(new Error("The tool call was aborted."));
-      };
-      signal?.addEventListener("abort", onAbort, { once: true });
-      pendingConfirm.set({
-        action,
-        input,
-        resolve: () => {
-          signal?.removeEventListener("abort", onAbort);
-          pendingConfirm.set(null);
-          resolve();
-        },
-        reject: (err: Error) => {
-          signal?.removeEventListener("abort", onAbort);
-          pendingConfirm.set(null);
-          reject(err);
-        },
-      });
-    }));
+    // ⌘K + WebMCP wiring: `webmcpCtx` already carries the bridge for the
+    // navigation actions and the daisyUI confirm gate; here only the
+    // identity-keyed registration stays (re-register on identity change,
+    // abort on unload).
     syncWebMcp(email() || null, webmcpCtx);
     window.addEventListener("pagehide", () => {
       syncWebMcp(null, webmcpCtx);
@@ -1328,9 +1305,11 @@ export function Console() {
                         });
                     }}
                     onJumpToIssue={(fingerprint) => {
-                      setJumpToIssue(fingerprint);
+                      pendingJump.set(fingerprint);
                       navigate({ view: "errors" });
                     }}
+                    jumpToIssue={pendingJump()}
+                    onJumpConsumed={() => pendingJump.set(null)}
                     onRetry={reload}
                     onRefreshDetail={refreshDetail}
                     onRenamed={afterRename}
@@ -1601,6 +1580,9 @@ function ViewBody(props: {
   onShowChanges: (sha: string) => void;
   onSwitchCodeTab: (tab: "files" | "changes") => void;
   onJumpToIssue: (fingerprint: string) => void;
+  /** A Logs "View issue" pick for the Errors view to expand, then consume. */
+  jumpToIssue: string | null;
+  onJumpConsumed: () => void;
   onCollaboratorsChanged: () => void;
   onAddDomain: (hostname: string) => Promise<void>;
   onRefreshDomains: () => Promise<void>;
@@ -1668,7 +1650,15 @@ function ViewBody(props: {
         />
       );
     case "errors":
-      return <ErrorsView slug={props.slug} panel={props.errors} onRetry={props.onRetry} />;
+      return (
+        <ErrorsView
+          slug={props.slug}
+          panel={props.errors}
+          onRetry={props.onRetry}
+          jump={props.jumpToIssue}
+          onJumpConsumed={props.onJumpConsumed}
+        />
+      );
     case "secrets":
       return (
         <SecretsView

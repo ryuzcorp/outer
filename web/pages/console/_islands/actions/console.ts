@@ -2,9 +2,9 @@
 // itself, so these three join every other `actions/*.ts` registry in
 // `index.ts` and are exposed through the palette and WebMCP like the rest.
 //
-// They reach the Console island's `navigate` and route state through a
-// small module-level bridge the island sets on mount: a function setter,
-// not an Ilha atom (module-level `atom()` is illegal in Ilha).
+// They reach the Console island's `navigate` and route state through the
+// bridge the island builds on mount and hands down in the execute context:
+// no module state, per the repo's explicit-dependencies rule.
 import {
   ACCOUNT_VIEWS,
   DATA_VIEWS,
@@ -12,28 +12,13 @@ import {
   type Route,
   type ViewId,
 } from "../common.tsx";
-import type { ConsoleApp } from "../api.ts";
-import type { ConsoleAction } from "./settings.ts";
+import type { ActionContext, ConsoleAction, ConsoleBridge } from "./settings.ts";
 
-export interface ConsoleBridge {
-  getEmail: () => string;
-  getRoute: () => Route;
-  getApps: () => ConsoleApp[];
-  navigate: (next: Partial<Route>) => void;
-}
-
-let bridge: ConsoleBridge | null = null;
-
-/** The Console island calls this on mount (and with null never — the page is single-lived). */
-export function setConsoleBridge(next: ConsoleBridge | null): void {
-  bridge = next;
-}
-
-function needBridge(): ConsoleBridge {
-  if (!bridge) {
+function needBridge(ctx: ActionContext | undefined): ConsoleBridge {
+  if (!ctx?.bridge) {
     throw new Error("The console is not ready yet — open it and try again.");
   }
-  return bridge;
+  return ctx.bridge;
 }
 
 const VIEW_IDS: ViewId[] = [
@@ -63,8 +48,8 @@ const consoleState: ConsoleAction<Record<string, never>, ConsoleStateOutput> = {
   readOnly: true,
   consequential: false,
   untrusted: false,
-  async run(): Promise<ConsoleStateOutput> {
-    const b = needBridge();
+  async run(_input, ctx?: ActionContext): Promise<ConsoleStateOutput> {
+    const b = needBridge(ctx);
     const route = b.getRoute();
     return {
       email: b.getEmail(),
@@ -108,8 +93,8 @@ const openApp: ConsoleAction<OpenAppInput, { slug: string; view: ViewId }> = {
   readOnly: true,
   consequential: false,
   untrusted: false,
-  async run(input): Promise<{ slug: string; view: ViewId }> {
-    const b = needBridge();
+  async run(input, ctx?: ActionContext): Promise<{ slug: string; view: ViewId }> {
+    const b = needBridge(ctx);
     const slug = input.slug ?? b.getRoute().app;
     if (!slug) {
       throw new Error("No app is open and no slug was given.");
@@ -158,8 +143,8 @@ const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId
   readOnly: true,
   consequential: false,
   untrusted: false,
-  async run(input): Promise<{ slug: string | null; view: ViewId }> {
-    const b = needBridge();
+  async run(input, ctx?: ActionContext): Promise<{ slug: string | null; view: ViewId }> {
+    const b = needBridge(ctx);
     if (!isViewId(input.view)) {
       throw new Error(`Unknown view "${input.view}".`);
     }
@@ -168,17 +153,32 @@ const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId
     if (!accountView && !route.app) {
       throw new Error("No app is open — open_app first, or pick an account view.");
     }
+    // Agents send values outside the declared schema (registerTool does
+    // not enforce it), so check the free-form fields before they reach
+    // the route and the views.
     const next: Partial<Route> = { view: input.view };
     if (input.sha !== undefined) {
+      if (input.sha !== null && typeof input.sha !== "string") {
+        throw new Error("sha must be a string.");
+      }
       next.sha = input.sha;
     }
     if (input.codeTab !== undefined) {
+      if (input.codeTab !== null && input.codeTab !== "files" && input.codeTab !== "changes") {
+        throw new Error(`Unknown codeTab "${String(input.codeTab)}".`);
+      }
       next.codeTab = input.codeTab;
     }
     if (input.db !== undefined) {
+      if (typeof input.db !== "string") {
+        throw new Error("db must be a string.");
+      }
       next.db = input.db;
     }
     if (input.table !== undefined) {
+      if (typeof input.table !== "string") {
+        throw new Error("table must be a string.");
+      }
       next.table = input.table;
     }
     b.navigate(next);

@@ -250,6 +250,33 @@ function summarize(value: unknown): string {
   return text.length > 2000 ? `${text.slice(0, 2000)}\n…(truncated)` : text;
 }
 
+/** Search across groups: every group's hits stay together in group
+ * order, ranked by score within the group, so headers never repeat. */
+export function searchEntries(
+  groups: ItemGroup[],
+  q: string,
+): { group: string; item: PaletteItem }[] {
+  const order = new Map(groups.map((g, i) => [g.title, i] as const));
+  const scored = groups.flatMap((g) =>
+    g.items.map((item) => ({ group: g.title, item })),
+  );
+  return scored
+    .map((entry) => ({
+      entry,
+      score: matchScore(
+        `${entry.item.title} ${entry.item.key} ${entry.item.sub}`,
+        q,
+      ),
+    }))
+    .filter((s) => s.score >= 0)
+    .sort(
+      (a, b) =>
+        (order.get(a.entry.group) ?? 0) - (order.get(b.entry.group) ?? 0) ||
+        a.score - b.score,
+    )
+    .map((s) => s.entry);
+}
+
 export function Palette(props: PaletteProps) {
   const query = atom("");
   const active = atom(0);
@@ -276,22 +303,8 @@ export function Palette(props: PaletteProps) {
         g.items.map((item) => ({ group: g.title, item })),
       );
     }
-    const scored = groups.flatMap((g) =>
-      g.items.map((item) => ({ group: g.title, item })),
-    );
-    return scored
-      .map((entry) => ({
-        entry,
-        score: matchScore(
-          `${entry.item.title} ${entry.item.key} ${entry.item.sub}`,
-          q,
-        ),
-      }))
-      .filter((s) => s.score >= 0)
-      .sort((a, b) => a.score - b.score)
-      .map((s) => s.entry);
+    return searchEntries(groups, q);
   };
-
   const entries = (): { group: string; item: PaletteItem }[] => {
     const list = flat();
     const index = active();

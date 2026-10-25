@@ -33,7 +33,7 @@ const rollbackApp: ConsoleAction<RollbackInput, RollbackOutput> = {
   readOnly: false,
   consequential: true,
   untrusted: true,
-  run(input, signal) {
+  run(input, _ctx, signal) {
     return request<RollbackOutput>(
       "POST",
       `/api/console/apps/${encodeURIComponent(input.slug)}/rollback`,

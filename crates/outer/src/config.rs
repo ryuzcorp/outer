@@ -481,6 +481,15 @@ impl Config {
                 problems.push(format!("OUTER_R2_ENDPOINT={:?} must be https", r2.endpoint));
             }
         }
+        // `file_response` silently drops an unparseable token, which would
+        // leave WebMCP unavailable despite a passing config check.
+        if let Some(token) = &self.webmcp_origin_trial {
+            if token.parse::<axum::http::HeaderValue>().is_err() {
+                problems.push(format!(
+                    "OUTER_WEBMCP_ORIGIN_TRIAL={token:?} is not a valid HTTP header value"
+                ));
+            }
+        }
         if !self.is_local() && self.terms_version == "dev" {
             problems.push(
                 "OUTER_TERMS_VERSION is required when OUTER_DOMAIN is not a localhost dev domain (changing it re-asks every account at next sign-in)"
@@ -703,6 +712,24 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.ai_gateway, "staging");
+    }
+    #[test]
+    fn webmcp_origin_trial_must_parse_as_a_header_value() {
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_WEBMCP_ORIGIN_TRIAL", "token-abc"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.webmcp_origin_trial.as_deref(), Some("token-abc"));
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_WEBMCP_ORIGIN_TRIAL", "abc\ndef"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter().any(|p| p.contains("OUTER_WEBMCP_ORIGIN_TRIAL")),
+            "{err:?}"
+        );
     }
 
     #[test]

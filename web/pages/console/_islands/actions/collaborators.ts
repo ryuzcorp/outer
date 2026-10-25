@@ -3,7 +3,7 @@
 // one exported entry here, so the later ⌘K and WebMCP layer can import
 // `actions/*.ts` wholesale. The Settings UI calls `run`.
 import { request } from "./http.ts";
-import type { ConsoleAction } from "./settings.ts";
+import type { ActionContext, ConsoleAction } from "./settings.ts";
 import type { CollaboratorEntry, CollaboratorsSummary } from "../api.ts";
 
 function slugPath(slug: string, suffix: string): string {
@@ -51,7 +51,7 @@ const listCollaborators: ConsoleAction<ListCollaboratorsInput, CollaboratorsSumm
   readOnly: true,
   consequential: false,
   untrusted: true,
-  run(input, signal?: AbortSignal): Promise<CollaboratorsSummary> {
+  run(input, _ctx?: ActionContext, signal?: AbortSignal): Promise<CollaboratorsSummary> {
     return request<CollaboratorsSummary>("GET", slugPath(input.app, "/collaborators"), undefined, signal);
   },
 };
@@ -65,7 +65,7 @@ const addCollaborator: ConsoleAction<AddCollaboratorInput, AddCollaboratorOutput
   readOnly: false,
   consequential: true,
   untrusted: false,
-  run(input, signal?: AbortSignal): Promise<AddCollaboratorOutput> {
+  run(input, _ctx?: ActionContext, signal?: AbortSignal): Promise<AddCollaboratorOutput> {
     return request("POST", slugPath(input.app, "/collaborators"), { email: input.email }, signal);
   },
 };
@@ -79,7 +79,7 @@ const removeCollaborator: ConsoleAction<AddCollaboratorInput, RemoveCollaborator
   readOnly: false,
   consequential: true,
   untrusted: false,
-  run(input, signal?: AbortSignal): Promise<RemoveCollaboratorOutput> {
+  run(input, _ctx?: ActionContext, signal?: AbortSignal): Promise<RemoveCollaboratorOutput> {
     return request("POST", slugPath(input.app, "/collaborators/remove"), { email: input.email }, signal);
   },
 };
