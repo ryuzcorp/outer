@@ -417,9 +417,10 @@ export function DoView({ slug }: { slug: string }) {
           </span>
           <h3 class="m-0 text-base font-semibold">No Durable Objects yet</h3>
           <p class="m-0 max-w-md text-sm opacity-60">
-            Declare a `durable_objects` binding in `void.config.ts` and deploy
-            — this viewer lists the class instances and previews the state
-            each app's `?read=1` handler reports.
+            Declare a <code>durable_objects</code> binding in{" "}
+            <code>void.config.ts</code> and deploy. This view lists each
+            class's instances and previews whatever the app's{" "}
+            <code>?read=1</code> handler returns.
           </p>
           <a class="btn btn-sm btn-neutral" href="/guides/storage">
             Read the storage guide
