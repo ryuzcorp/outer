@@ -133,12 +133,18 @@ export function DataEmptyState({
  * stays CSP-clean. */
 export function ConfirmModal({
   busy,
+  busyLabel,
+  confirmLabel,
   consequence,
   onCancel,
   onConfirm,
   title,
 }: {
   busy: boolean;
+  /** Busy button text; defaults to "Deleting…". */
+  busyLabel?: string;
+  /** Confirm button text; defaults to "Delete". */
+  confirmLabel?: string;
   consequence: string;
   onCancel: () => void;
   onConfirm: () => void;
@@ -164,7 +170,7 @@ export function ConfirmModal({
             disabled={busy}
             onclick={onConfirm}
           >
-            {busy ? "Deleting…" : "Delete"}
+            {busy ? (busyLabel ?? "Deleting…") : (confirmLabel ?? "Delete")}
           </button>
         </div>
       </div>

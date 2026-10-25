@@ -7,6 +7,7 @@ import type {
 } from "../actions/data-d1.ts";
 import type { Route } from "../common.tsx";
 import { DatabaseIcon } from "../icons.tsx";
+import { BackupsPanel } from "../data/d1/backups.tsx";
 import { D1Editor } from "../data/d1/panel.tsx";
 import { DataEmptyState } from "../data/shared.tsx";
 
@@ -160,10 +161,10 @@ export function D1View({
     );
   }
 
-  // No wrapping card: the table rail + grid sit directly on the main
-  // panel, which is itself the surface. On wide screens the editor takes
-  // the panel's full height (main is 100dvh minus its padding and title)
-  // and the grid scrolls inside it.
+  // No wrapping card: the tab row + table rail + grid sit directly on the
+  // main panel, which is itself the surface. On wide screens the view
+  // takes the panel's full height (main is 100dvh minus its padding and
+  // title) and the grid scrolls inside it.
   return (
     <div class="flex min-w-0 flex-col gap-3 md:h-[calc(100dvh-124px)]">
       {canWrite ? null : (
@@ -175,7 +176,7 @@ export function D1View({
         </div>
       )}
       <div class="flex min-h-0 min-w-0 flex-1">
-        <D1Editor
+        <D1DatabaseView
           key={editorKey}
           binding={binding}
           canWrite={canWrite}
@@ -184,6 +185,63 @@ export function D1View({
           slug={slug}
         />
       </div>
+    </div>
+  );
+}
+
+/** The single database's Tables/Backups tabs. Keyed per app by the caller,
+ * so the picked tab resets when the app changes. No wrapping card: the tab
+ * row and panels sit directly on the main panel surface. */
+function D1DatabaseView({
+  binding,
+  canWrite,
+  route,
+  setRoute,
+  slug,
+}: {
+  binding: string;
+  canWrite: boolean;
+  route: Route;
+  setRoute: (next: Partial<Route>) => void;
+  slug: string;
+}) {
+  const tab = atom<"tables" | "backups">("tables");
+
+  return (
+    <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div class="border-base-300 overflow-x-auto border-b px-4 pt-2">
+        <div role="tablist" class="tabs tabs-border w-max flex-nowrap" aria-label="D1 views">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab() === "tables" ? "true" : "false"}
+            class={`tab whitespace-nowrap ${tab() === "tables" ? "tab-active" : ""}`}
+            onclick={() => tab.set("tables")}
+          >
+            Tables
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab() === "backups" ? "true" : "false"}
+            class={`tab whitespace-nowrap ${tab() === "backups" ? "tab-active" : ""}`}
+            onclick={() => tab.set("backups")}
+          >
+            Backups
+          </button>
+        </div>
+      </div>
+      {tab() === "tables" ? (
+        <D1Editor
+          binding={binding}
+          canWrite={canWrite}
+          route={route}
+          setRoute={setRoute}
+          slug={slug}
+        />
+      ) : (
+        <BackupsPanel binding={binding} canWrite={canWrite} slug={slug} />
+      )}
     </div>
   );
 }
