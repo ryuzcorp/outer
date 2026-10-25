@@ -1586,6 +1586,7 @@ async fn api_write(
         &summary,
         o,
         code,
+        0,
     )
     .await;
     d1_response(result)
@@ -1649,6 +1650,7 @@ async fn api_delete_rows(
         &summary,
         o,
         code,
+        0,
     )
     .await;
     d1_response(result)

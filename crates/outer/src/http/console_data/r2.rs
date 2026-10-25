@@ -228,12 +228,16 @@ pub fn r2_decode(stored: &str) -> String {
 }
 
 /// A key the browser may write or delete: 1..=1024 bytes, no absolute path
-/// and no `..` segment, no control character. A trailing `/` is legal — it
-/// is the folder marker.
+/// and no `..` segment, no control character, and never starting with `-`.
+/// A trailing `/` is legal — it is the folder marker. Keys travel
+/// positionally to `celld r2 put` / `celld r2 delete`, and celld 0.6.2
+/// honors no `--` separator, so the leading-dash rule closes option
+/// injection there.
 pub fn r2_key_ok(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= R2_MAX_KEY_BYTES
         && !key.starts_with('/')
+        && !key.starts_with('-')
         && !key.split('/').any(|segment| segment == "..")
         && !key.chars().any(char::is_control)
 }
@@ -784,6 +788,7 @@ async fn api_put(
                 &format!("r2_put {} {} ({} bytes)", query.bucket, query.key, size),
                 "ok",
                 None,
+                0,
             )
             .await;
             super::ok(serde_json::json!({"key": query.key, "size": size}))
@@ -798,6 +803,7 @@ async fn api_put(
                 &format!("r2_put {} {}", query.bucket, query.key),
                 "error",
                 None,
+                0,
             )
             .await;
             status_for(&msg)
@@ -869,6 +875,7 @@ async fn api_delete(
                 &format!("r2_delete {} ({} keys)", body.bucket, count),
                 "ok",
                 None,
+                0,
             )
             .await;
             super::ok(serde_json::json!({"deleted": count}))
@@ -883,6 +890,7 @@ async fn api_delete(
                 &format!("r2_delete {}", body.bucket),
                 "error",
                 None,
+                0,
             )
             .await;
             status_for(&msg)
@@ -1003,6 +1011,22 @@ mod tests {
         assert!(!r2_key_ok("a\nb"));
         assert!(!r2_key_ok(&"x".repeat(R2_MAX_KEY_BYTES + 1)));
         assert!(r2_key_ok(&"x".repeat(R2_MAX_KEY_BYTES)));
+    }
+    #[test]
+    fn write_keys_reject_leading_dash_option_injection() {
+        // Keys travel positionally to `celld r2 put` / `celld r2 delete`
+        // (celld 0.6.2 honors no `--` separator): a leading `-` would parse
+        // as an option. Dashes elsewhere are inert and stay legal.
+        assert!(!r2_key_ok("-evil"));
+        assert!(!r2_key_ok("-"));
+        assert!(!r2_prefix_ok("-evil/"));
+        assert!(r2_key_ok("a-b"));
+        assert!(r2_key_ok("dir/-file"));
+        let bucket = R2Bucket {
+            binding: "F".to_string(),
+            bucket: "files".to_string(),
+        };
+        assert!(object_key("my-app", &bucket, "-evil").is_err());
     }
 
     #[test]

@@ -40,9 +40,6 @@ pub fn router(state: AppState) -> Router {
     let console = console::router(state.clone());
     // Data panels (D1, R2, Durable Objects): explicit Axum routes like the
     // console API above, so they win over the site fallback below.
-    // Data panels (D1 now; R2 + Durable Objects land in console_data too):
-    // explicit Axum routes like the console API above, so they win over the
-    // site fallback below.
     let console_data = console_data::routes();
     Router::new()
         .route("/health", get(health))

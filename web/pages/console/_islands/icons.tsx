@@ -239,6 +239,7 @@ export function KeyIcon({ size = 14 }: { size?: number }) {
 
 export function AccountIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={UserRound} size={size} />;
+}
 export function FolderIcon({ cls }: { cls?: string }) {
   return <Lucide node={Folder} size={16} cls={cls ?? "shrink-0 opacity-60"} />;
 }

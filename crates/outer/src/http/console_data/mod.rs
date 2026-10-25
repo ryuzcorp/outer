@@ -653,6 +653,22 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A leading-dash key would parse as a celld option: 400 with a
+        // user_message, before any credential or celld call.
+        let (status, _, body) = send(
+            &app,
+            authed(
+                "/api/console/apps/groceries/data/r2/file?bucket=files&key=-evil",
+                &cookie,
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["error"], "bad_request");
+        assert!(body["user_message"].is_string());
     }
 
     #[tokio::test]
@@ -712,6 +728,8 @@ mod tests {
         for payload in [
             r#"{"bucket":"files","keys":[]}"#,
             r#"{"bucket":"files","keys":["a/../b"]}"#,
+            // A leading-dash key would parse as a celld option.
+            r#"{"bucket":"files","keys":["-evil"]}"#,
         ] {
             let (status, _, _) = send(
                 &app,
@@ -731,7 +749,7 @@ mod tests {
                 .await
                 .unwrap();
         // Refused writes still audit (outcome error), like MCP's `record`.
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 
     #[tokio::test]
@@ -767,6 +785,19 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let body: serde_json::Value = body.parse().unwrap();
         assert!(body["user_message"].is_string());
+        // A leading-dash class would parse as a celld option: refused
+        // before any credential or celld call.
+        let (status, _, _) = send(
+            &app,
+            authed(
+                "/api/console/apps/groceries/data/do/instances?class=-evil",
+                &cookie,
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
