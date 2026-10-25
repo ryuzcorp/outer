@@ -744,7 +744,7 @@ mod tests {
                 .unwrap();
         assert_eq!(state, "ok");
         let tools: Vec<(String,)> = sqlx::query_as(
-            "SELECT tool FROM agent_action WHERE app_id = 'app-shop' ORDER BY created_at",
+            "SELECT tool FROM agent_action WHERE app_id = 'app-shop' ORDER BY created_at, rowid",
         )
         .fetch_all(&pool)
         .await
