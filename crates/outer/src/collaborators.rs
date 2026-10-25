@@ -185,7 +185,7 @@ pub async fn add(
         .unwrap_or(owner_email);
     let subject = format!("You've been added to {} on Outer", app.slug);
     let text = format!(
-        "{owner_name} added you to **{}** on Outer. Ask your agent to connect to {mcp_url}.",
+        "{owner_name} added you to {} on Outer. Ask your agent to connect to {mcp_url}.",
         app.slug
     );
     if let Err(err) = sender.send_text(&email, &subject, &text).await {

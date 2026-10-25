@@ -53,6 +53,7 @@ import {
   ActionsView,
   AdminView,
   DeploysView,
+  EmptyState,
   InvitesView,
   MetricsView,
   OverviewView,
@@ -1268,12 +1269,15 @@ export function Console() {
                   </li>
                 ))}
                 <li class="menu-title text-xs font-medium uppercase tracking-wider">Data</li>
-                <D1Nav
-                  active={r.view === "d1"}
-                  route={r}
-                  setRoute={(next) => navigate(next)}
-                  slug={active.slug}
-                />
+                {/* D1 is owner-only in v1 (every endpoint 403s for collaborators). */}
+                {active.role === "owner" && (
+                  <D1Nav
+                    active={r.view === "d1"}
+                    route={r}
+                    setRoute={(next) => navigate(next)}
+                    slug={active.slug}
+                  />
+                )}
                 {(["R2", "Durable Objects"] as const).map((name) => (
                   <li key={name} class="menu-disabled min-w-0" title="Coming later">
                     <span class="min-w-0">
@@ -1460,12 +1464,18 @@ function ViewBody(props: {
       );
     case "d1":
       return (
+      props.app.role !== "owner" ? (
+        <EmptyState icon={<DatabaseIcon />} title="D1 is owner-only">
+          Only the app owner can open this database for now.
+        </EmptyState>
+      ) : (
       <D1View
-        canWrite={props.app.role === "owner"}
+        canWrite
         route={props.route}
         setRoute={props.onRoute}
         slug={props.app.slug}
       />
+      )
       );
   }
 }
