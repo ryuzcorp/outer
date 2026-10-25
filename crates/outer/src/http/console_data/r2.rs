@@ -23,7 +23,7 @@ use axum::Router;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use super::{celld_env, console_app, run_celld, scoped_creds, scoped_s3, unavailable};
+use super::{celld_env, console_app, run_celld, scoped_creds, scoped_s3};
 
 /// R2's own key bound (1..=1024 bytes).
 const R2_MAX_KEY_BYTES: usize = 1024;
@@ -561,7 +561,10 @@ async fn declared_buckets(state: &super::AppState, slug: &str) -> anyhow::Result
     r2_buckets(&value)
 }
 
-fn status_for(msg: &str) -> Response {
+/// Backend failures (S3/celld) answer 500 with the failure's detail in
+/// `message` for the owner to act on, but `user_message` stays the friendly
+/// constant the caller passes: raw store XML must never reach the UI.
+fn status_for(msg: &str, user_message: &str) -> Response {
     if msg.contains("not found") || msg.contains("unknown R2 bucket") {
         super::missing(msg.to_string())
     } else if msg.contains("invalid") || msg.contains("bucket_name") || msg.contains("select 1 to")
@@ -570,7 +573,7 @@ fn status_for(msg: &str) -> Response {
     } else if msg.contains("too large") {
         super::too_large(msg.to_string())
     } else {
-        unavailable(msg.to_string())
+        super::unavailable_friendly(msg.to_string(), user_message)
     }
 }
 
@@ -585,7 +588,10 @@ async fn api_buckets(
     };
     match declared_buckets(&state, &app.slug).await {
         Ok(buckets) => super::ok(serde_json::json!({"buckets": buckets})),
-        Err(err) => unavailable(format!("{err:#}")),
+        Err(err) => super::unavailable_friendly(
+            format!("{err:#}"),
+            "Couldn't load the buckets right now. Try again.",
+        ),
     }
 }
 
@@ -623,7 +629,10 @@ async fn api_list(
     let _ = account;
     match list_inner(&state, &app.slug, &query).await {
         Ok(preview) => super::ok(serde_json::to_value(&preview).unwrap_or_default()),
-        Err(err) => status_for(&format!("{err:#}")),
+        Err(err) => status_for(
+            &format!("{err:#}"),
+            "Couldn't list this bucket right now. Try again.",
+        ),
     }
 }
 
@@ -690,7 +699,10 @@ async fn api_file(
     };
     match file_inner(&state, &app.slug, &query).await {
         Ok(file) => super::ok(serde_json::to_value(&file).unwrap_or_default()),
-        Err(err) => status_for(&format!("{err:#}")),
+        Err(err) => status_for(
+            &format!("{err:#}"),
+            "Couldn't open this object right now. Try again.",
+        ),
     }
 }
 
@@ -739,7 +751,10 @@ async fn api_raw(
     };
     match raw_inner(&state, &app.slug, &query).await {
         Ok(res) => res,
-        Err(err) => status_for(&format!("{err:#}")),
+        Err(err) => status_for(
+            &format!("{err:#}"),
+            "Couldn't download this object right now. Try again.",
+        ),
     }
 }
 
@@ -806,7 +821,7 @@ async fn api_put(
                 0,
             )
             .await;
-            status_for(&msg)
+            status_for(&msg, "Couldn't upload right now. Try again.")
         }
     }
 }
@@ -893,7 +908,7 @@ async fn api_delete(
                 0,
             )
             .await;
-            status_for(&msg)
+            status_for(&msg, "Couldn't delete right now. Try again.")
         }
     }
 }
@@ -1250,5 +1265,45 @@ mod tests {
         // A key with an empty segment round-trips through the parent prefix.
         assert_eq!(objects[0].key, "a//b");
         assert_eq!(objects[0].name, "b");
+    }
+    /// Backend failures (the live R2 501 whose XML names `NotImplemented`)
+    /// keep their detail in `message` but show a friendly `user_message`:
+    /// raw store XML must never reach the UI. Validation errors still show
+    /// their own message.
+    #[tokio::test]
+    async fn backend_failures_show_a_friendly_user_message() {
+        async fn body(res: Response) -> (StatusCode, serde_json::Value) {
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            (status, serde_json::from_str(&text).unwrap())
+        }
+        let xml = "s3 list fleets/demo/r2/files/ failed: HTTP 501 \
+            <Code>NotImplemented</Code>\
+            <Message>ListObjectsV2 search parameter X-Amz-Security-Token not implemented</Message>";
+        let (status, json) = body(status_for(
+            xml,
+            "Couldn't list this bucket right now. Try again.",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(json["message"].as_str().unwrap().contains("NotImplemented"));
+        assert_eq!(
+            json["user_message"],
+            "Couldn't list this bucket right now. Try again."
+        );
+        assert!(!json["user_message"].as_str().unwrap().contains('<'));
+
+        // Validation errors keep their own message as the user message.
+        let (status, json) = body(status_for(
+            "invalid prefix",
+            "Couldn't list this bucket right now. Try again.",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["message"], "invalid prefix");
+        assert_eq!(json["user_message"], "invalid prefix");
     }
 }

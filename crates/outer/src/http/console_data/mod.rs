@@ -273,11 +273,11 @@ pub(crate) async fn run_celld(
 // audit path for every console mutation.
 //
 // Error shape for data endpoints: `{error, message, user_message}` per the
-// console-actions contract. `message` and `user_message` carry the same
-// text here: every message is built to be safe to show (callers pass
-// validation failures and celld/S3 failure tails — env values and
-// credentials never enter them), and the panels surface the detail the
-// owner needs to act on. The shorthands below delegate to [`data_error`] /
+// console-actions contract. `message` carries the detail the owner needs to
+// act on (validation failures and celld/S3 failure tails — env values and
+// credentials never enter them); `user_message` is a friendly constant on
+// backend failures (see `unavailable_friendly`), so raw store XML never
+// reaches the UI. The shorthands below delegate to [`data_error`] /
 // [`data_json`] above; they are not a second error path.
 
 /// A 400 for a bad bucket, key, prefix or body: the caller's input, so the
@@ -289,11 +289,17 @@ pub(crate) fn bad_request(message: impl Into<String>) -> Response {
 /// A 500 for a celld/S3 failure: the message carries the failure's tail
 /// (never credentials — env values never enter it).
 pub(crate) fn unavailable(message: impl Into<String>) -> Response {
+    unavailable_friendly(message, "Couldn't reach the bucket right now. Try again.")
+}
+
+/// A 500 like [`unavailable`], but the UI shows only the friendly constant:
+/// raw store XML stays in `message`/logs, never in `user_message`.
+pub(crate) fn unavailable_friendly(message: impl Into<String>, user_message: &str) -> Response {
     data_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "unavailable",
         message.into(),
-        None,
+        Some(user_message.to_string()),
     )
 }
 
