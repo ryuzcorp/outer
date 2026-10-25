@@ -111,7 +111,7 @@ function ConnectionRow({
         {timeAgo(entry.created_at)}
       </td>
       <td class="whitespace-nowrap max-sm:hidden" title={when(entry.last_used_at)}>
-        {when(entry.last_used_at)}
+        {entry.last_used_at == null ? "never" : timeAgo(entry.last_used_at)}
       </td>
       <td class="text-right">
         <button
@@ -147,7 +147,7 @@ function ApiKeyRow({
         {timeAgo(entry.created_at)}
       </td>
       <td class="whitespace-nowrap max-sm:hidden" title={when(entry.last_used_at)}>
-        {when(entry.last_used_at)}
+        {entry.last_used_at == null ? "never" : timeAgo(entry.last_used_at)}
       </td>
       <td class="text-right">
         <button
