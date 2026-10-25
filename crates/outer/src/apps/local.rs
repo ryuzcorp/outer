@@ -10,12 +10,14 @@
 //!
 //! Shared by three claim points: `delete_app` (step 3, after the bucket
 //! purge), the create path (right after the row insert, before `init_repo`
-//! writes anything), and `rename_app` (for the TARGET slug, before the old
-//! dirs move in). The create/rename wipes matter because a crashed delete
-//! can leave local orphans behind under a slug that becomes unclaimed again:
-//! without the wipe, `move_path`'s existing-destination-means-done would
-//! silently skip moving the old dirs in (leaving the rename half-applied),
-//! and a fresh create would inherit stale caches, fleet state and sidecars.
+//! writes anything), and `rename_app` (the whole TARGET slug, but only on a
+//! fresh attempt — the mirror still at the old slug proves no move completed
+//! yet, so a retry after the moves started leaves moved content alone). The
+//! create/rename wipes matter because a crashed delete can leave local
+//! orphans behind under a slug that becomes unclaimed again: without the
+//! wipe, an existing destination would read as already moved and the old
+//! dirs would stay put (leaving the rename half-applied), and a fresh
+//! create would inherit stale caches, fleet state and sidecars.
 
 use std::path::Path;
 

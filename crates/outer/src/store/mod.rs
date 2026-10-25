@@ -160,12 +160,16 @@ impl Store {
         }
     }
 
-    /// Delete every key under `prefix`. An empty match is a no-op.
+    /// Delete every key under `prefix`, which must be a whole slug scope
+    /// (`fleets/{slug}/`, `git/{slug}/`): an empty prefix or one without a
+    /// trailing `/` is refused instead of deleting a wider scope. An empty
+    /// match is a no-op, so retries after a partial delete stay quiet.
     pub async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(message) = self.take_fault() {
             return Err(anyhow::anyhow!(message));
         }
+        check_delete_prefix(prefix)?;
         match &self.inner {
             StoreInner::S3(backend) => backend.delete_prefix(prefix).await,
             StoreInner::Memory(map) => {
@@ -174,6 +178,20 @@ impl Store {
             }
         }
     }
+}
+
+/// Guard for every prefix delete: prefixes are always whole slug scopes, so
+/// an empty prefix or one without a trailing `/` names a wider scope than
+/// intended and is refused instead of deleted. Both backends enforce it
+/// (defense in depth).
+pub(crate) fn check_delete_prefix(prefix: &str) -> anyhow::Result<()> {
+    if prefix.is_empty() {
+        anyhow::bail!("refusing to delete the empty store prefix");
+    }
+    if !prefix.ends_with('/') {
+        anyhow::bail!("refusing to delete store prefix without a trailing slash: {prefix:?}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -275,8 +293,26 @@ mod tests {
         assert_eq!(store.list("").await.unwrap(), vec!["git/b/1"]);
         // Empty matches are a no-op, so retries after a partial delete stay quiet.
         store.delete_prefix("git/a/").await.unwrap();
-        store.delete_prefix("").await.unwrap();
+        store.delete_prefix("git/").await.unwrap();
         assert!(store.list("").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_delete_prefix_refuses_unsafe_prefixes() {
+        let store = Store::memory();
+        for key in ["git/a/1", "fleets/a/1"] {
+            store.put(key, b"x".to_vec()).await.unwrap();
+        }
+        // The empty prefix and any prefix without a trailing `/` name a
+        // wider scope than intended: refused, and nothing is deleted.
+        for prefix in ["", "git", "git/a", "fleets", "fleets/a"] {
+            let err = store.delete_prefix(prefix).await.unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to delete"),
+                "prefix {prefix:?}: {err:#}"
+            );
+        }
+        assert_eq!(store.list("").await.unwrap(), vec!["fleets/a/1", "git/a/1"]);
     }
 
     #[tokio::test]

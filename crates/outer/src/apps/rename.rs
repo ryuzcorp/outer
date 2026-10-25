@@ -33,8 +33,10 @@
 //!    identical bytes instead of mixing stale with fresh. Overwrite makes
 //!    each object converge; a retry after a crash mid-copy rewrites the
 //!    same bytes.
-//! 3. Move the local dirs (each `rename(2)` atomic; a retry skips missing
-//!    sources, which means never-existed or already-moved).
+//! 3. Move the local dirs (each `rename(2)` atomic). A fresh attempt wipes
+//!    the whole target first, so abandoned orphans never read as
+//!    already-moved; a retry after the moves started leaves missing sources
+//!    (already-moved) alone, so moved content survives.
 //! 4. ONE transaction: drop our target cleanup rows (they are live data
 //!    now, and must never be drained), re-check the target authoritatively
 //!    — cleanup rows included, so a racing create or quarantine wins here
@@ -238,21 +240,23 @@ async fn copy_prefix(store: &Store, from_prefix: &str, to_prefix: &str) -> anyho
     Ok(copied)
 }
 
-/// `rename(2)` a local path, treating a missing source as done (never
-/// existed, or already moved by a retry after a crash) and an existing
-/// destination as done (a completed move — nothing else writes these paths
-/// while the locks are held).
-async fn move_path(src: &Path, dst: &Path) -> anyhow::Result<()> {
+/// Move one local path for the rename, wiping the target first — but only
+/// when the source still exists. A crashed delete can leave orphans behind
+/// under the now-unclaimed target, so the wipe keeps an existing
+/// destination from reading as already-moved. When the source is gone the
+/// move already happened (a retry after a pre-commit crash): the target is
+/// left untouched, so the retry never wipes moved content and then no-ops.
+/// Each `rename(2)` is atomic; a missing source means never-existed or
+/// already-moved. Returns whether the move ran.
+async fn move_local_path(src: &Path, dst: &Path) -> anyhow::Result<bool> {
     match tokio::fs::symlink_metadata(src).await {
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => {
             return Err(anyhow::anyhow!("cannot stat {}: {e:#}", src.display()));
         }
     }
-    if tokio::fs::symlink_metadata(dst).await.is_ok() {
-        return Ok(());
-    }
+    remove_local_path(dst).await?;
     if let Some(parent) = dst.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -260,11 +264,35 @@ async fn move_path(src: &Path, dst: &Path) -> anyhow::Result<()> {
     }
     tokio::fs::rename(src, dst)
         .await
-        .with_context(|| format!("moving {} to {}", src.display(), dst.display()))
+        .with_context(|| format!("moving {} to {}", src.display(), dst.display()))?;
+    Ok(true)
+}
+
+/// Remove a local path that may be a dir, a file, or already missing.
+async fn remove_local_path(path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_dir() => {
+            tokio::fs::remove_dir_all(path)
+                .await
+                .with_context(|| format!("removing local dir {}", path.display()))?;
+        }
+        Ok(_) => {
+            tokio::fs::remove_file(path)
+                .await
+                .with_context(|| format!("removing local file {}", path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!("cannot stat {}: {e:#}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 /// The slug a cleanup row belongs to: `fleets/{slug}/` or `git/{slug}/`.
-/// Anything else is a corrupt row the drain still deletes by raw prefix.
+/// Anything else is a corrupt row the drain only deletes by raw prefix when
+/// the prefix is still a safe scope (non-empty, trailing `/`); otherwise the
+/// row is kept and the drain warns.
 fn cleanup_slug(prefix: &str) -> Option<&str> {
     let rest = prefix
         .strip_prefix("fleets/")
@@ -306,6 +334,16 @@ pub async fn drain_prefix_cleanup(
     }
     let mut removed = 0u64;
     for prefix in raw {
+        // Unparseable rows are never deleted blindly: without a trailing
+        // `/` the raw prefix could name a wider scope than intended. Keep
+        // the row and shout — an operator owns the cleanup.
+        if prefix.is_empty() || !prefix.ends_with('/') {
+            tracing::warn!(
+                prefix = %prefix,
+                "prefix_cleanup row has an unsafe prefix; keeping the row, deleting nothing"
+            );
+            continue;
+        }
         store
             .delete_prefix(&prefix)
             .await
@@ -490,49 +528,52 @@ pub async fn rename_app_with_hooks(
         .map_err(internal)?;
     fail_if(hooks, RenameFailStep::AfterFleetsCopy)?;
 
-    // Claim-point wipe for the target: a crashed delete can leave local
-    // orphans behind under this now-unclaimed slug, and `move_path` skips
-    // an existing destination — without the wipe the old dirs would stay
-    // put and the new slug would serve stale state. The stale in-memory
-    // manifest seq goes too (`set_applied_seq` only moves forward, so a
-    // leftover higher seq would pin the moved repo's seq down).
-    super::local::remove_local_state(data_dir, git, cgroups, new_slug)
-        .await
-        .map_err(internal)?;
-    sync.forget(new_slug).await;
-
     // 4. Local state: the bare mirror, the worktree and its sidecars, the
     // install cache, the fleet's state dir, and the fleet cgroup leaf (empty:
     // the fleet is stopped — the next wake recreates it under the new name).
-    // The target was wiped just above (abandoned orphans must not block the
-    // moves: an existing destination reads as already-moved).
+    // The mirror moves first, so its presence means a fresh attempt: no move
+    // has completed yet, everything under the target is an abandoned orphan
+    // (a crashed delete's leftovers — even under paths the old slug never
+    // had), and the whole target is wiped before the moves. Its absence
+    // means a retry after the moves started: per path, a present source is
+    // wiped-then-moved, while a missing source means already-moved and the
+    // target is left alone — so moved content is never wiped into a no-op
+    // move. An abandoned target's leftovers stay unclaimable behind their
+    // cleanup rows until the drain proves them empty, and `create_app` keeps
+    // its own claim-time wipe, so no stale state is ever inherited.
     // The manifest generation marker follows the repo; the old slug's lock
     // and wake map entries leak one idle mutex each (bounded by renames).
-    move_path(
-        &crate::git::manifest::mirror_path(git, old_slug),
-        &crate::git::manifest::mirror_path(git, new_slug),
-    )
-    .await
-    .map_err(internal)?;
+    let mirror_src = crate::git::manifest::mirror_path(git, old_slug);
+    let fresh = tokio::fs::symlink_metadata(&mirror_src).await.is_ok();
+    if fresh {
+        super::local::remove_local_state(data_dir, git, cgroups, new_slug)
+            .await
+            .map_err(internal)?;
+        sync.forget(new_slug).await;
+    }
+    let mirror_dst = crate::git::manifest::mirror_path(git, new_slug);
+    let mirror_moved = move_local_path(&mirror_src, &mirror_dst)
+        .await
+        .map_err(internal)?;
     let work = PathBuf::from(data_dir).join("work");
-    move_path(&work.join(old_slug), &work.join(new_slug))
+    move_local_path(&work.join(old_slug), &work.join(new_slug))
         .await
         .map_err(internal)?;
     for sidecar in ["index", "install-hash"] {
-        move_path(
+        move_local_path(
             &work.join(format!("{old_slug}.{sidecar}")),
             &work.join(format!("{new_slug}.{sidecar}")),
         )
         .await
         .map_err(internal)?;
     }
-    move_path(
+    move_local_path(
         &PathBuf::from(data_dir).join("cache").join(old_slug),
         &PathBuf::from(data_dir).join("cache").join(new_slug),
     )
     .await
     .map_err(internal)?;
-    move_path(
+    move_local_path(
         &PathBuf::from(data_dir).join("fleets").join(old_slug),
         &PathBuf::from(data_dir).join("fleets").join(new_slug),
     )
@@ -540,7 +581,7 @@ pub async fn rename_app_with_hooks(
     .map_err(internal)?;
     let sidecars = PathBuf::from(data_dir).join("secret-sidecars");
     for ext in ["orig", "target"] {
-        move_path(
+        move_local_path(
             &sidecars.join(format!("{old_slug}.{ext}")),
             &sidecars.join(format!("{new_slug}.{ext}")),
         )
@@ -548,12 +589,28 @@ pub async fn rename_app_with_hooks(
         .map_err(internal)?;
     }
     if let Some(anchor) = cgroups {
-        crate::fleet::cgroups::remove_fleet_cgroup(
-            &anchor.join(crate::fleet::cgroups::fleet_dir_name(old_slug)),
-        );
+        let old_leaf = anchor.join(crate::fleet::cgroups::fleet_dir_name(old_slug));
+        if tokio::fs::symlink_metadata(&old_leaf).await.is_ok() {
+            // A fresh attempt carries abandoned orphans away with it; after
+            // the moves the leaf is already gone and stays gone.
+            crate::fleet::cgroups::remove_fleet_cgroup(
+                &anchor.join(crate::fleet::cgroups::fleet_dir_name(new_slug)),
+            );
+        }
+        crate::fleet::cgroups::remove_fleet_cgroup(&old_leaf);
     }
-    if let Some(seq) = sync.applied_seq(old_slug).await {
-        sync.set_applied_seq(new_slug, seq).await;
+    // The in-memory manifest seq follows the repo: it moves only while the
+    // repo move is still pending (`mirror_moved`) or the old value is still
+    // here (a crash between the mirror move and this transfer). A retry
+    // after the transfer finds neither and keeps the moved value; a stale
+    // target value never survives a fresh attempt (`set_applied_seq` only
+    // moves forward, so the stale value goes first).
+    let old_seq = sync.applied_seq(old_slug).await;
+    if mirror_moved || old_seq.is_some() {
+        sync.forget(new_slug).await;
+        if let Some(seq) = old_seq {
+            sync.set_applied_seq(new_slug, seq).await;
+        }
     }
     sync.forget(old_slug).await;
     fail_if(hooks, RenameFailStep::BeforeCommit)?;
@@ -979,6 +1036,93 @@ mod tests {
         assert!(!fx.data.join("work/groceries").exists());
         assert!(!fx.git.repos_dir.join("groceries.git").exists());
     }
+    #[tokio::test]
+    async fn crash_after_moves_retries_without_wiping_moved_state() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        // Distinct old-slug content that must survive the retry.
+        tokio::fs::write(fx.data.join("work/groceries/treasure"), b"old")
+            .await
+            .unwrap();
+        tokio::fs::write(fx.git.repos_dir.join("groceries.git/oldfile"), b"old")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(fx.data.join("secret-sidecars"))
+            .await
+            .unwrap();
+        tokio::fs::write(fx.data.join("secret-sidecars/groceries.orig"), b"old")
+            .await
+            .unwrap();
+        fx.sync.set_applied_seq("groceries", 7).await;
+        // Crash after the local moves, before the flip: the row still names
+        // the old slug but every local path already moved.
+        let err = run(
+            &fx,
+            "groceries",
+            "pantry",
+            RenameHooks {
+                fail_at: Some(RenameFailStep::BeforeCommit),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RenameError::Internal(_)));
+        assert!(!fx.data.join("work/groceries").exists());
+        assert!(!fx.git.repos_dir.join("groceries.git").exists());
+        assert_eq!(
+            tokio::fs::read(fx.data.join("work/pantry/treasure"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        // The same-target retry keeps the moved content: per path, a missing
+        // source means already-moved, so the target is left alone.
+        let out = run(&fx, "groceries", "pantry", RenameHooks::default())
+            .await
+            .unwrap();
+        assert_eq!(out.app.slug, "pantry");
+        assert_eq!(
+            tokio::fs::read(fx.data.join("work/pantry/treasure"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.data.join("work/pantry.index"))
+                .await
+                .unwrap(),
+            b"i"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.data.join("work/pantry.install-hash"))
+                .await
+                .unwrap(),
+            b"h"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.git.repos_dir.join("pantry.git/oldfile"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.data.join("secret-sidecars/pantry.orig"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        assert_eq!(fx.sync.applied_seq("pantry").await, Some(7));
+        assert_eq!(fx.sync.applied_seq("groceries").await, None);
+        // The old slug's paths are still gone, and the bucket data the copy
+        // re-converged on is intact.
+        assert!(!fx.data.join("work/groceries").exists());
+        assert!(!fx.git.repos_dir.join("groceries.git").exists());
+        assert_eq!(
+            fx.store.get("fleets/pantry/cells/d1.sqlite").await.unwrap(),
+            Some(b"D1DATA".to_vec())
+        );
+        assert!(cleanup_rows(&fx).await.is_empty(), "no jobs left behind");
+    }
 
     #[tokio::test]
     async fn crash_after_copy_retries_to_another_slug_without_orphans() {
@@ -1191,5 +1335,58 @@ mod tests {
             1
         );
         assert!(claimable(&fx, "stale").await);
+    }
+    #[tokio::test]
+    async fn drain_keeps_unsafe_raw_prefixes_and_deletes_nothing() {
+        let fx = fx().await;
+        // Data under scopes a bare prefix would swallow: it must survive.
+        fx.store
+            .put("fleets/keep/cells/d1.sqlite", b"D1DATA".to_vec())
+            .await
+            .unwrap();
+        fx.store.put("stray/file", b"stray".to_vec()).await.unwrap();
+        let now = now_ms();
+        for prefix in ["", "fleets", "fleets/keep", "stray"] {
+            sqlx::query(
+                "INSERT INTO prefix_cleanup (prefix, reason, created_at) VALUES (?1, 'rename-old', ?2)",
+            )
+            .bind(prefix)
+            .bind(now)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        }
+        // A safe unparseable row still drains by raw prefix.
+        sqlx::query(
+            "INSERT INTO prefix_cleanup (prefix, reason, created_at) VALUES ('stray/', 'rename-old', ?1)",
+        )
+        .bind(now)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let drained = drain_prefix_cleanup(&fx.pool, &fx.store, None)
+            .await
+            .unwrap();
+        assert_eq!(drained, 1, "only the safe raw row drains");
+        // Nothing under the unsafe scopes was touched.
+        assert_eq!(
+            fx.store.get("fleets/keep/cells/d1.sqlite").await.unwrap(),
+            Some(b"D1DATA".to_vec())
+        );
+        assert_eq!(
+            fx.store.get("stray/file").await.unwrap(),
+            None,
+            "the safe stray/ row drained"
+        );
+        // The unsafe rows are kept for an operator.
+        assert_eq!(
+            cleanup_rows(&fx).await,
+            vec![
+                "".to_string(),
+                "fleets".to_string(),
+                "fleets/keep".to_string(),
+                "stray".to_string(),
+            ]
+        );
     }
 }

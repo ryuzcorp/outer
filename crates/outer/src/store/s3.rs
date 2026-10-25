@@ -388,9 +388,12 @@ impl S3Backend {
         Ok(keys)
     }
 
-    /// Recursive delete of one prefix. Empty prefixes are a no-op, so
-    /// retries after a partial delete stay quiet.
+    /// Recursive delete of one prefix, which must be a whole slug scope
+    /// (empty or slash-less prefixes are refused, same as [`Store`]).
+    /// Empty matches are a no-op, so retries after a partial delete stay
+    /// quiet.
     pub async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
+        super::check_delete_prefix(prefix)?;
         let keys = self.list(prefix).await?;
         self.delete_keys(&keys).await
     }
@@ -699,6 +702,19 @@ mod tests {
                 .starts_with("https://account.eu.r2.cloudflarestorage.com/outer-state/"),
             "not path style: {url}"
         );
+    }
+    /// The prefix guard fires before any request is signed or sent: no
+    /// network needed.
+    #[tokio::test]
+    async fn delete_prefix_refuses_unsafe_prefixes() {
+        let backend = S3Backend::new(&test_cfg(None)).expect("backend");
+        for prefix in ["", "fleets", "fleets/a", "git"] {
+            let err = backend.delete_prefix(prefix).await.unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to delete"),
+                "prefix {prefix:?}: {err:#}"
+            );
+        }
     }
 
     /// Pagination: a truncated page yields its keys plus the token that

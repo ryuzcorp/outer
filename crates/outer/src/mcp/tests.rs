@@ -2878,6 +2878,51 @@ async fn rename_app_store_fault_refunds_quota_and_keeps_the_old_identity() {
     .await;
     assert_eq!(result(&again)["structuredContent"]["slug"], "pantry");
 }
+#[tokio::test]
+async fn rename_app_reports_a_failed_redeploy_as_rename_success() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    // The pipeline itself blows up on the redeploy: the rename already
+    // committed, so it still answers success with the failure embedded.
+    state.deploys.set_fake(FakeOutcome::transport_error());
+    let (_, body) = call(
+        &state,
+        Some(&ana),
+        "rename_app",
+        json!({"app": "groceries", "slug": "pantry"}),
+    )
+    .await;
+    assert!(
+        result(&body).get("isError").is_none(),
+        "a failed redeploy must not fail the rename: {body}"
+    );
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["slug"], "pantry");
+    assert_eq!(structured["deploy"]["status"], "failed");
+    // The pipeline's detail stays server-side (see `internal`): the agent
+    // gets the generic message, exactly like any other tool failure.
+    assert!(
+        structured["deploy"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("something failed on our side"),
+        "{body}"
+    );
+    // The committed rename counts: the quota claim is retained, not refunded.
+    let account = crate::apps::ensure_account(&state.pool, "ana@example.com")
+        .await
+        .unwrap();
+    let used: i64 = sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
+        .bind(&account)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        used, 1,
+        "a committed rename counts even when its redeploy fails"
+    );
+}
 
 #[tokio::test]
 async fn rename_app_waits_for_the_deploy_lock() {

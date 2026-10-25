@@ -127,8 +127,11 @@ pub struct FakeOutcome {
     pub user_message: Option<&'static str>,
     /// Answer only after this long (timeout-path tests).
     pub delay: Duration,
+    /// Fail the deploy itself instead of answering an outcome (the pipeline
+    /// blew up): `deploy` answers `Err`, so callers take their
+    /// infrastructure-failure path.
+    pub transport_error: bool,
 }
-
 #[cfg(test)]
 impl FakeOutcome {
     pub fn success() -> Self {
@@ -140,6 +143,7 @@ impl FakeOutcome {
             findings: Vec::new(),
             user_message: None,
             delay: Duration::ZERO,
+            transport_error: false,
         }
     }
 
@@ -161,6 +165,7 @@ impl FakeOutcome {
             findings: Vec::new(),
             user_message: None,
             delay: Duration::ZERO,
+            transport_error: false,
         }
     }
 
@@ -182,6 +187,16 @@ impl FakeOutcome {
                 "Outer didn't publish this change because the page text has strong profanity (pages/index.tsx, line 42). Your app still shows the previous version.",
             ),
             delay: Duration::ZERO,
+            transport_error: false,
+        }
+    }
+
+    /// The pipeline itself failed: `deploy` answers `Err` instead of an
+    /// outcome, so callers take their infrastructure-failure path.
+    pub fn transport_error() -> Self {
+        Self {
+            transport_error: true,
+            ..Self::success()
         }
     }
 }
@@ -210,6 +225,9 @@ impl FakeDeploys {
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
         let outcome = self.outcome.lock().expect("fake outcome poisoned").clone();
+        if outcome.transport_error {
+            return Err(anyhow::anyhow!("fake deploy transport failure"));
+        }
         if !outcome.delay.is_zero() {
             tokio::time::sleep(outcome.delay).await;
         }

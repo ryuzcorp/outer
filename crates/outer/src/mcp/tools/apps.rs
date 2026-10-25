@@ -426,7 +426,13 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     });
     match out.redeploy_sha {
         Some(sha) => {
-            let deploy = run_deploy(ctx.state, &out.app, &sha, true).await?;
+            // The rename already committed (the quota counts): a redeploy
+            // infrastructure failure still answers rename success — like the
+            // console path — with the failure embedded in the deploy object.
+            let deploy = match run_deploy(ctx.state, &out.app, &sha, true).await {
+                Ok(deploy) => deploy,
+                Err(err) => json!({"status": "failed", "sha": sha, "error": err.message}),
+            };
             let mut structured = structured;
             structured["deploy"] = deploy;
             Ok(super::ok_deploy(
