@@ -14,7 +14,7 @@
 //! grant and not an API key, so revoking connections or keys can never
 //! sign this browser out. The list responses say so explicitly.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,7 +31,10 @@ pub fn routes() -> Router<super::AppState> {
     Router::new()
         .route("/api/console/account", get(api_account))
         .route("/api/console/alerts/prefs", post(api_update_prefs))
-        .route("/console/alerts/unsubscribe", get(api_unsubscribe))
+        .route(
+            "/console/alerts/unsubscribe",
+            get(unsubscribe_confirm).post(unsubscribe_apply),
+        )
         .route("/api/console/connections", get(api_connections))
         .route(
             "/api/console/connections/{id}/revoke",
@@ -479,56 +482,111 @@ async fn api_update_prefs(
     }
 }
 
-/// `GET /console/alerts/unsubscribe?token=`: one click, no login. The
-/// token is HMAC-signed ([`crate::alerts::verify_unsubscribe`]); a valid
-/// token flips its scope off and says so, anything else explains the link
-/// is not valid. Always 200 HTML: email clients prefetch, and there is no
-/// session to challenge.
-async fn api_unsubscribe(
+/// `GET /console/alerts/unsubscribe?token=`: no login, and **never**
+/// changes state. Link scanners and email-client prefetchers open every
+/// URL in incoming mail, so applying the opt-out here would silently turn
+/// alerts off without any user action. A valid token renders a
+/// confirmation page whose form POSTs back; anything else explains the
+/// link is not valid. Always 200 HTML: there is no session to challenge.
+async fn unsubscribe_confirm(
     State(state): State<super::AppState>,
-    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let issuer = state.mcp.auth.config.issuer.clone();
     let key = state.mcp.unsub_key.clone();
     let token = query.get("token").cloned().unwrap_or_default();
-    let (title, message) = match crate::alerts::verify_unsubscribe(&key, &token) {
-        Some((user_id, scope)) => {
-            let started = now_ms();
-            match crate::alerts::apply_unsubscribe(&state.mcp.pool, &user_id, &scope, started).await {
-                Ok(_) => {
-                    accounts::record_account_action(
-                        &state.mcp.pool,
-                        &user_id,
-                        "update_alert_prefs",
-                        &format!("unsubscribe {scope} via email link"),
-                        "ok",
-                        None,
-                        started,
-                    )
-                    .await;
-                    (
-                        "Unsubscribed",
-                        format!(
-                            "You will no longer get {} emails from Outer. \
-                             Change your mind anytime in the console under Account.",
-                            scope_label(&scope),
-                        ),
-                    )
-                }
-                Err(_) => (
-                    "Something went wrong",
-                    "Outer could not update your email settings. Try again from the console under Account.".to_string(),
-                ),
-            }
-        }
-        None => (
+    let manage = format!("{}/console?t=account", issuer.trim_end_matches('/'));
+    let Some((_, scope)) = crate::alerts::verify_unsubscribe(&key, &token) else {
+        return unsubscribe_page(
             "Link not valid",
             "This unsubscribe link is not valid. It may be from an older email — \
-             manage email alerts in the console under Account."
-                .to_string(),
-        ),
+             manage email alerts in the console under Account.",
+            &manage,
+        );
     };
+    unsubscribe_page(
+        "Confirm unsubscribe",
+        &format!(
+            "Click below to stop getting {} emails from Outer. \
+             Change your mind anytime in the console under Account. \
+             <form method=\"post\" action=\"/console/alerts/unsubscribe\"> \
+             <input type=\"hidden\" name=\"token\" value=\"{token}\"> \
+             <button type=\"submit\">Turn off {} emails</button></form>",
+            scope_label(&scope),
+            scope_label(&scope),
+        ),
+        &manage,
+    )
+}
+
+/// `POST /console/alerts/unsubscribe`: applies the opt-out the GET page
+/// confirmed. Accepts the token from the form body or the query string so
+/// RFC 8058 one-click unsubscribes (`List-Unsubscribe-Post:
+/// List-Unsubscribe=One-Click`) succeed without a browser. The body is
+/// read as raw bytes and scanned for `token=` rather than via `Form`:
+/// one-click POSTs carry no `token` field at all, and our tokens are
+/// URL-safe base64url so no percent-decoding is needed. Always 200 HTML,
+/// same as the confirmation page.
+async fn unsubscribe_apply(
+    State(state): State<super::AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    body: bytes::Bytes,
+) -> Response {
+    let issuer = state.mcp.auth.config.issuer.clone();
+    let key = state.mcp.unsub_key.clone();
     let manage = format!("{}/console?t=account", issuer.trim_end_matches('/'));
+    let form_token = std::str::from_utf8(&body).ok().and_then(|text| {
+        text.split('&').find_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            (name == "token").then(|| value.to_string())
+        })
+    });
+    let token = form_token
+        .or_else(|| query.get("token").cloned())
+        .unwrap_or_default();
+    let Some((user_id, scope)) = crate::alerts::verify_unsubscribe(&key, &token) else {
+        return unsubscribe_page(
+            "Link not valid",
+            "This unsubscribe link is not valid. It may be from an older email — \
+             manage email alerts in the console under Account.",
+            &manage,
+        );
+    };
+    let started = now_ms();
+    match crate::alerts::apply_unsubscribe(&state.mcp.pool, &user_id, &scope, started).await {
+        Ok(_) => {
+            accounts::record_account_action(
+                &state.mcp.pool,
+                &user_id,
+                "update_alert_prefs",
+                &format!("unsubscribe {scope} via email link"),
+                "ok",
+                None,
+                started,
+            )
+            .await;
+            unsubscribe_page(
+                "Unsubscribed",
+                &format!(
+                    "You will no longer get {} emails from Outer. \
+                     Change your mind anytime in the console under Account.",
+                    scope_label(&scope),
+                ),
+                &manage,
+            )
+        }
+        Err(_) => unsubscribe_page(
+            "Something went wrong",
+            "Outer could not update your email settings. Try again from the console under Account.",
+            &manage,
+        ),
+    }
+}
+
+/// The shared 200-HTML shell for the unsubscribe pages (`message` may
+/// carry the confirmation form; it is server-rendered from a verified
+/// token, never from request text).
+fn unsubscribe_page(title: &str, message: &str, manage: &str) -> Response {
     (
         StatusCode::OK,
         [
@@ -1235,15 +1293,47 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    async fn unsubscribe_post(app: &HttpApp, token: &str, form: &str) -> (StatusCode, String) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/console/alerts/unsubscribe?token={token}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     #[tokio::test]
-    async fn email_unsubscribe_link_needs_no_login() {
+    async fn email_unsubscribe_get_confirms_post_applies() {
         let (app, pool) = setup().await;
         let id = account(&pool, "ana@example.com").await;
         let key = b"outer-test-unsub-key".to_vec();
 
-        // No session cookie, no same-origin header: one click opts out.
+        // No session cookie, no same-origin header. GET renders the
+        // confirmation form and changes nothing (link scanners prefetch).
         let token = crate::alerts::sign_unsubscribe(&key, &id, crate::alerts::KIND_ERROR_SPIKE);
         let (status, html) = unsubscribe_body(&app, &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Confirm unsubscribe"), "{html}");
+        assert!(html.contains("<form"), "{html}");
+        assert!(html.contains(&token), "form carries the token: {html}");
+        let prefs = crate::alerts::get_prefs(&pool, &id).await.unwrap();
+        assert!(
+            prefs.deploy_failed && prefs.error_spike && prefs.quota,
+            "GET changes nothing"
+        );
+        assert_eq!(audit_rows(&pool, &id, "update_alert_prefs").await.len(), 0);
+
+        // POSTing the form applies the opt-out.
+        let (status, html) = unsubscribe_post(&app, &token, &format!("token={token}")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("You will no longer get error spike emails"),
@@ -1253,11 +1343,33 @@ mod tests {
         assert!(!prefs.error_spike && prefs.deploy_failed && prefs.quota);
         assert_eq!(audit_rows(&pool, &id, "update_alert_prefs").await.len(), 1);
 
-        // A forged token explains itself and changes nothing.
+        // Forged tokens explain themselves on both methods, changing nothing.
         let (status, html) = unsubscribe_body(&app, "v1.eA.evil.eA").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("not valid"), "{html}");
+        let (status, html) = unsubscribe_post(&app, "v1.eA.evil.eA", "token=v1.eA.evil.eA").await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("not valid"), "{html}");
         let prefs = crate::alerts::get_prefs(&pool, &id).await.unwrap();
         assert!(!prefs.error_spike && prefs.deploy_failed && prefs.quota);
+    }
+
+    #[tokio::test]
+    async fn email_unsubscribe_one_click_post_applies() {
+        let (app, pool) = setup().await;
+        let id = account(&pool, "bob@example.com").await;
+        let key = b"outer-test-unsub-key".to_vec();
+
+        // RFC 8058: the mail client POSTs to the List-Unsubscribe URL with
+        // `List-Unsubscribe=One-Click` and no form fields.
+        let token = crate::alerts::sign_unsubscribe(&key, &id, crate::alerts::KIND_DEPLOY_FAILED);
+        let (status, html) = unsubscribe_post(&app, &token, "List-Unsubscribe=One-Click").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("You will no longer get deploy failure emails"),
+            "{html}"
+        );
+        let prefs = crate::alerts::get_prefs(&pool, &id).await.unwrap();
+        assert!(!prefs.deploy_failed && prefs.error_spike && prefs.quota);
     }
 }

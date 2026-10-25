@@ -388,19 +388,32 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
     // Quota threshold emails (alerts #2): the claim counted even when the
     // deploy failed, so evaluate from the claim numbers. Never raises.
-    crate::alerts::notify_quota(
-        &crate::alerts::Ctx {
-            pool: &ctx.state.pool,
-            sender: &ctx.state.auth.config.email,
-            issuer: &ctx.state.auth.config.issuer,
-            key: &ctx.state.unsub_key,
-        },
-        &app.owner_id,
-        claim.used,
-        claim.limit,
-        crate::auth::now_ms(),
-    )
-    .await;
+    // Spawned: the mailer network call must not delay the commit response
+    // after the deploy is already done (deploy-failure mail already runs
+    // inside the spawned `run_deploy` task the same way).
+    {
+        let pool = ctx.state.pool.clone();
+        let sender = ctx.state.auth.config.email.clone();
+        let issuer = ctx.state.auth.config.issuer.clone();
+        let key = ctx.state.unsub_key.clone();
+        let owner = app.owner_id.clone();
+        let (used, limit) = (claim.used, claim.limit);
+        tokio::spawn(async move {
+            crate::alerts::notify_quota(
+                &crate::alerts::Ctx {
+                    pool: &pool,
+                    sender: &sender,
+                    issuer: &issuer,
+                    key: &key,
+                },
+                &owner,
+                used,
+                limit,
+                crate::auth::now_ms(),
+            )
+            .await;
+        });
+    }
     let quota =
         json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
     let mut summary = format!(

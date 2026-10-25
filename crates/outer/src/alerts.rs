@@ -267,16 +267,35 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
 
 /// Send one alert, recording the debounce row only on success so a
 /// failed send retries on the next trigger instead of going silent.
+/// `list_unsubscribe` is the same one-click URL already printed in the
+/// body: it also travels as `List-Unsubscribe` (+ the RFC 8058 one-click
+/// `List-Unsubscribe-Post`) headers, which the Cloudflare Email Sending
+/// REST API accepts as a `headers` object.
 async fn send_alert(
     ctx: &Ctx<'_>,
     to: &str,
     subject: &str,
     body: &str,
-    debounce_subject: &str,
-    kind: &str,
+    debounce: (&str, &str),
     now: i64,
+    list_unsubscribe: Option<&str>,
 ) {
-    match ctx.sender.send_text(to, subject, body).await {
+    let (debounce_subject, kind) = debounce;
+    let headers: Vec<(&str, String)> = match list_unsubscribe {
+        Some(url) => vec![
+            ("List-Unsubscribe", format!("<{url}>")),
+            (
+                "List-Unsubscribe-Post",
+                "List-Unsubscribe=One-Click".to_string(),
+            ),
+        ],
+        None => Vec::new(),
+    };
+    match ctx
+        .sender
+        .send_text_with_headers(to, subject, body, &headers)
+        .await
+    {
         Ok(()) => {
             if let Err(err) = record_send(ctx.pool, debounce_subject, kind, now).await {
                 tracing::warn!(kind, error = %format!("{err:#}"), "alert send ledger insert failed");
@@ -337,6 +356,10 @@ pub async fn notify_deploy_failed(
     };
     let step = failed_step.unwrap_or("unknown step");
     let detail = truncate_middle(error.unwrap_or("no detail recorded"), 500);
+    let unsub = unsubscribe_url(
+        ctx.issuer,
+        &sign_unsubscribe(ctx.key, &app.owner_id, KIND_DEPLOY_FAILED),
+    );
     let subject = format!("Deploy failed for {}", app.slug);
     let body = format!(
         "The latest deploy of {slug} failed at step \"{step}\":\n\n{detail}\n\n\
@@ -347,13 +370,18 @@ pub async fn notify_deploy_failed(
          Manage all email alerts:\n{manage}\n",
         slug = app.slug,
         console = console_app_url(ctx.issuer, &app.slug, "deploys"),
-        unsub = unsubscribe_url(
-            ctx.issuer,
-            &sign_unsubscribe(ctx.key, &app.owner_id, KIND_DEPLOY_FAILED)
-        ),
         manage = console_url(ctx.issuer, "account"),
     );
-    send_alert(ctx, &to, &subject, &body, &app.id, KIND_DEPLOY_FAILED, now).await;
+    send_alert(
+        ctx,
+        &to,
+        &subject,
+        &body,
+        (app.id.as_str(), KIND_DEPLOY_FAILED),
+        now,
+        Some(&unsub),
+    )
+    .await;
 }
 
 /// Email the account when a claimed change crosses 80 % or 100 % of the
@@ -379,7 +407,11 @@ pub async fn notify_quota(ctx: &Ctx<'_>, user_id: &str, used: u64, limit: u64, n
     if !prefs.quota {
         return;
     }
-    let debounced = match should_send(ctx.pool, user_id, kind, now, QUOTA_DEBOUNCE_MS).await {
+    // One email per threshold per UTC quota day: the window starts at
+    // midnight UTC (the epoch was a Thursday midnight, so the day number
+    // is `now / QUOTA_DEBOUNCE_MS`).
+    let since_midnight = now.rem_euclid(QUOTA_DEBOUNCE_MS);
+    let debounced = match should_send(ctx.pool, user_id, kind, now, since_midnight + 1).await {
         Ok(debounced) => debounced,
         Err(err) => {
             tracing::warn!(error = %format!("{err:#}"), "quota alert debounce lookup failed");
@@ -413,6 +445,7 @@ pub async fn notify_quota(ctx: &Ctx<'_>, user_id: &str, used: u64, limit: u64, n
             ),
         )
     };
+    let unsub = unsubscribe_url(ctx.issuer, &sign_unsubscribe(ctx.key, user_id, "quota"));
     let body = format!(
         "{line}\n\n\
          See your usage:\n{console}\n\n\
@@ -421,10 +454,18 @@ pub async fn notify_quota(ctx: &Ctx<'_>, user_id: &str, used: u64, limit: u64, n
          Turn off quota emails:\n{unsub}\n\
          Manage all email alerts:\n{manage}\n",
         console = console_url(ctx.issuer, "usage"),
-        unsub = unsubscribe_url(ctx.issuer, &sign_unsubscribe(ctx.key, user_id, "quota")),
         manage = console_url(ctx.issuer, "account"),
     );
-    send_alert(ctx, &to, &subject, &body, user_id, kind, now).await;
+    send_alert(
+        ctx,
+        &to,
+        &subject,
+        &body,
+        (user_id, kind),
+        now,
+        Some(&unsub),
+    )
+    .await;
 }
 
 /// One app's spike verdict from [`error_issue`]: which rule fired, if any.
@@ -490,6 +531,44 @@ pub async fn spike_verdict(
         }));
     }
     Ok(None)
+}
+
+/// The human-readable messages behind `fingerprints`, in verdict order,
+/// deduplicated. Fingerprints are content hashes: useless to a reader,
+/// so the quiet-day email names the errors instead and links the errors
+/// view. Empty when the lookup fails (the email then names no error and
+/// still links the view — never raise from the sweep).
+async fn quiet_messages(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprints: &[String],
+    now: i64,
+) -> Vec<String> {
+    let rows: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT fingerprint, message FROM error_issue \
+         WHERE app_id = ?1 AND status = 'open' AND first_seen >= ?2",
+    )
+    .bind(app_id)
+    .bind(now - SPIKE_WINDOW_MS)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "spike message lookup failed");
+            return Vec::new();
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for fp in fingerprints {
+        for (row_fp, message) in &rows {
+            if row_fp == fp && seen.insert(message.clone()) {
+                out.push(truncate_middle(message, 140));
+            }
+        }
+    }
+    out
 }
 
 /// The sweep body, run every few minutes from [`spawn_sweep`]: one email
@@ -572,14 +651,22 @@ pub async fn check_error_spikes(ctx: &Ctx<'_>, now: i64) {
                 )
             }
             SpikeVerdict::NewAfterQuiet { fingerprints } => {
-                format!(
-                    "new error{} on {} after a quiet day ({}).",
-                    if fingerprints.len() == 1 { "" } else { "s" },
-                    slug,
-                    fingerprints.join(", ")
-                )
+                let plural = if fingerprints.len() == 1 { "" } else { "s" };
+                let messages = quiet_messages(ctx.pool, app_id, fingerprints, now).await;
+                if messages.is_empty() {
+                    format!("New error{plural} on {slug} after a quiet day.")
+                } else {
+                    format!(
+                        "New error{plural} on {slug} after a quiet day: {}.",
+                        truncate_middle(&messages.join("; "), 300)
+                    )
+                }
             }
         };
+        let unsub = unsubscribe_url(
+            ctx.issuer,
+            &sign_unsubscribe(ctx.key, owner_id, KIND_ERROR_SPIKE),
+        );
         let subject = format!("Error spike on {slug}");
         let body = format!(
             "{line}\n\n\
@@ -589,13 +676,18 @@ pub async fn check_error_spikes(ctx: &Ctx<'_>, now: i64) {
              Turn off error emails:\n{unsub}\n\
              Manage all email alerts:\n{manage}\n",
             console = console_app_url(ctx.issuer, slug, "errors"),
-            unsub = unsubscribe_url(
-                ctx.issuer,
-                &sign_unsubscribe(ctx.key, owner_id, KIND_ERROR_SPIKE)
-            ),
             manage = console_url(ctx.issuer, "account"),
         );
-        send_alert(ctx, &to, &subject, &body, app_id, KIND_ERROR_SPIKE, now).await;
+        send_alert(
+            ctx,
+            &to,
+            &subject,
+            &body,
+            (app_id.as_str(), KIND_ERROR_SPIKE),
+            now,
+            Some(&unsub),
+        )
+        .await;
     }
 }
 
@@ -806,6 +898,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_threshold_resets_each_utc_day() {
+        let pool = test_pool().await;
+        let (config, codes) = test_config();
+        seed_user(&pool, "u1", "owner@example.com").await;
+        let issuer = "http://outer.localhost:8080";
+        let ctx = ctx(&pool, &config.email, issuer);
+
+        // 80% at 23:00 UTC, then 80% again at 22:00 UTC the next day:
+        // inside a rolling 24 h window, but a new UTC quota day.
+        let day = QUOTA_DEBOUNCE_MS;
+        notify_quota(&ctx, "u1", 40, 50, day - 3_600_000).await;
+        let first = sent_to(&codes, "owner@example.com").expect("80% emails");
+        assert!(first.contains("40 of today's 50"), "{first}");
+
+        notify_quota(&ctx, "u1", 44, 50, day + 22 * 3_600_000).await;
+        let next_day = sent_to(&codes, "owner@example.com").expect("next UTC day emails again");
+        assert!(
+            next_day.contains("44 of today's 50"),
+            "new UTC day resets the debounce: {next_day}"
+        );
+        assert!(
+            next_day.contains(
+                "List-Unsubscribe: <http://outer.localhost:8080/console/alerts/unsubscribe?token="
+            ),
+            "one-click header travels with the mail: {next_day}"
+        );
+        assert!(
+            next_day.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click"),
+            "one-click POST header travels with the mail: {next_day}"
+        );
+
+        // Same UTC day stays silent.
+        notify_quota(&ctx, "u1", 46, 50, day + 22 * 3_600_000 + 1_000).await;
+        assert!(
+            !sent_to(&codes, "owner@example.com")
+                .unwrap()
+                .contains("46 of"),
+            "same UTC day debounced"
+        );
+    }
+
+    #[tokio::test]
     async fn quota_respects_the_toggle() {
         let pool = test_pool().await;
         let (config, codes) = test_config();
@@ -992,6 +1126,54 @@ mod tests {
                 .unwrap()
                 .contains("fp2"),
             "debounced per app per 6 h"
+        );
+    }
+
+    #[tokio::test]
+    async fn spike_quiet_email_names_messages_not_fingerprints() {
+        let pool = test_pool().await;
+        let (config, codes) = test_config();
+        seed_user(&pool, "u1", "owner@example.com").await;
+        seed_app(&pool, "app1", "shop", "u1").await;
+        let now = 100_000_000;
+        seed_issue(
+            &pool,
+            "app1",
+            "old",
+            4,
+            now - 2 * 86_400_000,
+            now - 2 * 86_400_000,
+            "open",
+        )
+        .await;
+        // A custom message (not the 'Error: kaboom' default): the email
+        // must name this, not the fingerprint.
+        sqlx::query(
+            "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, \
+                                  first_seen, last_seen, status) \
+             VALUES ('app1', 'fp-abc-123', 'TypeError: Cannot read properties of null', \
+                     'at handler (x:1:2)', 1, ?1, ?1, 'open')",
+        )
+        .bind(now - 60_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ctx = ctx(&pool, &config.email, "http://outer.localhost:8080");
+        check_error_spikes(&ctx, now).await;
+        let mail = sent_to(&codes, "owner@example.com").expect("quiet-day spike emails");
+        assert!(
+            mail.contains("New error on shop after a quiet day"),
+            "capitalized, names the app: {mail}"
+        );
+        assert!(
+            mail.contains("TypeError: Cannot read properties of null"),
+            "names the error, not its hash: {mail}"
+        );
+        assert!(!mail.contains("fp-abc-123"), "no raw fingerprints: {mail}");
+        assert!(
+            mail.contains("/console?app=shop&t=errors"),
+            "links to the errors view: {mail}"
         );
     }
 
