@@ -297,6 +297,8 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
             uid_range: rt.app_uid_range,
             port_range: rt.fleet_ports,
         },
+        data_dir: config.data_dir.clone(),
+        cgroups: cgroups(),
         domain: config.domain.clone(),
     })
 }

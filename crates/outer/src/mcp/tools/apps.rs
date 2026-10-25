@@ -87,6 +87,20 @@ async fn seed_app(
     .map_err(|err| ToolError::from_create(err, &plan))?;
     let author = crate::ops::noreply_author(owner_id, owner_email, &ctx.state.domain);
     let seeded = async {
+        // Claim-point wipe: a crashed delete can leave local orphans behind
+        // under this now-unclaimed slug. The row insert above is the claim
+        // and nothing local is written yet, so wipe before `init_repo`. A
+        // wipe failure lands in the row-removing cleanup below (nobody ever
+        // saw the slug: no quarantine). The stale in-memory manifest seq
+        // goes too, or `ensure_synced` could read it as already-applied.
+        crate::apps::local::remove_local_state(
+            &ctx.state.delete_cfg.data_dir,
+            &ctx.state.git,
+            ctx.state.delete_cfg.cgroups.as_deref(),
+            slug,
+        )
+        .await?;
+        ctx.state.sync.forget(slug).await;
         crate::git::manifest::init_repo(&ctx.state.store, &ctx.state.git, &ctx.state.sync, slug)
             .await?;
         let message = format!(

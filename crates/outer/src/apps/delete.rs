@@ -12,7 +12,7 @@
 //! Custom domains (M3) and collaborator notices (Pro, M2) don't exist yet:
 //! there is nothing to remove or notify.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use sqlx::SqlitePool;
 
@@ -155,28 +155,12 @@ pub async fn delete_app(
         .await
         .map_err(internal)?;
 
-    // 3. Local state: the worktree and its sidecars, the install cache, the
-    // fleet's state dir, and the fleet cgroup leaf. All idempotent.
-    let work = cfg.data_dir.join("work").join(slug);
-    remove_dir(&work).await.map_err(internal)?;
-    let sidecars = cfg.data_dir.join("work");
-    remove_file(&sidecars.join(format!("{slug}.index")))
+    // 3. Local state: the mirror, the worktree and its sidecars, the
+    // install cache, the fleet's state dir, the secret sidecars, and the
+    // fleet cgroup leaf. All idempotent (missing is done).
+    crate::apps::local::remove_local_state(&cfg.data_dir, git, cfg.cgroups.as_deref(), slug)
         .await
         .map_err(internal)?;
-    remove_file(&sidecars.join(format!("{slug}.install-hash")))
-        .await
-        .map_err(internal)?;
-    remove_dir(&cfg.data_dir.join("cache").join(slug))
-        .await
-        .map_err(internal)?;
-    remove_dir(&cfg.data_dir.join("fleets").join(slug))
-        .await
-        .map_err(internal)?;
-    if let Some(anchor) = &cfg.cgroups {
-        crate::fleet::cgroups::remove_fleet_cgroup(
-            &anchor.join(crate::fleet::cgroups::fleet_dir_name(slug)),
-        );
-    }
 
     // 4. Rows: every app-scoped child explicitly, then the app row itself —
     // LAST, so a failure above keeps the row and a retry finishes the job.
@@ -219,29 +203,4 @@ pub async fn delete_app(
         slug: slug.to_string(),
         quarantined_until,
     })
-}
-
-/// `remove_dir_all`, treating a missing path as done. Anything else is a
-/// real failure (the row stays, the retry finishes the job).
-async fn remove_dir(path: &Path) -> anyhow::Result<()> {
-    match tokio::fs::remove_dir_all(path).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow::anyhow!(
-            "removing local dir {}: {err}",
-            path.display()
-        )),
-    }
-}
-
-/// `remove_file`, treating a missing path as done.
-async fn remove_file(path: &Path) -> anyhow::Result<()> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow::anyhow!(
-            "removing local file {}: {err}",
-            path.display()
-        )),
-    }
 }

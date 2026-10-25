@@ -490,9 +490,22 @@ pub async fn rename_app_with_hooks(
         .map_err(internal)?;
     fail_if(hooks, RenameFailStep::AfterFleetsCopy)?;
 
+    // Claim-point wipe for the target: a crashed delete can leave local
+    // orphans behind under this now-unclaimed slug, and `move_path` skips
+    // an existing destination — without the wipe the old dirs would stay
+    // put and the new slug would serve stale state. The stale in-memory
+    // manifest seq goes too (`set_applied_seq` only moves forward, so a
+    // leftover higher seq would pin the moved repo's seq down).
+    super::local::remove_local_state(data_dir, git, cgroups, new_slug)
+        .await
+        .map_err(internal)?;
+    sync.forget(new_slug).await;
+
     // 4. Local state: the bare mirror, the worktree and its sidecars, the
     // install cache, the fleet's state dir, and the fleet cgroup leaf (empty:
     // the fleet is stopped — the next wake recreates it under the new name).
+    // The target was wiped just above (abandoned orphans must not block the
+    // moves: an existing destination reads as already-moved).
     // The manifest generation marker follows the repo; the old slug's lock
     // and wake map entries leak one idle mutex each (bounded by renames).
     move_path(
@@ -839,6 +852,132 @@ mod tests {
                 .unwrap();
         assert_eq!(target.as_deref(), Some("pantry"));
         assert!(!claimable(&fx, "groceries").await);
+    }
+
+    /// Abandoned local state under the target (a crashed delete's orphans):
+    /// stale markers under every local path for `slug`.
+    async fn plant_stale_target(fx: &Fx, slug: &str) {
+        tokio::fs::create_dir_all(fx.data.join(format!("work/{slug}")))
+            .await
+            .unwrap();
+        tokio::fs::write(fx.data.join(format!("work/{slug}/leftover")), b"stale")
+            .await
+            .unwrap();
+        tokio::fs::write(fx.data.join(format!("work/{slug}.index")), b"stale")
+            .await
+            .unwrap();
+        tokio::fs::write(fx.data.join(format!("work/{slug}.install-hash")), b"stale")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(fx.data.join(format!("cache/{slug}")))
+            .await
+            .unwrap();
+        tokio::fs::write(fx.data.join(format!("cache/{slug}/leftover")), b"stale")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(fx.data.join(format!("fleets/{slug}")))
+            .await
+            .unwrap();
+        tokio::fs::write(fx.data.join(format!("fleets/{slug}/leftover")), b"stale")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(fx.data.join("secret-sidecars"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            fx.data.join(format!("secret-sidecars/{slug}.orig")),
+            b"stale",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            fx.data.join(format!("secret-sidecars/{slug}.target")),
+            b"stale",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(fx.git.repos_dir.join(format!("{slug}.git")))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            fx.git.repos_dir.join(format!("{slug}.git/leftover")),
+            b"stale",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn target_orphans_are_wiped_before_the_local_moves() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        // Distinct old-slug content that must move over to the target.
+        tokio::fs::write(fx.data.join("work/groceries/treasure"), b"old")
+            .await
+            .unwrap();
+        tokio::fs::write(fx.git.repos_dir.join("groceries.git/oldfile"), b"old")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(fx.data.join("secret-sidecars"))
+            .await
+            .unwrap();
+        tokio::fs::write(fx.data.join("secret-sidecars/groceries.orig"), b"old")
+            .await
+            .unwrap();
+        // A crashed delete's orphans under the unclaimed target, plus a
+        // stale in-memory manifest seq for it.
+        plant_stale_target(&fx, "pantry").await;
+        fx.sync.set_applied_seq("pantry", 99).await;
+
+        let out = run(&fx, "groceries", "pantry", RenameHooks::default())
+            .await
+            .unwrap();
+        assert_eq!(out.app.slug, "pantry");
+        // The old dirs moved in over the wiped target.
+        assert_eq!(
+            tokio::fs::read(fx.data.join("work/pantry/treasure"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.data.join("work/pantry.index"))
+                .await
+                .unwrap(),
+            b"i"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.data.join("work/pantry.install-hash"))
+                .await
+                .unwrap(),
+            b"h"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.git.repos_dir.join("pantry.git/oldfile"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.data.join("secret-sidecars/pantry.orig"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        // Every stale marker is gone; the stale seq went with them.
+        for stale in [
+            "work/pantry/leftover",
+            "cache/pantry/leftover",
+            "fleets/pantry/leftover",
+            "secret-sidecars/pantry.target",
+        ] {
+            assert!(!fx.data.join(stale).exists(), "{stale} survived the wipe");
+        }
+        assert!(!fx.git.repos_dir.join("pantry.git/leftover").exists());
+        assert_eq!(fx.sync.applied_seq("pantry").await, None);
+        // The old slug's paths are gone.
+        assert!(!fx.data.join("work/groceries").exists());
+        assert!(!fx.git.repos_dir.join("groceries.git").exists());
     }
 
     #[tokio::test]

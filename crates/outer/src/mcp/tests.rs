@@ -1699,7 +1699,15 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
     tokio::fs::create_dir_all(data.join("fleets/groceries"))
         .await
         .unwrap();
-    assert!(state.git.repos_dir.join("groceries.git").exists());
+    tokio::fs::create_dir_all(data.join("secret-sidecars"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("secret-sidecars/groceries.orig"), b"o")
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("secret-sidecars/groceries.target"), b"0\ncfg")
+        .await
+        .unwrap();
 
     let (_, body) = call(
         &state,
@@ -1739,6 +1747,8 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
     assert!(!data.join("work/groceries.install-hash").exists());
     assert!(!data.join("cache/groceries").exists());
     assert!(!data.join("fleets/groceries").exists());
+    assert!(!data.join("secret-sidecars/groceries.orig").exists());
+    assert!(!data.join("secret-sidecars/groceries.target").exists());
     assert!(!state.git.repos_dir.join("groceries.git").exists());
     // Rows: the app, every child table, and the quarantine row to prove it.
     for table in [
@@ -1791,6 +1801,74 @@ async fn delete_app_removes_everything_and_quarantines_the_slug() {
     // And Bob's app still serves its summary.
     let (_, kept) = call(&state, Some(&bob), "get_app", json!({"app": "bobapp"})).await;
     assert_eq!(result(&kept)["structuredContent"]["slug"], "bobapp");
+}
+#[tokio::test]
+async fn create_app_wipes_abandoned_local_state_for_an_unclaimed_slug() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    // A crashed delete's orphans under a slug nobody owns: stale files
+    // under every local path the slug will own.
+    let data = &state.delete_cfg.data_dir;
+    tokio::fs::create_dir_all(data.join("work/fig"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("work/fig/leftover"), b"stale")
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("work/fig.index"), b"stale")
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("work/fig.install-hash"), b"stale")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("cache/fig"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("cache/fig/leftover"), b"stale")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("fleets/fig"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("fleets/fig/leftover"), b"stale")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("secret-sidecars"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("secret-sidecars/fig.orig"), b"stale")
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("secret-sidecars/fig.target"), b"stale")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(state.git.repos_dir.join("fig.git"))
+        .await
+        .unwrap();
+    tokio::fs::write(state.git.repos_dir.join("fig.git/leftover"), b"stale")
+        .await
+        .unwrap();
+    state.sync.set_applied_seq("fig", 99).await;
+
+    let (_, body) = call(&state, Some(&ana), "create_app", json!({"slug": "fig"})).await;
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["app"]["slug"], "fig");
+    // Every stale marker is gone; the mirror is the fresh seed, not the
+    // orphan, and the stale seq went with the orphans.
+    for stale in [
+        "work/fig/leftover",
+        "work/fig.index",
+        "work/fig.install-hash",
+        "cache/fig/leftover",
+        "fleets/fig/leftover",
+        "secret-sidecars/fig.orig",
+        "secret-sidecars/fig.target",
+    ] {
+        assert!(!data.join(stale).exists(), "{stale} survived the claim");
+    }
+    assert!(!state.git.repos_dir.join("fig.git/leftover").exists());
+    assert!(state.git.repos_dir.join("fig.git").exists());
+    assert_eq!(state.sync.applied_seq("fig").await, Some(1));
 }
 
 #[tokio::test]
