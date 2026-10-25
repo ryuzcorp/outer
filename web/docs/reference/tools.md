@@ -528,3 +528,41 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated �
 | `app` | string | yes | The app slug. |
 | `key` | string | yes | The secret name to remove. |
 
+## `list_backups`
+
+- **Access:** signed in
+- **Description:** An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `binding` | string | no | The D1 binding. Omit to list the app's dumps (one database per app). |
+
+## `backup_database`
+
+- **Access:** signed in
+- **Description:** Back up an app's D1 database now: {app, binding?} (binding defaults to the single declared binding). Returns the stored backup id, time and size. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `binding` | string | no | The D1 binding. Omit to use the app's only declared binding. |
+
+## `restore_backup`
+
+- **Access:** signed in
+- **Description:** Restore an app's D1 database from a backup: {app, binding?, backup_id, confirm} with confirm equal to backup_id. Takes a fresh backup first, then replaces the live tables with the dump. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `backup_id` | string | yes | The backup id to restore, from `list_backups`. |
+| `binding` | string | no | The D1 binding. Omit to use the app's only declared binding. |
+| `confirm` | string | yes | Must equal `backup_id`: restoring overwrites the live database (a fresh backup is taken first, so a bad restore is itself restorable). |
+

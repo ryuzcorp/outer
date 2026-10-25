@@ -207,15 +207,17 @@ async fn copy_prefix(store: &Store, from_prefix: &str, to_prefix: &str) -> anyho
         .list(from_prefix)
         .await
         .with_context(|| format!("listing {from_prefix} for the rename copy"))?;
-    if keys.is_empty() {
-        return Ok(0);
-    }
-    // Wipe-first (see above): retrying a crashed copy restarts from empty
-    // instead of mixing stale bytes with fresh ones.
+    // Wipe-first (see above) even when the source is empty: a crashed
+    // attempt can leave an abandoned copy under the target — adopted by our
+    // own target-claim rows — and an empty source must still clear it, or
+    // the stale bytes ride along under the new slug with no cleanup row.
     store
         .delete_prefix(to_prefix)
         .await
         .with_context(|| format!("clearing {to_prefix} for the rename copy"))?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
     let tmp = tempfile::tempdir().context("staging the rename copy")?;
     let mut copied = 0u64;
     for key in &keys {
@@ -241,6 +243,24 @@ async fn copy_prefix(store: &Store, from_prefix: &str, to_prefix: &str) -> anyho
         copied += 1;
     }
     Ok(copied)
+}
+
+/// Post-commit bucket cleanup for one prefix: delete the objects, then the
+/// cleanup row — but only after the delete succeeds. A failed delete keeps
+/// its row, so the maintenance drain still knows about the leftover objects
+/// and retries their deletion.
+async fn delete_prefix_and_row(pool: &SqlitePool, store: &Store, prefix: &str) {
+    if let Err(err) = store.delete_prefix(prefix).await {
+        tracing::warn!(error = %format!("{err:#}"), prefix, "rename post-commit prefix delete failed; the maintenance drain retries it");
+        return;
+    }
+    if let Err(err) = sqlx::query("DELETE FROM prefix_cleanup WHERE prefix = ?1")
+        .bind(prefix)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(error = %format!("{err:#}"), prefix, "rename post-commit cleanup row delete failed; the maintenance drain retries it");
+    }
 }
 
 /// Move one local path for the rename, wiping the target first — but only
@@ -292,14 +312,19 @@ async fn remove_local_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The slug a cleanup row belongs to: `fleets/{slug}/` or `git/{slug}/`.
-/// Anything else is a corrupt row the drain only deletes by raw prefix when
-/// the prefix is still a safe scope (non-empty, trailing `/`); otherwise the
-/// row is kept and the drain warns.
+/// The slug a cleanup row belongs to: `fleets/{slug}/`, `git/{slug}/` or
+/// `outer/backups/{slug}/`. Anything else is a corrupt row the drain only
+/// deletes by raw prefix when the prefix is still a safe scope (non-empty,
+/// trailing `/`); otherwise the row is kept and the drain warns.
 fn cleanup_slug(prefix: &str) -> Option<&str> {
     let rest = prefix
         .strip_prefix("fleets/")
-        .or_else(|| prefix.strip_prefix("git/"))?;
+        .or_else(|| prefix.strip_prefix("git/"))
+        .or_else(|| {
+            prefix
+                .strip_prefix(crate::d1_backup::BACKUP_ROOT)
+                .and_then(|rest| rest.strip_prefix('/'))
+        })?;
     rest.strip_suffix("/")
 }
 
@@ -362,12 +387,13 @@ pub async fn drain_prefix_cleanup(
             Some(fleets) => Some(fleets.wake_lock(&slug).await.lock_owned().await),
             None => None,
         };
-        let [fleets_prefix, git_prefix] = cleanup_prefixes(&slug);
+        let [fleets_prefix, git_prefix, backups_prefix] = cleanup_prefixes(&slug);
         let pending: Vec<String> = sqlx::query_scalar(
-            "SELECT prefix FROM prefix_cleanup WHERE prefix IN (?1, ?2) ORDER BY prefix",
+            "SELECT prefix FROM prefix_cleanup WHERE prefix IN (?1, ?2, ?3) ORDER BY prefix",
         )
         .bind(&fleets_prefix)
         .bind(&git_prefix)
+        .bind(&backups_prefix)
         .fetch_all(pool)
         .await?;
         if pending.is_empty() {
@@ -382,9 +408,10 @@ pub async fn drain_prefix_cleanup(
                 slug,
                 "prefix_cleanup rows name a live app; dropping the rows, keeping the data"
             );
-            sqlx::query("DELETE FROM prefix_cleanup WHERE prefix IN (?1, ?2)")
+            sqlx::query("DELETE FROM prefix_cleanup WHERE prefix IN (?1, ?2, ?3)")
                 .bind(&fleets_prefix)
                 .bind(&git_prefix)
+                .bind(&backups_prefix)
                 .execute(pool)
                 .await?;
             removed += pending.len() as u64;
@@ -396,9 +423,10 @@ pub async fn drain_prefix_cleanup(
                 .await
                 .with_context(|| format!("draining cleanup prefix {prefix}"))?;
         }
-        sqlx::query("DELETE FROM prefix_cleanup WHERE prefix IN (?1, ?2)")
+        sqlx::query("DELETE FROM prefix_cleanup WHERE prefix IN (?1, ?2, ?3)")
             .bind(&fleets_prefix)
             .bind(&git_prefix)
+            .bind(&backups_prefix)
             .execute(pool)
             .await?;
         removed += pending.len() as u64;
@@ -481,7 +509,7 @@ pub async fn rename_app_with_hooks(
     // is unclaimable until the flip trades them away. `OR IGNORE` adopts
     // our own abandoned attempt's rows — the copy below wipes the target
     // first, so the retry converges.
-    let [to_fleets, to_git] = cleanup_prefixes(new_slug);
+    let [to_fleets, to_git, to_backups] = cleanup_prefixes(new_slug);
     {
         let _guard = lock_for_rename_target().await;
         let live: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE slug = ?1")
@@ -502,7 +530,7 @@ pub async fn rename_app_with_hooks(
             return Err(RenameError::Taken);
         }
         let now = now_ms();
-        for prefix in [&to_fleets, &to_git] {
+        for prefix in [&to_fleets, &to_git, &to_backups] {
             sqlx::query(
                 "INSERT OR IGNORE INTO prefix_cleanup (prefix, reason, created_at) \
                  VALUES (?1, 'rename-target', ?2)",
@@ -515,14 +543,15 @@ pub async fn rename_app_with_hooks(
         }
     }
 
-    // 3. Bucket: the repo WAL under `git/{old}/`, and deploys, D1/DO cell
-    // state, leases and the fleet secret under `fleets/{old}/`. The cell and
-    // database identities live in the app's config (unchanged by a rename),
-    // so the copied state stays valid under the new prefix; the copied node
+    // 3. Bucket: the repo WAL under `git/{old}/`, deploys, D1/DO cell state,
+    // leases and the fleet secret under `fleets/{old}/`, and the D1 dumps
+    // under `outer/backups/{old}/`. The cell and database identities live
+    // in the app's config (unchanged by a rename), so the copied state
+    // stays valid under the new prefix; the copied node
     // leases name stopped nodes, and the new fleet claims its cells past
     // them (same failover as a dead owner node — the old fleet is stopped,
     // so there is no split brain).
-    let [from_fleets, from_git] = cleanup_prefixes(old_slug);
+    let [from_fleets, from_git, from_backups] = cleanup_prefixes(old_slug);
     copy_prefix(store, &from_git, &to_git)
         .await
         .map_err(internal)?;
@@ -531,6 +560,9 @@ pub async fn rename_app_with_hooks(
         .await
         .map_err(internal)?;
     fail_if(hooks, RenameFailStep::AfterFleetsCopy)?;
+    copy_prefix(store, &from_backups, &to_backups)
+        .await
+        .map_err(internal)?;
 
     // 4. Local state: the bare mirror, the worktree and its sidecars, the
     // install cache, the fleet's state dir, and the fleet cgroup leaf (empty:
@@ -627,7 +659,7 @@ pub async fn rename_app_with_hooks(
     // prefixes' cleanup rows. A UNIQUE failure on the flip is a lost race,
     // not corruption: map it to Taken.
     let mut tx = pool.begin().await.map_err(internal)?;
-    for prefix in [&to_fleets, &to_git] {
+    for prefix in [&to_fleets, &to_git, &to_backups] {
         sqlx::query("DELETE FROM prefix_cleanup WHERE prefix = ?1")
             .bind(prefix)
             .execute(&mut *tx)
@@ -686,7 +718,8 @@ pub async fn rename_app_with_hooks(
         }
         return Err(internal(e));
     }
-    let [old_fleets, old_git] = [from_fleets.clone(), from_git.clone()];
+    let [old_fleets, old_git, old_backups] =
+        [from_fleets.clone(), from_git.clone(), from_backups.clone()];
     // Exports are 24 h-ephemeral links keyed under the old slug, so the
     // rename drops them instead of moving them: the objects go through the
     // same post-commit drain as the git/fleets prefixes, and the rows go
@@ -697,11 +730,35 @@ pub async fn rename_app_with_hooks(
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
+    // The D1 dumps copied buckets above; their rows move slugs in the same
+    // transaction, or download/restore read stale keys (and post-commit
+    // cleanup removes the objects those keys name).
+    let backup_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, store_key FROM d1_backup WHERE app_id = ?1")
+            .bind(&app.id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal)?;
+    for (id, store_key) in &backup_rows {
+        let Some(suffix) = store_key.strip_prefix(&from_backups) else {
+            // Backup rows always live under the slug prefix; a foreign key
+            // (impossible via `backup_binding`) must not block the rename.
+            continue;
+        };
+        let new_key = format!("{to_backups}{suffix}");
+        sqlx::query("UPDATE d1_backup SET store_key = ?1 WHERE id = ?2")
+            .bind(&new_key)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+    }
     let now = now_ms();
     for (prefix, reason) in [
         (&old_fleets, "rename-old"),
         (&old_git, "rename-old"),
         (&old_exports, "rename-old"),
+        (&old_backups, "rename-old"),
     ] {
         if let Err(e) = sqlx::query(
             "INSERT INTO prefix_cleanup (prefix, reason, created_at) VALUES (?1, ?2, ?3)",
@@ -741,23 +798,8 @@ pub async fn rename_app_with_hooks(
     // the rename, so any error above means "never happened" and the caller
     // refunds the quota.
     if hooks.fail_at != Some(RenameFailStep::SkipCleanup) {
-        if let Err(err) = store.delete_prefix(&from_git).await {
-            tracing::warn!(error = %format!("{err:#}"), "rename post-commit git prefix delete failed; the maintenance drain retries it");
-        }
-        if let Err(err) = store.delete_prefix(&from_fleets).await {
-            tracing::warn!(error = %format!("{err:#}"), "rename post-commit fleets prefix delete failed; the maintenance drain retries it");
-        }
-        if let Err(err) = store.delete_prefix(&old_exports).await {
-            tracing::warn!(error = %format!("{err:#}"), "rename post-commit exports prefix delete failed; the maintenance drain retries it");
-        }
-        for prefix in [&from_git, &from_fleets, &old_exports] {
-            if let Err(err) = sqlx::query("DELETE FROM prefix_cleanup WHERE prefix = ?1")
-                .bind(prefix)
-                .execute(pool)
-                .await
-            {
-                tracing::warn!(error = %format!("{err:#}"), "rename post-commit cleanup row delete failed; the maintenance drain retries it");
-            }
+        for prefix in [&from_git, &from_fleets, &old_exports, &from_backups] {
+            delete_prefix_and_row(pool, store, prefix).await;
         }
     }
     crate::cloudflare::purge_host_cache(cache_purge, &format!("{old_slug}.{apps_domain}")).await;
@@ -936,6 +978,117 @@ mod tests {
                 .unwrap();
         assert_eq!(target.as_deref(), Some("pantry"));
         assert!(!claimable(&fx, "groceries").await);
+    }
+
+    #[tokio::test]
+    async fn rename_rewrites_backup_store_keys() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        let app = super::super::get_by_slug(&fx.pool, "groceries")
+            .await
+            .unwrap()
+            .unwrap();
+        fx.store
+            .put(
+                "outer/backups/groceries/123-DB.sql",
+                b"CREATE TABLE t (id);".to_vec(),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO d1_backup (id, app_id, binding, store_key, created_at, size_bytes) \
+             VALUES ('b1', ?1, 'DB', 'outer/backups/groceries/123-DB.sql', 123, 19)",
+        )
+        .bind(&app.id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let out = run(&fx, "groceries", "pantry", RenameHooks::default())
+            .await
+            .unwrap();
+        assert_eq!(out.app.slug, "pantry");
+        // The row follows the bucket: restore reads the new key.
+        let key: String = sqlx::query_scalar("SELECT store_key FROM d1_backup WHERE id = 'b1'")
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(key, "outer/backups/pantry/123-DB.sql");
+        assert_eq!(
+            fx.store
+                .get("outer/backups/pantry/123-DB.sql")
+                .await
+                .unwrap(),
+            Some(b"CREATE TABLE t (id);".to_vec())
+        );
+        assert!(fx
+            .store
+            .list("outer/backups/groceries/")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(cleanup_rows(&fx).await.is_empty(), "no jobs left behind");
+    }
+
+    #[tokio::test]
+    async fn rename_clears_an_orphaned_target_prefix_when_source_is_empty() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        // The source app has no backups, but a crashed earlier attempt left
+        // bytes under the target. The rename must still clear the target,
+        // or the stale dump rides along under the new slug.
+        fx.store
+            .put("outer/backups/pantry/stale.sql", b"stale".to_vec())
+            .await
+            .unwrap();
+        let out = run(&fx, "groceries", "pantry", RenameHooks::default())
+            .await
+            .unwrap();
+        assert_eq!(out.app.slug, "pantry");
+        assert!(fx
+            .store
+            .list("outer/backups/pantry/")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_prefix_delete_keeps_its_cleanup_row_for_the_drain() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        fx.store
+            .put("outer/backups/groceries/dump.sql", b"dump".to_vec())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO prefix_cleanup (prefix, reason, created_at) \
+             VALUES ('outer/backups/groceries/', 'rename-old', 1)",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        // The prefix delete fails: the row stays, so the drain retries it.
+        fx.store.fail_next(1, "r2 is down");
+        delete_prefix_and_row(&fx.pool, &fx.store, "outer/backups/groceries/").await;
+        assert_eq!(
+            cleanup_rows(&fx).await,
+            vec!["outer/backups/groceries/".to_string()]
+        );
+        assert!(fx
+            .store
+            .get("outer/backups/groceries/dump.sql")
+            .await
+            .unwrap()
+            .is_some());
+        // The retry converges: bytes gone, row gone.
+        delete_prefix_and_row(&fx.pool, &fx.store, "outer/backups/groceries/").await;
+        assert!(cleanup_rows(&fx).await.is_empty());
+        assert!(fx
+            .store
+            .list("outer/backups/groceries/")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Abandoned local state under the target (a crashed delete's orphans):
@@ -1186,7 +1339,11 @@ mod tests {
         // The abandoned target is blocked: its rows are pending.
         assert_eq!(
             cleanup_rows(&fx).await,
-            vec!["fleets/pantry/".to_string(), "git/pantry/".to_string()]
+            vec![
+                "fleets/pantry/".to_string(),
+                "git/pantry/".to_string(),
+                "outer/backups/pantry/".to_string()
+            ]
         );
         assert!(!claimable(&fx, "pantry").await);
         // Retry to a DIFFERENT slug converges with all data.
@@ -1211,9 +1368,15 @@ mod tests {
         let drained = drain_prefix_cleanup(&fx.pool, &fx.store, None)
             .await
             .unwrap();
-        assert_eq!(drained, 2, "the abandoned pantry copy's two rows");
+        assert_eq!(drained, 3, "the abandoned pantry copy's three rows");
         assert!(fx.store.list("fleets/pantry/").await.unwrap().is_empty());
         assert!(fx.store.list("git/pantry/").await.unwrap().is_empty());
+        assert!(fx
+            .store
+            .list("outer/backups/pantry/")
+            .await
+            .unwrap()
+            .is_empty());
         assert!(fx.store.list("fleets/groceries/").await.unwrap().is_empty());
         assert!(cleanup_rows(&fx).await.is_empty());
         // The abandoned target is claimable again, and provably empty: a
@@ -1252,6 +1415,7 @@ mod tests {
             vec![
                 "fleets/groceries/".to_string(),
                 "git/groceries/".to_string(),
+                "outer/backups/groceries/".to_string(),
                 "outer/exports/groceries/".to_string()
             ]
         );
@@ -1266,12 +1430,18 @@ mod tests {
         let drained = drain_prefix_cleanup(&fx.pool, &fx.store, None)
             .await
             .unwrap();
-        assert_eq!(drained, 3);
+        assert_eq!(drained, 4);
         assert!(fx.store.list("fleets/groceries/").await.unwrap().is_empty());
         assert!(fx.store.list("git/groceries/").await.unwrap().is_empty());
         assert!(fx
             .store
             .list("outer/exports/groceries/")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fx
+            .store
+            .list("outer/backups/groceries/")
             .await
             .unwrap()
             .is_empty());

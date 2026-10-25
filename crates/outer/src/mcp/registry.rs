@@ -5,9 +5,9 @@
 use serde_json::Value;
 
 use crate::mcp::tools::{
-    account, apps as app_inputs, code as code_inputs, collaborators as collab_inputs,
-    domains as domain_inputs, export as export_inputs, look as look_inputs,
-    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
+    account, apps as app_inputs, backups as backup_inputs, code as code_inputs,
+    collaborators as collab_inputs, domains as domain_inputs, export as export_inputs,
+    look as look_inputs, runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -89,13 +89,11 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
         | "get_app" | "share_app" | "look_at_app" | "list_files" | "read_file" | "search_code"
         | "history" | "show_commit" | "deploy_status" | "deploy_log" | "app_logs"
-        | "app_errors" | "list_secrets" | "list_collaborators" | "list_domains" | "export_code" => {
-            Hints::READ
-        }
+        | "app_errors" | "list_secrets" | "list_collaborators" | "list_domains" | "export_code"
+        | "list_backups" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
-        | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain" => {
-            Hints::WRITE
-        }
+        | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
+        | "backup_database" => Hints::WRITE,
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -113,6 +111,12 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         },
         "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
         | "unset_secret" | "remove_domain" => Hints::DESTRUCTIVE,
+        // Repeating a restore takes another fresh backup, so one call is
+        // never a no-op repeat of the last: not idempotent.
+        "restore_backup" => Hints {
+            idempotent: false,
+            ..Hints::DESTRUCTIVE
+        },
         _ => return None,
     })
 }
@@ -371,11 +375,26 @@ pub fn registry() -> Vec<ToolDef> {
  "Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names match ^[A-Z_][A-Z0-9_]{0,63}$, at most 50 per app.",
  Account, false,
  ),
- tool::<secrets_inputs::UnsetSecretInput>(
- "unset_secret",
- "Remove an app secret {app, key}. Applies on the next deploy.",
- Account, false,
- ),
+        tool::<secrets_inputs::UnsetSecretInput>(
+            "unset_secret",
+            "Remove an app secret {app, key}. Applies on the next deploy.",
+            Account, false,
+        ),
+        tool::<backup_inputs::ListBackupsInput>(
+            "list_backups",
+            "An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.",
+            Account, false,
+        ),
+        tool::<backup_inputs::BackupDatabaseInput>(
+            "backup_database",
+            "Back up an app's D1 database now: {app, binding?} (binding defaults to the single declared binding). Returns the stored backup id, time and size. Owner only.",
+            Account, false,
+        ),
+        tool::<backup_inputs::RestoreBackupInput>(
+            "restore_backup",
+            "Restore an app's D1 database from a backup: {app, binding?, backup_id, confirm} with confirm equal to backup_id. Takes a fresh backup first, then replaces the live tables with the dump. Owner only.",
+            Account, false,
+        ),
     ]
 }
 
@@ -402,16 +421,15 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 44);
+        assert_eq!(tools.len(), 47);
     }
 }
 
 #[cfg(test)]
 mod hint_tests {
     use super::*;
-
     #[test]
-    fn every_tool_is_classified_and_only_revoke_delete_unset_and_remove_are_destructive() {
+    fn every_tool_is_classified_and_only_revoke_delete_unset_remove_and_restore_are_destructive() {
         for tool in registry() {
             let hints = hints_for(tool.name)
                 .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
@@ -429,6 +447,7 @@ mod hint_tests {
                     | "unset_secret"
                     | "remove_collaborator"
                     | "remove_domain"
+                    | "restore_backup"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);
             // Untrusted tools return app content; they must never change state.
@@ -442,6 +461,9 @@ mod hint_tests {
         }
         assert!(hints_for("commit").is_some_and(|h| !h.read_only && !h.destructive));
         assert!(hints_for("list_apps").is_some_and(|h| h.read_only));
+        // Every restore takes a fresh backup first, so a retry is never a
+        // no-op: destructive but not idempotent.
+        assert!(hints_for("restore_backup").is_some_and(|h| h.destructive && !h.idempotent));
         assert_eq!(title_of("create_app"), "Create app");
     }
 }

@@ -622,6 +622,14 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         outer::cron::TICK_EVERY,
         outer::cron::WAKE_LEAD,
     );
+    // Daily D1 backups (wave 3, feature #4): dump each active app's
+    // databases to `outer/backups/{slug}/` and prune past retention.
+    outer::d1_backup::spawn_backup_task(
+        pool.clone(),
+        store.clone(),
+        fleets.clone(),
+        outer::d1_backup::TICK_EVERY,
+    );
 
     let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
     // One client for the pipeline gate and the slug/name check alike: both

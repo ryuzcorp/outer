@@ -233,7 +233,7 @@ fn escape_like(needle: &str) -> String {
 /// Render a UI value for a column: JSON null → NULL, "" → the empty string;
 /// numbers for INTEGER/REAL-affinity columns stay bare so REAL precision is
 /// preserved, everything else is quote-escaped.
-fn literal(decltype: &str, value: Option<&str>) -> String {
+pub(crate) fn literal(decltype: &str, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".to_string();
     };
@@ -617,6 +617,8 @@ pub enum D1Error {
     NoConfig,
     #[error("unknown table {0:?}")]
     UnknownTable(String),
+    #[error("unknown backup {0:?}")]
+    UnknownBackup(String),
     #[error("{0}")]
     BadQuery(String),
     #[error("the app is still starting")]
@@ -627,6 +629,8 @@ pub enum D1Error {
     Timeout,
     #[error("database is unavailable right now")]
     Unavailable(#[source] anyhow::Error),
+    #[error("backup too large: {0}")]
+    TooLarge(String),
 }
 
 impl D1Error {
@@ -820,7 +824,7 @@ async fn materialize_project(config: &[u8]) -> anyhow::Result<tempfile::TempDir>
 /// SQL only — never raw browser input. The env carries the scoped grant
 /// alone (`env_clear` + minimal PATH, so no parent-process AWS keys leak),
 /// and the timeout kills the child on expiry.
-async fn d1_exec(
+pub(crate) async fn d1_exec(
     ctx: &D1Ctx,
     slug: &str,
     identity: &str,
@@ -900,7 +904,7 @@ fn first_lines(stderr: &str, n: usize) -> String {
 
 /// Parse `--json` output: one JSON object per line (informational lines go to
 /// stderr, but be tolerant and skip anything that isn't an object).
-fn parse_json_rows(out: &str) -> Vec<serde_json::Map<String, serde_json::Value>> {
+pub(crate) fn parse_json_rows(out: &str) -> Vec<serde_json::Map<String, serde_json::Value>> {
     out.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -940,8 +944,9 @@ fn json_str<'a>(row: &'a serde_json::Map<String, serde_json::Value>, key: &str) 
 }
 
 /// One cell as the UI sees it: NULL → null, numbers stringified exactly,
-/// blobs as `x'hex'`.
-fn cell_value(value: &serde_json::Value) -> Option<String> {
+/// blobs as `x'hex'`. Shared with the backup dump, which renders the same
+/// strings through [`literal`].
+pub(crate) fn cell_value(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::Null => None,
         serde_json::Value::String(s) => Some(s.clone()),
@@ -985,6 +990,36 @@ async fn ready_config(ctx: &D1Ctx, app: &crate::apps::App) -> Result<DeployedSta
             .map_err(|_| D1Error::AppStarting)?;
     }
     deployed_state(ctx, &app.slug).await
+}
+
+/// The backup engine's entry point ([`crate::d1_backup`]): wake the fleet,
+/// resolve `binding` to its celld identity, and materialize the synthesized
+/// config dir celld resolves that identity from. The caller runs its own
+/// validated SQL through [`d1_exec`] against the returned dir.
+pub(crate) async fn ready_backup(
+    ctx: &D1Ctx,
+    app: &crate::apps::App,
+    binding: &str,
+) -> Result<(String, tempfile::TempDir), D1Error> {
+    let state = ready_config(ctx, app).await?;
+    let identity = identity_for(&state.dbs, binding)?;
+    let project = materialize_project(&state.config)
+        .await
+        .map_err(D1Error::Unavailable)?;
+    Ok((identity, project))
+}
+
+/// Every declared D1 binding for a slug, from the live manifest. A missing
+/// pointer or manifest means never-deployed (no bindings, not an error),
+/// so the backup sweep skips apps that never deployed.
+pub(crate) async fn database_bindings(store: &Store, slug: &str) -> anyhow::Result<Vec<String>> {
+    let Some(manifest) = super::deployed_manifest(store, slug).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(manifest_dbs(&manifest)?
+        .into_iter()
+        .map(|db| db.binding)
+        .collect())
 }
 
 /// Tables plus row counts, in one `SELECT … UNION ALL …` exec.
@@ -1386,7 +1421,7 @@ pub async fn delete_rows(
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn d1_response(result: Result<serde_json::Value, D1Error>) -> Response {
+pub(crate) fn d1_response(result: Result<serde_json::Value, D1Error>) -> Response {
     use crate::http::console_data::{data_error, data_json};
     match result {
         Ok(value) => data_json(StatusCode::OK, value),
@@ -1411,6 +1446,12 @@ fn d1_response(result: Result<serde_json::Value, D1Error>) -> Response {
             "not_found",
             format!("unknown table {table:?}"),
             Some(format!("Unknown table {table:?}.")),
+        ),
+        Err(D1Error::UnknownBackup(id)) => data_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("unknown backup {id:?}"),
+            Some("Unknown backup: it may have been pruned past retention.".to_string()),
         ),
         Err(D1Error::BadQuery(message)) => data_error(
             StatusCode::BAD_REQUEST,
@@ -1441,6 +1482,12 @@ fn d1_response(result: Result<serde_json::Value, D1Error>) -> Response {
             "unavailable",
             format!("{source:#}"),
             Some("Couldn't load the database right now.".to_string()),
+        ),
+        Err(D1Error::TooLarge(detail)) => data_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "backup_too_large",
+            format!("backup too large: {detail}"),
+            Some("This database is too large to back up right now.".to_string()),
         ),
     }
 }

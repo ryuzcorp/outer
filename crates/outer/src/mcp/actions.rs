@@ -78,6 +78,8 @@ const LOGGED_TOOLS: &[&str] = &[
     "remove_domain",
     "list_domains",
     "look_at_app",
+    "backup_database",
+    "restore_backup",
 ];
 
 /// Ceiling on one stored summary, in chars.
@@ -197,6 +199,17 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
         "share_app" | "get_app" => tool.to_string(),
         "list_secrets" | "list_collaborators" | "list_domains" | "remove_domain" => {
             tool.to_string()
+        }
+        "backup_database" | "restore_backup" => {
+            let mut s = format!("{} {}", tool, arg_str(args, "app").unwrap_or("?"));
+            // Two restores of one app must be distinguishable in the log.
+            if tool == "restore_backup" {
+                s.push_str(&format!(
+                    " backup {}",
+                    arg_str(args, "backup_id").unwrap_or("?")
+                ));
+            }
+            s
         }
         "add_domain" => format!("add_domain {}", arg_str(args, "hostname").unwrap_or("?")),
         "add_collaborator" | "remove_collaborator" => {

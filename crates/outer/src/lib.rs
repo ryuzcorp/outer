@@ -12,6 +12,7 @@ pub mod cloudflare;
 pub mod collaborators;
 pub mod config;
 pub mod cron;
+pub mod d1_backup;
 pub mod db;
 pub mod deploy;
 pub mod fleet;

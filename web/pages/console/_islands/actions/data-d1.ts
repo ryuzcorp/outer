@@ -4,9 +4,9 @@
 // every `actions/*.ts` registry). Components call `run`; they never fetch
 // the D1 API directly.
 //
-// Reads are `readOnly`; both writes are `consequential` (they change app
-// data and audit to the action log). Row content is app/user data, so reads
-// are `untrusted`.
+// Reads are `readOnly`; writes, manual backups and restores are
+// `consequential` (they change app data and audit to the action log). Row
+// content is app/user data, so reads of rows are `untrusted`.
 
 import type { ActionContext } from "./settings.ts";
 import type {
@@ -158,6 +158,47 @@ export interface D1DeleteRowsInput {
   keys: D1Key[];
 }
 
+export interface D1Backup {
+  id: string;
+  binding: string;
+  created_at: number;
+  size_bytes: number;
+}
+
+export interface D1BackupsInput {
+  slug: string;
+  binding: string;
+}
+
+export interface D1BackupsOutput {
+  binding: string;
+  backups: D1Backup[];
+}
+
+export interface D1BackupNowInput {
+  slug: string;
+  binding: string;
+}
+
+export interface D1BackupNowOutput {
+  backup: D1Backup;
+}
+
+export interface D1BackupRestoreInput {
+  slug: string;
+  binding: string;
+  backup_id: string;
+  confirm: string;
+}
+
+export interface D1BackupRestoreOutput {
+  backup: D1Backup;
+  restore: {
+    tables_dropped: number;
+    statements_applied: number;
+    bytes_applied: number;
+  };
+}
 const slugSchema = { type: "string", minLength: 1, maxLength: 128 };
 const bindingSchema = { type: "string", minLength: 1, maxLength: 128 };
 const tableSchema = { type: "string", minLength: 1, maxLength: 128 };
@@ -330,6 +371,79 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
       const { slug, binding, table, ...body } = input;
       return d1post<{ deleted: number }>(
         `${base(slug, binding, `/tables/${encodeURIComponent(table)}/delete-rows`)}`,
+        body,
+        signal,
+      );
+    },
+  },
+  {
+    name: "d1_backups",
+    title: "List D1 backups",
+    description:
+      "List a D1 database's stored backups: id, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30). Returns {binding, backups}.",
+    inputSchema: {
+      type: "object",
+      required: ["slug", "binding"],
+      properties: { slug: slugSchema, binding: bindingSchema },
+    },
+    readOnly: true,
+    consequential: false,
+    untrusted: false,
+    run(input: D1BackupsInput, _ctx?: ActionContext, signal?: AbortSignal): Promise<D1BackupsOutput> {
+      return d1get<D1BackupsOutput>(`${base(input.slug, input.binding, "/backups")}`, signal);
+    },
+  },
+  {
+    name: "d1_backup_now",
+    title: "Back up a D1 database now",
+    description:
+      "Take a D1 backup now and store it (pruning past retention on the way out). Returns {backup}. Audited to the action log as Console.",
+    inputSchema: {
+      type: "object",
+      required: ["slug", "binding"],
+      properties: { slug: slugSchema, binding: bindingSchema },
+    },
+    readOnly: false,
+    consequential: true,
+    untrusted: false,
+    run(
+      input: D1BackupNowInput,
+      _ctx?: ActionContext,
+      signal?: AbortSignal,
+    ): Promise<D1BackupNowOutput> {
+      return d1post<D1BackupNowOutput>(
+        `${base(input.slug, input.binding, "/backups")}`,
+        {},
+        signal,
+      );
+    },
+  },
+  {
+    name: "d1_backup_restore",
+    title: "Restore a D1 backup",
+    description:
+      "Restore a D1 database from a backup id (pass confirm equal to backup_id). Takes a fresh backup first, then replaces the live tables. Returns {backup, restore}. Audited to the action log as Console.",
+    inputSchema: {
+      type: "object",
+      required: ["slug", "binding", "backup_id", "confirm"],
+      properties: {
+        slug: slugSchema,
+        binding: bindingSchema,
+        backup_id: { type: "string", minLength: 1, maxLength: 128 },
+        confirm: { type: "string", minLength: 1, maxLength: 128 },
+      },
+    },
+    readOnly: false,
+    consequential: true,
+    untrusted: false,
+    run(
+      input: D1BackupRestoreInput,
+      _ctx?: ActionContext,
+      signal?: AbortSignal,
+    ): Promise<D1BackupRestoreOutput> {
+      const { slug, binding, backup_id, ...body } = input;
+      return d1post<D1BackupRestoreOutput>(
+        `${base(slug, binding, `/backups/${encodeURIComponent(backup_id)}/restore`)}`,
         body,
         signal,
       );
