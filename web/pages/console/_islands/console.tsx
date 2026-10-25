@@ -240,7 +240,6 @@ export function Console() {
       case "secrets":
         return ["secrets"];
       case "settings":
-      case "settings":
         return ["collaborators"];
       case "connections":
       case "usage":
