@@ -30,6 +30,7 @@ import {
   DeploysIcon,
   DocsIcon,
   ErrorsIcon,
+  ExpandIcon,
   LogsIcon,
   MenuIcon,
   MetricsIcon,
@@ -56,7 +57,6 @@ import {
 } from "./views.tsx";
 
 import {
-  ACCOUNT_VIEWS,
   CopyButton,
   RANGES,
   VIEWS,
@@ -70,23 +70,14 @@ import {
 
 // --- Shared bits -------------------------------------------------------------
 
-const TINTS = 8;
-
-function tintIndex(slug: string): number {
-  let h = 0;
-  for (let i = 0; i < slug.length; i++) {
-    h = (h * 31 + slug.charCodeAt(i)) >>> 0;
-  }
-  return h % TINTS;
-}
-
 function monogram(slug: string): string {
   const clean = slug.replace(/[^a-z0-9]/gi, "");
   return (clean.slice(0, 1) || "?").toUpperCase();
 }
 
-// daisyUI mappings: status pills are `badge badge-soft`, rail dots are
-// `indicator-item` dots with theme backgrounds.
+// daisyUI mappings: status pills are `badge badge-soft`, rail dots are the
+// `status` component inside `indicator-item` (pinned inside the tile bounds
+// by `.rail-dot` in console.css, so the rail never overflows).
 function statusBadge(status: string): string {
   if (status === "success" || status === "running" || status === "ok") {
     return "badge-success";
@@ -107,7 +98,7 @@ function statusBadge(status: string): string {
 
 function statusDot(status: string): string {
   if (status === "success" || status === "running" || status === "ok") {
-    return "bg-success";
+    return "status-success";
   }
   if (
     status === "building" ||
@@ -115,12 +106,12 @@ function statusDot(status: string): string {
     status === "reviewing" ||
     status === "queued"
   ) {
-    return "bg-warning";
+    return "status-warning";
   }
   if (status === "failed" || status === "error" || status === "blocked") {
-    return "bg-error";
+    return "status-error";
   }
-  return "bg-base-300";
+  return "status-neutral";
 }
 
 async function loadActionsPage(
@@ -135,13 +126,15 @@ async function loadActionsPage(
 
 // --- Shell -------------------------------------------------------------------
 
-interface Ui {
-  collapsed: boolean;
-  drawer: boolean;
-  createOpen: boolean;
-  accountOpen: boolean;
-  expanded: string[];
+const COLLAPSED_KEY = "outer-console-collapsed";
+
+function readCollapsed(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.localStorage.getItem(COLLAPSED_KEY) === "1";
 }
+
 
 const VIEW_TITLES: Record<ViewId, string> = {
   overview: "Overview",
@@ -173,7 +166,7 @@ export function Console() {
   const logs = atom<Panel<LogLine[]>>({ kind: "loading" });
   const secrets = atom<Panel<SecretsSummary>>({ kind: "loading" });
   const ui = atom<Ui>({
-    collapsed: false,
+    collapsed: readCollapsed(),
     drawer: false,
     createOpen: false,
     accountOpen: false,
@@ -683,10 +676,26 @@ export function Console() {
       ? errorsPanel.value.issues.filter((i) => i.status === "open").length
       : 0;
 
-  const patchUi = (patch: Partial<Ui>) => ui.set({ ...ui(), ...patch });
+  const patchUi = (patch: Partial<Ui>) => {
+    if (patch.collapsed !== undefined && typeof window !== "undefined") {
+      window.localStorage.setItem(COLLAPSED_KEY, patch.collapsed ? "1" : "0");
+    }
+    ui.set({ ...ui(), ...patch });
+  };
+
+  // Reload the visible view's data (error Retry buttons reuse it).
+  function reload(): void {
+    const r = route();
+    if (r.app && !isAccountView(r.view)) {
+      void loadViewData(r.app, r.view, r.range, epoch, false);
+    } else if (isAccountView(r.view)) {
+      epoch += 1;
+      void loadAccountView(r.view, epoch);
+    }
+  }
 
   return (
-    <div class={`console${ui().collapsed ? " is-collapsed" : ""}`}>
+    <div class="console">
       <a class="skip-link" href="#console-main">
         Skip to content
       </a>
@@ -711,8 +720,9 @@ export function Console() {
               key={a.slug}
               type="button"
               role="listitem"
-              class="tooltip tooltip-right rounded-[14px]"
+              class={`rail-tile tooltip tooltip-right${a.slug === r.app ? " is-active" : ""}`}
               data-tip={`${a.slug} · ${a.status}`}
+              title={`${a.slug} · ${a.status}`}
               aria-label={`${a.slug}, ${a.status}`}
               aria-current={a.slug === r.app ? "page" : undefined}
               onclick={() => {
@@ -723,16 +733,12 @@ export function Console() {
             >
               <span class="indicator">
                 <span
-                  class={`indicator-item indicator-bottom indicator-end h-2.5 w-2.5 rounded-full border-2 border-base-100 ${statusDot(a.status)}`}
+                  class={`indicator-item status rail-dot ${statusDot(a.status)}`}
                   aria-hidden="true"
                 />
-                <span class="avatar avatar-placeholder">
-                  <span
-                    class={`flex h-11 w-11 items-center justify-center rounded-[14px] text-xl font-bold ${a.slug === r.app ? "border border-base-300 bg-base-100 shadow-sm" : `tint-${tintIndex(a.slug)}`}`}
-                  >
-                    <span aria-hidden="true">
-                      {monogram(a.slug)}
-                    </span>
+                <span class="avatar avatar-placeholder" aria-hidden="true">
+                  <span class="flex h-11 w-11 items-center justify-center text-xl font-bold">
+                    {monogram(a.slug)}
                   </span>
                 </span>
               </span>
@@ -751,7 +757,7 @@ export function Console() {
             <PlusIcon />
           </button>
           {ui().createOpen && (
-            <div class="dropdown-content card card-border bg-base-100 w-64 p-4 text-left shadow-lg" role="dialog" aria-label="Creating apps">
+            <div class="dropdown-content card card-border bg-base-100 w-64 p-4 text-left" role="dialog" aria-label="Creating apps">
               <div class="mb-1 flex min-w-0 items-center justify-between gap-2">
                 <strong class="min-w-0 flex-1 truncate">Apps are created by your agent</strong>
                 <button
@@ -802,7 +808,7 @@ export function Console() {
               </span>
             </button>
             {ui().accountOpen && (
-              <ul class="dropdown-content menu bg-base-100 rounded-box border border-base-300 w-60 min-w-0 p-2 shadow-lg" role="menu" aria-label="Account">
+              <ul class="dropdown-content menu bg-base-100 rounded-box border border-base-300 w-60 min-w-0 p-2" role="menu" aria-label="Account">
                 <li class="menu-title min-w-0">
                   <span class="block truncate" title={email()}>
                     {email() || "Account"}
@@ -868,22 +874,34 @@ export function Console() {
           <div class="drawer-content min-w-0">
             <main class="main" id="console-main" tabindex={-1}>
               <div class="main-head">
+                {ui().collapsed && (
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-square btn-sm hidden shrink-0 md:inline-flex"
+                    title="Expand sidebar"
+                    aria-label="Expand sidebar"
+                    onclick={() => patchUi({ collapsed: false })}
+                  >
+                    <ExpandIcon />
+                  </button>
+                )}
                 <button
                   type="button"
                   class="btn btn-ghost btn-square btn-sm shrink-0 md:hidden"
+                  title="Open navigation"
                   aria-label="Open navigation"
                   onclick={() => patchUi({ drawer: true })}
                 >
                   <MenuIcon />
                 </button>
-                <h1 class="main-title">{VIEW_TITLES[r.view]}</h1>
+                <h1 class="main-title" title={VIEW_TITLES[r.view]}>{VIEW_TITLES[r.view]}</h1>
                 {(r.view === "overview" || r.view === "metrics") && (
-                  <div class="join ml-auto shrink-0" role="group" aria-label="Metrics range">
+                  <div class="join border border-base-300 ml-auto shrink-0 rounded-full p-1" role="group" aria-label="Metrics range">
                     {RANGES.map((opt) => (
                       <button
                         key={opt.hours}
                         type="button"
-                        class={`btn btn-sm join-item${r.range === opt.hours ? " btn-neutral" : ""}`}
+                        class={`btn btn-sm join-item border-0 rounded-full${r.range === opt.hours ? " bg-base-200" : " btn-ghost"}`}
                         title={opt.title}
                         aria-pressed={r.range === opt.hours}
                         onclick={() => navigate({ r: opt.hours } as Partial<Route>)}
@@ -892,17 +910,6 @@ export function Console() {
                       </button>
                     ))}
                   </div>
-                )}
-                {ui().collapsed && (
-                  <button
-                    type="button"
-                    class="btn btn-ghost btn-square btn-sm shrink-0"
-                    title="Expand sidebar"
-                    aria-label="Expand sidebar"
-                    onclick={() => patchUi({ collapsed: false })}
-                  >
-                    <MenuIcon />
-                  </button>
                 )}
               </div>
               <div class="tabs tabs-box tabs-sm mb-3 w-full min-w-0 overflow-x-auto md:hidden" role="tablist" aria-label="Views">
@@ -977,6 +984,7 @@ export function Console() {
                           logs.set({ kind: "error", message: String(err) });
                         });
                     }}
+                    onRetry={reload}
                   />
                 )}
               </div>
@@ -987,13 +995,14 @@ export function Console() {
             <aside class="side max-md:min-h-dvh min-w-0" aria-label="App navigation">
               <div class="side-head">
                 <div class="side-id">
-                  <p class="m-0 min-w-0 truncate text-[15px] font-bold" title={active.slug}>
+                  <p class="m-0 min-w-0 truncate text-[15px] font-semibold" title={active.slug}>
                     {active.slug}
                   </p>
-                  <a class="block truncate text-xs opacity-60 hover:opacity-100 hover:underline" href={active.url} title={active.url}>
+                  <p class="m-0 min-w-0 truncate text-xs opacity-60" title={active.url}>
                     {active.url.replace(/^https?:\/\//, "")}
-                  </a>
+                  </p>
                 </div>
+                <span class={`status ${statusDot(active.status)} mt-1.5 shrink-0`} title={active.status} aria-label={active.status} />
                 <span class={`badge badge-soft ${statusBadge(active.status)} shrink-0`} title={active.status}>{active.status}</span>
                 <button
                   type="button"
@@ -1018,11 +1027,8 @@ export function Console() {
                       <ViewIcon id={v.id as ViewId} />
                       <span class="min-w-0 flex-1 truncate">{v.label}</span>
                       {v.id === "errors" && openErrors > 0 && (
-                        <span class="indicator shrink-0">
-                          <span class="indicator-item badge badge-error badge-xs" aria-label={`${openErrors} open`}>
-                            {openErrors}
-                          </span>
-                          <span class="block h-4 w-4" aria-hidden="true" />
+                        <span class="badge badge-neutral badge-sm ml-auto shrink-0" title={`${openErrors} open errors`} aria-label={`${openErrors} open errors`}>
+                          {openErrors}
                         </span>
                       )}
                     </button>
@@ -1034,22 +1040,8 @@ export function Console() {
                     <span class="min-w-0">
                       <DatabaseIcon />
                       <span class="truncate">{name}</span>
-                      <span class="badge badge-ghost badge-xs ml-auto shrink-0">Soon</span>
+                      <span class="badge badge-soft badge-sm ml-auto shrink-0">Soon</span>
                     </span>
-                  </li>
-                ))}
-                <li class="menu-title">Account</li>
-                {ACCOUNT_VIEWS.filter((v) => v.id !== "admin" || isAdmin()).map((v) => (
-                  <li key={v.id} class="min-w-0">
-                    <button
-                      type="button"
-                      class={r.view === v.id ? "menu-active min-w-0" : "min-w-0"}
-                      aria-current={r.view === v.id ? "page" : undefined}
-                      onclick={() => navigate({ view: v.id })}
-                    >
-                      <ViewIcon id={v.id} />
-                      <span class="min-w-0 flex-1 truncate">{v.label}</span>
-                    </button>
                   </li>
                 ))}
               </ul>
@@ -1074,7 +1066,7 @@ export function Console() {
           <div class="drawer-content min-w-0">
             <main class="main" id="console-main" tabindex={-1}>
               <div class="main-head">
-                <h1 class="main-title">{VIEW_TITLES[r.view]}</h1>
+                <h1 class="main-title" title={VIEW_TITLES[r.view]}>{VIEW_TITLES[r.view]}</h1>
               </div>
               <div class="main-body">{accountPanel}</div>
             </main>
@@ -1122,6 +1114,7 @@ function ViewBody(props: {
   onToggleExpand: (id: string) => void;
   onLoadMore: () => void;
   onRefreshLogs: () => void;
+  onRetry: () => void;
 }) {
   switch (props.route.view) {
     case "overview":
@@ -1132,12 +1125,19 @@ function ViewBody(props: {
           actions={props.actions}
           errors={props.errors}
           onView={(view) => navigate({ view })}
+          onRetry={props.onRetry}
         />
       );
     case "metrics":
-      return <MetricsView metrics={props.metrics} />;
+      return <MetricsView metrics={props.metrics} onRetry={props.onRetry} />;
     case "actions":
-      return <ActionsView panel={props.actions} onMore={props.onLoadMore} />;
+      return (
+        <ActionsView
+          panel={props.actions}
+          onMore={props.onLoadMore}
+          onRetry={props.onRetry}
+        />
+      );
     case "deploys":
       return (
         <DeploysView
@@ -1147,11 +1147,17 @@ function ViewBody(props: {
         />
       );
     case "logs":
-      return <LogsView panel={props.logs} onRefresh={props.onRefreshLogs} />;
+      return (
+        <LogsView
+          panel={props.logs}
+          onRefresh={props.onRefreshLogs}
+          onRetry={props.onRetry}
+        />
+      );
     case "errors":
-      return <ErrorsView panel={props.errors} />;
+      return <ErrorsView panel={props.errors} onRetry={props.onRetry} />;
     case "secrets":
-      return <SecretsView panel={props.secrets} />;
+      return <SecretsView panel={props.secrets} onRetry={props.onRetry} />;
     case "settings":
       return <SettingsView app={props.app} />;
   }

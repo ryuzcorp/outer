@@ -23,6 +23,7 @@ import {
   LogOut,
   Menu,
   PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   Rocket,
   Settings,
@@ -110,9 +111,12 @@ export function SecretsIcon({ size = 18 }: { size?: number }) {
 export function SettingsIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={Settings} size={size} />;
 }
-
 export function CollapseIcon({ size = 18 }: { size?: number }) {
   return <Lucide node={PanelLeftClose} size={size} />;
+}
+
+export function ExpandIcon({ size = 18 }: { size?: number }) {
+  return <Lucide node={PanelLeftOpen} size={size} />;
 }
 
 export function MenuIcon({ size = 18 }: { size?: number }) {

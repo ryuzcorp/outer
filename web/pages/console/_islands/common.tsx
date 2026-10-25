@@ -110,8 +110,9 @@ export function CopyButton({ value, label }: { value: string; label: string }) {
   return (
     <button
       type="button"
-      class="btn btn-ghost btn-square btn-xs shrink-0"
-      title={label}
+      class="btn btn-ghost btn-square btn-xs tooltip shrink-0"
+      data-tip={copied() ? "Copied" : label}
+      title={copied() ? "Copied" : label}
       aria-label={label}
       onclick={() => {
         const done = () => {
