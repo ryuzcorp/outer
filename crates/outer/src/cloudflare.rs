@@ -264,7 +264,9 @@ impl CustomHostnames {
             }
             // 400: Cloudflare validated the input and said no (a prohibited
             // or malformed hostname). That's the caller's input, not an outage.
-            reqwest::StatusCode::BAD_REQUEST => CfError::Rejected(
+            // Routing/request-shape codes (bad zone id, unroutable path) are
+            // our configuration, not the hostname: keep those as Api errors.
+            reqwest::StatusCode::BAD_REQUEST if !request_config_error(body) => CfError::Rejected(
                 body.get("errors")
                     .and_then(|v| v.as_array())
                     .map(|es| {
@@ -281,6 +283,23 @@ impl CustomHostnames {
             )),
         }
     }
+}
+
+/// Cloudflare error codes that mean the request itself was misrouted or
+/// malformed (zone identifier, path), so a 400 carrying them is Outer's
+/// configuration problem rather than a verdict on the customer's hostname.
+const REQUEST_CONFIG_CODES: [i64; 4] = [1402, 1403, 7000, 7003];
+
+fn request_config_error(body: &serde_json::Value) -> bool {
+    body.get("errors")
+        .and_then(|v| v.as_array())
+        .is_some_and(|es| {
+            es.iter().any(|e| {
+                e.get("code")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|c| REQUEST_CONFIG_CODES.contains(&c))
+            })
+        })
 }
 
 /// What went wrong talking to the custom-hostnames API. Callers map these
@@ -559,6 +578,25 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::FakePurge;
     use super::*;
+
+    /// A 400 is the hostname's fault only when Cloudflare says so: a
+    /// prohibited hostname is `Rejected` with Cloudflare's own words, a
+    /// misrouted request (bad zone id) stays an `Api` error.
+    #[test]
+    fn bad_request_splits_hostname_verdicts_from_request_config() {
+        let prohibited = serde_json::json!({"errors": [{"code": 1411,
+            "message": "Custom hostnames ending in example.com, example.net, or example.org are prohibited."}]});
+        match CustomHostnames::refused(reqwest::StatusCode::BAD_REQUEST, &prohibited) {
+            CfError::Rejected(reason) => assert!(reason.contains("example.com"), "{reason}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        let misrouted = serde_json::json!({"errors": [{"code": 7003,
+            "message": "Could not route to /zones/nope/custom_hostnames, perhaps your object identifier is invalid?"}]});
+        assert!(matches!(
+            CustomHostnames::refused(reqwest::StatusCode::BAD_REQUEST, &misrouted),
+            CfError::Api(_)
+        ));
+    }
 
     fn purge(base_url: &str) -> CachePurge {
         CachePurge::new("zone-1".to_string(), "token-1".to_string())
