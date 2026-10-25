@@ -370,6 +370,11 @@ a.rail-tile:hover {
   white-space: pre;
 }
 
+/* The Logs wrap toggle: one line per row, horizontal scroll for long lines. */
+.log-list.nowrap .log-line code {
+  white-space: pre;
+}
+
 .log-stream {
   flex: none;
   opacity: 0.5;

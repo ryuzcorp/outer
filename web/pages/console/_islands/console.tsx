@@ -48,9 +48,7 @@ import {
   ActionsView,
   AdminView,
   DeploysView,
-  ErrorsView,
   InvitesView,
-  LogsView,
   MetricsView,
   OverviewView,
   SecretsView,
@@ -60,6 +58,9 @@ import { CodeView } from "./views/code.tsx";
 import { D1Nav, D1View } from "./views/d1.tsx";
 
 import { secretsActions } from "./actions/secrets.ts";
+import { ErrorsView } from "./views/errors.tsx";
+import { LogsView } from "./views/logs.tsx";
+import { setJumpToIssue } from "./actions/observe.ts";
 
 import {
   CopyButton,
@@ -1016,6 +1017,7 @@ export function Console() {
                     onView={(view) => navigate({ view })}
                     onRoute={(next) => navigate(next)}
                     app={detailPanel.value}
+                    slug={r.app as string}
                     metrics={metrics()}
                     actions={actions()}
                     errors={errors()}
@@ -1049,6 +1051,10 @@ export function Console() {
                         .catch((err: unknown) => {
                           logs.set({ kind: "error", message: String(err) });
                         });
+                    }}
+                    onJumpToIssue={(fingerprint) => {
+                      setJumpToIssue(fingerprint);
+                      navigate({ view: "errors" });
                     }}
                     onRetry={reload}
                     onRefreshDetail={refreshDetail}
@@ -1185,6 +1191,7 @@ function ViewBody(props: {
   route: Route;
   app: AppDetail;
   plan: string;
+  slug: string;
   metrics: Panel<{ hours: number; summary: MetricsSummary }>;
   actions: ActionsPanel;
   errors: Panel<ErrorsSummary>;
@@ -1197,6 +1204,7 @@ function ViewBody(props: {
   onPickSha: (sha: string | null) => void;
   onShowChanges: (sha: string) => void;
   onSwitchCodeTab: (tab: "files" | "changes") => void;
+  onJumpToIssue: (fingerprint: string) => void;
   onRetry: () => void;
   onRefreshDetail: () => void;
   onRenamed: (slug: string) => void;
@@ -1253,13 +1261,14 @@ function ViewBody(props: {
     case "logs":
       return (
         <LogsView
+          slug={props.slug}
           panel={props.logs}
-          onRefresh={props.onRefreshLogs}
           onRetry={props.onRetry}
+          onJumpToIssue={props.onJumpToIssue}
         />
       );
     case "errors":
-      return <ErrorsView panel={props.errors} onRetry={props.onRetry} />;
+      return <ErrorsView slug={props.slug} panel={props.errors} onRetry={props.onRetry} />;
     case "secrets":
       return (
         <SecretsView

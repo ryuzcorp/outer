@@ -22,7 +22,6 @@ import {
   type ErrorsSummary,
   type InviteEntry,
   type InvitesSummary,
-  type LogLine,
   type MetricsBucket,
   type MetricsSummary,
   type SecretsSummary,
@@ -53,7 +52,7 @@ import {
 
 // --- Small pieces ------------------------------------------------------------
 
-function Loading({ label }: { label: string }) {
+export function Loading({ label }: { label: string }) {
   return (
     <div class="flex min-w-0 flex-col gap-3" role="status" aria-label={label}>
       <div class="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4" aria-hidden="true">
@@ -68,7 +67,7 @@ function Loading({ label }: { label: string }) {
   );
 }
 
-function Err({ message, onRetry }: { message: string; onRetry?: () => void }) {
+export function Err({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
     <div class="flex min-w-0 flex-col gap-3">
       <div class="alert alert-error alert-soft min-w-0" role="alert">
@@ -88,7 +87,7 @@ function Err({ message, onRetry }: { message: string; onRetry?: () => void }) {
 // One shared empty state: an icon in a soft circle, a title, a muted line,
 // and an optional action. `plain` skips the card chrome for empties that
 // already sit inside a card (Overview rows, log lines).
-function EmptyState({
+export function EmptyState({
   icon,
   title,
   children,
@@ -1136,141 +1135,8 @@ export function DeploysView({
   );
 }
 
-// --- Logs ----------------------------------------------------------------------
-
-export function LogsView({
-  panel,
-  onRefresh,
-  onRetry,
-}: {
-  panel: Panel<LogLine[]>;
-  onRefresh: () => void;
-  onRetry: () => void;
-}) {
-  if (panel.kind === "loading") {
-    return <Loading label="Loading logs" />;
-  }
-  if (panel.kind === "error") {
-    return <Err message={panel.message} onRetry={onRetry} />;
-  }
-  const lines = panel.value;
-  return (
-    <section class="card card-border bg-base-100 min-w-0" aria-label="Logs">
-      <div class="card-body min-w-0">
-        <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
-          <h2 class="card-title min-w-0 truncate" title={`Recent logs (${lines.length.toLocaleString()} lines)`}>
-            Recent logs{" "}
-            <span class="opacity-60">
-              ({lines.length.toLocaleString()} lines)
-            </span>
-          </h2>
-          <button type="button" class="btn btn-sm shrink-0" onclick={onRefresh}>
-            Refresh
-          </button>
-        </div>
-        {lines.length === 0 ? (
-          <EmptyState plain icon={<LogsIcon />} title="No log lines yet">
-            Lines your app writes will show up here.
-          </EmptyState>
-        ) : (
-          <ol class="log-list">
-            {lines.map((entry) => (
-              <li
-                key={entry.seq}
-                class={`log-line is-${entry.stream}`}
-                title={when(entry.ts)}
-              >
-                <span class="log-stream" aria-hidden="true">
-                  {entry.stream === "stderr" ? "!" : ">"}
-                </span>
-                <code>{entry.line}</code>
-              </li>
-            ))}
-          </ol>
-        )}
-      </div>
-    </section>
-  );
-}
-
-// --- Errors --------------------------------------------------------------------
-// Ported from Noite's errors.tsx: grouped issues with counts + first/last
-// seen, plus the trailing-hour proxy 5xx count.
-
-export function ErrorsView({ panel, onRetry }: { panel: Panel<ErrorsSummary>; onRetry: () => void }) {
-  if (panel.kind === "loading") {
-    return <Loading label="Loading errors" />;
-  }
-  if (panel.kind === "error") {
-    return <Err message={panel.message} onRetry={onRetry} />;
-  }
-  const { issues, s5xx_last_hour } = panel.value;
-  if (issues.length === 0) {
-    return (
-      <EmptyState icon={<ErrorsIcon />} title="No errors recorded">
-        {`Grouped runtime errors will show up here.${s5xx_last_hour > 0 ? ` ${s5xx_last_hour} proxy 5xx in the last hour, with no grouped issue.` : ""}`}
-      </EmptyState>
-    );
-  }
-  return (
-    <section class="card card-border bg-base-100 min-w-0" aria-label="Errors">
-      <div class="card-body min-w-0">
-        <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
-          <h2 class="card-title min-w-0 truncate" title="Errors">Errors</h2>
-          <span class="min-w-0 shrink-0 truncate text-xs opacity-60" title={`${s5xx_last_hour.toLocaleString()} proxy 5xx in the last hour`}>
-            {s5xx_last_hour.toLocaleString()} proxy 5xx in the last hour
-          </span>
-        </div>
-        <div class="min-w-0 overflow-x-auto">
-          <table class="table table-fixed w-full">
-            <colgroup>
-              <col class="w-24" />
-              <col />
-              <col class="w-20" />
-              <col class="w-24" />
-              <col class="w-24" />
-            </colgroup>
-            <thead>
-              <tr>
-                <th scope="col">Last seen</th>
-                <th scope="col">Error</th>
-                <th scope="col">Seen</th>
-                <th scope="col">First seen</th>
-                <th scope="col">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {issues.map((issue) => (
-                <tr key={issue.fingerprint}>
-                  <td class="whitespace-nowrap" title={when(issue.last_seen)}>
-                    {timeAgo(issue.last_seen)}
-                  </td>
-                  <td class="min-w-0 truncate font-mono" title={issue.frame ? `${issue.message}\n${issue.frame}` : issue.message}>
-                    {issue.message}
-                    {issue.frame && (
-                      <span class="block truncate opacity-60" title={issue.frame}>
-                        {issue.frame}
-                      </span>
-                    )}
-                  </td>
-                  <td class="whitespace-nowrap">{issue.count.toLocaleString()}×</td>
-                  <td class="whitespace-nowrap" title={when(issue.first_seen)}>
-                    {timeAgo(issue.first_seen)}
-                  </td>
-                  <td class="min-w-0">
-                    <span class={`badge badge-soft ${outcomeBadge(issue.status)}`} title={issue.status}>
-                      {issue.status}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-  );
-}
+// Logs and Errors live in `views/logs.tsx` and `views/errors.tsx` (wave 2):
+// imported directly by `console.tsx`. The shared pieces above stay here.
 
 // --- Secrets -------------------------------------------------------------------
 
