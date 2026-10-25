@@ -49,6 +49,16 @@ pub struct DeleteAppInput {
     /// Type the slug again to confirm: must equal `app` exactly.
     pub confirm: String,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenameAppInput {
+    /// The app's current slug.
+    pub app: String,
+    /// The new slug: lowercase letters, digits and dashes, 1-48 chars. The
+    /// old name stays reserved for 30 days and redirects to the new one.
+    pub slug: String,
+}
+
 /// Seed `slug` from the vendored template and create its repo. Mirrors
 /// `ops::create_app` without the deploy: the MCP layer runs deploys through
 /// its own [`super::Deploys`] so tests can substitute a fake.
@@ -77,6 +87,20 @@ async fn seed_app(
     .map_err(|err| ToolError::from_create(err, &plan))?;
     let author = crate::ops::noreply_author(owner_id, owner_email, &ctx.state.domain);
     let seeded = async {
+        // Claim-point wipe: a crashed delete can leave local orphans behind
+        // under this now-unclaimed slug. The row insert above is the claim
+        // and nothing local is written yet, so wipe before `init_repo`. A
+        // wipe failure lands in the row-removing cleanup below (nobody ever
+        // saw the slug: no quarantine). The stale in-memory manifest seq
+        // goes too, or `ensure_synced` could read it as already-applied.
+        crate::apps::local::remove_local_state(
+            &ctx.state.delete_cfg.data_dir,
+            &ctx.state.git,
+            ctx.state.delete_cfg.cgroups.as_deref(),
+            slug,
+        )
+        .await?;
+        ctx.state.sync.forget(slug).await;
         crate::git::manifest::init_repo(&ctx.state.store, &ctx.state.git, &ctx.state.sync, slug)
             .await?;
         let message = format!(
@@ -318,4 +342,105 @@ pub async fn delete_app(input: DeleteAppInput, ctx: &Ctx<'_>) -> Result<Value, T
             "user_message": user_message,
         }),
     ))
+}
+
+/// Rename an app (owner only): move its slug, hostname, code, data and
+/// files to `slug`, and quarantine the old slug for 30 days (it answers 308
+/// to the new hostname while the quarantine holds). D1 and Durable Object
+/// data survive: the fleet's bucket prefix moves with the app. Counts one
+/// code change; a running app redeploys under the new name. A slug the
+/// caller has no role on answers `not_found`, exactly like a missing one.
+pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    // `not_found` first: a foreign slug never reaches validation or quota.
+    let app = owned_app(ctx, &input.app).await?;
+    let caller = authed(ctx)?;
+    if input.app == input.slug {
+        return Err(ToolError::invalid_argument(format!(
+            "the app is already named {:?}; nothing to rename",
+            input.app
+        )));
+    }
+    apps::validate_slug(&input.slug).map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    // Claimed before the move; refunded on any error. The domain rename
+    // never fails post-commit (post-commit steps are warn-and-continue, and
+    // the maintenance drain finishes them), so an error always means the
+    // rename never happened — while a committed rename counts even when
+    // its redeploy fails or is blocked.
+    let claim = super::claim_change(&ctx.state.pool, &caller.account_id).await?;
+    // Serialize against a racing rollback, deploy and wake, on both slugs:
+    // the wake pair sorts by slug so two renames can never ABBA.
+    let rollback = ctx.state.rollback_locks.lock(&app.id).await;
+    let deploy = ctx.state.deploys.app_lock(&app.id).lock_owned().await;
+    let (first, second) = if input.app.as_str() <= input.slug.as_str() {
+        (&input.app, &input.slug)
+    } else {
+        (&input.slug, &input.app)
+    };
+    let wake_first_key = ctx.state.fleets.wake_lock(first).await;
+    let wake_first = wake_first_key.lock_owned().await;
+    let wake_second_key = ctx.state.fleets.wake_lock(second).await;
+    let wake_second = wake_second_key.lock_owned().await;
+    let (wake_old, wake_new) = if first == &input.app {
+        (&wake_first, &wake_second)
+    } else {
+        (&wake_second, &wake_first)
+    };
+    let locks = crate::apps::rename::RenameLocks {
+        deploy: &deploy,
+        rollback: &rollback,
+        wake_old,
+        wake_new,
+    };
+    let deps = crate::apps::rename::RenameDeps {
+        pool: &ctx.state.pool,
+        store: &ctx.state.store,
+        git: &ctx.state.git,
+        sync: &ctx.state.sync,
+        fleets: Some(&ctx.state.fleets),
+        data_dir: &ctx.state.delete_cfg.data_dir,
+        cgroups: ctx.state.delete_cfg.cgroups.as_deref(),
+        apps_domain: &ctx.state.delete_cfg.apps_domain,
+        cache_purge: ctx.state.delete_cfg.cache_purge.as_ref(),
+    };
+    let out = match crate::apps::rename::rename_app(&deps, &input.app, &input.slug, locks).await {
+        Ok(out) => out,
+        Err(err) => {
+            if let Err(refund) = super::refund_change(&ctx.state.pool, &caller.account_id).await {
+                tracing::warn!("rename refund failed: {refund:#}");
+            }
+            return Err(ToolError::from_rename(err));
+        }
+    };
+    let url = ctx.state.app_url(&out.app.slug);
+    let quota =
+        json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
+    let summary = format!(
+        "{} is now {} at {}. The name {} stays reserved for 30 days.",
+        out.old_slug, out.app.slug, url, out.old_slug
+    );
+    let structured = json!({
+        "slug": out.app.slug,
+        "url": url,
+        "quarantined_until": out.quarantined_until,
+        "quota": quota,
+    });
+    match out.redeploy_sha {
+        Some(sha) => {
+            // The rename already committed (the quota counts): a redeploy
+            // infrastructure failure still answers rename success — like the
+            // console path — with the failure embedded in the deploy object.
+            let deploy = match run_deploy(ctx.state, &out.app, &sha, true).await {
+                Ok(deploy) => deploy,
+                Err(err) => json!({"status": "failed", "sha": sha, "error": err.message}),
+            };
+            let mut structured = structured;
+            structured["deploy"] = deploy;
+            Ok(super::ok_deploy(
+                summary,
+                &structured["deploy"].clone(),
+                structured,
+            ))
+        }
+        None => Ok(ok(summary, structured)),
+    }
 }

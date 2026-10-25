@@ -19,6 +19,11 @@ pub struct Platform {
     pub sync: GitSync,
     pub deployer: Deployer,
     pub alloc: Allocation,
+    /// Local state lives here (`work/`, `cache/`, `fleets/`, mirrors): the
+    /// create path wipes a claimed slug's orphans before writing any.
+    pub data_dir: std::path::PathBuf,
+    /// Cgroup anchor when containment is active, else `None` (dev).
+    pub cgroups: Option<std::path::PathBuf>,
     /// Commit identities are `<account-id>@users.noreply.<domain>`.
     pub domain: String,
 }
@@ -63,6 +68,15 @@ pub async fn create_app(
     .await?;
     let author = noreply_author(&owner_id, owner_email, &p.domain);
     let seeded = async {
+        // Claim-point wipe: a crashed delete can leave local orphans behind
+        // under this now-unclaimed slug. The row insert above is the claim
+        // and nothing local is written yet, so wipe before `init_repo`. A
+        // wipe failure lands in the row-removing cleanup below (nobody ever
+        // saw the slug: no quarantine). The stale in-memory manifest seq
+        // goes too, or the sync could read it as already-applied.
+        crate::apps::local::remove_local_state(&p.data_dir, &p.git, p.cgroups.as_deref(), slug)
+            .await?;
+        p.sync.forget(slug).await;
         manifest::init_repo(&p.store, &p.git, &p.sync, slug).await?;
         let message = format!(
             "Start from the Ilha + Void template ({})",

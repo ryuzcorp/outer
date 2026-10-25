@@ -35,6 +35,11 @@ pub struct S3Config {
 #[derive(Clone)]
 pub struct Store {
     inner: StoreInner,
+    /// Test-only fault injection: the next `fail_next` operations fail
+    /// instead of touching the backend, so crash paths stay deterministic
+    /// without a store fake. Absent in prod builds: no cost, no surface.
+    #[cfg(test)]
+    faults: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -48,6 +53,8 @@ impl Store {
     pub fn s3(cfg: S3Config) -> anyhow::Result<Store> {
         Ok(Store {
             inner: StoreInner::S3(std::sync::Arc::new(S3Backend::new(&cfg)?)),
+            #[cfg(test)]
+            faults: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -55,11 +62,17 @@ impl Store {
     pub fn memory() -> Store {
         Store {
             inner: StoreInner::Memory(std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()))),
+            #[cfg(test)]
+            faults: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
     /// Small-object upload (manifests, meta, owner claims).
     pub async fn put(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
         match &self.inner {
             StoreInner::S3(backend) => backend.put(key, body).await,
             StoreInner::Memory(map) => {
@@ -72,6 +85,10 @@ impl Store {
     /// File upload that streams large files (bundles, snapshots) instead of
     /// buffering them whole.
     pub async fn put_file(&self, key: &str, path: &Path) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
         match &self.inner {
             StoreInner::S3(backend) => backend.put_file(key, path).await,
             StoreInner::Memory(map) => {
@@ -84,6 +101,10 @@ impl Store {
 
     /// Whole-object download. `None` means the key does not exist (404).
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
         match &self.inner {
             StoreInner::S3(backend) => backend.get(key).await,
             StoreInner::Memory(map) => Ok(lock(map).get(key).cloned()),
@@ -93,6 +114,10 @@ impl Store {
     /// Object download streamed to `dest`. `false` means the key does not
     /// exist (404); no partial file is left behind in that case.
     pub async fn get_to_file(&self, key: &str, dest: &Path) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
         match &self.inner {
             StoreInner::S3(backend) => backend.get_to_file(key, dest).await,
             StoreInner::Memory(map) => {
@@ -106,6 +131,10 @@ impl Store {
 
     /// Delete one key. A missing key is Ok.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
         match &self.inner {
             StoreInner::S3(backend) => backend.delete(key).await,
             StoreInner::Memory(map) => {
@@ -117,6 +146,10 @@ impl Store {
 
     /// All keys under `prefix`, in sort order.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
         match &self.inner {
             StoreInner::S3(backend) => backend.list(prefix).await,
             StoreInner::Memory(map) => Ok(lock(map)
@@ -127,14 +160,56 @@ impl Store {
         }
     }
 
-    /// Delete every key under `prefix`. An empty match is a no-op.
+    /// Delete every key under `prefix`, which must be a whole slug scope
+    /// (`fleets/{slug}/`, `git/{slug}/`): an empty prefix or one without a
+    /// trailing `/` is refused instead of deleting a wider scope. An empty
+    /// match is a no-op, so retries after a partial delete stay quiet.
     pub async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
+        check_delete_prefix(prefix)?;
         match &self.inner {
             StoreInner::S3(backend) => backend.delete_prefix(prefix).await,
             StoreInner::Memory(map) => {
                 lock(map).retain(|k, _| !k.starts_with(prefix));
                 Ok(())
             }
+        }
+    }
+}
+
+/// Guard for every prefix delete: prefixes are always whole slug scopes, so
+/// an empty prefix or one without a trailing `/` names a wider scope than
+/// intended and is refused instead of deleted. Both backends enforce it
+/// (defense in depth).
+pub(crate) fn check_delete_prefix(prefix: &str) -> anyhow::Result<()> {
+    if prefix.is_empty() {
+        anyhow::bail!("refusing to delete the empty store prefix");
+    }
+    if !prefix.ends_with('/') {
+        anyhow::bail!("refusing to delete store prefix without a trailing slash: {prefix:?}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+impl Store {
+    /// Fail the next `n` store operations with `message` instead of touching
+    /// the backend (FIFO). Cloned handles share the queue, so a fault set on
+    /// `state.store` fires inside the code under test.
+    pub fn fail_next(&self, n: usize, message: &str) {
+        let mut faults = self.faults.lock().unwrap_or_else(|e| e.into_inner());
+        faults.extend(std::iter::repeat_n(message.to_string(), n));
+    }
+
+    fn take_fault(&self) -> Option<String> {
+        let mut faults = self.faults.lock().unwrap_or_else(|e| e.into_inner());
+        if faults.is_empty() {
+            None
+        } else {
+            Some(faults.remove(0))
         }
     }
 }
@@ -218,8 +293,26 @@ mod tests {
         assert_eq!(store.list("").await.unwrap(), vec!["git/b/1"]);
         // Empty matches are a no-op, so retries after a partial delete stay quiet.
         store.delete_prefix("git/a/").await.unwrap();
-        store.delete_prefix("").await.unwrap();
+        store.delete_prefix("git/").await.unwrap();
         assert!(store.list("").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_delete_prefix_refuses_unsafe_prefixes() {
+        let store = Store::memory();
+        for key in ["git/a/1", "fleets/a/1"] {
+            store.put(key, b"x".to_vec()).await.unwrap();
+        }
+        // The empty prefix and any prefix without a trailing `/` name a
+        // wider scope than intended: refused, and nothing is deleted.
+        for prefix in ["", "git", "git/a", "fleets", "fleets/a"] {
+            let err = store.delete_prefix(prefix).await.unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to delete"),
+                "prefix {prefix:?}: {err:#}"
+            );
+        }
+        assert_eq!(store.list("").await.unwrap(), vec!["fleets/a/1", "git/a/1"]);
     }
 
     #[tokio::test]

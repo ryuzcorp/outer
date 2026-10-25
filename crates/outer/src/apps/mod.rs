@@ -9,16 +9,146 @@ use anyhow::Context as _;
 use sqlx::SqlitePool;
 
 pub mod delete;
+pub(crate) mod local;
+pub mod rename;
 mod slug;
 pub use slug::{validate_slug, SlugError};
 
+/// Bucket prefixes a slug owns. Shared by the claim check, the rename guard
+/// and the maintenance drain: a slug is exactly its two prefixes.
+pub(crate) fn cleanup_prefixes(slug: &str) -> [String; 2] {
+    [format!("fleets/{slug}/"), format!("git/{slug}/")]
+}
+
 /// How long a deleted slug stays quarantined before anyone may reuse it.
-const QUARANTINE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub(crate) const QUARANTINE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The new slug is claimable: well-formed, not reserved, naming no live app,
+/// and not inside its 30-day quarantine. An expired quarantine row is
+/// deleted, so a stale prune never blocks a legitimate reuse. Shared by
+/// [`create`] and [`rename::rename_app`]: both refuse exactly the same
+/// slugs with exactly the same errors.
+pub(crate) async fn check_slug_claimable(pool: &SqlitePool, slug: &str) -> Result<(), CreateError> {
+    let mut conn = pool.acquire().await.map_err(internal)?;
+    check_slug_claimable_conn(&mut conn, slug).await
+}
+
+/// [`check_slug_claimable`] on an open transaction, for the rename commit's
+/// authoritative re-check (a racing create converges on `Taken` there).
+pub(crate) async fn check_slug_claimable_conn(
+    conn: &mut sqlx::SqliteConnection,
+    slug: &str,
+) -> Result<(), CreateError> {
+    validate_slug(slug)?;
+    let now = now_ms();
+    // A pending cleanup row blocks the slug even past its quarantine: the
+    // prefix still holds someone's data, so no app may inherit it. Checked
+    // first, so an expired quarantine row survives below and the old
+    // hostname keeps redirecting while the drain is still due.
+    let [fleets_prefix, git_prefix] = cleanup_prefixes(slug);
+    let blocked: Option<String> =
+        sqlx::query_scalar("SELECT prefix FROM prefix_cleanup WHERE prefix IN (?1, ?2) LIMIT 1")
+            .bind(&fleets_prefix)
+            .bind(&git_prefix)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(internal)?;
+    if blocked.is_some() {
+        return Err(CreateError::Taken);
+    }
+    let taken: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE slug = ?1")
+        .bind(slug)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(internal)?;
+    if taken.is_some() {
+        return Err(CreateError::Taken);
+    }
+    let until: Option<i64> =
+        sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = ?1")
+            .bind(slug)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(internal)?;
+    if let Some(until) = until {
+        if until > now {
+            return Err(CreateError::Taken);
+        }
+        sqlx::query("DELETE FROM slug_quarantine WHERE slug = ?1")
+            .bind(slug)
+            .execute(&mut *conn)
+            .await
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
+/// One `slug_quarantine` row: when the slug is claimable again, and where a
+/// renamed app went (`None` for plain deletes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineRow {
+    pub until: i64,
+    pub renamed_to: Option<String>,
+}
+
+/// The quarantine row for `slug`, if any. The proxy uses it to redirect an
+/// old hostname to its renamed app.
+pub async fn quarantine_lookup(
+    pool: &SqlitePool,
+    slug: &str,
+) -> anyhow::Result<Option<QuarantineRow>> {
+    let row: Option<(i64, Option<String>)> =
+        sqlx::query_as("SELECT until, renamed_to FROM slug_quarantine WHERE slug = ?1")
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(until, renamed_to)| QuarantineRow { until, renamed_to }))
+}
+
+/// Fast pre-check for renames: well-formed, naming no live app and no live
+/// quarantine. Pending cleanup rows are ignored on purpose: they may be our
+/// own abandoned attempt's (adopted by the pre-copy guard, whose copy wipes
+/// the target first) or another in-flight rename's target (serialized on the
+/// new slug's wake lock, which the rename holds). The flip transaction
+/// re-checks authoritatively with [`check_slug_claimable_conn`], cleanup
+/// rows included — so this early refusal can only be conservative, never
+/// wrong in the other direction.
+pub(crate) async fn check_slug_preclaim(pool: &SqlitePool, slug: &str) -> Result<(), CreateError> {
+    validate_slug(slug)?;
+    let taken: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE slug = ?1")
+        .bind(slug)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal)?;
+    if taken.is_some() {
+        return Err(CreateError::Taken);
+    }
+    let until: Option<i64> =
+        sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = ?1")
+            .bind(slug)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
+    if until.is_some_and(|until| until > now_ms()) {
+        return Err(CreateError::Taken);
+    }
+    Ok(())
+}
 
 /// One process-wide lock serializing [`create`]: the check-then-insert over
 /// slug, quarantine, uids and ports must not interleave with itself.
 static CREATE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// The rename's pre-copy guard runs under the same lock: recording the
+/// target's cleanup rows and checking the target unclaimed must not
+/// interleave with a create's check-then-insert for the same slug. Held
+/// only for two indexed statements, and never while holding app locks in
+/// the other direction (create and delete take no per-app locks under it),
+/// so no lock cycle.
+pub(crate) async fn lock_for_rename_target() -> tokio::sync::MutexGuard<'static, ()> {
+    CREATE_LOCK.lock().await
+}
 
 /// Who may open the app. Unlisted hides it from search engines; the pages
 /// themselves stay reachable to anyone with the link.
@@ -232,32 +362,8 @@ pub async fn create(
     app_limit: u64,
 ) -> Result<App, CreateError> {
     let _guard = CREATE_LOCK.lock().await;
-    validate_slug(slug)?;
+    check_slug_claimable(pool, slug).await?;
     let now = now_ms();
-    let taken: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE slug = ?1")
-        .bind(slug)
-        .fetch_optional(pool)
-        .await
-        .map_err(internal)?;
-    if taken.is_some() {
-        return Err(CreateError::Taken);
-    }
-    let until: Option<i64> =
-        sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = ?1")
-            .bind(slug)
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    if let Some(until) = until {
-        if until > now {
-            return Err(CreateError::Taken);
-        }
-        sqlx::query("DELETE FROM slug_quarantine WHERE slug = ?1")
-            .bind(slug)
-            .execute(pool)
-            .await
-            .map_err(internal)?;
-    }
     // The plan quota re-checked under the lock: an earlier check races with
     // concurrent creates, so the count here is the one that counts.
     let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE owner_id = ?1")
@@ -363,12 +469,19 @@ pub async fn delete_row(pool: &SqlitePool, app_id: &str) -> anyhow::Result<()> {
 
 /// Delete quarantine rows whose slug is claimable again (the daily prune).
 /// `create` treats `until > now` as taken and deletes the row otherwise, so
-/// `until <= now` is exactly the dead set. Returns the rows removed.
+/// `until <= now` is exactly the dead set — except a slug with a pending
+/// `prefix_cleanup` row, which stays blocked (and keeps redirecting, for
+/// renames) until the drain deletes its leftover prefix. Returns the rows
+/// removed.
 pub async fn prune_quarantine(pool: &SqlitePool, now: i64) -> anyhow::Result<u64> {
-    let result = sqlx::query("DELETE FROM slug_quarantine WHERE until <= ?")
-        .bind(now)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM slug_quarantine WHERE until <= ?1 AND NOT EXISTS ( \
+             SELECT 1 FROM prefix_cleanup \
+             WHERE prefix IN ('fleets/' || slug || '/', 'git/' || slug || '/'))",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
 }
 

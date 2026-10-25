@@ -2510,6 +2510,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn console_rename_moves_the_app_and_audits_as_console() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let cookie = login(&pool, "ana@example.com").await;
+
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/rename",
+                &cookie,
+                serde_json::json!({"slug": "pantry"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out: serde_json::Value = body.parse().unwrap();
+        assert_eq!(out["slug"], "pantry");
+        assert_eq!(out["url"], "http://pantry.outer.localhost");
+
+        // The row flipped and the old slug is quarantined with its target.
+        let id: String = sqlx::query_scalar("SELECT id FROM app WHERE slug = 'pantry'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(id, "app-groceries");
+        let row: (i64, Option<String>) = sqlx::query_as(
+            "SELECT until, renamed_to FROM slug_quarantine WHERE slug = 'groceries'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.0 > now);
+        assert_eq!(row.1.as_deref(), Some("pantry"));
+        // Never deployed: nothing redeployed, so no new deploy rows.
+        let deploys: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM deploy WHERE app_id = 'app-groceries'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(deploys, 1);
+
+        // The audit row is the MCP tool name with both credential columns
+        // NULL, and the action log reads that pair as "Console".
+        let audit: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT tool, summary, consent_id, apikey_id FROM agent_action WHERE app_id = 'app-groceries' AND tool = 'rename_app'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.1, "rename_app groceries to pantry");
+        assert!(audit.2.is_none() && audit.3.is_none());
+        let (status, _, body) =
+            send(&app, authed("/api/console/apps/pantry/actions", &cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let actions: serde_json::Value = body.parse().unwrap();
+        let entry = actions["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["tool"] == "rename_app")
+            .expect("rename audit row listed");
+        assert_eq!(entry["by"], "Console");
+        assert_eq!(entry["summary"], "rename_app groceries to pantry");
+    }
+
+    #[tokio::test]
+    async fn console_rename_needs_same_origin_owner_and_shape() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "bob@example.com", "bobapp", now).await;
+        let cookie = login(&pool, "ana@example.com").await;
+
+        // No same-origin metadata: refuse before touching anything.
+        let (status, _, _) = send(
+            &app,
+            Request::post("/api/console/apps/groceries/rename")
+                .header("cookie", cookie.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"slug":"pantry"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Foreign slug answers exactly like a missing one.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/bobapp/rename",
+                &cookie,
+                serde_json::json!({"slug": "bobbins"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Missing and misshapen bodies are 400 with the MCP error codes.
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"slug": ""}),
+            serde_json::json!({"slug": "Bad_Shape"}),
+        ] {
+            let (status, _, text) = send(
+                &app,
+                post_json("/api/console/apps/groceries/rename", &cookie, body.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let err: serde_json::Value = text.parse().unwrap();
+            assert_eq!(err["error"], "invalid_argument", "{body}");
+            assert!(err["message"].is_string(), "{body}");
+            assert!(err["user_message"].is_null(), "{body}");
+        }
+        // Nothing moved.
+        let slug: String = sqlx::query_scalar("SELECT slug FROM app WHERE id = 'app-groceries'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(slug, "groceries");
+    }
+
+    #[tokio::test]
     async fn console_delete_requires_confirm_and_is_owner_scoped() {
         let (app, pool, _, _) = test_app().await;
         let now = crate::auth::now_ms();

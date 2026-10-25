@@ -1,4 +1,4 @@
-//! Console mutating actions: visibility, delete, secrets, rollback.
+//! Console mutating actions: visibility, delete, secrets, rollback, rename.
 //!
 //! One module per the wave-2 seam: `console.rs` only gains a
 //! `.merge(console_actions::routes())` line, so parallel console work lands
@@ -20,13 +20,14 @@ use super::console::{guard, nostore_json, not_found, ok_json, owned_app};
 use super::AppState;
 use crate::auth::AccountRow;
 use crate::mcp::error::ToolError;
-use crate::mcp::tools::plan_of;
+use crate::mcp::tools::{claim_change, plan_of, refund_change, run_deploy};
 use crate::mcp::McpState;
 
 /// The mutating console routes, merged by [`super::console::router`].
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/console/apps/{slug}/visibility", post(api_visibility))
+        .route("/api/console/apps/{slug}/rename", post(api_rename))
         .route("/api/console/apps/{slug}/delete", post(api_delete))
         .route(
             "/api/console/apps/{slug}/secrets/{name}",
@@ -119,6 +120,7 @@ async fn audited(
         summary,
         outcome,
         error_code,
+        0,
     )
     .await;
     match result {
@@ -377,4 +379,136 @@ async fn api_rollback(
     }
     .await;
     audited(mcp, &account, &app, "rollback", &summary, result).await
+}
+
+/// `POST /api/console/apps/:slug/rename {slug: "<new>"}`: the console side
+/// of MCP `rename_app` — the same domain function, the same daily-changes
+/// quota, and the audit row under the `rename_app` tool name with the
+/// "Console" client label. Answers `{slug, url}` for the new name; the
+/// Settings UI navigates there (console reads stay slug-addressed).
+async fn api_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let mcp = &state.mcp;
+    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+        Ok(pair) => pair,
+        Err(res) => return *res,
+    };
+    // One audit row whatever the outcome (mirrors the MCP path, which logs
+    // refused calls too): the app is owned, so the row always resolves.
+    let audit = |summary: &str, outcome: &str, error_code: Option<&str>| {
+        let pool = mcp.pool.clone();
+        let app_id = app.id.clone();
+        let account_id = account.id.clone();
+        let summary = summary.to_string();
+        let outcome = outcome.to_string();
+        let error_code = error_code.map(str::to_string);
+        let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        async move {
+            crate::mcp::actions::record_console(
+                &pool,
+                &app_id,
+                &account_id,
+                "rename_app",
+                &summary,
+                &outcome,
+                error_code.as_deref(),
+                duration_ms,
+            )
+            .await;
+        }
+    };
+    let summary_for = |old: &str, new: &str| format!("rename_app {old} to {new}");
+    let new_slug: Option<String> = body
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let Some(new_slug) = new_slug.filter(|s| !s.is_empty()) else {
+        let err = ToolError::invalid_argument("body must be {\"slug\": \"<new-slug>\"}");
+        audit(&summary_for(&slug, "?"), "error", Some(err.code)).await;
+        return tool_response(&err);
+    };
+    if slug == new_slug {
+        let err = ToolError::invalid_argument(format!(
+            "the app is already named {slug:?}; nothing to rename"
+        ));
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return tool_response(&err);
+    }
+    if let Err(e) = crate::apps::validate_slug(&new_slug) {
+        let err = ToolError::invalid_argument(e.to_string());
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return tool_response(&err);
+    }
+    if let Err(err) = claim_change(&mcp.pool, &account.id).await {
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return tool_response(&err);
+    }
+    // Same locks as the MCP tool, in the same order (deploy, rollback, then
+    // the wake pair sorted by slug so two renames can never ABBA).
+    let rollback = mcp.rollback_locks.lock(&app.id).await;
+    let deploy = mcp.deploys.app_lock(&app.id).lock_owned().await;
+    let (first, second) = if slug.as_str() <= new_slug.as_str() {
+        (&slug, &new_slug)
+    } else {
+        (&new_slug, &slug)
+    };
+    let wake_first_key = mcp.fleets.wake_lock(first).await;
+    let wake_first = wake_first_key.lock_owned().await;
+    let wake_second_key = mcp.fleets.wake_lock(second).await;
+    let wake_second = wake_second_key.lock_owned().await;
+    let (wake_old, wake_new) = if first == &slug {
+        (&wake_first, &wake_second)
+    } else {
+        (&wake_second, &wake_first)
+    };
+    let locks = crate::apps::rename::RenameLocks {
+        deploy: &deploy,
+        rollback: &rollback,
+        wake_old,
+        wake_new,
+    };
+    let deps = crate::apps::rename::RenameDeps {
+        pool: &mcp.pool,
+        store: &mcp.store,
+        git: &mcp.git,
+        sync: &mcp.sync,
+        fleets: Some(&mcp.fleets),
+        data_dir: &mcp.delete_cfg.data_dir,
+        cgroups: mcp.delete_cfg.cgroups.as_deref(),
+        apps_domain: &mcp.delete_cfg.apps_domain,
+        cache_purge: mcp.delete_cfg.cache_purge.as_ref(),
+    };
+    let out = match crate::apps::rename::rename_app(&deps, &slug, &new_slug, locks).await {
+        Ok(out) => out,
+        Err(err) => {
+            // Any domain error is pre-commit (post-commit steps never fail),
+            // so the rename never happened: refund the claimed change.
+            let _ = refund_change(&mcp.pool, &account.id).await;
+            let err = ToolError::from_rename(err);
+            audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+            return tool_response(&err);
+        }
+    };
+    let url = mcp.app_url(&out.app.slug);
+    // A running app redeploys under the new name; the rename already counts
+    // the change, so a failed redeploy still answers success for the rename
+    // itself (the deploy has its own rows and the previous version serves).
+    let deploy_status = match out.redeploy_sha {
+        Some(sha) => match run_deploy(mcp, &out.app, &sha, true).await {
+            Ok(deploy) => deploy
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("building")
+                .to_string(),
+            Err(_) => "failed".to_string(),
+        },
+        None => "ok".to_string(),
+    };
+    audit(&summary_for(&slug, &out.app.slug), &deploy_status, None).await;
+    ok_json(json!({"slug": out.app.slug, "url": url}))
 }

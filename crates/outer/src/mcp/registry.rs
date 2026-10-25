@@ -89,9 +89,8 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "get_app" | "share_app" | "list_files" | "read_file" | "search_code" | "history"
         | "show_commit" | "deploy_status" | "deploy_log" | "app_logs" | "app_errors"
         | "list_secrets" => Hints::READ,
-        "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "set_secret" => {
-            Hints::WRITE
-        }
+        "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
+        | "set_secret" => Hints::WRITE,
         "set_visibility" => Hints {
             idempotent: true,
             ..Hints::WRITE
@@ -227,6 +226,11 @@ pub fn registry() -> Vec<ToolDef> {
             "Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. Pass confirm equal to the slug. The name stays reserved for 30 days.",
             Account, false,
         ),
+        tool::<app_inputs::RenameAppInput>(
+            "rename_app",
+            "Rename an app: {app, slug}. Moves its slug, hostname, code, data and files to the new name (D1 and Durable Object data survive); the old name stays reserved for 30 days and redirects to the new one. Counts one code change; a running app redeploys.",
+            Account, false,
+        ),
         tool::<code_inputs::ListFilesInput>(
             "list_files",
             "List an app's files at a commit: {app, sha?, path_prefix?}.",
@@ -323,7 +327,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 30);
+        assert_eq!(tools.len(), 31);
     }
 }
 

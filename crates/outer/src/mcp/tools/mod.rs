@@ -731,6 +731,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "delete_app" => apps::delete_app(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
+        "rename_app" => apps::rename_app(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
         "list_files" => code::list_files(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
