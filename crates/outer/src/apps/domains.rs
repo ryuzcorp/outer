@@ -566,6 +566,9 @@ fn map_cf(err: crate::cloudflare::CfError) -> DomainError {
     use crate::cloudflare::CfError as E;
     match err {
         E::Conflict(detail) => DomainError::Conflict(detail),
+        E::Rejected(reason) => {
+            DomainError::InvalidArgument(format!("Cloudflare won't accept this hostname: {reason}"))
+        }
         E::NotFound => DomainError::Unavailable("the custom hostname is gone at Cloudflare".to_string()),
         E::Auth(detail) => DomainError::Unavailable(format!(
             "Cloudflare refused the custom-hostname request (check the API token permissions): {detail}"
@@ -583,6 +586,28 @@ fn map_cf(err: crate::cloudflare::CfError) -> DomainError {
 mod tests {
     use super::*;
     use crate::cloudflare::fake_saas::FakeSaaS;
+
+    /// Cloudflare's own refusal of a hostname (HTTP 400, e.g. a reserved
+    /// domain) is the caller's input problem: `invalid_argument` with
+    /// Cloudflare's reason, not an `internal` outage.
+    #[test]
+    fn cloudflare_rejections_are_invalid_arguments() {
+        let err = map_cf(crate::cloudflare::CfError::Rejected(
+            "Custom hostnames ending in example.com, example.net, or example.org are prohibited."
+                .to_string(),
+        ));
+        assert_eq!(err.code(), "invalid_argument");
+        assert!(
+            err.user_message().contains("example.com"),
+            "{}",
+            err.user_message()
+        );
+        assert!(
+            !err.user_message().contains("400"),
+            "{}",
+            err.user_message()
+        );
+    }
 
     async fn pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
         let dir = tempfile::tempdir().unwrap();

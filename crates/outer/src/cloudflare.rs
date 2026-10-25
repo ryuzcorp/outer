@@ -262,6 +262,20 @@ impl CustomHostnames {
             {
                 CfError::Conflict(errors)
             }
+            // 400: Cloudflare validated the input and said no (a prohibited
+            // or malformed hostname). That's the caller's input, not an outage.
+            reqwest::StatusCode::BAD_REQUEST => CfError::Rejected(
+                body.get("errors")
+                    .and_then(|v| v.as_array())
+                    .map(|es| {
+                        es.iter()
+                            .filter_map(|e| e.get("message").and_then(|v| v.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or(errors),
+            ),
             _ => CfError::Api(format!(
                 "Cloudflare refused the request ({status}): {errors}"
             )),
@@ -273,6 +287,9 @@ impl CustomHostnames {
 /// to agent-facing errors; the raw strings never reach agents.
 #[derive(Debug, thiserror::Error)]
 pub enum CfError {
+    /// Cloudflare rejected the input (HTTP 400), with its own explanation.
+    #[error("Cloudflare rejected the request: {0}")]
+    Rejected(String),
     /// The hostname id is unknown at Cloudflare (deleted elsewhere).
     #[error("custom hostname not found at Cloudflare")]
     NotFound,
