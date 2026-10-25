@@ -16,7 +16,7 @@ use crate::store::Store;
 /// Where the template lives upstream.
 pub const ILHA_VOID_URL: &str = "https://github.com/ryuzcorp/outer-template";
 /// The pinned commit `outer templates sync` vendors.
-pub const ILHA_VOID_SHA: &str = "60edb359d7698e527533b43dfac63ebb8d1d553a";
+pub const ILHA_VOID_SHA: &str = "32d413655a4f050485c14d04e9476325619f2b32";
 
 /// Pointer to the vendored bundle in the store.
 const CURRENT_KEY: &str = "outer/templates/ilha-void/current.json";
