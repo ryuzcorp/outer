@@ -110,6 +110,28 @@ fn slug_for(host: &str, apps_domain: &str) -> Option<String> {
     Some(slug.to_string())
 }
 
+/// A 308 to the renamed app's hostname, preserving any dev port on the
+/// authority and the request's path + query. The old hostname's quarantine
+/// guarantees nobody else can take it while this answers.
+fn redirect_to_slug(state: &ProxyState, raw_host: &str, target: &str, req: &Request) -> Response {
+    let rest = raw_host
+        .split_once('.')
+        .map(|(_, rest)| rest)
+        .unwrap_or(&state.apps_domain);
+    let scheme = if state.origin_locked { "https" } else { "http" };
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let location = format!("{scheme}://{target}.{rest}{path}");
+    Response::builder()
+        .status(StatusCode::PERMANENT_REDIRECT)
+        .header("location", location)
+        .body(Body::from(format!("this app moved to {target}")))
+        .unwrap()
+}
+
 fn header_bytes(headers: &HeaderMap) -> usize {
     headers
         .iter()
@@ -246,7 +268,20 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     };
     let app = match apps::get_by_slug(&state.pool, &slug).await {
         Ok(Some(app)) => app,
-        Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
+        Ok(None) => match apps::quarantine_lookup(&state.pool, &slug).await {
+            // A renamed-away slug redirects to the new hostname while its
+            // quarantine holds; a plain-deleted (or never-existing) slug
+            // 404s exactly as before.
+            Ok(Some(quarantine)) => match quarantine.renamed_to {
+                Some(target) => return redirect_to_slug(&state, &raw_host, &target, &req),
+                None => return text(StatusCode::NOT_FOUND, "no such app"),
+            },
+            Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
+            Err(err) => {
+                tracing::warn!(slug = %slug, error = %err, "quarantine lookup failed");
+                return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
+        },
         Err(err) => {
             tracing::warn!(slug = %slug, error = %err, "app lookup failed");
             return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
@@ -1178,5 +1213,65 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(paths, [("/items/:id".to_string(), 3)]);
+    }
+
+    #[tokio::test]
+    async fn renamed_slug_redirects_to_the_new_host() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-new", "new", fleet.addr.port(), "public").await;
+        let until = crate::apps::now_ms() + 30 * 24 * 60 * 60 * 1000;
+        sqlx::query(
+            "INSERT INTO slug_quarantine (slug, until, renamed_to) VALUES ('old', ?1, 'new')",
+        )
+        .bind(until)
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        // A plain-deleted slug carries no target and keeps its 404.
+        sqlx::query(
+            "INSERT INTO slug_quarantine (slug, until, renamed_to) VALUES ('gone', ?1, NULL)",
+        )
+        .bind(until)
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        async fn get(state: &ProxyState, host: &str, uri: &str) -> (StatusCode, HeaderMap, String) {
+            let req = Request::builder()
+                .uri(uri)
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await
+        }
+        // Path and query survive; the dev port on the authority survives.
+        let (status, headers, _) = get(&state, "old.outer.test", "/items/42?page=2").await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            headers.get("location").and_then(|v| v.to_str().ok()),
+            Some("http://new.outer.test/items/42?page=2")
+        );
+        let (status, headers, _) = get(&state, "old.outer.test:8080", "/").await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            headers.get("location").and_then(|v| v.to_str().ok()),
+            Some("http://new.outer.test:8080/")
+        );
+        // Deleted and unknown slugs still 404.
+        let (status, _, body) = get(&state, "gone.outer.test", "/").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "no such app");
+        let (status, _, _) = get(&state, "ghost.outer.test", "/").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The new hostname itself is untouched by the quarantine row.
+        let (status, _, _) = get(&state, "new.outer.test", "/ok").await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

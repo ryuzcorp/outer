@@ -48,6 +48,7 @@ const LOGGED_TOOLS: &[&str] = &[
     "create_app",
     "commit",
     "rollback",
+    "rename_app",
     "set_visibility",
     "share_app",
     "get_app",
@@ -168,6 +169,11 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             "set_visibility {}",
             arg_str(args, "visibility").unwrap_or("?")
         ),
+        "rename_app" => format!(
+            "rename_app {} to {}",
+            arg_str(args, "app").unwrap_or("?"),
+            arg_str(args, "slug").unwrap_or("?")
+        ),
         "share_app" | "get_app" => tool.to_string(),
         "list_secrets" => tool.to_string(),
         "set_secret" | "unset_secret" => {
@@ -287,19 +293,26 @@ pub async fn record(
     if summary_for(tool, args).is_none() {
         return;
     }
-    // `create_app` names the slug `slug`; every other app tool uses `app`.
-    let slug = args
-        .get("app")
-        .or_else(|| args.get("slug"))
-        .and_then(Value::as_str);
-    let Some(slug) = slug else { return };
-    let app: Option<(String, String)> =
-        sqlx::query_as("SELECT id, owner_id FROM app WHERE slug = ?1")
-            .bind(slug)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-    let Some((app_id, owner_id)) = app else {
+    // `create_app` names the slug `slug`; every other app tool uses `app`;
+    // `rename_app` carries both, and the row already moved, so the old slug
+    // misses — try each present key until one resolves.
+    let mut found: Option<(String, String)> = None;
+    for key in ["app", "slug"] {
+        let Some(slug) = args.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let app: Option<(String, String)> =
+            sqlx::query_as("SELECT id, owner_id FROM app WHERE slug = ?1")
+                .bind(slug)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        if app.is_some() {
+            found = app;
+            break;
+        }
+    }
+    let Some((app_id, owner_id)) = found else {
         return;
     };
     if owner_id != caller.account_id {
@@ -336,7 +349,7 @@ pub async fn record(
     .execute(pool)
     .await
     {
-        tracing::warn!(app = %slug, tool, error = %format!("{err:#}"), "agent_action insert failed");
+        tracing::warn!(app = %app_id, tool, error = %format!("{err:#}"), "agent_action insert failed");
     }
 }
 

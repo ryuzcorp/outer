@@ -171,6 +171,18 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `confirm` | string | yes | Type the slug again to confirm: must equal `app` exactly. |
 
+## `rename_app`
+
+- **Access:** signed in
+- **Description:** Rename an app: {app, slug}. Moves its slug, hostname, code, data and files to the new name (D1 and Durable Object data survive); the old name stays reserved for 30 days and redirects to the new one. Counts one code change; a running app redeploys.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app's current slug. |
+| `slug` | string | yes | The new slug: lowercase letters, digits and dashes, 1-48 chars. The old name stays reserved for 30 days and redirects to the new one. |
+
 ## `list_files`
 
 - **Access:** signed in

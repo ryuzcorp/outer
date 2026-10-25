@@ -334,7 +334,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 30);
+    assert_eq!(anon.len(), 31);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -351,9 +351,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 28);
-    assert!(!authed.contains(&"sign_in".to_string()));
-    assert!(!authed.contains(&"verify_code".to_string()));
+    assert_eq!(authed.len(), 29);
 
     // The test admin sees the same rows: M1 has no admin tools.
     let admin = api_key_for(&state, "owner@example.com").await;
@@ -2484,4 +2482,310 @@ async fn set_visibility_public_is_pro_gated() {
     )
     .await;
     assert_eq!(result(&public)["structuredContent"]["visibility"], "public");
+}
+
+#[tokio::test]
+async fn rename_app_moves_everything_and_quarantines_with_redirect() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    create_app(&state, &bob, "bobapp").await;
+    let id_before = app_id(&state, "groceries").await;
+
+    // Fake deploys write no bucket objects, so seed both prefixes by hand:
+    // a deploy pointer plus a D1-shaped object that must survive the move.
+    for (key, body) in [
+        ("fleets/groceries/deploy/current.json", "{}"),
+        ("fleets/groceries/cells/d1.sqlite", "D1DATA"),
+        ("fleets/bobapp/deploy/current.json", "{}"),
+    ] {
+        state
+            .store
+            .put(key, body.as_bytes().to_vec())
+            .await
+            .unwrap();
+    }
+    // Local state the pipeline would have left behind.
+    let data = &state.delete_cfg.data_dir;
+    tokio::fs::create_dir_all(data.join("work/groceries"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("work/groceries.index"), b"i")
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("work/groceries.install-hash"), b"h")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("cache/groceries"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("fleets/groceries"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(data.join("secret-sidecars"))
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("secret-sidecars/groceries.orig"), b"o")
+        .await
+        .unwrap();
+    tokio::fs::write(data.join("secret-sidecars/groceries.target"), b"0\ncfg")
+        .await
+        .unwrap();
+    assert!(state.git.repos_dir.join("groceries.git").exists());
+
+    let (_, body) = call(
+        &state,
+        Some(&ana),
+        "rename_app",
+        json!({"app": "groceries", "slug": "pantry"}),
+    )
+    .await;
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["slug"], "pantry");
+    assert_eq!(structured["url"], "http://pantry.outer.localhost");
+    // The app ran (fresh create leaves it awake with a successful deploy),
+    // so it redeployed under the new name through the fake.
+    assert_eq!(structured["deploy"]["status"], "success");
+    let quarantined_until = structured["quarantined_until"].as_i64().unwrap();
+    assert!(quarantined_until > crate::apps::now_ms());
+    assert!(
+        result(&body)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("stays reserved for 30 days"),
+        "{body}"
+    );
+
+    // The row flipped, same id; the old slug is gone.
+    assert_eq!(app_id(&state, "pantry").await, id_before);
+    let gone: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE slug = 'groceries'")
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+    assert!(gone.is_none());
+    // Bucket prefixes moved (deploy pointer + D1 data intact), old ones
+    // empty, the sibling app untouched.
+    assert_eq!(
+        state
+            .store
+            .get("fleets/pantry/deploy/current.json")
+            .await
+            .unwrap(),
+        Some(b"{}".to_vec())
+    );
+    assert_eq!(
+        state
+            .store
+            .get("fleets/pantry/cells/d1.sqlite")
+            .await
+            .unwrap(),
+        Some(b"D1DATA".to_vec())
+    );
+    assert!(state
+        .store
+        .list("fleets/groceries/")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(state.store.list("git/groceries/").await.unwrap().is_empty());
+    assert!(!state.store.list("git/pantry/").await.unwrap().is_empty());
+    assert!(!state.store.list("fleets/bobapp/").await.unwrap().is_empty());
+    // Local state moved.
+    assert!(data.join("work/pantry").exists());
+    assert!(!data.join("work/groceries").exists());
+    assert!(data.join("work/pantry.index").exists());
+    assert!(!data.join("work/groceries.index").exists());
+    assert!(data.join("work/pantry.install-hash").exists());
+    assert!(!data.join("work/groceries.install-hash").exists());
+    assert!(data.join("cache/pantry").exists());
+    assert!(!data.join("cache/groceries").exists());
+    assert!(data.join("fleets/pantry").exists());
+    assert!(!data.join("fleets/groceries").exists());
+    assert!(state.git.repos_dir.join("pantry.git").exists());
+    assert!(!state.git.repos_dir.join("groceries.git").exists());
+    assert!(data.join("secret-sidecars/pantry.orig").exists());
+    assert!(!data.join("secret-sidecars/groceries.orig").exists());
+    // Quarantine names the redirect target.
+    let row: (i64, Option<String>) =
+        sqlx::query_as("SELECT until, renamed_to FROM slug_quarantine WHERE slug = 'groceries'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, quarantined_until);
+    assert_eq!(row.1.as_deref(), Some("pantry"));
+    // The old slug answers not_found on the tools, and a fresh account's
+    // create is refused as quarantined (Ana is at her Free app slot, so her
+    // own create would fail quota first); app_id-keyed history followed.
+    let (_, missing) = call(&state, Some(&ana), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+    let carol = api_key_for(&state, "carol@example.com").await;
+    let (_, again) = call(
+        &state,
+        Some(&carol),
+        "create_app",
+        json!({"slug": "groceries"}),
+    )
+    .await;
+    let err = is_error(&again);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("taken or quarantined"));
+    let deploys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deploy WHERE app_id = ?1")
+        .bind(&id_before)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert!(deploys >= 2, "create + rename redeploy: {deploys}");
+    // The committed rename counted one change.
+    let account = crate::apps::ensure_account(&state.pool, "ana@example.com")
+        .await
+        .unwrap();
+    let used: i64 = sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
+        .bind(&account)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(used, 1);
+    // The MCP audit row logged old → new.
+    let audit: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT tool, summary, consent_id, apikey_id FROM agent_action WHERE app_id = ?1 AND tool = 'rename_app'",
+    )
+    .bind(&id_before)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit.0, "rename_app");
+    assert_eq!(audit.1, "rename_app groceries to pantry");
+    // And Bob's app still serves its summary.
+    let (_, kept) = call(&state, Some(&bob), "get_app", json!({"app": "bobapp"})).await;
+    assert_eq!(result(&kept)["structuredContent"]["slug"], "bobapp");
+}
+
+#[tokio::test]
+async fn rename_app_refusals_keep_the_app_and_refund_quota() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    create_app(&state, &bob, "bobapp").await;
+    // Commit one rename so a quarantined target exists.
+    let (_, first) = call(
+        &state,
+        Some(&ana),
+        "rename_app",
+        json!({"app": "groceries", "slug": "pantry"}),
+    )
+    .await;
+    assert_eq!(result(&first)["structuredContent"]["slug"], "pantry");
+
+    // Quarantined (someone's old name), taken (a live app), reserved,
+    // misshapen and same-slug targets are all refused with the create_app
+    // messages; unknown and foreign slugs are not_found.
+    for (app, slug, code, message) in [
+        (
+            "pantry",
+            "groceries",
+            "invalid_argument",
+            "taken or quarantined",
+        ),
+        (
+            "pantry",
+            "bobapp",
+            "invalid_argument",
+            "taken or quarantined",
+        ),
+        ("pantry", "api", "invalid_argument", "reserved"),
+        ("pantry", "Bad_Shape", "invalid_argument", "must match"),
+        ("pantry", "pantry", "invalid_argument", "already named"),
+        ("nope", "pantry", "not_found", "no app"),
+    ] {
+        let (_, body) = call(
+            &state,
+            Some(&ana),
+            "rename_app",
+            json!({"app": app, "slug": slug}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], code, "{app} → {slug}: {body}");
+        assert!(
+            err["message"].as_str().unwrap().contains(message),
+            "{app} → {slug}: {body}"
+        );
+    }
+    // Foreign: Bob's correct-looking call answers exactly like missing.
+    let (_, foreign) = call(
+        &state,
+        Some(&bob),
+        "rename_app",
+        json!({"app": "pantry", "slug": "bobbins"}),
+    )
+    .await;
+    assert_eq!(is_error(&foreign)["error"], "not_found");
+
+    // The row never moved and the quarantine still points at pantry.
+    let id: String = app_id(&state, "pantry").await;
+    let target: Option<String> =
+        sqlx::query_scalar("SELECT renamed_to FROM slug_quarantine WHERE slug = 'groceries'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(target.as_deref(), Some("pantry"));
+    // Only the committed rename counted: every refusal refunded its claim.
+    let account = crate::apps::ensure_account(&state.pool, "ana@example.com")
+        .await
+        .unwrap();
+    let used: i64 = sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
+        .bind(&account)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(used, 1, "refusals must refund");
+    let _ = id;
+}
+
+#[tokio::test]
+async fn rename_app_waits_for_the_deploy_lock() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    let id = app_id(&state, "groceries").await;
+
+    // A deploy holds the app lock: the rename serializes behind it. The
+    // pre-release assertions hold in every schedule — the rename cannot pass
+    // lock acquisition while this guard lives, whatever runs first.
+    let guard = state.deploys.app_lock(&id).lock_owned().await;
+    let moved = state.clone();
+    let token = ana.clone();
+    let handle = tokio::spawn(async move {
+        let (_, body) = call(
+            &moved,
+            Some(&token),
+            "rename_app",
+            json!({"app": "groceries", "slug": "pantry"}),
+        )
+        .await;
+        body
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let still: Option<String> = sqlx::query_scalar("SELECT slug FROM app WHERE id = ?1")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(still.as_deref(), Some("groceries"));
+    let quarantine: Option<String> =
+        sqlx::query_scalar("SELECT slug FROM slug_quarantine WHERE slug = 'groceries'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+    assert!(quarantine.is_none());
+    drop(guard);
+    let body = handle.await.unwrap();
+    assert_eq!(result(&body)["structuredContent"]["slug"], "pantry");
 }

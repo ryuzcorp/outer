@@ -9,11 +9,79 @@ use anyhow::Context as _;
 use sqlx::SqlitePool;
 
 pub mod delete;
+pub mod rename;
 mod slug;
 pub use slug::{validate_slug, SlugError};
 
 /// How long a deleted slug stays quarantined before anyone may reuse it.
-const QUARANTINE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub(crate) const QUARANTINE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The new slug is claimable: well-formed, not reserved, naming no live app,
+/// and not inside its 30-day quarantine. An expired quarantine row is
+/// deleted, so a stale prune never blocks a legitimate reuse. Shared by
+/// [`create`] and [`rename::rename_app`]: both refuse exactly the same
+/// slugs with exactly the same errors.
+pub(crate) async fn check_slug_claimable(pool: &SqlitePool, slug: &str) -> Result<(), CreateError> {
+    let mut conn = pool.acquire().await.map_err(internal)?;
+    check_slug_claimable_conn(&mut conn, slug).await
+}
+
+/// [`check_slug_claimable`] on an open transaction, for the rename commit's
+/// authoritative re-check (a racing create converges on `Taken` there).
+pub(crate) async fn check_slug_claimable_conn(
+    conn: &mut sqlx::SqliteConnection,
+    slug: &str,
+) -> Result<(), CreateError> {
+    validate_slug(slug)?;
+    let now = now_ms();
+    let taken: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE slug = ?1")
+        .bind(slug)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(internal)?;
+    if taken.is_some() {
+        return Err(CreateError::Taken);
+    }
+    let until: Option<i64> =
+        sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = ?1")
+            .bind(slug)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(internal)?;
+    if let Some(until) = until {
+        if until > now {
+            return Err(CreateError::Taken);
+        }
+        sqlx::query("DELETE FROM slug_quarantine WHERE slug = ?1")
+            .bind(slug)
+            .execute(&mut *conn)
+            .await
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
+/// One `slug_quarantine` row: when the slug is claimable again, and where a
+/// renamed app went (`None` for plain deletes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineRow {
+    pub until: i64,
+    pub renamed_to: Option<String>,
+}
+
+/// The quarantine row for `slug`, if any. The proxy uses it to redirect an
+/// old hostname to its renamed app.
+pub async fn quarantine_lookup(
+    pool: &SqlitePool,
+    slug: &str,
+) -> anyhow::Result<Option<QuarantineRow>> {
+    let row: Option<(i64, Option<String>)> =
+        sqlx::query_as("SELECT until, renamed_to FROM slug_quarantine WHERE slug = ?1")
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(until, renamed_to)| QuarantineRow { until, renamed_to }))
+}
 
 /// One process-wide lock serializing [`create`]: the check-then-insert over
 /// slug, quarantine, uids and ports must not interleave with itself.
@@ -232,32 +300,8 @@ pub async fn create(
     app_limit: u64,
 ) -> Result<App, CreateError> {
     let _guard = CREATE_LOCK.lock().await;
-    validate_slug(slug)?;
+    check_slug_claimable(pool, slug).await?;
     let now = now_ms();
-    let taken: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE slug = ?1")
-        .bind(slug)
-        .fetch_optional(pool)
-        .await
-        .map_err(internal)?;
-    if taken.is_some() {
-        return Err(CreateError::Taken);
-    }
-    let until: Option<i64> =
-        sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = ?1")
-            .bind(slug)
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    if let Some(until) = until {
-        if until > now {
-            return Err(CreateError::Taken);
-        }
-        sqlx::query("DELETE FROM slug_quarantine WHERE slug = ?1")
-            .bind(slug)
-            .execute(pool)
-            .await
-            .map_err(internal)?;
-    }
     // The plan quota re-checked under the lock: an earlier check races with
     // concurrent creates, so the count here is the one that counts.
     let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE owner_id = ?1")

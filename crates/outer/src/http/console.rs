@@ -721,6 +721,185 @@ async fn api_secrets(
     }
 }
 
+/// The contract error shape for console mutations: the same `{error, message,
+/// user_message?}` codes the MCP tools return, over the matching HTTP
+/// status. Sibling console endpoints share this helper.
+fn mutation_error(status: StatusCode, err: &crate::mcp::error::ToolError) -> Response {
+    let mut body = json!({"error": err.code, "message": err.message});
+    if let Some(user_message) = &err.user_message {
+        body["user_message"] = json!(user_message);
+    }
+    (
+        status,
+        [
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+            ("content-type", "application/json"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn mutation_status(err: &crate::mcp::error::ToolError) -> StatusCode {
+    match err.code {
+        "invalid_argument" => StatusCode::BAD_REQUEST,
+        "not_found" => StatusCode::NOT_FOUND,
+        "forbidden" => StatusCode::FORBIDDEN,
+        "quota_exceeded" | "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// `POST /api/console/apps/:slug/rename {slug: "<new>"}`: the console side
+/// of MCP `rename_app` — the same domain function, the same daily-changes
+/// quota, and the audit row under the `rename_app` tool name with the
+/// "Console" client label. Answers `{slug, url}` for the new name; the
+/// Settings UI navigates there (console reads stay slug-addressed).
+async fn api_rename(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    body: axum::Json<serde_json::Value>,
+) -> Response {
+    use crate::mcp::tools::{claim_change, refund_change, run_deploy};
+
+    let started = std::time::Instant::now();
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    let app = match owned_app(mcp, &account, &slug).await {
+        Ok(Some(app)) => app,
+        Ok(None) => return not_found(),
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load the app right now",
+            );
+        }
+    };
+    // One audit row whatever the outcome (mirrors the MCP path, which logs
+    // refused calls too): the app is owned, so the row always resolves.
+    let audit = |summary: &str, outcome: &str, error_code: Option<&str>| {
+        let pool = mcp.pool.clone();
+        let app_id = app.id.clone();
+        let account_id = account.id.clone();
+        let summary = summary.to_string();
+        let outcome = outcome.to_string();
+        let error_code = error_code.map(str::to_string);
+        let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+        async move {
+            crate::mcp::actions::record_console(
+                &pool,
+                &crate::mcp::actions::ConsoleAudit {
+                    app_id: &app_id,
+                    account_id: &account_id,
+                    tool: "rename_app",
+                    summary: &summary,
+                    outcome: &outcome,
+                    error_code: error_code.as_deref(),
+                    duration_ms,
+                },
+            )
+            .await;
+        }
+    };
+    let summary_for = |old: &str, new: &str| format!("rename_app {old} to {new}");
+    let new_slug: Option<String> = body
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let Some(new_slug) = new_slug.filter(|s| !s.is_empty()) else {
+        let err = crate::mcp::error::ToolError::invalid_argument(
+            "body must be {\"slug\": \"<new-slug>\"}",
+        );
+        audit(&summary_for(&slug, "?"), "error", Some(err.code)).await;
+        return mutation_error(mutation_status(&err), &err);
+    };
+    if slug == new_slug {
+        let err = crate::mcp::error::ToolError::invalid_argument(format!(
+            "the app is already named {slug:?}; nothing to rename"
+        ));
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return mutation_error(mutation_status(&err), &err);
+    }
+    if let Err(e) = crate::apps::validate_slug(&new_slug) {
+        let err = crate::mcp::error::ToolError::invalid_argument(e.to_string());
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return mutation_error(mutation_status(&err), &err);
+    }
+    if let Err(err) = claim_change(&mcp.pool, &account.id).await {
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return mutation_error(mutation_status(&err), &err);
+    }
+    // Same locks as the MCP tool, in the same order (deploy, rollback, then
+    // the wake pair sorted by slug so two renames can never ABBA).
+    let rollback = mcp.rollback_locks.lock(&app.id).await;
+    let deploy = mcp.deploys.app_lock(&app.id).lock_owned().await;
+    let (first, second) = if slug.as_str() <= new_slug.as_str() {
+        (&slug, &new_slug)
+    } else {
+        (&new_slug, &slug)
+    };
+    let wake_first_key = mcp.fleets.wake_lock(first).await;
+    let wake_first = wake_first_key.lock_owned().await;
+    let wake_second_key = mcp.fleets.wake_lock(second).await;
+    let wake_second = wake_second_key.lock_owned().await;
+    let (wake_old, wake_new) = if first == &slug {
+        (&wake_first, &wake_second)
+    } else {
+        (&wake_second, &wake_first)
+    };
+    let locks = crate::apps::rename::RenameLocks {
+        deploy: &deploy,
+        rollback: &rollback,
+        wake_old,
+        wake_new,
+    };
+    let deps = crate::apps::rename::RenameDeps {
+        pool: &mcp.pool,
+        store: &mcp.store,
+        git: &mcp.git,
+        sync: &mcp.sync,
+        fleets: Some(&mcp.fleets),
+        data_dir: &mcp.delete_cfg.data_dir,
+        cgroups: mcp.delete_cfg.cgroups.as_deref(),
+        apps_domain: &mcp.delete_cfg.apps_domain,
+        cache_purge: mcp.delete_cfg.cache_purge.as_ref(),
+    };
+    let out = match crate::apps::rename::rename_app(&deps, &slug, &new_slug, locks).await {
+        Ok(out) => out,
+        Err(err) => {
+            if !matches!(err, crate::apps::rename::RenameError::Internal(_)) {
+                let _ = refund_change(&mcp.pool, &account.id).await;
+            }
+            let err = crate::mcp::error::ToolError::from_rename(err);
+            audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+            return mutation_error(mutation_status(&err), &err);
+        }
+    };
+    let url = mcp.app_url(&out.app.slug);
+    // A running app redeploys under the new name; the rename already counts
+    // the change, so a failed redeploy still answers success for the rename
+    // itself (the deploy has its own rows and the previous version serves).
+    let deploy_status = match out.redeploy_sha {
+        Some(sha) => match run_deploy(mcp, &out.app, &sha, true).await {
+            Ok(deploy) => deploy
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("building")
+                .to_string(),
+            Err(_) => "failed".to_string(),
+        },
+        None => "ok".to_string(),
+    };
+    audit(&summary_for(&slug, &out.app.slug), &deploy_status, None).await;
+    ok_json(json!({"slug": out.app.slug, "url": url}))
+}
+
 /// `GET /api/console/apps/:slug/actions`: the app's agent action log,
 /// newest first. `before` is the opaque `<created_at>:<id>` cursor of the
 /// last row on the previous page; `limit` defaults to 20 and clamps to
@@ -2507,6 +2686,128 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn console_rename_moves_the_app_and_audits_as_console() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let cookie = login(&pool, "ana@example.com").await;
+
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/rename",
+                &cookie,
+                serde_json::json!({"slug": "pantry"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let out: serde_json::Value = body.parse().unwrap();
+        assert_eq!(out["slug"], "pantry");
+        assert_eq!(out["url"], "http://pantry.outer.localhost");
+
+        // The row flipped and the old slug is quarantined with its target.
+        let id: String = sqlx::query_scalar("SELECT id FROM app WHERE slug = 'pantry'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(id, "app-groceries");
+        let row: (i64, Option<String>) = sqlx::query_as(
+            "SELECT until, renamed_to FROM slug_quarantine WHERE slug = 'groceries'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.0 > now);
+        assert_eq!(row.1.as_deref(), Some("pantry"));
+        // Never deployed: nothing redeployed, so no new deploy rows.
+        let deploys: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM deploy WHERE app_id = 'app-groceries'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(deploys, 1);
+
+        // The audit row is the MCP tool name with both credential columns
+        // NULL, and the action log reads that pair as "Console".
+        let audit: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT tool, summary, consent_id, apikey_id FROM agent_action WHERE app_id = 'app-groceries' AND tool = 'rename_app'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.1, "rename_app groceries to pantry");
+        assert!(audit.2.is_none() && audit.3.is_none());
+        let (status, _, body) =
+            send(&app, authed("/api/console/apps/pantry/actions", &cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let actions: serde_json::Value = body.parse().unwrap();
+        let entry = actions["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["tool"] == "rename_app")
+            .expect("rename audit row listed");
+        assert_eq!(entry["by"], "Console");
+        assert_eq!(entry["summary"], "rename_app groceries to pantry");
+    }
+
+    #[tokio::test]
+    async fn console_rename_needs_same_origin_owner_and_shape() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "bob@example.com", "bobapp", now).await;
+        let cookie = login(&pool, "ana@example.com").await;
+
+        // No same-origin metadata: refuse before touching anything.
+        let (status, _, _) = send(
+            &app,
+            Request::post("/api/console/apps/groceries/rename")
+                .header("cookie", cookie.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"slug":"pantry"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Foreign slug answers exactly like a missing one.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/bobapp/rename",
+                &cookie,
+                serde_json::json!({"slug": "bobbins"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Missing and misshapen bodies are 400 with the MCP error codes.
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"slug": ""}),
+            serde_json::json!({"slug": "Bad_Shape"}),
+        ] {
+            let (status, _, text) = send(
+                &app,
+                post_json("/api/console/apps/groceries/rename", &cookie, body.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let err: serde_json::Value = text.parse().unwrap();
+            assert_eq!(err["error"], "invalid_argument", "{body}");
+            assert!(err["message"].is_string(), "{body}");
+            assert!(err["user_message"].is_null(), "{body}");
+        }
+        // Nothing moved.
+        let slug: String = sqlx::query_scalar("SELECT slug FROM app WHERE id = 'app-groceries'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(slug, "groceries");
     }
 
     #[tokio::test]

@@ -136,7 +136,9 @@ impl ToolError {
         match err {
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
             E::Taken => Self::invalid_argument("slug is taken or quarantined; choose another slug"),
-            E::Exhausted(what) => Self::internal(format!("no free {what} left; ask the operator")),
+            E::Exhausted(what) => {
+                Self::internal(format!("no free {what} left; ask the operator to widen it"))
+            }
             E::Quota { limit, used } => Self::quota_exceeded(
                 format!("app quota: {limit} allowed, {used} owned"),
                 crate::mcp::tools::app_slots_message(plan, limit),
@@ -148,6 +150,24 @@ impl ToolError {
             E::Internal(e) => {
                 tracing::warn!("create_app internal: {e:#}");
                 Self::internal("creating the app failed on our side; try again in a minute")
+            }
+        }
+    }
+
+    /// Map rename failures. A taken or quarantined slug is the agent's to
+    /// fix, so it is `invalid_argument` exactly like creation's.
+    pub fn from_rename(err: crate::apps::rename::RenameError) -> Self {
+        use crate::apps::rename::RenameError as E;
+        match err {
+            E::NotFound(slug) => Self::not_found(format!("no app named {slug:?}")),
+            E::SameSlug(slug) => {
+                Self::invalid_argument(format!("the app is already named {slug:?}"))
+            }
+            E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
+            E::Taken => Self::invalid_argument("slug is taken or quarantined; choose another slug"),
+            E::Internal(e) => {
+                tracing::warn!("rename_app internal: {e:#}");
+                Self::internal("renaming the app failed on our side; try again in a minute")
             }
         }
     }
