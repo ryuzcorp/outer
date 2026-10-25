@@ -73,6 +73,10 @@ pub struct Issue {
     pub first_seen: i64,
     pub last_seen: i64,
     pub status: String,
+    /// Ms of the last resolve/ignore; `None` when never triaged. A
+    /// resolved issue that recurs flips back to `open` but keeps this,
+    /// so readers can badge it regressed (see [`upsert_issue`]).
+    pub resolved_at: Option<i64>,
 }
 
 /// Split a leading `2026-10-24T09:41:44.123Z`-style timestamp plus the
@@ -196,37 +200,49 @@ fn is_stack_frame(line: &str) -> bool {
     false
 }
 
-/// Group an ordered line stream into error events. A non-frame line — or a
-/// second error line — closes the open event. The one exception is a
-/// trailing exception line after frames in a `Traceback` block (Python's
-/// `ValueError: ...`): it joins the open event as its message, since the
-/// header alone carries no information.
-pub fn scan_errors<'a>(lines: impl Iterator<Item = (i64, &'a str)>) -> Vec<ErrorEvent> {
-    let mut events = Vec::new();
-    let mut current: Vec<(i64, String)> = Vec::new();
+/// One grouped error event plus the line span that produced it: `start`
+/// is the index of the opening line, `end` one past the last line of
+/// the event. Spans let readers map events back to exact lines (error
+/// links in the console, the recent-lines slice of an issue detail).
+#[derive(Debug, Clone)]
+pub struct EventSpan {
+    pub start: usize,
+    pub end: usize,
+    pub event: ErrorEvent,
+}
+
+/// Group an ordered line stream into error events with their line spans.
+/// Same grouping as [`scan_errors`]: a non-frame line — or a second
+/// error line — closes the open event, except a trailing exception line
+/// after frames in a `Traceback` block (Python's `ValueError: ...`),
+/// which joins the open event as its message.
+pub fn scan_spans(lines: &[(i64, &str)]) -> Vec<EventSpan> {
+    let mut spans = Vec::new();
+    let mut current: Vec<(usize, i64, String)> = Vec::new();
     // Whether `current` already holds a frame. A second error line then
     // either belongs to the open event (Python's trailing exception line)
     // or starts a new one (back-to-back bare error lines stay separate).
     let mut has_frame = false;
-    for (ts, line) in lines {
+    for (idx, (ts, line)) in lines.iter().enumerate() {
+        let ts = *ts;
         if is_error_start(line) {
             let traceback_open = current
                 .first()
-                .is_some_and(|(_, first)| first.trim_start() == TRACEBACK_HEADER);
+                .is_some_and(|(_, _, first)| first.trim_start() == TRACEBACK_HEADER);
             if has_frame && traceback_open {
                 if current.len() < MAX_EVENT_LINES {
-                    current.push((ts, line.to_string()));
+                    current.push((idx, ts, line.to_string()));
                 }
-                close_event(&mut current, &mut events);
+                close_span(&mut current, &mut spans);
                 has_frame = false;
             } else {
-                close_event(&mut current, &mut events);
-                current.push((ts, line.to_string()));
+                close_span(&mut current, &mut spans);
+                current.push((idx, ts, line.to_string()));
                 has_frame = false;
             }
         } else if !current.is_empty() && is_stack_frame(line) {
             if current.len() < MAX_EVENT_LINES {
-                current.push((ts, line.to_string()));
+                current.push((idx, ts, line.to_string()));
             }
             has_frame = true;
         } else {
@@ -236,26 +252,35 @@ pub fn scan_errors<'a>(lines: impl Iterator<Item = (i64, &'a str)>) -> Vec<Error
             // rather than closing it. Anything else closes the event.
             let traceback_context = current
                 .first()
-                .is_some_and(|(_, first)| first.trim_start() == TRACEBACK_HEADER)
+                .is_some_and(|(_, _, first)| first.trim_start() == TRACEBACK_HEADER)
                 && line.starts_with(char::is_whitespace);
             if !traceback_context {
-                close_event(&mut current, &mut events);
+                close_span(&mut current, &mut spans);
                 has_frame = false;
             }
         }
     }
-    close_event(&mut current, &mut events);
-    events
+    close_span(&mut current, &mut spans);
+    spans
 }
-fn close_event(current: &mut Vec<(i64, String)>, events: &mut Vec<ErrorEvent>) {
+
+fn close_span(current: &mut Vec<(usize, i64, String)>, spans: &mut Vec<EventSpan>) {
     if current.is_empty() {
         return;
     }
-    let first_ts = current.first().map(|(ts, _)| *ts).unwrap_or(0);
-    let last_ts = current.last().map(|(ts, _)| *ts).unwrap_or(first_ts);
+    let start = current.first().map(|(idx, _, _)| *idx).unwrap_or(0);
+    let end = current.last().map(|(idx, _, _)| *idx + 1).unwrap_or(start);
+    let first_ts = current.first().map(|(_, ts, _)| *ts).unwrap_or(0);
+    let last_ts = current.last().map(|(_, ts, _)| *ts).unwrap_or(first_ts);
     let message = {
-        let first = current.first().map(|(_, l)| l.clone()).unwrap_or_default();
-        let last = current.last().map(|(_, l)| l.clone()).unwrap_or_default();
+        let first = current
+            .first()
+            .map(|(_, _, l)| l.clone())
+            .unwrap_or_default();
+        let last = current
+            .last()
+            .map(|(_, _, l)| l.clone())
+            .unwrap_or_default();
         // A trailing exception line after frames (Python's `ValueError: ...`
         // after `Traceback ...`) carries the actual error; otherwise the
         // opening line is the message.
@@ -271,15 +296,32 @@ fn close_event(current: &mut Vec<(i64, String)>, events: &mut Vec<ErrorEvent>) {
     let frame = current
         .iter()
         .skip(1)
-        .map(|(_, l)| l.trim().to_string())
+        .map(|(_, _, l)| l.trim().to_string())
         .find(|l| is_stack_frame(l));
-    events.push(ErrorEvent {
-        message,
-        frame,
-        first_ts,
-        last_ts,
+    spans.push(EventSpan {
+        start,
+        end,
+        event: ErrorEvent {
+            message,
+            frame,
+            first_ts,
+            last_ts,
+        },
     });
     current.clear();
+}
+
+/// Group an ordered line stream into error events. A non-frame line — or a
+/// second error line — closes the open event. The one exception is a
+/// trailing exception line after frames in a `Traceback` block (Python's
+/// `ValueError: ...`): it joins the open event as its message, since the
+/// header alone carries no information.
+pub fn scan_errors<'a>(lines: impl Iterator<Item = (i64, &'a str)>) -> Vec<ErrorEvent> {
+    let owned: Vec<(i64, &'a str)> = lines.collect();
+    scan_spans(&owned)
+        .into_iter()
+        .map(|span| span.event)
+        .collect()
 }
 
 /// Normalize an error message for fingerprinting: strip the log prefix,
@@ -405,22 +447,28 @@ struct NewIssue<'a> {
 
 /// Record one grouped event: insert a new `open` issue, or — on a known
 /// fingerprint — bump `count` and refresh `last_seen`/`message`/`frame`
-/// while keeping `first_seen` and `status`. A resolved issue that recurs
-/// keeps its status: resolving is the owner's explicit choice, and a
-/// recount must not silently reopen it.
+/// while keeping `first_seen`. A resolved issue that recurs (the new event
+/// lands after `resolved_at`) flips back to `open` automatically but keeps
+/// `resolved_at`, so the console badges it regressed. An ignored issue
+/// keeps counting and stays ignored: ignoring is the owner's explicit
+/// choice to stop hearing about it.
 async fn upsert_issue(
     tx: &mut sqlx::SqliteConnection,
     app_id: &str,
     issue: &NewIssue<'_>,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open') \
+        "INSERT INTO error_issue (app_id, fingerprint, message, frame, count, first_seen, last_seen, status, resolved_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', NULL) \
          ON CONFLICT (app_id, fingerprint) DO UPDATE SET \
            count = error_issue.count + excluded.count, \
            last_seen = excluded.last_seen, \
            message = excluded.message, \
-           frame = excluded.frame",
+           frame = excluded.frame, \
+           status = CASE \
+             WHEN error_issue.status = 'resolved' \
+               AND excluded.last_seen > COALESCE(error_issue.resolved_at, 0) THEN 'open' \
+             ELSE error_issue.status END",
     )
     .bind(app_id)
     .bind(issue.fingerprint)
@@ -617,6 +665,301 @@ fn cursor_page<T>(mut entries: Vec<T>, limit: usize) -> Vec<T> {
     entries
 }
 
+/// One log line with its sequence cursor, plus the error-issue
+/// fingerprint when the line opens (or continues) a grouped error event:
+/// the console links those lines to their issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogLine {
+    pub seq: u64,
+    pub ts: i64,
+    pub stream: String,
+    pub line: String,
+    pub fingerprint: Option<String>,
+}
+
+impl LogLine {
+    pub fn to_json(&self) -> Value {
+        let mut out =
+            json!({"seq": self.seq, "ts": self.ts, "stream": self.stream, "line": self.line});
+        if let Some(fp) = &self.fingerprint {
+            out["fingerprint"] = json!(fp);
+        }
+        out
+    }
+}
+
+/// Server-side log filter (console Logs view, SSE follow). Everything is
+/// optional; every bound is checked at the HTTP edge, so this struct
+/// only carries validated values.
+#[derive(Debug, Clone, Default)]
+pub struct LogFilter {
+    /// Substring match on the line, case-insensitive.
+    pub q: Option<String>,
+    /// `stdout` or `stderr`.
+    pub stream: Option<String>,
+    /// `error`, `warn` or `info` (lines without a level prefix count as
+    /// info: plain `console.log` output carries no prefix).
+    pub level: Option<String>,
+    /// Millisecond time range, inclusive.
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+/// What [`read_filtered`] pages on: forward from `since` (follow/poll),
+/// backward from `before` (the `Load older` button), or the newest tail.
+#[derive(Debug, Clone, Copy)]
+pub enum LogCursor {
+    Since(u64),
+    Before(u64),
+    Tail,
+}
+
+/// The tracing level of one stored line for [`LogFilter::level`]:
+/// the parsed prefix level, or `info` for plain output lines.
+fn line_level(line: &str) -> &'static str {
+    match split_log_prefix(line).0 {
+        Some("ERROR") => "error",
+        Some("WARN") => "warn",
+        _ => "info",
+    }
+}
+
+fn filter_match(filter: &LogFilter, ts: i64, stream: &str, line: &str) -> bool {
+    if let Some(q) = &filter.q {
+        if !line.to_lowercase().contains(q) {
+            return false;
+        }
+    }
+    if let Some(want) = &filter.stream {
+        if stream != want {
+            return false;
+        }
+    }
+    if let Some(want) = &filter.level {
+        if line_level(line) != want {
+            return false;
+        }
+    }
+    // Stored `ts` is unix seconds (the ring's unit); the API takes unix
+    // milliseconds, so compare in ms. Second-granularity lines at the
+    // edges stay inclusive.
+    let ts_ms = ts.saturating_mul(1000);
+    if let Some(from) = filter.from {
+        if ts_ms < from {
+            return false;
+        }
+    }
+    if let Some(to) = filter.to {
+        if ts_ms > to {
+            return false;
+        }
+    }
+    true
+}
+
+/// Persisted lines merged with the live ring on the same `seq` cursor,
+/// filtered server-side and paged: `Since` keeps the OLDEST `limit` lines
+/// past the seq (follow/poll), `Before` keeps the newest `limit` older
+/// than the seq (`Load older`), `Tail` keeps the newest `limit` overall.
+/// Lines that open a grouped error carry its fingerprint (computed over
+/// the returned page, so `scan_errors` only ever sees `limit` lines).
+pub async fn read_filtered(
+    pool: &SqlitePool,
+    fleets: &FleetManager,
+    app_id: &str,
+    slug: &str,
+    filter: &LogFilter,
+    cursor: LogCursor,
+    limit: usize,
+) -> Vec<LogLine> {
+    let normalized = LogFilter {
+        q: filter.q.as_ref().map(|q| q.to_lowercase()),
+        stream: filter.stream.clone(),
+        level: filter.level.clone(),
+        from: filter.from,
+        to: filter.to,
+    };
+    let persisted: Vec<(i64, i64, String, String)> =
+        sqlx::query_as("SELECT seq, ts, stream, line FROM app_log WHERE app_id = ?1 ORDER BY seq")
+            .bind(app_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let mut by_seq: std::collections::BTreeMap<u64, (i64, String, String)> = persisted
+        .into_iter()
+        .map(|(seq, ts, stream, line)| (seq as u64, (ts, stream, line)))
+        .collect();
+    if let Some(ring) = fleets.logs(slug) {
+        for entry in ring_snapshot(&ring).await {
+            by_seq.insert(
+                entry.seq,
+                (
+                    entry.ts,
+                    format!("{:?}", entry.stream).to_ascii_lowercase(),
+                    entry.line,
+                ),
+            );
+        }
+    }
+    let mut entries: Vec<(u64, (i64, String, String))> = by_seq.into_iter().collect();
+    match cursor {
+        LogCursor::Since(seq) => {
+            entries.retain(|(s, _)| *s > seq);
+            entries.truncate(limit);
+        }
+        LogCursor::Before(seq) => {
+            entries.retain(|(s, _)| *s < seq);
+            let skip = entries.len().saturating_sub(limit);
+            entries = entries.into_iter().skip(skip).collect();
+        }
+        LogCursor::Tail => {
+            let skip = entries.len().saturating_sub(limit);
+            entries = entries.into_iter().skip(skip).collect();
+        }
+    }
+    // Fingerprint the page's error events over exact line spans, so the
+    // fingerprints match what the flush grouped (same `scan_spans`
+    // core): every line of an event carries its issue fingerprint.
+    let refs: Vec<(i64, &str)> = entries
+        .iter()
+        .map(|(_, (ts, _, line))| (*ts, line.as_str()))
+        .collect();
+    let mut fps: Vec<Option<String>> = vec![None; entries.len()];
+    for span in scan_spans(&refs) {
+        let fp = fingerprint(&span.event.message, span.event.frame.as_deref());
+        let end = span.end.min(fps.len());
+        for slot in &mut fps[span.start..end] {
+            *slot = Some(fp.clone());
+        }
+    }
+    entries
+        .into_iter()
+        .zip(fps)
+        .filter(|((_, (ts, stream, line)), _)| filter_match(&normalized, *ts, stream, line))
+        .map(|((seq, (ts, stream, line)), fingerprint)| LogLine {
+            seq,
+            ts,
+            stream,
+            line,
+            fingerprint,
+        })
+        .collect()
+}
+
+/// One sparkline bucket: occurrences of one issue in `[start, start + 3600_000)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkBucket {
+    pub start: i64,
+    pub count: i64,
+}
+
+/// Issue detail for the console: the issue, an hourly occurrence
+/// sparkline over the trailing 24 hours (recomputed from the retained
+/// lines, so buckets only cover what `app_log` still holds), and the
+/// most recent matching log lines.
+#[derive(Debug, Clone)]
+pub struct IssueDetail {
+    pub issue: Issue,
+    pub sparkline: Vec<SparkBucket>,
+    pub recent: Vec<LogLine>,
+}
+
+/// Buckets for one issue's sparkline: 24 hourly buckets ending at `now_ms`.
+const SPARK_BUCKETS: usize = 24;
+/// Most recent matching lines one detail answer carries.
+const DETAIL_RECENT_LINES: usize = 30;
+
+/// The issue plus its sparkline and recent lines, or `None` for an
+/// unknown fingerprint.
+///
+/// One `error_issue` row: message, frame, count, first/last seen, status
+/// and the triage stamp.
+type IssueDetailRow = (String, Option<String>, i64, i64, i64, String, Option<i64>);
+
+pub async fn issue_detail(
+    pool: &SqlitePool,
+    app_id: &str,
+    wanted: &str,
+    now_ms: i64,
+) -> anyhow::Result<Option<IssueDetail>> {
+    let row: Option<IssueDetailRow> = sqlx::query_as(
+        "SELECT message, frame, count, first_seen, last_seen, status, resolved_at \
+         FROM error_issue WHERE app_id = ?1 AND fingerprint = ?2",
+    )
+    .bind(app_id)
+    .bind(wanted)
+    .fetch_optional(pool)
+    .await?;
+    let Some((message, frame, count, first_seen, last_seen, status, resolved_at)) = row else {
+        return Ok(None);
+    };
+    let issue = Issue {
+        fingerprint: wanted.to_string(),
+        message,
+        frame,
+        count,
+        first_seen,
+        last_seen,
+        status,
+        resolved_at,
+    };
+    // Re-scan the retained lines with the same grouping core the flush
+    // uses, so fingerprints and spans match the stored issues exactly.
+    let persisted: Vec<(i64, i64, String, String)> =
+        sqlx::query_as("SELECT seq, ts, stream, line FROM app_log WHERE app_id = ?1 ORDER BY seq")
+            .bind(app_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let refs: Vec<(i64, &str)> = persisted
+        .iter()
+        .map(|(_, ts, _, line)| (*ts, line.as_str()))
+        .collect();
+    let mut buckets = vec![0i64; SPARK_BUCKETS];
+    let start = now_ms - SPARK_BUCKETS as i64 * 3_600_000;
+    let mut recent_span: Option<(usize, usize)> = None;
+    for span in scan_spans(&refs) {
+        if fingerprint(&span.event.message, span.event.frame.as_deref()) != wanted {
+            continue;
+        }
+        let last_ms = span.event.last_ts * 1000;
+        if last_ms >= start {
+            let idx = ((last_ms - start) / 3_600_000)
+                .min(SPARK_BUCKETS as i64 - 1)
+                .max(0) as usize;
+            buckets[idx] += 1;
+        }
+        recent_span = Some((span.start, span.end));
+    }
+    // The newest matching event's own lines, oldest first.
+    let mut recent: Vec<LogLine> = Vec::new();
+    if let Some((span_start, span_end)) = recent_span {
+        let from = span_start.max(span_end.saturating_sub(DETAIL_RECENT_LINES));
+        for (seq, ts, stream, line) in &persisted[from..span_end.min(persisted.len())] {
+            recent.push(LogLine {
+                seq: *seq as u64,
+                ts: *ts,
+                stream: stream.clone(),
+                line: line.clone(),
+                fingerprint: Some(wanted.to_string()),
+            });
+        }
+    }
+    let sparkline = buckets
+        .into_iter()
+        .enumerate()
+        .map(|(i, count)| SparkBucket {
+            start: start + i as i64 * 3_600_000,
+            count,
+        })
+        .collect();
+    Ok(Some(IssueDetail {
+        issue,
+        sparkline,
+        recent,
+    }))
+}
+
 /// Persisted lines for one app merged with its live ring on the same `seq`
 /// cursor: `since` keeps the OLDEST `limit` lines past it (polling), no
 /// `since` keeps the newest `limit` tail. Same JSON shape as the ring-only
@@ -679,14 +1022,23 @@ pub async fn issues(
     app_id: &str,
     status: Option<&str>,
 ) -> anyhow::Result<Vec<Issue>> {
-    type IssueRow = (String, String, Option<String>, i64, i64, i64, String);
+    type IssueRow = (
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        String,
+        Option<i64>,
+    );
     let rows: Vec<IssueRow> = if let Some(status) = status {
         anyhow::ensure!(
             matches!(status, "open" | "resolved" | "ignored"),
             "unknown status {status:?}"
         );
         sqlx::query_as(
-            "SELECT fingerprint, message, frame, count, first_seen, last_seen, status \
+            "SELECT fingerprint, message, frame, count, first_seen, last_seen, status, resolved_at \
              FROM error_issue WHERE app_id = ?1 AND status = ?2 \
              ORDER BY last_seen DESC, fingerprint ASC LIMIT ?3",
         )
@@ -697,7 +1049,7 @@ pub async fn issues(
         .await?
     } else {
         sqlx::query_as(
-            "SELECT fingerprint, message, frame, count, first_seen, last_seen, status \
+            "SELECT fingerprint, message, frame, count, first_seen, last_seen, status, resolved_at \
              FROM error_issue WHERE app_id = ?1 \
              ORDER BY last_seen DESC, fingerprint ASC LIMIT ?2",
         )
@@ -709,17 +1061,99 @@ pub async fn issues(
     Ok(rows
         .into_iter()
         .map(
-            |(fingerprint, message, frame, count, first_seen, last_seen, status)| Issue {
-                fingerprint,
-                message,
-                frame,
-                count,
-                first_seen,
-                last_seen,
-                status,
+            |(fingerprint, message, frame, count, first_seen, last_seen, status, resolved_at)| {
+                Issue {
+                    fingerprint,
+                    message,
+                    frame,
+                    count,
+                    first_seen,
+                    last_seen,
+                    status,
+                    resolved_at,
+                }
             },
         )
         .collect())
+}
+
+/// `true` when an `open` issue is a regression: it was resolved before
+/// and a later event reopened it (see [`upsert_issue`]). The console
+/// badges these `Regressed`.
+pub fn is_regressed(issue: &Issue) -> bool {
+    issue.status == "open" && issue.resolved_at.is_some()
+}
+
+/// Per-status issue totals for one app (uncapped, unlike [`issues`]), for
+/// the console's Open / Resolved / Ignored tabs.
+pub async fn status_counts(pool: &SqlitePool, app_id: &str) -> anyhow::Result<(i64, i64, i64)> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM error_issue WHERE app_id = ?1 GROUP BY status",
+    )
+    .bind(app_id)
+    .fetch_all(pool)
+    .await?;
+    let mut open = 0;
+    let mut resolved = 0;
+    let mut ignored = 0;
+    for (status, count) in rows {
+        match status.as_str() {
+            "open" => open = count,
+            "resolved" => resolved = count,
+            "ignored" => ignored = count,
+            _ => {}
+        }
+    }
+    Ok((open, resolved, ignored))
+}
+
+/// Most fingerprints one triage call touches: the `IN` list stays small
+/// and a bulk call can't rewrite an app's whole issue table by accident.
+pub const MAX_BULK_TRIAGE: usize = 100;
+
+/// Move issues to `open` / `resolved` / `ignored`. Resolve and ignore
+/// stamp `resolved_at` (drives automatic regression reopen in
+/// [`upsert_issue`]); reopen clears it, so only an automatic reopen
+/// reads as regressed. Returns the issues moved. Unknown fingerprints
+/// simply match nothing.
+pub async fn set_status(
+    pool: &SqlitePool,
+    app_id: &str,
+    fingerprints: &[&str],
+    status: &str,
+    now_ms: i64,
+) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        matches!(status, "open" | "resolved" | "ignored"),
+        "unknown status {status:?}"
+    );
+    anyhow::ensure!(
+        !fingerprints.is_empty() && fingerprints.len() <= MAX_BULK_TRIAGE,
+        "triage takes 1..={MAX_BULK_TRIAGE} fingerprints"
+    );
+    for fp in fingerprints {
+        anyhow::ensure!(!fp.is_empty() && fp.len() <= 64, "bad fingerprint {fp:?}");
+    }
+    // The `IN` list is dynamic by length only: every element rides a
+    // bind parameter, so fingerprints never touch the SQL text.
+    let resolved_at: Option<i64> = match status {
+        "open" => None,
+        _ => Some(now_ms),
+    };
+    let mut builder: sqlx::QueryBuilder<sqlx::Sqlite> =
+        sqlx::QueryBuilder::new("UPDATE error_issue SET status = ");
+    builder.push_bind(status);
+    builder.push(", resolved_at = ");
+    builder.push_bind(resolved_at);
+    builder.push(" WHERE app_id = ");
+    builder.push_bind(app_id);
+    builder.push(" AND fingerprint IN (");
+    let mut separated = builder.separated(", ");
+    for fp in fingerprints {
+        separated.push_bind(fp);
+    }
+    separated.push_unseparated(")");
+    Ok(builder.build().execute(pool).await?.rows_affected())
 }
 
 /// Proxy 5xx over the trailing hour, from the already-flushed per-minute
@@ -1159,6 +1593,406 @@ mod tests {
         // Only the trailing hour counts: 4 + 7, not the 100.
         assert_eq!(s5xx_last_hour(&pool, "app1", now).await.unwrap(), 11);
         assert_eq!(s5xx_last_hour(&pool, "other", now).await.unwrap(), 0);
+        pool.close().await;
+    }
+
+    async fn triage_pool() -> (tempfile::TempDir, SqlitePool) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        (dir, pool)
+    }
+
+    fn flush_lines(start: u64, lines: &[&str]) -> Vec<LogEntry> {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        // Blocking in a test: the ring is in-memory and tiny.
+        let mut ring = LogRing::new_with_next(lines.len().max(1), start);
+        for line in lines {
+            ring.push(LogStream::Stderr, line.to_string());
+        }
+        ring.tail(lines.len().max(1))
+    }
+
+    #[tokio::test]
+    async fn resolved_issue_recurs_reopens_as_regressed() {
+        let (_dir, pool) = triage_pool().await;
+        let app_id = "app1";
+        let entries = flush_lines(0, &["Error: kaboom"]);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let fp = issues(&pool, app_id, None).await.unwrap()[0]
+            .fingerprint
+            .clone();
+        // Stamp the resolve a minute back: stored event times are
+        // second-granularity, so `now` would race the test's own flush.
+        let resolved_at = crate::apps::now_ms() - 60_000;
+        set_status(&pool, app_id, &[&fp], "resolved", resolved_at)
+            .await
+            .unwrap();
+        let issue = issues(&pool, app_id, Some("resolved")).await.unwrap();
+        assert_eq!(issue.len(), 1);
+        assert_eq!(issue[0].resolved_at, Some(resolved_at));
+        // A new event after resolved_at reopens automatically but keeps
+        // the stamp, so the console badges it regressed.
+        let entries = flush_lines(1, &["Error: kaboom"]);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let open = issues(&pool, app_id, Some("open")).await.unwrap();
+        assert_eq!(open.len(), 1, "resolved issue recurs reopens");
+        assert_eq!(open[0].fingerprint, fp);
+        assert_eq!(open[0].count, 2, "recurrence counts");
+        assert_eq!(
+            open[0].resolved_at,
+            Some(resolved_at),
+            "stamp kept for the regressed badge"
+        );
+        assert!(is_regressed(&open[0]));
+        assert!(issues(&pool, app_id, Some("resolved"))
+            .await
+            .unwrap()
+            .is_empty());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn ignored_issue_keeps_counting_and_stays_ignored() {
+        let (_dir, pool) = triage_pool().await;
+        let app_id = "app1";
+        let entries = flush_lines(0, &["Error: noisy"]);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let fp = issues(&pool, app_id, None).await.unwrap()[0]
+            .fingerprint
+            .clone();
+        set_status(&pool, app_id, &[&fp], "ignored", crate::apps::now_ms())
+            .await
+            .unwrap();
+        let entries = flush_lines(1, &["Error: noisy"]);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let ignored = issues(&pool, app_id, Some("ignored")).await.unwrap();
+        assert_eq!(ignored.len(), 1, "ignored issues never reopen");
+        assert_eq!(ignored[0].count, 2, "recurrences still count");
+        assert!(!is_regressed(&ignored[0]), "ignored is not a regression");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn set_status_round_trips_and_rejects_shapes() {
+        let (_dir, pool) = triage_pool().await;
+        let app_id = "app1";
+        let entries = flush_lines(0, &["Error: flip"]);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let fp = issues(&pool, app_id, None).await.unwrap()[0]
+            .fingerprint
+            .clone();
+        let now = crate::apps::now_ms();
+        assert_eq!(
+            set_status(&pool, app_id, &[&fp], "resolved", now)
+                .await
+                .unwrap(),
+            1
+        );
+        let resolved = issues(&pool, app_id, Some("resolved")).await.unwrap();
+        assert_eq!(resolved[0].resolved_at, Some(now));
+        // A manual reopen clears the stamp: only automatic reopens read
+        // as regressed.
+        assert_eq!(
+            set_status(&pool, app_id, &[&fp], "open", now + 1)
+                .await
+                .unwrap(),
+            1
+        );
+        let open = issues(&pool, app_id, Some("open")).await.unwrap();
+        assert_eq!(open[0].resolved_at, None);
+        assert!(!is_regressed(&open[0]));
+        assert_eq!(
+            set_status(&pool, app_id, &["nope"], "open", now)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(set_status(&pool, app_id, &[], "open", now).await.is_err());
+        assert!(set_status(&pool, app_id, &[&fp], "bogus", now)
+            .await
+            .is_err());
+        assert!(set_status(&pool, app_id, &[""], "open", now).await.is_err());
+        let too_many: Vec<&str> = (0..=MAX_BULK_TRIAGE).map(|_| "fp").collect();
+        assert!(set_status(&pool, app_id, &too_many, "open", now)
+            .await
+            .is_err());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn status_counts_total_per_status() {
+        let (_dir, pool) = triage_pool().await;
+        let app_id = "app1";
+        let entries = flush_lines(0, &["Error: one", "Error: two", "Error: three"]);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let found = issues(&pool, app_id, None).await.unwrap();
+        assert_eq!(found.len(), 3);
+        set_status(&pool, app_id, &[&found[0].fingerprint], "resolved", 1)
+            .await
+            .unwrap();
+        set_status(&pool, app_id, &[&found[1].fingerprint], "ignored", 1)
+            .await
+            .unwrap();
+        assert_eq!(status_counts(&pool, app_id).await.unwrap(), (1, 1, 1));
+        assert_eq!(status_counts(&pool, "missing").await.unwrap(), (0, 0, 0));
+        pool.close().await;
+    }
+
+    fn empty_fleets() -> crate::fleet::manager::FleetManager {
+        let dir = tempfile::tempdir().unwrap();
+        // The TempDir drops at the end of this fn, but the manager only
+        // keeps the path; the pool below is a separate tempdir that
+        // outlives the test. Manager construction never touches the dir.
+        std::mem::forget(dir);
+        crate::fleet::manager::FleetManager::new(crate::fleet::manager::ManagerSettings {
+            data_dir: std::path::PathBuf::from("/nonexistent-test-dir"),
+            celld_bin: "celld".to_string(),
+            storage: crate::fleet::manager::FleetStorage {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "b".to_string(),
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: "k".to_string(),
+                    secret_access_key: "s".to_string(),
+                },
+            },
+            cgroups: None,
+            memory_max_bytes: 0,
+            cpu_max: "1".to_string(),
+            sleep_after: std::time::Duration::from_secs(60),
+            credential_refresh_after: std::time::Duration::from_secs(60),
+            wake_timeout: std::time::Duration::from_secs(1),
+            wake_concurrency: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn read_filtered_search_stream_level_and_time() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let (_dir, pool) = triage_pool().await;
+        let fleets = empty_fleets();
+        let app_id = "app1";
+        let mut ring = LogRing::new(10);
+        ring.push(LogStream::Stdout, "INFO serving on :8080".to_string());
+        ring.push(LogStream::Stdout, "console.log hello visitor".to_string());
+        ring.push(LogStream::Stderr, "ERROR disk full on vol-9".to_string());
+        ring.push(LogStream::Stderr, "WARN retrying fetch".to_string());
+        let entries = ring.tail(10);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let all = LogFilter::default();
+        assert_eq!(
+            read_filtered(&pool, &fleets, app_id, "ghost", &all, LogCursor::Tail, 100)
+                .await
+                .len(),
+            4
+        );
+        // Substring search is case-insensitive and bounded server-side.
+        let q = LogFilter {
+            q: Some("DISK".to_string()),
+            ..Default::default()
+        };
+        let found = read_filtered(&pool, &fleets, app_id, "ghost", &q, LogCursor::Tail, 100).await;
+        assert_eq!(found.len(), 1);
+        assert!(found[0].line.contains("disk full"));
+        // Stream filter.
+        let stderr = LogFilter {
+            stream: Some("stderr".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            read_filtered(
+                &pool,
+                &fleets,
+                app_id,
+                "ghost",
+                &stderr,
+                LogCursor::Tail,
+                100
+            )
+            .await
+            .len(),
+            2
+        );
+        // Level filter: the ERROR line matches error, the WARN line warn,
+        // and prefix-less stdout output counts as info.
+        for (level, want) in [("error", 1), ("warn", 1), ("info", 2)] {
+            let filter = LogFilter {
+                level: Some(level.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                read_filtered(
+                    &pool,
+                    &fleets,
+                    app_id,
+                    "ghost",
+                    &filter,
+                    LogCursor::Tail,
+                    100
+                )
+                .await
+                .len(),
+                want,
+                "level {level}",
+            );
+        }
+        // Time range in unix ms against second-granularity stored lines.
+        let now_ms = crate::apps::now_ms();
+        let wide = LogFilter {
+            from: Some(now_ms - 3_600_000),
+            to: Some(now_ms + 60_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            read_filtered(&pool, &fleets, app_id, "ghost", &wide, LogCursor::Tail, 100)
+                .await
+                .len(),
+            4
+        );
+        let past = LogFilter {
+            to: Some(now_ms - 3_600_000),
+            ..Default::default()
+        };
+        assert!(
+            read_filtered(&pool, &fleets, app_id, "ghost", &past, LogCursor::Tail, 100)
+                .await
+                .is_empty()
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn read_filtered_paginates_since_and_before() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let (_dir, pool) = triage_pool().await;
+        let fleets = empty_fleets();
+        let app_id = "app1";
+        let mut ring = LogRing::new(10);
+        for i in 0..5 {
+            ring.push(LogStream::Stdout, format!("line {i}"));
+        }
+        let entries = ring.tail(10);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let all = LogFilter::default();
+        let tail = read_filtered(&pool, &fleets, app_id, "ghost", &all, LogCursor::Tail, 2).await;
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].line, "line 3");
+        assert_eq!(tail[1].line, "line 4");
+        // `Load older`: the newest lines strictly older than the seq.
+        let older = read_filtered(
+            &pool,
+            &fleets,
+            app_id,
+            "ghost",
+            &all,
+            LogCursor::Before(tail[0].seq),
+            2,
+        )
+        .await;
+        assert_eq!(older.len(), 2);
+        assert_eq!(older[0].line, "line 1");
+        assert_eq!(older[1].line, "line 2");
+        // Forward poll: the oldest lines past the cursor.
+        let next = read_filtered(
+            &pool,
+            &fleets,
+            app_id,
+            "ghost",
+            &all,
+            LogCursor::Since(1),
+            10,
+        )
+        .await;
+        assert_eq!(next.len(), 3);
+        assert_eq!(next[0].seq, 2);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn page_lines_carry_their_issue_fingerprint() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let (_dir, pool) = triage_pool().await;
+        let fleets = empty_fleets();
+        let app_id = "app1";
+        let mut ring = LogRing::new(10);
+        ring.push(LogStream::Stdout, "serving on :8080".to_string());
+        ring.push(LogStream::Stderr, "Error: kaboom".to_string());
+        ring.push(
+            LogStream::Stderr,
+            "    at handler (file:///app/index.js:10:5)".to_string(),
+        );
+        let entries = ring.tail(10);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let fp = issues(&pool, app_id, None).await.unwrap()[0]
+            .fingerprint
+            .clone();
+        let page = read_filtered(
+            &pool,
+            &fleets,
+            app_id,
+            "ghost",
+            &LogFilter::default(),
+            LogCursor::Tail,
+            10,
+        )
+        .await;
+        assert_eq!(page.len(), 3);
+        assert_eq!(
+            page[0].fingerprint, None,
+            "plain lines carry no fingerprint"
+        );
+        assert_eq!(page[1].fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(
+            page[2].fingerprint.as_deref(),
+            Some(fp.as_str()),
+            "frames link too"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn issue_detail_carries_sparkline_and_recent_lines() {
+        use crate::fleet::supervisor::{LogRing, LogStream};
+        let (_dir, pool) = triage_pool().await;
+        let fleets = empty_fleets();
+        let app_id = "app1";
+        let mut ring = LogRing::new(10);
+        ring.push(LogStream::Stdout, "serving on :8080".to_string());
+        ring.push(LogStream::Stderr, "Error: kaboom".to_string());
+        ring.push(
+            LogStream::Stderr,
+            "    at handler (file:///app/index.js:10:5)".to_string(),
+        );
+        let entries = ring.tail(10);
+        flush_fleet(&pool, app_id, &entries).await.unwrap();
+        let fp = issues(&pool, app_id, None).await.unwrap()[0]
+            .fingerprint
+            .clone();
+        let now = crate::apps::now_ms();
+        let detail = issue_detail(&pool, app_id, &fp, now)
+            .await
+            .unwrap()
+            .expect("issue exists");
+        assert_eq!(detail.issue.fingerprint, fp);
+        assert_eq!(detail.sparkline.len(), 24, "24 hourly buckets");
+        assert_eq!(
+            detail.sparkline.iter().map(|b| b.count).sum::<i64>(),
+            1,
+            "the one event lands in the trailing-day window"
+        );
+        assert_eq!(detail.recent.len(), 2, "the event's own lines");
+        assert!(detail.recent[0].line.contains("kaboom"));
+        assert!(detail
+            .recent
+            .iter()
+            .all(|l| l.fingerprint.as_deref() == Some(fp.as_str())));
+        assert!(issue_detail(&pool, app_id, "nope", now)
+            .await
+            .unwrap()
+            .is_none());
+        let _ = fleets;
         pool.close().await;
     }
 }
