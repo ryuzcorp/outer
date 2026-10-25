@@ -13,8 +13,10 @@ built `dist/wrangler.json` at deploy time. Only keys celld accepts pass:
 - `r2_buckets` for file uploads. `queues` and `workflows` for background
   work.
 
-Plan gating for bindings arrives with billing. Until then every accepted
-key deploys on every account.
+One D1 database and one R2 bucket per app for now: a second
+`d1_databases` or `r2_buckets` entry fails the deploy at its validation
+step. Plan gating for bindings arrives with billing. Until then every
+accepted key deploys on every account.
 
 ## Files
 
@@ -24,9 +26,10 @@ content.
 
 ## Browse your data in the console
 
-Console → your app → **Data → R2** shows every `r2_buckets` binding: browse
-folders, preview text (up to 256 KiB) and images inline, download (up to 64
-MiB), upload (up to 64 MiB), create folders, and delete with confirmation.
+Console → your app → **Data → R2** opens the app's single `r2_buckets`
+binding directly: browse folders, preview text (up to 256 KiB) and images
+inline, download (up to 64 MiB), upload (up to 64 MiB), create folders, and
+delete with confirmation.
 Reads use the same scoped credentials as your app; writes go through celld
 and are recorded in the agent action log. The binding list comes from the
 deployed manifest in your bucket, not the local build directory.

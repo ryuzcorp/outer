@@ -423,81 +423,77 @@ export function CodeView({
 
   return (
     <div class="flex min-w-0 flex-col gap-3">
-      <section class="card card-border bg-base-100 min-w-0" aria-label="Version">
-        <div class="card-body min-w-0 gap-3">
-          <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
-            <label class="form-control min-w-0 flex-1" for="code-version">
-              <span class="label min-w-0">
-                <span class="label-text truncate" title="The repo version to browse (recent commits with their deploy status)">
-                  Version{live && sha === live ? " · live" : ""}
-                </span>
-              </span>
-              {historyPanel.kind === "loading" && <div class="skeleton h-9 w-full" aria-hidden="true" />}
-              {historyPanel.kind === "error" && (
-                <p class="m-0 min-w-0 break-words text-sm text-error" role="alert">
-                  Couldn't load versions: {historyPanel.message}{" "}
-                  <button type="button" class="btn btn-xs" onclick={() => void loadHistory()}>
-                    Retry
-                  </button>
-                </p>
-              )}
-              {historyPanel.kind === "ready" && (
-                <select
-                  id="code-version"
-                  class="select select-bordered select-sm w-full min-w-0"
-                  value={pickerValue}
-                  onchange={(e: Event) => {
-                    const value = (e.target as HTMLSelectElement).value;
-                    onPickSha(value === live ? null : value);
-                  }}
-                >
-                  {commits.map((c) => {
-                    const deploy = deployBySha.get(c.sha);
-                    const marks = [
-                      c.sha === live ? "live" : null,
-                      deploy ? deploy.status : null,
-                    ].filter(Boolean);
-                    const label = `${shortSha(c.sha)} · ${c.message.split("\n")[0] || "(no message)"} · ${timeAgo(c.at * 1000)}${marks.length > 0 ? ` · ${marks.join(", ")}` : ""}`;
-                    return (
-                      <option key={c.sha} value={c.sha} title={`${c.sha}\n${c.author} <${c.email}>\n${when(c.at * 1000)}\n\n${c.message}`}>
-                        {label}
-                      </option>
-                    );
-                  })}
-                </select>
-              )}
-            </label>
-            <div class="tabs tabs-box shrink-0" role="tablist" aria-label="Code sections">
-              {(["files", "changes"] as const).map((id) => (
-                <button
-                  key={id}
-                  type="button"
-                  role="tab"
-                  aria-selected={initialTab === id}
-                  class={`tab shrink-0 capitalize${initialTab === id ? " tab-active" : ""}`}
-                  onclick={() => switchTab(id)}
-                >
-                  {id}
-                </button>
-              ))}
-            </div>
-          </div>
-          {initialTab === "changes" && live && sha && sha !== live && (
-            <label class="label min-w-0 cursor-pointer justify-start gap-2">
-              <input
-                type="checkbox"
-                class="checkbox checkbox-sm shrink-0"
-                checked={compareOn()}
-                onchange={() => toggleCompare()}
-              />
-              <span class="label-text min-w-0 truncate" title={`Diff this version against the live sha ${shortSha(live)}`}>
-                Compare with live ({shortSha(live)})
-              </span>
-            </label>
+      <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center" aria-label="Version">
+        <label class="form-control min-w-0 flex-1" for="code-version">
+          <span class="label min-w-0">
+            <span class="label-text truncate" title="The repo version to browse (recent commits with their deploy status)">
+              Version{live && sha === live ? " · live" : ""}
+            </span>
+          </span>
+          {historyPanel.kind === "loading" && <div class="skeleton h-9 w-full" aria-hidden="true" />}
+          {historyPanel.kind === "error" && (
+            <p class="m-0 min-w-0 break-words text-sm text-error" role="alert">
+              Couldn't load versions: {historyPanel.message}{" "}
+              <button type="button" class="btn btn-xs" onclick={() => void loadHistory()}>
+                Retry
+              </button>
+            </p>
           )}
+          {historyPanel.kind === "ready" && (
+            <select
+              id="code-version"
+              class="select select-bordered select-sm w-full min-w-0"
+              value={pickerValue}
+              onchange={(e: Event) => {
+                const value = (e.target as HTMLSelectElement).value;
+                onPickSha(value === live ? null : value);
+              }}
+            >
+              {commits.map((c) => {
+                const deploy = deployBySha.get(c.sha);
+                const marks = [
+                  c.sha === live ? "live" : null,
+                  deploy ? deploy.status : null,
+                ].filter(Boolean);
+                const label = `${shortSha(c.sha)} · ${c.message.split("\n")[0] || "(no message)"} · ${timeAgo(c.at * 1000)}${marks.length > 0 ? ` · ${marks.join(", ")}` : ""}`;
+                return (
+                  <option key={c.sha} value={c.sha} title={`${c.sha}\n${c.author} <${c.email}>\n${when(c.at * 1000)}\n\n${c.message}`}>
+                    {label}
+                  </option>
+                );
+              })}
+            </select>
+          )}
+        </label>
+        <div class="tabs tabs-box shrink-0" role="tablist" aria-label="Code sections">
+          {(["files", "changes"] as const).map((id) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={initialTab === id}
+              class={`tab shrink-0 capitalize${initialTab === id ? " tab-active" : ""}`}
+              onclick={() => switchTab(id)}
+            >
+              {id}
+            </button>
+          ))}
         </div>
-      </section>
-
+      </div>
+      {initialTab === "changes" && live && sha && sha !== live && (
+        <label class="label min-w-0 cursor-pointer justify-start gap-2">
+          <input
+            type="checkbox"
+            class="checkbox checkbox-sm shrink-0"
+            checked={compareOn()}
+            onchange={() => toggleCompare()}
+          />
+          <span class="label-text min-w-0 truncate" title={`Diff this version against the live sha ${shortSha(live)}`}>
+            Compare with live ({shortSha(live)})
+          </span>
+        </label>
+      )}
+      <div class="border-base-300 border-t" aria-hidden="true" />
       {initialTab === "files" ? (
         <FilesTab
           tree={treePanel}
@@ -555,23 +551,21 @@ function FilesTab({
           </span>
         </p>
       )}
-      <div class="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-3">
-        <section class="card card-border bg-base-100 min-w-0 lg:col-span-1" aria-label="File tree">
-          <div class="card-body min-w-0">
-            <h2 class="card-title m-0 min-w-0 truncate text-base" title={`${tree.value.files.length.toLocaleString()} files at ${tree.value.sha}`}>
-              Files{" "}
-              <span class="opacity-60">({tree.value.files.length.toLocaleString()})</span>
-            </h2>
-            {nodes.length === 0 ? (
-              <p class="m-0 min-w-0 text-sm opacity-60">This version has no files.</p>
-            ) : (
-              <div class="max-h-[480px] min-w-0 overflow-auto">
-                <TreeNodes nodes={nodes} depth={0} selected={filePath} onSelect={onSelect} />
-              </div>
-            )}
-          </div>
-        </section>
-        <div class="min-w-0 lg:col-span-2">
+      <div class="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-3">
+        <div class="min-w-0 lg:col-span-1" aria-label="File tree">
+          <h2 class="m-0 min-w-0 truncate text-base font-semibold" title={`${tree.value.files.length.toLocaleString()} files at ${tree.value.sha}`}>
+            Files{" "}
+            <span class="opacity-60">({tree.value.files.length.toLocaleString()})</span>
+          </h2>
+          {nodes.length === 0 ? (
+            <p class="m-0 min-w-0 text-sm opacity-60">This version has no files.</p>
+          ) : (
+            <div class="max-h-[480px] min-w-0 overflow-auto">
+              <TreeNodes nodes={nodes} depth={0} selected={filePath} onSelect={onSelect} />
+            </div>
+          )}
+        </div>
+        <div class="min-w-0 lg:col-span-2 lg:border-l lg:border-base-300 lg:pl-4">
           <FileViewer file={file} filePath={filePath} wrap={wrap} onToggleWrap={onToggleWrap} onRetry={onRetry} />
         </div>
       </div>
@@ -594,11 +588,9 @@ function FileViewer({
 }) {
   if (!filePath) {
     return (
-      <section class="card card-border bg-base-100 min-w-0" aria-label="File viewer">
-        <div class="card-body min-w-0">
-          <p class="m-0 min-w-0 text-sm opacity-60">Pick a file to read it.</p>
-        </div>
-      </section>
+      <p class="m-0 min-w-0 text-sm opacity-60" aria-label="File viewer">
+        Pick a file to read it.
+      </p>
     );
   }
   if (file.kind === "loading") {
@@ -615,10 +607,10 @@ function FileViewer({
     lines.pop();
   }
   return (
-    <section class="card card-border bg-base-100 min-w-0" aria-label={`File ${value.path}`}>
-      <div class="card-body min-w-0">
+    <div class="flex min-w-0 flex-col gap-2" aria-label={`File ${value.path}`}>
+      <div class="min-w-0">
         <div class="flex min-w-0 flex-wrap items-center gap-2">
-          <h2 class="card-title m-0 min-w-0 flex-1 truncate font-mono text-sm" title={value.path}>
+          <h2 class="m-0 min-w-0 flex-1 truncate font-mono text-sm font-semibold" title={value.path}>
             {value.path}
           </h2>
           {value.kind === "text" && <CopyButton value={value.text ?? ""} label="Copy file contents" />}
@@ -677,7 +669,7 @@ function FileViewer({
           </div>
         )}
       </div>
-    </section>
+    </div>
   );
 }
 
@@ -723,101 +715,93 @@ function ChangesTab({
   const sections = splitSections(shown.patch);
   const sectionByPath = new Map(sections.map((s, i) => [s.path, i]));
   return (
-    <div class="flex min-w-0 flex-col gap-3">
-      <section class="card card-border bg-base-100 min-w-0" aria-label="Commit">
-        <div class="card-body min-w-0 gap-2 text-[13px]">
-          <div class="flex min-w-0 items-center gap-2">
-            <span class="min-w-0 flex-1 truncate font-mono" title={value.commit.sha}>
-              {shortSha(value.commit.sha)}
-            </span>
-            <CopyButton value={value.commit.sha} label="Copy full SHA" />
-          </div>
-          <p class="m-0 min-w-0 break-words font-medium" title={value.commit.message}>
-            {value.commit.message || "(no message)"}
-          </p>
-          <p class="m-0 min-w-0 truncate text-xs opacity-60" title={`${value.commit.author} <${value.commit.email}> · ${when(value.commit.at * 1000)}`}>
-            {value.commit.author} · {timeAgo(value.commit.at * 1000)}
-          </p>
-          <p class="m-0 min-w-0 truncate text-xs opacity-60" title={value.parent ? `Diff vs parent ${value.parent}` : "Initial commit: diff vs the empty tree"}>
-            {value.parent ? (
-              <span>
-                vs parent{" "}
-                <button type="button" class="link font-mono" title={value.parent} onclick={() => onOpenVersion(value.parent as string)}>
-                  {shortSha(value.parent)}
-                </button>
-              </span>
-            ) : (
-              "Initial commit"
-            )}
-          </p>
+    <div class="flex min-w-0 flex-col gap-4">
+      <div class="flex min-w-0 flex-col gap-1 text-[13px]" aria-label="Commit">
+        <div class="flex min-w-0 items-center gap-2">
+          <span class="min-w-0 flex-1 truncate font-mono" title={value.commit.sha}>
+            {shortSha(value.commit.sha)}
+          </span>
+          <CopyButton value={value.commit.sha} label="Copy full SHA" />
         </div>
-      </section>
-      {compareOn && (
-        <section class="card card-border bg-base-100 min-w-0" aria-label="Compare with live">
-          <div class="card-body min-w-0 gap-2 text-[13px]">
-            {compared.kind === "loading" && <div class="skeleton h-20 w-full" aria-hidden="true" />}
-            {compared.kind === "error" && (
-              <p class="m-0 min-w-0 break-words text-error" role="alert">
-                Couldn't compare: {compared.message}
-              </p>
-            )}
-            {compared.kind === "ready" && (
-              <p class="m-0 min-w-0 break-words" title={`Diff ${compared.value.from} against live ${compared.value.to}`}>
-                {compared.value.from === compared.value.to
-                  ? "This version is live — nothing differs."
-                  : `Diff against live (${shortSha(compared.value.to)}): ${compared.value.files.length} file(s).`}
-              </p>
-            )}
-          </div>
-        </section>
-      )}
-      <section class="card card-border bg-base-100 min-w-0" aria-label="Changed files">
-        <div class="card-body min-w-0">
-          <h2 class="card-title m-0 min-w-0 text-base" title={`${shown.files.length} changed files`}>
-            Changed files{" "}
-            <span class="opacity-60">({shown.files.length})</span>
-          </h2>
-          {shown.files.length === 0 ? (
-            <p class="m-0 min-w-0 text-sm opacity-60">
-              {compareOn ? "Still comparing…" : "No changes in this range."}
-            </p>
+        <p class="m-0 min-w-0 break-words font-medium" title={value.commit.message}>
+          {value.commit.message || "(no message)"}
+        </p>
+        <p class="m-0 min-w-0 truncate text-xs opacity-60" title={`${value.commit.author} <${value.commit.email}> · ${when(value.commit.at * 1000)}`}>
+          {value.commit.author} · {timeAgo(value.commit.at * 1000)}
+        </p>
+        <p class="m-0 min-w-0 truncate text-xs opacity-60" title={value.parent ? `Diff vs parent ${value.parent}` : "Initial commit: diff vs the empty tree"}>
+          {value.parent ? (
+            <span>
+              vs parent{" "}
+              <button type="button" class="link font-mono" title={value.parent} onclick={() => onOpenVersion(value.parent as string)}>
+                {shortSha(value.parent)}
+              </button>
+            </span>
           ) : (
-            <ul class="list min-w-0">
-              {shown.files.map((f) => (
-                <li key={f.path} class="list-row min-w-0 items-center gap-2 text-[13px]">
-                  <span class={`badge badge-soft ${statusBadge(f.status)} shrink-0`} title={f.status === "A" ? "Added" : f.status === "D" ? "Deleted" : f.status === "M" ? "Modified" : `Status ${f.status}`}>
-                    {f.status}
-                  </span>
-                  <a
-                    class="min-w-0 flex-1 truncate font-mono"
-                    href={`#code-diff-${sectionByPath.get(f.path.replace(/^[ab]\//, "")) ?? 0}`}
-                    title={f.path}
-                  >
-                    {f.path}
-                  </a>
-                  <span class="shrink-0 whitespace-nowrap font-mono text-xs opacity-60" title={`${f.added} added, ${f.removed} removed`}>
-                    {f.binary ? "binary" : `+${f.added} −${f.removed}`}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            "Initial commit"
+          )}
+        </p>
+      </div>
+      {compareOn && (
+        <div class="min-w-0 text-[13px]" aria-label="Compare with live">
+          {compared.kind === "loading" && <div class="skeleton h-20 w-full" aria-hidden="true" />}
+          {compared.kind === "error" && (
+            <p class="m-0 min-w-0 break-words text-error" role="alert">
+              Couldn't compare: {compared.message}
+            </p>
+          )}
+          {compared.kind === "ready" && (
+            <p class="m-0 min-w-0 break-words" title={`Diff ${compared.value.from} against live ${compared.value.to}`}>
+              {compared.value.from === compared.value.to
+                ? "This version is live — nothing differs."
+                : `Diff against live (${shortSha(compared.value.to)}): ${compared.value.files.length} file(s).`}
+            </p>
           )}
         </div>
-      </section>
+      )}
+      <div class="min-w-0 border-t border-base-300 pt-3" aria-label="Changed files">
+        <h2 class="m-0 min-w-0 text-base font-semibold" title={`${shown.files.length} changed files`}>
+          Changed files{" "}
+          <span class="opacity-60">({shown.files.length})</span>
+        </h2>
+        {shown.files.length === 0 ? (
+          <p class="m-0 min-w-0 text-sm opacity-60">
+            {compareOn ? "Still comparing…" : "No changes in this range."}
+          </p>
+        ) : (
+          <ul class="list min-w-0">
+            {shown.files.map((f) => (
+              <li key={f.path} class="list-row min-w-0 items-center gap-2 text-[13px]">
+                <span class={`badge badge-soft ${statusBadge(f.status)} shrink-0`} title={f.status === "A" ? "Added" : f.status === "D" ? "Deleted" : f.status === "M" ? "Modified" : `Status ${f.status}`}>
+                  {f.status}
+                </span>
+                <a
+                  class="min-w-0 flex-1 truncate font-mono"
+                  href={`#code-diff-${sectionByPath.get(f.path.replace(/^[ab]\//, "")) ?? 0}`}
+                  title={f.path}
+                >
+                  {f.path}
+                </a>
+                <span class="shrink-0 whitespace-nowrap font-mono text-xs opacity-60" title={`${f.added} added, ${f.removed} removed`}>
+                  {f.binary ? "binary" : `+${f.added} −${f.removed}`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
       {sections.map((section, i) => (
-        <section
+        <div
           key={`${section.path}-${i}`}
           id={`code-diff-${i}`}
-          class="card card-border bg-base-100 min-w-0 scroll-mt-4"
+          class="min-w-0 scroll-mt-4 border-t border-base-300 pt-3"
           aria-label={`Patch for ${section.path}`}
         >
-          <div class="card-body min-w-0">
-            <h3 class="m-0 min-w-0 truncate font-mono text-sm" title={section.path}>
-              {section.path}
-            </h3>
-            <DiffSection path={section.path} lines={section.lines} />
-          </div>
-        </section>
+          <h3 class="m-0 min-w-0 truncate font-mono text-sm font-semibold" title={section.path}>
+            {section.path}
+          </h3>
+          <DiffSection path={section.path} lines={section.lines} />
+        </div>
       ))}
       {shown.truncated && (
         <p class="alert alert-warning alert-soft m-0 min-w-0 text-[13px]" role="note">

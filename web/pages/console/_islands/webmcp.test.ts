@@ -9,7 +9,7 @@ import { consoleActions } from "./actions/console.ts";
 import type { ActionContext, ConsoleBridge } from "./actions/settings.ts";
 import type { ConsoleApp } from "./api.ts";
 import type { Route } from "./common.tsx";
-import { actionView, isRunnable, matchScore, searchEntries, type ItemGroup } from "./palette.tsx";
+import { actionView, emptyQueryEntries, isRunnable, matchScore, searchEntries, type ItemGroup } from "./palette.tsx";
 import {
   applyDefaults,
   createConfirmHandler,
@@ -511,5 +511,95 @@ describe("palette", () => {
     expect(entries.map((e) => e.group)).toEqual(["Apps", "Apps", "Views", "Actions"]);
     // Score still ranks within the group: the title-start hit leads.
     expect(entries[0].item.title).toBe("code");
+  });
+  test("empty query lists every group in group order", () => {
+    const groups: ItemGroup[] = [
+      {
+        title: "Apps",
+        items: [{ kind: "app", key: "app:b", title: "b", sub: "running" }],
+      },
+      {
+        title: "Views",
+        items: [{ kind: "view", key: "view:code", title: "Code", sub: "Go to Code", view: "code" }],
+      },
+      {
+        title: "Account",
+        items: [{ kind: "view", key: "view:account", title: "Account", sub: "Go to Account", view: "account" }],
+      },
+      {
+        title: "Actions",
+        items: [
+          {
+            kind: "action",
+            key: "action:list_secrets",
+            title: "List secrets",
+            sub: "Run on x",
+            action: findAction("list_secrets")!,
+            runnable: true,
+          },
+        ],
+      },
+    ];
+    const entries = emptyQueryEntries(groups, []);
+    expect(entries.map((e) => e.group)).toEqual(["Apps", "Views", "Account", "Actions"]);
+    expect(entries.map((e) => e.item.key)).toEqual([
+      "app:b",
+      "view:code",
+      "view:account",
+      "action:list_secrets",
+    ]);
+  });
+  test("empty query puts recents first without hiding or reordering the rest", () => {
+    const groups: ItemGroup[] = [
+      {
+        title: "Apps",
+        items: [
+          { kind: "app", key: "app:a", title: "a", sub: "running" },
+          { kind: "app", key: "app:b", title: "b", sub: "running" },
+        ],
+      },
+      {
+        title: "Views",
+        items: [{ kind: "view", key: "view:code", title: "Code", sub: "Go to Code", view: "code" }],
+      },
+      {
+        title: "Account",
+        items: [{ kind: "view", key: "view:account", title: "Account", sub: "Go to Account", view: "account" }],
+      },
+      {
+        title: "Actions",
+        items: [
+          {
+            kind: "action",
+            key: "action:list_secrets",
+            title: "List secrets",
+            sub: "Run on x",
+            action: findAction("list_secrets")!,
+            runnable: true,
+          },
+        ],
+      },
+    ];
+    const entries = emptyQueryEntries(groups, [
+      // Stale keys (deleted apps) and repeats resolve against the live list.
+      { kind: "action", key: "action:list_secrets" },
+      { kind: "app", key: "app:b" },
+      { kind: "app", key: "app:gone" },
+      { kind: "app", key: "app:b" },
+    ]);
+    expect(entries.map((e) => e.group)).toEqual([
+      "Recents",
+      "Recents",
+      "Apps",
+      "Views",
+      "Account",
+    ]);
+    expect(entries.map((e) => e.item.key)).toEqual([
+      "action:list_secrets",
+      "app:b",
+      "app:a",
+      "view:code",
+      "view:account",
+    ]);
   });
 });

@@ -180,7 +180,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     name: "d1_databases",
     title: "List D1 databases",
     description:
-      "List the app's declared D1 databases (binding + database name). Use it to pick a `binding` for the other d1_* actions. Returns {databases}.",
+      "List the app's declared D1 database (binding + database name; at most one). Pass its `binding` to the other d1_* actions. Returns {databases}.",
     inputSchema: {
       type: "object",
       required: ["slug"],

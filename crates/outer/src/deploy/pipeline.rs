@@ -387,6 +387,13 @@ const BUILD_PARENT_MEMORY_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const BUILD_PARENT_CPU_WEIGHT: u64 = 20;
 const BUILD_LEAF_MEMORY_MAX: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Agent-facing refusal when the built config declares more than one D1
+/// database or R2 bucket (spec: one of each for now). Kept as a const so
+/// the deploy-root step can surface the same line as the outcome's
+/// `user_message`.
+pub(crate) const BINDING_CAP_MESSAGE: &str =
+    "Outer apps can have one D1 database and one R2 bucket for now; merge the extra ones";
+
 /// Top-level wrangler keys celld accepts. Anything else fails `deploy-root`.
 const ACCEPTED_CONFIG_KEYS: &[&str] = &[
     "$schema",
@@ -869,8 +876,16 @@ impl Deployer {
                 (deploy_root, crons)
             }
             Err(e) => {
-                push_step(steps, log, "deploy-root", started, false, &format!("{e:#}"));
-                return Err(StepEnd::Failed(StepFailed::plain("deploy-root", &e)));
+                let message = format!("{e:#}");
+                push_step(steps, log, "deploy-root", started, false, &message);
+                // The binding cap is an agent-fixable config error, so it
+                // rides the outcome's `user_message` like a failed migration.
+                let failed = if message == BINDING_CAP_MESSAGE {
+                    StepFailed::refused("deploy-root", message)
+                } else {
+                    StepFailed::plain("deploy-root", &e)
+                };
+                return Err(StepEnd::Failed(failed));
             }
         };
 
@@ -1827,6 +1842,16 @@ impl StepFailed {
             user_message: Some(user_message),
         }
     }
+
+    /// For a config the deploy refuses (the binding cap): the refusal line
+    /// is the agent-facing message, so it doubles as the outcome error.
+    fn refused(step: &'static str, user_message: String) -> Self {
+        Self {
+            step,
+            error: cap_error(&user_message),
+            user_message: Some(user_message),
+        }
+    }
 }
 
 fn cap_error(s: &str) -> String {
@@ -1987,6 +2012,18 @@ fn validate_config_keys(value: &serde_json::Value) -> anyhow::Result<()> {
     for key in obj.keys() {
         if !ACCEPTED_CONFIG_KEYS.contains(&key.as_str()) {
             anyhow::bail!("unknown wrangler key {key:?}");
+        }
+    }
+    // One D1 database and one R2 bucket per app for now: anything more
+    // fails the deploy at its validation step, before migrations or upload.
+    for key in ["d1_databases", "r2_buckets"] {
+        let count = obj
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|list| list.len())
+            .unwrap_or(0);
+        if count > 1 {
+            anyhow::bail!(BINDING_CAP_MESSAGE);
         }
     }
     Ok(())
@@ -2789,6 +2826,45 @@ mod tests {
             "containers": [], "define": {}, "rules": [],
         });
         validate_config_keys(&full).unwrap();
+    }
+
+    #[test]
+    fn second_d1_database_fails_with_the_cap_message() {
+        let two = serde_json::json!({
+            "name": "app",
+            "main": "index.js",
+            "d1_databases": [
+                {"binding": "DB", "database_name": "app-db"},
+                {"binding": "AUX", "database_name": "aux-db"},
+            ],
+        });
+        let err = validate_config_keys(&two).unwrap_err();
+        assert_eq!(format!("{err:#}"), BINDING_CAP_MESSAGE);
+    }
+
+    #[test]
+    fn second_r2_bucket_fails_with_the_cap_message() {
+        let two = serde_json::json!({
+            "name": "app",
+            "main": "index.js",
+            "r2_buckets": [
+                {"binding": "FILES", "bucket_name": "files"},
+                {"binding": "AVATARS", "bucket_name": "avatars"},
+            ],
+        });
+        let err = validate_config_keys(&two).unwrap_err();
+        assert_eq!(format!("{err:#}"), BINDING_CAP_MESSAGE);
+    }
+
+    #[test]
+    fn one_d1_database_and_one_r2_bucket_pass_validation() {
+        let one_each = serde_json::json!({
+            "name": "app",
+            "main": "index.js",
+            "d1_databases": [{"binding": "DB", "database_name": "app-db"}],
+            "r2_buckets": [{"binding": "FILES", "bucket_name": "files"}],
+        });
+        validate_config_keys(&one_each).unwrap();
     }
 
     #[test]
@@ -4902,7 +4978,11 @@ exit 0
     }
 
     #[tokio::test]
-    async fn migrate_applies_each_database_sharing_one_dir() {
+    async fn migrate_applies_the_declared_database() {
+        // One database: the deploy cap (see BINDING_CAP_MESSAGE) rejects a
+        // second entry at deploy-root, so a full deploy only ever migrates
+        // the single declared database. Multi-entry parsing stays covered
+        // by `migrate::d1_databases` unit tests.
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
@@ -4916,12 +4996,12 @@ exit 0
             &sync,
             "grocery",
             CommitRequest {
-                message: "two databases".to_string(),
+                message: "one database".to_string(),
                 base: None,
                 writes: vec![
                     write(
                         "dist/wrangler.json",
-                        r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","d1_databases":[{"binding":"DB","database_name":"app-db"},{"binding":"AUX","database_name":"aux-db"}]}"#,
+                        r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","d1_databases":[{"binding":"DB","database_name":"app-db"}]}"#,
                     ),
                     write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
                     write("db/migrations/0001_init.sql", "CREATE TABLE item (id INTEGER);"),
@@ -4944,21 +5024,18 @@ exit 0
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
-        assert_eq!(apply_calls(state.path()), 2, "one apply per database");
+        assert_eq!(apply_calls(state.path()), 1, "one apply for the database");
         let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
         assert!(calls.contains("d1 migrations apply app-db"), "{calls}");
-        assert!(calls.contains("d1 migrations apply aux-db"), "{calls}");
-        for db in ["app-db", "aux-db"] {
-            let (count,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM d1_migration WHERE app_id = ?1 AND database_identity = ?2",
-            )
-            .bind(&app.id)
-            .bind(db)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(count, 1, "recorded under the effective identity for {db}");
-        }
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM d1_migration WHERE app_id = ?1 AND database_identity = ?2",
+        )
+        .bind(&app.id)
+        .bind("app-db")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "recorded under the effective identity");
     }
 
     #[tokio::test]
@@ -5237,6 +5314,121 @@ exit 0
             .await
             .unwrap();
         assert_eq!(count, 0, "a failed deploy writes no cron rows");
+    }
+
+    #[tokio::test]
+    async fn deploy_with_two_d1_databases_fails_at_deploy_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "seed".to_string(),
+                base: None,
+                writes: vec![
+                    write("index.ts", "v1"),
+                    write(
+                        "wrangler.json",
+                        r#"{"name":"grocery","main":"index.js","d1_databases":[{"binding":"DB","database_name":"app-db"},{"binding":"AUX","database_name":"aux-db"}]}"#,
+                    ),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10011);
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // No package.json: install and build skip without binaries, and the
+        // second database stops the deploy at deploy-root with the cap
+        // message, before migrations or celld run.
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
+        assert_eq!(outcome.error.as_deref(), Some(BINDING_CAP_MESSAGE));
+        assert_eq!(outcome.user_message.as_deref(), Some(BINDING_CAP_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn deploy_with_two_r2_buckets_fails_at_deploy_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "seed".to_string(),
+                base: None,
+                writes: vec![
+                    write("index.ts", "v1"),
+                    write(
+                        "wrangler.json",
+                        r#"{"name":"grocery","main":"index.js","r2_buckets":[{"binding":"FILES","bucket_name":"files"},{"binding":"AVATARS","bucket_name":"avatars"}]}"#,
+                    ),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10012);
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&app.id)
+        .bind(&app.slug)
+        .bind(&app.owner_id)
+        .bind(app.uid as i64)
+        .bind(app.port as i64)
+        .bind(app.internal_port as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
+        assert_eq!(outcome.error.as_deref(), Some(BINDING_CAP_MESSAGE));
+        assert_eq!(outcome.user_message.as_deref(), Some(BINDING_CAP_MESSAGE));
     }
 
     #[tokio::test]

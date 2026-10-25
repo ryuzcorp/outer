@@ -1,10 +1,9 @@
-// The R2 object browser: bucket picker, folder pages, detail panel.
-// Ported from Noite apps/noite/src/lib/storage/r2/{panel,browser}.tsx @
+// The R2 object browser: folder pages and detail panel for the app's single
+// bucket. Ported from Noite apps/noite/src/lib/storage/r2/{panel,browser}.tsx @
 // 58a977a. Outer differences: fetches go through the registered data-r2
 // actions (components never fetch directly), folder state lives in the
-// island instead of the URL, the bucket picker is a tab row (one view per
-// app, not per bucket route), and both deletes confirm in the shared
-// daisyUI modal.
+// island instead of the URL (one view per app, not per bucket route), and
+// both deletes confirm in the shared daisyUI modal.
 
 import { atom, watch } from "ilha";
 
@@ -524,12 +523,11 @@ function R2Browser({ slug, bucket }: { slug: string; bucket: R2Bucket }) {
   );
 }
 
-/** The R2 entry: bucket picker, then the browser. Apps that declare no
- * buckets get the empty state with the docs link. */
+/** The R2 entry: the single declared bucket, then the browser. Apps that
+ * declare no buckets get the empty state with the docs link. */
 export function R2View({ slug }: { slug: string }) {
   const buckets = atom<R2Bucket[] | null>(null);
   const loadError = atom("");
-  const picked = atom<string | null>(null);
   // Fetch once on mount (watch.once, never from render: island bodies
   // re-run on every atom update, so a render-driven fetch loops forever).
 
@@ -585,30 +583,7 @@ export function R2View({ slug }: { slug: string }) {
     );
   }
 
-  const current = buckets()!.find((b) => b.bucket === picked()) ?? buckets()![0];
-
-  return (
-    <div class="flex h-full min-h-0 flex-col">
-      {buckets()!.length > 1 ? (
-        <div class="border-base-300 flex flex-wrap items-center gap-2 border-b px-3 py-2" role="group" aria-label="Bucket">
-          {buckets()!.map((b) => (
-            <button
-              key={b.bucket}
-              type="button"
-              class={`btn btn-sm ${b.bucket === current.bucket ? "btn-active" : "btn-ghost"}`}
-              title={`Binding ${b.binding}`}
-              onclick={() => {
-                picked.set(b.bucket);
-              }}
-            >
-              {b.bucket}
-            </button>
-          ))}
-        </div>
-      ) : null}
-      <div class="flex min-h-0 flex-1 flex-col" key={current.bucket}>
-        <R2Browser slug={slug} bucket={current} />
-      </div>
-    </div>
-  );
+  // At most one bucket per app (deploy validation refuses a second), so
+  // the single binding is used directly: no picker, no list.
+  return <R2Browser slug={slug} bucket={buckets()![0]} />;
 }
