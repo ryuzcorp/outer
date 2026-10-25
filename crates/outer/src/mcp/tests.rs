@@ -3763,3 +3763,206 @@ async fn delete_account_removes_custom_hostnames() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+/// Jev stand-ins for the slug/name check: flag any text holding `flagme`
+/// (slug hyphens already became spaces), clear everything else.
+mod slug_check_tests {
+    use super::*;
+    use crate::moderation::jev::fake::{envelope, FakeJev, Responder};
+    use crate::moderation::{JevClient, JevConfig};
+
+    fn slug_test_client(base_url: &str) -> JevClient {
+        let mut config = JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = base_url.to_string();
+        config.timeout = std::time::Duration::from_millis(500);
+        JevClient::new(config).unwrap()
+    }
+
+    fn flagging_responder() -> Responder {
+        std::sync::Arc::new(|body| {
+            let state = body.pointer("/input/state").unwrap().as_object().unwrap();
+            let questions = body
+                .pointer("/input/questions")
+                .unwrap()
+                .as_object()
+                .unwrap();
+            let mut answers = serde_json::Map::new();
+            for (qid, question) in questions {
+                let slot = qid.split('_').next().unwrap_or("");
+                let text = state
+                    .get(slot)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let flagged = text.contains("flagme");
+                let value = if question.get("type").and_then(|t| t.as_str()) == Some("score") {
+                    serde_json::json!({"type": "score", "score": 0.0})
+                } else {
+                    serde_json::json!({"type": "noul", "noul": if flagged { 0.95 } else { 0.01 }})
+                };
+                answers.insert(qid.clone(), value);
+            }
+            (200, envelope(serde_json::json!({"answers": answers})))
+        })
+    }
+
+    #[tokio::test]
+    async fn create_and_rename_refuse_brand_slugs_with_the_rule() {
+        let (state, _) = setup().await;
+        let token = api_key_for(&state, "ana@example.com").await;
+        // Create refuses the brand slug with the plain-language rule.
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "create_app",
+            json!({"slug": "paypal-login"}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "invalid_argument");
+        let message = err["message"].as_str().unwrap();
+        assert!(
+            message.contains("paypal") && message.contains("aren't allowed"),
+            "create refusal names the brand and the rule: {body}"
+        );
+        // Rename refuses the same way, before claiming any quota.
+        create_app(&state, &token, "groceries").await;
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "rename_app",
+            json!({"app": "groceries", "slug": "secure-bank-verify"}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "invalid_argument");
+        let message = err["message"].as_str().unwrap();
+        assert!(
+            message.contains("bank") && message.contains("aren't allowed"),
+            "rename refusal names the brand and the rule: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_flagged_slug_and_name_are_refused_without_a_claim() {
+        let (mut state, _) = setup().await;
+        let fake = FakeJev::start(flagging_responder()).await;
+        state.jev = Some(slug_test_client(&fake.base_url));
+        let token = api_key_for(&state, "ana@example.com").await;
+        // A flagged slug refuses.
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "create_app",
+            json!({"slug": "flagme-shop"}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "invalid_argument");
+        assert!(
+            err["message"].as_str().unwrap().contains("flagged"),
+            "flagged slug refused: {body}"
+        );
+        // A clean slug with a flagged display name refuses too, naming it.
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "create_app",
+            json!({"slug": "clean-shop", "name": "Flagme Store"}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "invalid_argument");
+        assert!(
+            err["message"].as_str().unwrap().contains("Flagme Store"),
+            "flagged name refused: {body}"
+        );
+        // Brand slugs never reach Jev: the cheap checks run first.
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "create_app",
+            json!({"slug": "paypal-login"}),
+        )
+        .await;
+        assert_eq!(is_error(&body)["error"], "invalid_argument");
+        assert_eq!(fake.calls(), 2, "only the two Jev-checked names classify");
+        // Rename applies the same check to its target slug.
+        create_app(&state, &token, "groceries").await;
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "rename_app",
+            json!({"app": "groceries", "slug": "flagme-shop"}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "invalid_argument");
+        assert!(
+            err["message"].as_str().unwrap().contains("flagged"),
+            "flagged rename target refused: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_outage_fails_the_name_check_closed_with_a_retry() {
+        let (mut state, _) = setup().await;
+        let fake = FakeJev::start(std::sync::Arc::new(|_| {
+            (500, serde_json::json!({"error": "gateway down"}))
+        }))
+        .await;
+        state.jev = Some(slug_test_client(&fake.base_url));
+        let token = api_key_for(&state, "ana@example.com").await;
+        // Create fails closed with the retryable line.
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "create_app",
+            json!({"slug": "clean-shop"}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "internal");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("try again in a minute"),
+            "create outage is retryable: {body}"
+        );
+        // Rename answers not_found for a missing app before ever reaching
+        // Jev; with the app in place the outage fails closed the same way.
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "rename_app",
+            json!({"app": "groceries", "slug": "clean-shop"}),
+        )
+        .await;
+        assert_eq!(is_error(&body)["error"], "not_found");
+        // Seed with the check disabled: the seed itself must not fail closed.
+        state.jev = None;
+        create_app(&state, &token, "groceries").await;
+        state.jev = Some(slug_test_client(&fake.base_url));
+        let (_, body) = call(
+            &state,
+            Some(&token),
+            "rename_app",
+            json!({"app": "groceries", "slug": "clean-shop"}),
+        )
+        .await;
+        let err = is_error(&body);
+        assert_eq!(err["error"], "internal");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("try again in a minute"),
+            "rename outage is retryable: {body}"
+        );
+    }
+}

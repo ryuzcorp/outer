@@ -125,8 +125,8 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
-| `name` | string | no | Display name (defaults to the slug). |
-| `slug` | string | yes | URL name: lowercase letters, digits and dashes, 1-48 chars. |
+| `name` | string | no | Display name (defaults to the slug). Checked by the same content check as the slug. |
+| `slug` | string | yes | URL name: lowercase letters, digits and dashes, 1-48 chars. Brand and account-page names (paypal, apple, bank, login, â€¦) and flagged names are refused; without a Jev client (localhost dev) the content check is skipped. |
 | `wait` | boolean | no | Wait for the first deploy (default true). False returns immediately; poll deploy_status. |
 
 ## `list_apps`
@@ -192,7 +192,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app's current slug. |
-| `slug` | string | yes | The new slug: lowercase letters, digits and dashes, 1-48 chars. The old name stays reserved for 30 days and redirects to the new one. |
+| `slug` | string | yes | The new slug: lowercase letters, digits and dashes, 1-48 chars. The old name stays reserved for 30 days and redirects to the new one. Brand and account-page names and flagged names are refused like at creation. |
 
 ## `add_collaborator`
 

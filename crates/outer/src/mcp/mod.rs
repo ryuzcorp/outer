@@ -336,6 +336,10 @@ pub struct McpState {
     pub app_scheme: String,
     /// `:port` when the listener is off the scheme's default port, else "".
     pub app_port_suffix: String,
+    /// Jev client for the slug/name check on `create_app` and `rename_app`.
+    /// `None` is localhost dev without the Cloudflare pair: the check logs
+    /// a warning and passes, exactly like the pre-live gate.
+    pub jev: Option<crate::moderation::JevClient>,
     /// Awaited calls return the in-progress status after this long (§10.3).
     pub tool_wait: Duration,
     /// At most one rollback runs per app (fails fast otherwise).
@@ -441,6 +445,7 @@ impl McpState {
             apps_domain: "outer.localhost".to_string(),
             app_scheme: "http".to_string(),
             app_port_suffix: String::new(),
+            jev: None,
             tool_wait: Duration::from_millis(200),
             rollback_locks: RollbackLocks::default(),
             delete_cfg: crate::apps::delete::DeleteConfig {

@@ -149,6 +149,9 @@ pub enum RenameError {
     SameSlug(String),
     #[error(transparent)]
     InvalidSlug(#[from] super::SlugError),
+    /// Jev flagged the new slug, or was unreachable (fail closed).
+    #[error(transparent)]
+    Profanity(#[from] super::ProfanityError),
     #[error("slug is taken or quarantined; choose another slug")]
     Taken,
     #[error(transparent)]
@@ -451,6 +454,7 @@ pub async fn rename_app_with_hooks(
         .await
         .map_err(|err| match err {
             CreateError::InvalidSlug(e) => RenameError::InvalidSlug(e),
+            CreateError::Profanity(e) => RenameError::Profanity(e),
             CreateError::Taken => RenameError::Taken,
             CreateError::Exhausted(_) | CreateError::Quota { .. } => {
                 RenameError::Internal(anyhow::anyhow!("claimable check refused: {err}"))
@@ -634,6 +638,7 @@ pub async fn rename_app_with_hooks(
         .await
         .map_err(|err| match err {
             CreateError::InvalidSlug(e) => RenameError::InvalidSlug(e),
+            CreateError::Profanity(e) => RenameError::Profanity(e),
             CreateError::Taken => RenameError::Taken,
             CreateError::Exhausted(_) | CreateError::Quota { .. } => {
                 RenameError::Internal(anyhow::anyhow!("claimable check refused: {err}"))
@@ -1309,6 +1314,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn brand_targets_refuse_with_the_rule_before_touching_anything() {
+        let fx = fx().await;
+        seed_app(&fx, "groceries").await;
+        let err = run(&fx, "groceries", "paypal-login", RenameHooks::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RenameError::InvalidSlug(super::super::SlugError::Brand { .. })
+            ),
+            "brand target refuses as InvalidSlug::Brand, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("paypal") && message.contains("aren't allowed"),
+            "brand refusal tells the agent the rule: {message}"
+        );
+        // The pre-check refused before the fleet stop and the bucket copy:
+        // the old identity is untouched and no cleanup rows were recorded.
+        assert!(super::super::get_by_slug(&fx.pool, "groceries")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(cleanup_rows(&fx).await.is_empty());
+    }
+    #[tokio::test]
+
     async fn pending_cleanup_blocks_claims_past_quarantine() {
         let fx = fx().await;
         let now = now_ms();

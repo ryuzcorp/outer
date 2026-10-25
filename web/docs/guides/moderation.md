@@ -42,6 +42,14 @@ and `commit` returns `failed` with `review_unavailable`. (On localhost
 dev without the Cloudflare pair the gate logs a warning and passes —
 production always classifies.)
 
+Slugs and app names are checked when claimed, before any deploy runs:
+brand and account-page fragments (`paypal`, `apple`, `bank`, `login`, … —
+whole or embedded in the slug) are refused outright, and the slug and name
+go through the same Jev decision as the table above. When Jev is
+unreachable the claim fails closed ("Couldn't check this name right now;
+try again in a minute"). On localhost dev without the Cloudflare pair the
+check logs a warning and passes, like the gate.
+
 ## Coming
 
 - **After-live crawl**: rendered pages are not re-checked yet, so

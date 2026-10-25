@@ -138,6 +138,7 @@ impl ToolError {
         use crate::apps::CreateError as E;
         match err {
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
+            E::Profanity(err) => Self::from_profanity(err),
             E::Taken => Self::invalid_argument("slug is taken or quarantined; choose another slug"),
             E::Exhausted(what) => {
                 Self::internal(format!("no free {what} left; ask the operator to widen it"))
@@ -167,10 +168,25 @@ impl ToolError {
                 Self::invalid_argument(format!("the app is already named {slug:?}"))
             }
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
+            E::Profanity(err) => Self::from_profanity(err),
             E::Taken => Self::invalid_argument("slug is taken or quarantined; choose another slug"),
             E::Internal(e) => {
                 tracing::warn!("rename_app internal: {e:#}");
                 Self::internal("renaming the app failed on our side; try again in a minute")
+            }
+        }
+    }
+
+    /// Map a slug/name check failure. A flagged name is the agent's to fix
+    /// (`invalid_argument`); an unreachable Jev fails closed with a retryable
+    /// `internal`, exactly like the gate's `review_unavailable`.
+    pub fn from_profanity(err: crate::apps::ProfanityError) -> Self {
+        match err {
+            crate::apps::ProfanityError::Flagged(text) => Self::invalid_argument(format!(
+                "the name {text:?} was flagged by the content check; choose another name"
+            )),
+            crate::apps::ProfanityError::Unavailable => {
+                Self::internal("Couldn't check this name right now; try again in a minute")
             }
         }
     }

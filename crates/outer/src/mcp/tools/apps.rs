@@ -17,9 +17,13 @@ use crate::mcp::error::ToolError;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateAppInput {
-    /// URL name: lowercase letters, digits and dashes, 1-48 chars.
+    /// URL name: lowercase letters, digits and dashes, 1-48 chars. Brand and
+    /// account-page names (paypal, apple, bank, login, …) and flagged names
+    /// are refused; without a Jev client (localhost dev) the content check
+    /// is skipped.
     pub slug: String,
-    /// Display name (defaults to the slug).
+    /// Display name (defaults to the slug). Checked by the same content
+    /// check as the slug.
     pub name: Option<String>,
     /// Wait for the first deploy (default true). False returns immediately;
     /// poll deploy_status.
@@ -60,6 +64,8 @@ pub struct RenameAppInput {
     pub app: String,
     /// The new slug: lowercase letters, digits and dashes, 1-48 chars. The
     /// old name stays reserved for 30 days and redirects to the new one.
+    /// Brand and account-page names and flagged names are refused like at
+    /// creation.
     pub slug: String,
 }
 
@@ -155,6 +161,12 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     let caller = authed(ctx)?;
     apps::validate_slug(&input.slug).map_err(|e| ToolError::invalid_argument(e.to_string()))?;
     check_app_quota(&ctx.state.pool, &caller.account_id).await?;
+    // The name check runs before any row exists and before the quota claim,
+    // so refused names cost nothing and Jev never sees a name the cheap
+    // checks already refused.
+    apps::check_slug_profanity(ctx.state.jev.as_ref(), &input.slug, input.name.as_deref())
+        .await
+        .map_err(ToolError::from_profanity)?;
     let (app, sha) = seed_app(
         ctx,
         &caller.account_id,
@@ -381,6 +393,11 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         )));
     }
     apps::validate_slug(&input.slug).map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    // After the cheap checks, before the quota claim: a refused name costs
+    // nothing and Jev never runs for a malformed, reserved or brand slug.
+    apps::check_slug_profanity(ctx.state.jev.as_ref(), &input.slug, None)
+        .await
+        .map_err(ToolError::from_profanity)?;
     // Claimed before the move; refunded on any error. The domain rename
     // never fails post-commit (post-commit steps are warn-and-continue, and
     // the maintenance drain finishes them), so an error always means the

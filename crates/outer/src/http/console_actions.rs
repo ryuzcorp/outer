@@ -479,6 +479,13 @@ async fn api_rename(
         audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
         return tool_response(&err);
     }
+    // After the cheap checks, before the quota claim: mirrors the MCP tool,
+    // so the console refuses flagged and uncheckable names identically.
+    if let Err(e) = crate::apps::check_slug_profanity(mcp.jev.as_ref(), &new_slug, None).await {
+        let err = ToolError::from_profanity(e);
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return tool_response(&err);
+    }
     if let Err(err) = claim_change(&mcp.pool, &account.id).await {
         audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
         return tool_response(&err);
