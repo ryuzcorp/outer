@@ -386,6 +386,21 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     };
     let sha = outcome.sha;
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
+    // Quota threshold emails (alerts #2): the claim counted even when the
+    // deploy failed, so evaluate from the claim numbers. Never raises.
+    crate::alerts::notify_quota(
+        &crate::alerts::Ctx {
+            pool: &ctx.state.pool,
+            sender: &ctx.state.auth.config.email,
+            issuer: &ctx.state.auth.config.issuer,
+            key: &ctx.state.unsub_key,
+        },
+        &app.owner_id,
+        claim.used,
+        claim.limit,
+        crate::auth::now_ms(),
+    )
+    .await;
     let quota =
         json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
     let mut summary = format!(

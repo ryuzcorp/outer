@@ -30,6 +30,8 @@ use crate::auth::{self, now_ms};
 pub fn routes() -> Router<super::AppState> {
     Router::new()
         .route("/api/console/account", get(api_account))
+        .route("/api/console/alerts/prefs", post(api_update_prefs))
+        .route("/console/alerts/unsubscribe", get(api_unsubscribe))
         .route("/api/console/connections", get(api_connections))
         .route(
             "/api/console/connections/{id}/revoke",
@@ -73,25 +75,33 @@ async fn api_account(State(state): State<super::AppState>, headers: HeaderMap) -
         Err(res) => return *res,
     };
     match accounts::account_summary(&mcp.pool, &account.id).await {
-        Ok(summary) => ok_json(json!({
-            "email": summary.email,
-            "plan": summary.plan,
-            "plan_status": summary.plan_status,
-            "member_since": summary.member_since,
-            "usage": {
-                "apps_owned": summary.apps_owned,
-                "apps_limit": summary.apps_limit,
-                "code_changes_today": summary.code_changes_today,
-                "code_changes_limit": summary.code_changes_limit,
-                "build_ms_today": summary.build_ms_today,
-                "rollbacks": summary.rollbacks,
-                "rollback_limit": summary.rollback_limit,
-                "requests_month": summary.requests_month,
-                "storage_peak_bytes": summary.storage_peak_bytes,
-                "egress_bytes_month": summary.egress_bytes_month,
-            },
-            "resets_at": summary.resets_at,
-        })),
+        Ok(summary) => match crate::alerts::get_prefs(&mcp.pool, &account.id).await {
+            Ok(prefs) => ok_json(json!({
+                "email": summary.email,
+                "plan": summary.plan,
+                "plan_status": summary.plan_status,
+                "member_since": summary.member_since,
+                "usage": {
+                    "apps_owned": summary.apps_owned,
+                    "apps_limit": summary.apps_limit,
+                    "code_changes_today": summary.code_changes_today,
+                    "code_changes_limit": summary.code_changes_limit,
+                    "build_ms_today": summary.build_ms_today,
+                    "rollbacks": summary.rollbacks,
+                    "rollback_limit": summary.rollback_limit,
+                    "requests_month": summary.requests_month,
+                    "storage_peak_bytes": summary.storage_peak_bytes,
+                    "egress_bytes_month": summary.egress_bytes_month,
+                },
+                "alerts": {
+                    "deploy_failed": prefs.deploy_failed,
+                    "error_spike": prefs.error_spike,
+                    "quota": prefs.quota,
+                },
+                "resets_at": summary.resets_at,
+            })),
+            Err(err) => err_json(AccountError::internal(format!("{err:#}"))),
+        },
         Err(err) => err_json(err),
     }
 }
@@ -402,6 +412,150 @@ async fn api_delete_account(
         )
             .into_response(),
         Err(err) => err_json(err),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PrefsBody {
+    deploy_failed: Option<bool>,
+    error_spike: Option<bool>,
+    quota: Option<bool>,
+}
+
+/// `POST /api/console/alerts/prefs {deploy_failed?, error_spike?,
+/// quota?}`: flip the caller's email-alert toggles. At least one toggle
+/// must be present; absent toggles stay as they are. Audited as
+/// `update_alert_prefs` like every other account mutation.
+async fn api_update_prefs(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    body: axum::Json<PrefsBody>,
+) -> Response {
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    let started = now_ms();
+    if body.deploy_failed.is_none() && body.error_spike.is_none() && body.quota.is_none() {
+        return err_json(AccountError::invalid_argument(
+            "no toggles provided".to_string(),
+            "Pass at least one of deploy_failed, error_spike or quota.".to_string(),
+        ));
+    }
+    let patch = crate::alerts::PrefsPatch {
+        deploy_failed: body.deploy_failed,
+        error_spike: body.error_spike,
+        quota: body.quota,
+    };
+    let result: Result<serde_json::Value, AccountError> = async {
+        let prefs = crate::alerts::set_prefs(&mcp.pool, &account.id, &patch, started)
+            .await
+            .map_err(|err| AccountError::internal(format!("{err:#}")))?;
+        Ok(json!({
+            "deploy_failed": prefs.deploy_failed,
+            "error_spike": prefs.error_spike,
+            "quota": prefs.quota,
+        }))
+    }
+    .await;
+    let (outcome, error_code) = outcome_of(&result);
+    accounts::record_account_action(
+        &mcp.pool,
+        &account.id,
+        "update_alert_prefs",
+        &format!(
+            "update_alert_prefs deploy_failed={:?} error_spike={:?} quota={:?}",
+            body.deploy_failed, body.error_spike, body.quota
+        ),
+        outcome,
+        error_code,
+        started,
+    )
+    .await;
+    match result {
+        Ok(body) => ok_json(body),
+        Err(err) => err_json(err),
+    }
+}
+
+/// `GET /console/alerts/unsubscribe?token=`: one click, no login. The
+/// token is HMAC-signed ([`crate::alerts::verify_unsubscribe`]); a valid
+/// token flips its scope off and says so, anything else explains the link
+/// is not valid. Always 200 HTML: email clients prefetch, and there is no
+/// session to challenge.
+async fn api_unsubscribe(
+    State(state): State<super::AppState>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let issuer = state.mcp.auth.config.issuer.clone();
+    let key = state.mcp.unsub_key.clone();
+    let token = query.get("token").cloned().unwrap_or_default();
+    let (title, message) = match crate::alerts::verify_unsubscribe(&key, &token) {
+        Some((user_id, scope)) => {
+            let started = now_ms();
+            match crate::alerts::apply_unsubscribe(&state.mcp.pool, &user_id, &scope, started).await {
+                Ok(_) => {
+                    accounts::record_account_action(
+                        &state.mcp.pool,
+                        &user_id,
+                        "update_alert_prefs",
+                        &format!("unsubscribe {scope} via email link"),
+                        "ok",
+                        None,
+                        started,
+                    )
+                    .await;
+                    (
+                        "Unsubscribed",
+                        format!(
+                            "You will no longer get {} emails from Outer. \
+                             Change your mind anytime in the console under Account.",
+                            scope_label(&scope),
+                        ),
+                    )
+                }
+                Err(_) => (
+                    "Something went wrong",
+                    "Outer could not update your email settings. Try again from the console under Account.".to_string(),
+                ),
+            }
+        }
+        None => (
+            "Link not valid",
+            "This unsubscribe link is not valid. It may be from an older email — \
+             manage email alerts in the console under Account."
+                .to_string(),
+        ),
+    };
+    let manage = format!("{}/console?t=account", issuer.trim_end_matches('/'));
+    (
+        StatusCode::OK,
+        [
+            ("cache-control", "no-store"),
+            ("content-type", "text/html; charset=utf-8"),
+        ],
+        format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+             <title>{title} — Outer</title></head>\
+             <body style=\"font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; padding: 0 1rem;\">\
+             <h1>{title}</h1><p>{message}</p>\
+             <p><a href=\"{manage}\">Manage email alerts in the console</a></p>\
+             </body></html>"
+        ),
+    )
+        .into_response()
+}
+
+/// Human label for an unsubscribe scope, for the confirmation page and
+/// (through [`crate::alerts`]) the email footers.
+fn scope_label(scope: &str) -> &'static str {
+    match scope {
+        crate::alerts::KIND_DEPLOY_FAILED => "deploy failure",
+        crate::alerts::KIND_ERROR_SPIKE => "error spike",
+        crate::alerts::SCOPE_ALL => "alert",
+        _ => "quota",
     }
 }
 
@@ -996,5 +1150,114 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn alert_prefs_default_on_and_partial_update() {
+        let (app, pool) = setup().await;
+        let id = account(&pool, "ana@example.com").await;
+        let cookie = session_cookie(&pool, &id).await;
+
+        let (status, body, _) = send(&app, get("/api/console/account", Some(&cookie), true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["alerts"],
+            serde_json::json!({"deploy_failed": true, "error_spike": true, "quota": true}),
+            "no row means all on"
+        );
+
+        // An empty patch is a no-op refusal, not a silent success.
+        let (status, body, _) = send(
+            &app,
+            post(
+                "/api/console/alerts/prefs",
+                Some(&cookie),
+                true,
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["user_message"].is_string());
+
+        // Partial update: only the provided toggle moves.
+        let (status, body, _) = send(
+            &app,
+            post(
+                "/api/console/alerts/prefs",
+                Some(&cookie),
+                true,
+                serde_json::json!({"quota": false}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({"deploy_failed": true, "error_spike": true, "quota": false})
+        );
+        let (status, body, _) = send(&app, get("/api/console/account", Some(&cookie), true)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["alerts"]["quota"], false);
+        assert_eq!(body["alerts"]["deploy_failed"], true);
+
+        // The mutation is audited under the MCP tool name.
+        assert_eq!(audit_rows(&pool, &id, "update_alert_prefs").await.len(), 1);
+
+        // Same-origin session still required.
+        let (status, _, _) = send(
+            &app,
+            post(
+                "/api/console/alerts/prefs",
+                Some(&cookie),
+                false,
+                serde_json::json!({"quota": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    async fn unsubscribe_body(app: &HttpApp, token: &str) -> (StatusCode, String) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/console/alerts/unsubscribe?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn email_unsubscribe_link_needs_no_login() {
+        let (app, pool) = setup().await;
+        let id = account(&pool, "ana@example.com").await;
+        let key = b"outer-test-unsub-key".to_vec();
+
+        // No session cookie, no same-origin header: one click opts out.
+        let token = crate::alerts::sign_unsubscribe(&key, &id, crate::alerts::KIND_ERROR_SPIKE);
+        let (status, html) = unsubscribe_body(&app, &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("You will no longer get error spike emails"),
+            "{html}"
+        );
+        let prefs = crate::alerts::get_prefs(&pool, &id).await.unwrap();
+        assert!(!prefs.error_spike && prefs.deploy_failed && prefs.quota);
+        assert_eq!(audit_rows(&pool, &id, "update_alert_prefs").await.len(), 1);
+
+        // A forged token explains itself and changes nothing.
+        let (status, html) = unsubscribe_body(&app, "v1.eA.evil.eA").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("not valid"), "{html}");
+        let prefs = crate::alerts::get_prefs(&pool, &id).await.unwrap();
+        assert!(!prefs.error_spike && prefs.deploy_failed && prefs.quota);
     }
 }

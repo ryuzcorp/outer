@@ -4,6 +4,7 @@
 //! binary that boots them.
 
 pub mod accounts;
+pub mod alerts;
 pub mod apps;
 pub mod auth;
 pub mod browser;

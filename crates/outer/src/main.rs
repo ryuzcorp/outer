@@ -679,7 +679,18 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             cache_purge: cache_purge(&config),
         },
         secrets_key,
+        unsub_key: config.outer_secret.as_bytes().to_vec(),
     };
+    // Email alerts (wave 3, feature #2): error spikes are evaluated from
+    // `error_issue` every five minutes; deploy failures and quota
+    // thresholds notify inline at their trigger sites.
+    outer::alerts::spawn_sweep(
+        pool.clone(),
+        mcp.auth.config.email.clone(),
+        mcp.auth.config.issuer.clone(),
+        mcp.unsub_key.clone(),
+        std::time::Duration::from_secs(300),
+    );
     // Request metrics (spec §13): owned by the proxy state, flushed to
     // SQLite every few seconds by the sweep below (and once more on
     // shutdown), pruned per plan by the same sweep.

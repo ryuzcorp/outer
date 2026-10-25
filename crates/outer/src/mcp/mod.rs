@@ -328,6 +328,9 @@ pub struct McpState {
     pub alloc: Allocation,
     /// AES-256-GCM key for app secrets, derived from `OUTER_SECRET` at boot.
     pub secrets_key: crate::secrets::SecretsKey,
+    /// HMAC key for alert unsubscribe tokens, `OUTER_SECRET` bytes: the
+    /// sweep and the deploy hook sign with it, the console verifies.
+    pub unsub_key: Vec<u8>,
     /// Noreply identities are `<account-id>@users.noreply.<domain>`.
     pub domain: String,
     /// Apps live at `<slug>.<apps_domain>`.
@@ -448,6 +451,7 @@ impl McpState {
                 port_range: (18000, 18003),
             },
             secrets_key: crate::secrets::SecretsKey::test_key(),
+            unsub_key: b"outer-test-unsub-key".to_vec(),
             domain: "outer.localhost".to_string(),
             apps_domain: "outer.localhost".to_string(),
             app_scheme: "http".to_string(),
