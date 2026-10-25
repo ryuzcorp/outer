@@ -1351,9 +1351,9 @@ export function SecretsView({
       <section class="card card-border bg-base-100 min-w-0" aria-label="About secrets">
         <div class="card-body min-w-0">
           <p class="m-0 min-w-0 break-words opacity-60">
-            Names only — values never leave the server. Your agent manages them
-            over MCP (`list_secrets`, `set_secret`, `unset_secret`); they reach
-            the app as Worker env vars on the next deploy.
+            Add them here or have your agent set them over MCP. Values are
+            write-only: they're encrypted on the server, never shown again, and
+            reach the app as Worker env vars when it redeploys.
           </p>
         </div>
       </section>
@@ -1426,7 +1426,7 @@ export function SecretsView({
       </section>
       {secrets.length === 0 ? (
         <EmptyState icon={<SecretsIcon />} title="No secrets set">
-          Your agent manages secret names over MCP; values never leave the server.
+          Add an API key or token above, or ask your agent to set one.
         </EmptyState>
       ) : (
         <section class="card card-border bg-base-100 min-w-0" aria-label="Secrets">
