@@ -21,7 +21,7 @@ use crate::store::Store;
 pub const TEMPLATES_URL: &str = "https://github.com/ryuzcorp/outer-templates";
 /// The pinned commit `outer templates sync` vendors. Repinning is a
 /// one-line change, then `outer templates sync`.
-pub const TEMPLATES_SHA: &str = "4d271d4c86bb6ddaacda01439ddb274e93d5a297";
+pub const TEMPLATES_SHA: &str = "1ae125f38bc58c1fbe3cfa8925990a761ed092a6";
 
 /// The store pointer to the vendored bundle.
 const CURRENT_KEY: &str = "outer/templates/current.json";
