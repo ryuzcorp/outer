@@ -5,9 +5,10 @@
 // branch's console.tsx edits stay trivial to merge.
 import { atom } from "ilha";
 import {
-  ACCOUNT_VIEWS,
+  ACCOUNT_TABS,
   DATA_VIEWS,
   VIEWS,
+  type AccountTabId,
   type Route,
   type ViewId,
 } from "./common.tsx";
@@ -29,7 +30,7 @@ export interface PaletteProps {
 
 export type PaletteItem =
   | { kind: "app"; key: string; title: string; sub: string }
-  | { kind: "view"; key: string; title: string; sub: string; view: ViewId }
+  | { kind: "view"; key: string; title: string; sub: string; view: ViewId; acctab?: AccountTabId }
   | {
       kind: "action";
       key: string;
@@ -58,56 +59,69 @@ export function isRunnable(action: AnyAction): boolean {
   return required.every((name) => name === "slug" || name === "app");
 }
 
-/** Where an action that needs real input sends the user. */
-const ACTION_VIEWS: Record<string, ViewId> = {
-  set_visibility: "settings",
-  rename_app: "settings",
-  delete_app: "settings",
-  add_collaborator: "settings",
-  remove_collaborator: "settings",
-  add_domain: "settings",
-  set_secret: "secrets",
-  unset_secret: "secrets",
-  rollback: "deploys",
-  create_api_key: "connections",
-  revoke_connection: "connections",
-  revoke_api_key: "connections",
-  delete_account: "account",
-  sign_out_others: "account",
-  resolve_error: "errors",
-  ignore_error: "errors",
-  reopen_error: "errors",
-  bulk_triage: "errors",
-  error_detail: "errors",
-  query_logs: "logs",
-  list_errors: "errors",
-  d1_databases: "d1",
-  d1_tables: "d1",
-  d1_schema: "d1",
-  d1_rows: "d1",
-  d1_write: "d1",
-  d1_delete_rows: "d1",
-  r2_list_buckets: "r2",
-  r2_list: "r2",
-  r2_file: "r2",
-  r2_delete: "r2",
-  r2_upload: "r2",
-  do_list_classes: "do",
-  do_list_instances: "do",
-  do_probe: "do",
-  code_list_files: "code",
-  code_read_file: "code",
-  code_compare: "code",
-  moderation_queue: "admin",
-  admin_stats: "admin",
-  admin_review: "admin",
-  admin_suspend_app: "admin",
-  admin_restore_app: "admin",
-  admin_ban_account: "admin",
+/** Where an action that needs real input sends the user. Account actions
+ * land on the matching hub tab. */
+export interface ActionTarget {
+  view: ViewId;
+  acctab?: AccountTabId;
+}
+
+const ACTION_TARGETS: Record<string, ActionTarget> = {
+  set_visibility: { view: "settings" },
+  rename_app: { view: "settings" },
+  delete_app: { view: "settings" },
+  add_collaborator: { view: "settings" },
+  remove_collaborator: { view: "settings" },
+  add_domain: { view: "settings" },
+  set_secret: { view: "secrets" },
+  unset_secret: { view: "secrets" },
+  rollback: { view: "deploys" },
+  create_api_key: { view: "account", acctab: "connections" },
+  revoke_connection: { view: "account", acctab: "connections" },
+  revoke_api_key: { view: "account", acctab: "connections" },
+  delete_account: { view: "account", acctab: "account" },
+  sign_out_others: { view: "account", acctab: "account" },
+  update_alert_prefs: { view: "account", acctab: "account" },
+  create_checkout: { view: "account", acctab: "usage" },
+  create_portal: { view: "account", acctab: "usage" },
+  resolve_error: { view: "errors" },
+  ignore_error: { view: "errors" },
+  reopen_error: { view: "errors" },
+  bulk_triage: { view: "errors" },
+  error_detail: { view: "errors" },
+  query_logs: { view: "logs" },
+  list_errors: { view: "errors" },
+  d1_databases: { view: "d1" },
+  d1_tables: { view: "d1" },
+  d1_schema: { view: "d1" },
+  d1_rows: { view: "d1" },
+  d1_write: { view: "d1" },
+  d1_delete_rows: { view: "d1" },
+  r2_list_buckets: { view: "r2" },
+  r2_list: { view: "r2" },
+  r2_file: { view: "r2" },
+  r2_delete: { view: "r2" },
+  r2_upload: { view: "r2" },
+  do_list_classes: { view: "do" },
+  do_list_instances: { view: "do" },
+  do_probe: { view: "do" },
+  code_list_files: { view: "code" },
+  code_read_file: { view: "code" },
+  code_compare: { view: "code" },
+  moderation_queue: { view: "admin" },
+  admin_stats: { view: "admin" },
+  admin_review: { view: "admin" },
+  admin_suspend_app: { view: "admin" },
+  admin_restore_app: { view: "admin" },
+  admin_ban_account: { view: "admin" },
 };
 
+export function actionTarget(action: AnyAction): ActionTarget {
+  return ACTION_TARGETS[action.name] ?? { view: "overview" };
+}
+
 export function actionView(action: AnyAction): ViewId {
-  return ACTION_VIEWS[action.name] ?? "overview";
+  return actionTarget(action).view;
 }
 
 /** After navigating, focus the field the action needs. Polled: the view renders after its data loads. */
@@ -181,26 +195,39 @@ export function buildGroups(props: PaletteProps): ItemGroup[] {
           sub: `Go to ${v.label} in ${props.slug}`,
           view: v.id as ViewId,
         }));
-  const accountItems: PaletteItem[] = ACCOUNT_VIEWS.filter(
-    (v) => v.id !== "admin" || props.isAdmin,
-  ).map((v) => ({
+  const accountItems: PaletteItem[] = ACCOUNT_TABS.map((t) => ({
     kind: "view" as const,
-    key: `view:${v.id}`,
-    title: v.label,
-    sub: `Go to ${v.label}`,
-    view: v.id as ViewId,
+    key: `view:${t.id}`,
+    title: t.label,
+    sub: `Go to ${t.label}`,
+    view: "account" as ViewId,
+    acctab: t.id as AccountTabId,
   }));
+  if (props.isAdmin) {
+    accountItems.push({
+      kind: "view" as const,
+      key: "view:admin",
+      title: "Admin",
+      sub: "Go to Admin",
+      view: "admin" as ViewId,
+    });
+  }
   const actionItems: PaletteItem[] = allActions
     .filter((a) => !EXCLUDED_FROM_PALETTE[a.name] && (!a.adminOnly || props.isAdmin))
     .map((action) => {
       const runnable = isRunnable(action);
+      const target = actionTarget(action);
+      const targetLabel =
+        target.acctab !== undefined
+          ? (ACCOUNT_TABS.find((t) => t.id === target.acctab)?.label ?? target.view)
+          : target.view;
       return {
         kind: "action" as const,
         key: `action:${action.name}`,
         title: action.title,
         sub: runnable
           ? `Run on ${props.slug ?? "the current app"}`
-          : `Open ${actionView(action)}`,
+          : `Open ${targetLabel}`,
         action,
         runnable,
       };
@@ -356,14 +383,17 @@ export function Palette(props: PaletteProps) {
     }
     if (item.kind === "view") {
       saveRecent({ kind: "view", key: item.key });
-      props.onNavigate({ view: item.view });
+      props.onNavigate(
+        item.acctab === undefined ? { view: item.view } : { view: item.view, acctab: item.acctab },
+      );
       props.onClose();
       return;
     }
-    saveRecent({ kind: "action", key: item.key });
     if (!item.runnable) {
-      const target = actionView(item.action);
-      props.onNavigate({ view: target });
+      const target = actionTarget(item.action);
+      props.onNavigate(
+        target.acctab === undefined ? { view: target.view } : { view: target.view, acctab: target.acctab },
+      );
       props.onClose();
       const focus = FOCUS[item.action.name];
       if (focus) {

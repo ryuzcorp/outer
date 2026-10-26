@@ -86,12 +86,14 @@ import {
 } from "./views/account.tsx";
 
 import {
+  ACCOUNT_TABS,
   CopyButton,
   DATA_VIEWS,
   RANGES,
   VIEWS,
   readRoute,
   routeUrl,
+  toAccountRoute,
   type ActionsPanel,
   type Panel,
   type Route,
@@ -270,13 +272,20 @@ export function Console() {
   // never repaint the new one (Noite keys its cards per app id instead).
   let epoch = 0;
 
+  // The hub tab label, used in the tab title and both hub headings.
+  function hubTitle(r: Route): string {
+    return ACCOUNT_TABS.find((t) => t.id === r.acctab)?.label ?? "Account";
+  }
+
   function setTitle(r: Route, app: AppDetail | null): void {
     document.title =
       app && r.app
         ? `${r.app} · ${VIEW_TITLES[r.view]} · Outer console`
-        : isAccountView(r.view)
-          ? `${VIEW_TITLES[r.view]} · Outer console`
-          : "Console · Outer";
+        : r.view === "account"
+          ? `${hubTitle(r)} · Account · Outer console`
+          : isAccountView(r.view)
+            ? `${VIEW_TITLES[r.view]} · Outer console`
+            : "Console · Outer";
   }
 
   function loadersFor(view: ViewId): Array<"metrics" | "actions" | "errors" | "logs" | "secrets" | "collaborators" | "domains"> {
@@ -299,14 +308,18 @@ export function Console() {
         return ["secrets"];
       case "settings":
         return ["collaborators", "domains"];
-      case "connections":
-      case "usage":
       case "account":
-      case "invites":
       case "admin":
       case "r2":
       case "do":
         return [];
+      default: {
+        // Legacy `?t=usage|connections|invites` routes never reach the
+        // loaders (readRoute maps them onto the hub), but exhaustiveness
+        // here keeps the next added view honest.
+        const _exhaustive: "connections" | "usage" | "invites" = view;
+        return [];
+      }
     }
   }
 
@@ -460,18 +473,41 @@ export function Console() {
   }
 
   function isAccountView(view: ViewId): boolean {
-    return (
-      view === "connections" ||
-      view === "usage" ||
-      view === "account" ||
-      view === "invites" ||
-      view === "admin"
-    );
+    return view === "account" || view === "admin";
   }
 
-  async function loadAccountView(view: ViewId, myEpoch: number): Promise<void> {
+  async function loadAccountView(r: Route, myEpoch: number): Promise<void> {
     const fresh = () => epoch === myEpoch;
-    if (view === "invites") {
+    if (r.view === "admin") {
+      adminInvites.set({ kind: "loading" });
+      waitlist.set({ kind: "loading" });
+      moderationQueue.set({ kind: "loading" });
+      adminStats.set({ kind: "loading" });
+      telemetry.set({ kind: "loading" });
+      // Each panel stands alone: a failing moderation endpoint must not
+      // wipe the invite-code or waitlist panels (or vice versa).
+      const [page, list, queue, stats, calls] = await Promise.allSettled([
+        api<AdminInvitesPage>("/api/console/admin/invites?limit=50"),
+        api<WaitlistSummary>("/api/console/admin/waitlist?limit=100"),
+        api<ModerationQueue>("/api/console/admin/moderation/queue"),
+        api<AdminStats>("/api/console/admin/stats"),
+        fetchTelemetry(),
+      ]);
+      if (fresh()) {
+        const settle = <T,>(res: PromiseSettledResult<T>): Panel<T> =>
+          res.status === "fulfilled"
+            ? { kind: "ready", value: res.value }
+            : { kind: "error", message: String(res.reason) };
+        adminInvites.set(settle(page));
+        waitlist.set(settle(list));
+        moderationQueue.set(settle(queue));
+        adminStats.set(settle(stats));
+        telemetry.set(settle(calls));
+        setTitle(route(), null);
+      }
+      return;
+    }
+    if (r.acctab === "invites") {
       invites.set({ kind: "loading" });
       try {
         const summary = await api<InvitesSummary>("/api/console/invites");
@@ -486,7 +522,7 @@ export function Console() {
       }
       return;
     }
-    if (view === "connections") {
+    if (r.acctab === "connections") {
       connections.set({ kind: "loading" });
       apiKeys.set({ kind: "loading" });
       try {
@@ -508,47 +544,17 @@ export function Console() {
       }
       return;
     }
-    if (view === "usage" || view === "account") {
-      accountSummary.set({ kind: "loading" });
-      try {
-        const summary = await api<AccountSummary>("/api/console/account");
-        if (fresh()) {
-          accountSummary.set({ kind: "ready", value: summary });
-          setTitle(route(), null);
-        }
-      } catch (err: unknown) {
-        if (fresh()) {
-          accountSummary.set({ kind: "error", message: String(err) });
-        }
-      }
-      return;
-    }
-    if (view === "admin") {
-      adminInvites.set({ kind: "loading" });
-      waitlist.set({ kind: "loading" });
-      moderationQueue.set({ kind: "loading" });
-      adminStats.set({ kind: "loading" });
-      telemetry.set({ kind: "loading" });
-      // Each panel stands alone: a failing moderation endpoint must not
-      // wipe the invite-code or waitlist panels (or vice versa).
-      const [page, list, queue, stats, calls] = await Promise.allSettled([
-        api<AdminInvitesPage>("/api/console/admin/invites?limit=50"),
-        api<WaitlistSummary>("/api/console/admin/waitlist?limit=100"),
-        api<ModerationQueue>("/api/console/admin/moderation/queue"),
-        api<AdminStats>("/api/console/admin/stats"),
-        fetchTelemetry(),
-      ]);
+    // The Account and Usage tabs share the summary endpoint.
+    accountSummary.set({ kind: "loading" });
+    try {
+      const summary = await api<AccountSummary>("/api/console/account");
       if (fresh()) {
-        const settle = <T,>(r: PromiseSettledResult<T>): Panel<T> =>
-          r.status === "fulfilled"
-            ? { kind: "ready", value: r.value }
-            : { kind: "error", message: String(r.reason) };
-        adminInvites.set(settle(page));
-        waitlist.set(settle(list));
-        moderationQueue.set(settle(queue));
-        adminStats.set(settle(stats));
-        telemetry.set(settle(calls));
+        accountSummary.set({ kind: "ready", value: summary });
         setTitle(route(), null);
+      }
+    } catch (err: unknown) {
+      if (fresh()) {
+        accountSummary.set({ kind: "error", message: String(err) });
       }
     }
   }
@@ -558,7 +564,7 @@ export function Console() {
       count,
       note: note || undefined,
     });
-    await loadAccountView("admin", epoch);
+    await loadAccountView(route(), epoch);
   }
 
   async function revokeCode(code: string): Promise<void> {
@@ -566,7 +572,7 @@ export function Console() {
       `/api/console/admin/invites/${encodeURIComponent(code)}/revoke`,
       {},
     );
-    await loadAccountView("admin", epoch);
+    await loadAccountView(route(), epoch);
   }
 
   async function loadMoreAdminCodes(): Promise<void> {
@@ -593,9 +599,10 @@ export function Console() {
   }
 
   async function enter(r: Route, myEpoch: number): Promise<void> {
+    scrollRailActive();
     if (isAccountView(r.view)) {
       setTitle(r, null);
-      await loadAccountView(r.view, myEpoch);
+      await loadAccountView(r, myEpoch);
       if (!r.app) {
         return;
       }
@@ -634,6 +641,13 @@ export function Console() {
   function navigate(next: Partial<Route>, replace = false): void {
     const prev = route();
     const r: Route = { ...prev, ...next };
+    // Agents and old callers may still navigate by legacy top-level
+    // account view (`usage`, …): land on the matching hub tab instead.
+    const mapped = toAccountRoute(r.view);
+    if (mapped) {
+      r.view = mapped.view;
+      r.acctab = mapped.acctab;
+    }
     const url = routeUrl(r);
     if (replace) {
       window.history.replaceState(null, "", url);
@@ -643,6 +657,7 @@ export function Console() {
     route.set(r);
     const current = ui();
     ui.set({ ...current, drawer: false, createOpen: false });
+    scrollRailActive();
     epoch += 1;
     if (r.app !== prev.app) {
       void enter(r, epoch);
@@ -650,7 +665,7 @@ export function Console() {
     }
     if (isAccountView(r.view)) {
       setTitle(r, null);
-      void loadAccountView(r.view, epoch);
+      void loadAccountView(r, epoch);
       return;
     }
     if (r.app) {
@@ -711,6 +726,19 @@ export function Console() {
     }
     ui.set({ ...ui(), ...patch });
   };
+
+  // Phones show the app picker as a horizontal snap row: keep the
+  // current app's tile in view after boot and every navigation.
+  function scrollRailActive(): void {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      document
+        .querySelector(".rail-apps .rail-tile.is-active")
+        ?.scrollIntoView({ block: "nearest", inline: "center" });
+    });
+  }
 
   watch.once(() => {
     if (typeof window === "undefined") {
@@ -872,54 +900,47 @@ export function Console() {
       </div>
     );
   }
-  function reloadAccount(view: ViewId): void {
+  function reloadAccount(): void {
     epoch += 1;
-    void loadAccountView(view, epoch);
+    void loadAccountView(route(), epoch);
   }
-  const accountPanel = accountView ? (
-    r.view === "connections" ? (
+  const hubPanel = (
+    r.acctab === "connections" ? (
       <ConnectionsView
         connections={connections()}
         keys={apiKeys()}
-        onReload={() => reloadAccount("connections")}
-        onRetry={() => reloadAccount("connections")}
+        onReload={reloadAccount}
+        onRetry={reloadAccount}
       />
-    ) : r.view === "usage" ? (
-      <UsageView panel={accountSummary()} onRetry={() => reloadAccount("usage")} />
-    ) : r.view === "account" ? (
-      <AccountView panel={accountSummary()} onRetry={() => reloadAccount("account")} />
-    ) : r.view === "invites" ? (
+    ) : r.acctab === "usage" ? (
+      <UsageView panel={accountSummary()} onRetry={reloadAccount} />
+    ) : r.acctab === "invites" ? (
       <InvitesView
         panel={invites()}
         isAdmin={isAdmin()}
-        onRetry={() => {
-          epoch += 1;
-          void loadAccountView("invites", epoch);
-        }}
+        onRetry={reloadAccount}
       />
     ) : (
-      <AdminView
-        codes={adminInvites()}
-        waitlist={waitlist()}
-        queue={moderationQueue()}
-        stats={adminStats()}
-        telemetry={telemetry()}
-        isAdmin={isAdmin()}
-        onGenerate={(count, note) => generateCodes(count, note)}
-        onRevoke={(code) => revokeCode(code)}
-        onMoreCodes={() => void loadMoreAdminCodes()}
-        onRetry={() => {
-          epoch += 1;
-          void loadAccountView("admin", epoch);
-        }}
-        onMutated={() => {
-          epoch += 1;
-          void loadAccountView("admin", epoch);
-        }}
-        onOpenCode={(slug, sha) => navigate({ app: slug, view: "code", sha })}
-      />
+      <AccountView panel={accountSummary()} onRetry={reloadAccount} />
     )
-  ) : null;
+  );
+  const adminPanel = (
+    <AdminView
+      codes={adminInvites()}
+      waitlist={waitlist()}
+      queue={moderationQueue()}
+      stats={adminStats()}
+      telemetry={telemetry()}
+      isAdmin={isAdmin()}
+      onGenerate={(count, note) => generateCodes(count, note)}
+      onRevoke={(code) => revokeCode(code)}
+      onMoreCodes={() => void loadMoreAdminCodes()}
+      onRetry={reloadAccount}
+      onMutated={reloadAccount}
+      onOpenCode={(slug, sha) => navigate({ app: slug, view: "code", sha })}
+    />
+  );
+  const accountPanel = accountView ? (r.view === "admin" ? adminPanel : hubPanel) : null;
   const active =
     list.find((a) => a.slug === r.app) ??
     (detailPanel.kind === "ready" ? detailPanel.value : null);
@@ -933,16 +954,15 @@ export function Console() {
 
   // Reload the visible view's data (error Retry buttons reuse it).
   function reload(): void {
-    const r = route();
-    if (r.app && !isAccountView(r.view)) {
-      void loadViewData(r.app, r.view, r.range, epoch, false);
-    } else if (isAccountView(r.view)) {
+    const current = route();
+    if (current.app && !isAccountView(current.view)) {
+      void loadViewData(current.app, current.view, current.range, epoch, false);
+    } else if (isAccountView(current.view)) {
       epoch += 1;
-      void loadAccountView(r.view, epoch);
+      void loadAccountView(current, epoch);
     }
   }
 
-  // Re-read the app detail (and the rail) after a mutation: visibility and
   // rollback change what the detail carries, rename changes the slug, and
   // delete changes the rail.
   function refreshDetail(): void {
@@ -1116,47 +1136,11 @@ export function Console() {
                     type="button"
                     onclick={() => {
                       patchUi({ accountOpen: false });
-                      navigate({ view: "connections" });
-                    }}
-                  >
-                    <SecretsIcon size={16} />
-                    Connections &amp; keys
-                  </button>
-                </li>
-                <li>
-                  <button
-                    type="button"
-                    onclick={() => {
-                      patchUi({ accountOpen: false });
-                      navigate({ view: "usage" });
-                    }}
-                  >
-                    <MetricsIcon size={16} />
-                    Usage &amp; plan
-                  </button>
-                </li>
-                <li>
-                  <button
-                    type="button"
-                    onclick={() => {
-                      patchUi({ accountOpen: false });
                       navigate({ view: "account" });
                     }}
                   >
                     <AccountIcon size={16} />
                     Account
-                  </button>
-                </li>
-                <li>
-                  <button
-                    type="button"
-                    onclick={() => {
-                      patchUi({ accountOpen: false });
-                      navigate({ view: "invites" });
-                    }}
-                  >
-                    <TicketIcon size={16} />
-                    Invite codes
                   </button>
                 </li>
                 {isAdmin() && (
@@ -1194,7 +1178,7 @@ export function Console() {
         </div>
       </nav>
 
-      {active && (
+      {active && r.view !== "account" && (
         <div class={`drawer min-w-0${ui().collapsed ? "" : " md:drawer-open"}`}>
           <input
             id="console-nav"
@@ -1494,7 +1478,107 @@ export function Console() {
           </div>
         </div>
       )}
-      {!active && accountView && (
+      {r.view === "account" && (
+        <div class={`drawer min-w-0${ui().collapsed ? "" : " md:drawer-open"}`}>
+          <input
+            id="console-nav"
+            type="checkbox"
+            class="drawer-toggle"
+            checked={ui().drawer}
+            aria-label="Account navigation toggle"
+            onchange={(e: Event) => patchUi({ drawer: (e.target as HTMLInputElement).checked })}
+          />
+          <div class="drawer-content min-w-0">
+            <main class="main" id="console-main" tabindex={-1}>
+              <div class="main-head">
+                {ui().collapsed && (
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-square btn-sm hidden shrink-0 md:inline-flex"
+                    title="Expand sidebar"
+                    aria-label="Expand sidebar"
+                    onclick={() => patchUi({ collapsed: false })}
+                  >
+                    <ExpandIcon />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-square btn-sm shrink-0 md:hidden"
+                  title="Open navigation"
+                  aria-label="Open navigation"
+                  onclick={() => patchUi({ drawer: true })}
+                >
+                  <MenuIcon />
+                </button>
+                <h1 class="main-title" title={hubTitle(r)}>{hubTitle(r)}</h1>
+              </div>
+              <div class="tabs tabs-box tabs-sm mb-3 w-full min-w-0 overflow-x-auto md:hidden" role="tablist" aria-label="Account">
+                {ACCOUNT_TABS.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={r.acctab === t.id}
+                    class={`tab shrink-0${r.acctab === t.id ? " tab-active" : ""}`}
+                    onclick={() => navigate({ view: "account", acctab: t.id })}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <div class="main-body">{hubPanel}</div>
+            </main>
+          </div>
+          <div class="drawer-side">
+            <label for="console-nav" class="drawer-overlay" aria-label="Close navigation" />
+            <aside class="side max-md:min-h-dvh min-w-0" aria-label="Account navigation">
+              <div class="side-head">
+                <div class="side-id">
+                  <p class="m-0 min-w-0 truncate text-[15px] font-semibold" title="Account">
+                    Account
+                  </p>
+                  <p class="m-0 min-w-0 truncate text-xs opacity-60" title={email()}>
+                    {email() || "Signed in"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-square btn-sm hidden shrink-0 md:inline-flex"
+                  title="Collapse sidebar"
+                  aria-label="Collapse sidebar"
+                  onclick={() => patchUi({ collapsed: true })}
+                >
+                  <CollapseIcon />
+                </button>
+              </div>
+              <ul class="menu w-full min-w-0 gap-0.5 p-0">
+                <li class="menu-title text-xs font-medium uppercase tracking-wider">Account</li>
+                {ACCOUNT_TABS.map((t) => (
+                  <li key={t.id} class="min-w-0">
+                    <button
+                      type="button"
+                      class={r.acctab === t.id ? "menu-active min-w-0" : "min-w-0"}
+                      aria-current={r.acctab === t.id ? "page" : undefined}
+                      onclick={() => navigate({ view: "account", acctab: t.id })}
+                    >
+                      <ViewIcon id={t.id} />
+                      <span class="min-w-0 flex-1 truncate">{t.label}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div class="side-foot">
+                <div class="divider my-2" aria-hidden="true" />
+                <p class="m-0 min-w-0 truncate font-mono text-xs opacity-60" title={email()}>
+                  {email()}
+                </p>
+              </div>
+            </aside>
+          </div>
+        </div>
+      )}
+      {!active && r.view === "admin" && (
         <div class="drawer min-w-0">
           <div class="drawer-content min-w-0">
             <main class="main" id="console-main" tabindex={-1}>

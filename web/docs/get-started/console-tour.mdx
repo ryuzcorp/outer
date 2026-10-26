@@ -94,11 +94,17 @@ Owner-only browsers over the app's live bindings:
 
 ## Your account
 
-- **Connections & keys** — OAuth grants per client (revoke any time) and API
-  key metadata: names and prefixes, never secrets.
+One **Account** area (the avatar menu, bottom of the app picker) with
+tabs, just like an app's overview:
+
+- **Account** — email, terms, delete-account.
 - **Usage & plan** — plan, usage against quota, reset dates (`whoami` shows
   the same over MCP). See [Plans](/account/plans) and [Limits](/deploy/limits).
-- **Account** — email, terms, delete-account.
+- **Connections & keys** — OAuth grants per client (revoke any time) and API
+  key metadata: names and prefixes, never secrets.
 - **Invite codes** — your `OUTER-XXXX-XXXX` codes during the closed beta: who
   redeemed them, which are spent. Admins generate codes in bulk on the Admin
   page instead and see the waitlist there.
+
+Old links keep working: `/console?t=usage` and the other account views
+land on the matching tab.

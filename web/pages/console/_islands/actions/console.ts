@@ -9,6 +9,8 @@ import {
   ACCOUNT_VIEWS,
   DATA_VIEWS,
   VIEWS,
+  toAccountRoute,
+  type AccountTabId,
   type Route,
   type ViewId,
 } from "../common.tsx";
@@ -35,6 +37,7 @@ export interface ConsoleStateOutput {
   email: string;
   slug: string | null;
   view: ViewId;
+  acctab: AccountTabId;
   params: Record<string, string | number | null>;
   apps: { slug: string; role: string; status: string }[];
 }
@@ -55,6 +58,7 @@ const consoleState: ConsoleAction<Record<string, never>, ConsoleStateOutput> = {
       email: b.getEmail(),
       slug: route.app,
       view: route.view,
+      acctab: route.acctab,
       params: {
         range: route.range,
         sha: route.sha,
@@ -103,11 +107,18 @@ const openApp: ConsoleAction<OpenAppInput, { slug: string; view: ViewId }> = {
       const known = b.getApps().map((a) => a.slug).join(", ");
       throw new Error(`Unknown app "${slug}". Open one of: ${known || "(no apps yet)"}.`);
     }
-    const view: ViewId = input.view === undefined ? "overview" : input.view as ViewId;
+    let view: ViewId = input.view === undefined ? "overview" : input.view as ViewId;
     if (input.view !== undefined && !isViewId(input.view)) {
       throw new Error(`Unknown view "${input.view}".`);
     }
-    b.navigate({ app: slug, view });
+    const mapped = toAccountRoute(view);
+    const target: Partial<Route> = mapped
+      ? { app: slug, view: mapped.view, acctab: mapped.acctab }
+      : { app: slug, view };
+    b.navigate(target);
+    if (mapped) {
+      view = mapped.view;
+    }
     return { slug, view };
   },
 };
@@ -120,11 +131,11 @@ export interface OpenViewInput {
   table?: string;
 }
 
-const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId }> = {
+const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId; acctab: AccountTabId }> = {
   name: "open_view",
   title: "Open view",
   description:
-    "Navigate within the current app: views, account pages (connections, usage, account, invites, admin), and D1/Code deep links (db, table, sha, codeTab). The app is the current one; pass an app-scoped view with no app open rejects. Returns the opened {slug, view}.",
+    "Navigate within the current app: views, the Account hub tabs (account, usage, connections, invites), admin, and D1/Code deep links (db, table, sha, codeTab). The app is the current one; pass an app-scoped view with no app open rejects. Returns the opened {slug, view, acctab}.",
   inputSchema: {
     type: "object",
     properties: {
@@ -143,7 +154,7 @@ const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId
   readOnly: true,
   consequential: false,
   untrusted: false,
-  async run(input, ctx?: ActionContext): Promise<{ slug: string | null; view: ViewId }> {
+  async run(input, ctx?: ActionContext): Promise<{ slug: string | null; view: ViewId; acctab: AccountTabId }> {
     const b = needBridge(ctx);
     if (!isViewId(input.view)) {
       throw new Error(`Unknown view "${input.view}".`);
@@ -156,7 +167,10 @@ const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId
     // Agents send values outside the declared schema (registerTool does
     // not enforce it), so check the free-form fields before they reach
     // the route and the views.
-    const next: Partial<Route> = { view: input.view };
+    const mapped = toAccountRoute(input.view);
+    const next: Partial<Route> = mapped
+      ? { view: mapped.view, acctab: mapped.acctab }
+      : { view: input.view };
     if (input.sha !== undefined) {
       if (input.sha !== null && typeof input.sha !== "string") {
         throw new Error("sha must be a string.");
@@ -182,7 +196,7 @@ const openView: ConsoleAction<OpenViewInput, { slug: string | null; view: ViewId
       next.table = input.table;
     }
     b.navigate(next);
-    return { slug: route.app, view: input.view };
+    return { slug: route.app, view: mapped?.view ?? input.view, acctab: mapped?.acctab ?? route.acctab };
   },
 };
 
