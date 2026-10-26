@@ -395,6 +395,9 @@ pub struct McpState {
     pub jev: Option<crate::moderation::JevClient>,
     /// Awaited calls return the in-progress status after this long (§10.3).
     pub tool_wait: Duration,
+    /// Inactivity windows (spec §7.8) from `OUTER_INACTIVE_DAYS` /
+    /// `OUTER_INACTIVE_GRACE_DAYS`: tool outputs and the daily sweep share it.
+    pub inactivity: crate::inactivity::Windows,
     /// Cloudflare browser rendering for `look_at_app`. `None` on localhost
     /// dev without the Cloudflare pair: the tool refuses, exactly like the
     /// Jev gate when the pair is missing.
@@ -514,6 +517,7 @@ impl McpState {
             app_port_suffix: String::new(),
             jev: None,
             tool_wait: Duration::from_millis(200),
+            inactivity: crate::inactivity::Windows::default(),
             browser: None,
             look_tokens: crate::look_tokens::LookTokens::new(),
             rollback_locks: RollbackLocks::default(),
@@ -723,6 +727,24 @@ async fn handle_call(
     // tool runs. Anonymous callers may still list account tools — only
     // calling one without a token answers 401.
     let caller = resolve_caller(state, headers).await;
+    // Owner activity (spec §7.8): any authenticated tool call stamps the
+    // account, plus the touched app when the caller has a role on it. Runs
+    // before the tool so a refused call still counts as activity, and never
+    // alters the outcome.
+    if let Some(caller) = caller.as_ref() {
+        let app_slug = args
+            .as_ref()
+            .and_then(|v| v.get("app"))
+            .and_then(Value::as_str);
+        crate::inactivity::record_call(
+            &state.pool,
+            &caller.account_id,
+            &caller.email,
+            app_slug,
+            crate::apps::now_ms(),
+        )
+        .await;
+    }
     if def.access != registry::Access::Public && caller.is_none() {
         return (
             StatusCode::UNAUTHORIZED,

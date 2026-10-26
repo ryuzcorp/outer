@@ -620,20 +620,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // A previous process may have died between a rename's commit and its
     // post-commit deletes: drain pending prefix cleanups before serving, so
     // no old slug stays blocked (and no leftover prefix stays adoptable)
-    // across a restart. The sleep sweep below retries this every tick.
+    // across a restart. The sleep sweep retries this every tick.
     if let Err(err) = outer::apps::rename::drain_prefix_cleanup(&pool, &store, Some(&fleets)).await
     {
         tracing::warn!(error = %format!("{err:#}"), "startup prefix cleanup drain failed");
     }
     let git = git_config(&config);
     let git_sync = outer::git::GitSync::default();
-    fleets.spawn_sleep_sweep(
-        pool.clone(),
-        store.clone(),
-        git.clone(),
-        git_sync.clone(),
-        Duration::from_secs(60.min(rt.sleep_after_secs.max(1))),
-    );
     outer::cron::spawn_cron_task(
         pool.clone(),
         fleets.clone(),
@@ -695,6 +688,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         app_scheme: scheme(&config).to_string(),
         app_port_suffix: port_suffix(config.listen, config.tls_enabled()),
         tool_wait: config.tool_wait,
+        inactivity: outer::inactivity::Windows::new(rt.inactive_days, rt.inactive_grace_days),
         jev,
         rollback_locks: outer::mcp::RollbackLocks::default(),
         browser: browser_render(&config),
@@ -725,18 +719,38 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // day 7, plus the downgrade-retention pass (day-23 warnings, day-30
     // purges). A missed tick only delays mail and the downgrade; the next
     // tick catches up.
+    let retention = outer::billing::RetentionDeps {
+        store: store.clone(),
+        git: git.clone(),
+        sync: git_sync.clone(),
+        fleets: fleets.clone(),
+        deploys: mcp.deploys.clone(),
+        rollback_locks: mcp.rollback_locks.clone(),
+        delete_cfg: mcp.delete_cfg.clone(),
+    };
     outer::billing::spawn_grace_sweep(
         mcp.billing.clone(),
         pool.clone(),
         mcp.auth.config.email.clone(),
-        outer::billing::RetentionDeps {
-            store: store.clone(),
-            git: git.clone(),
-            sync: git_sync.clone(),
-            fleets: fleets.clone(),
-            deploys: mcp.deploys.clone(),
-            rollback_locks: mcp.rollback_locks.clone(),
-            delete_cfg: mcp.delete_cfg.clone(),
+        retention.clone(),
+    );
+    // Sleep, preview-expiry, keep-warm, log flush and prefix-cleanup ticks
+    // (every minute) with the daily maintenance block: retention prunes
+    // plus the inactivity sweep (spec §7.8: reminders, expiry, restores,
+    // purges). Spawned after the MCP state so the daily block owns the
+    // delete handles and the mail handles.
+    fleets.spawn_sleep_sweep(
+        pool.clone(),
+        store.clone(),
+        git.clone(),
+        git_sync.clone(),
+        Duration::from_secs(60.min(rt.sleep_after_secs.max(1))),
+        outer::inactivity::SweepDeps {
+            sender: mcp.auth.config.email.clone(),
+            issuer: mcp.auth.config.issuer.clone(),
+            unsub_key: mcp.unsub_key.clone(),
+            retention: retention.clone(),
+            windows: outer::inactivity::Windows::new(rt.inactive_days, rt.inactive_grace_days),
         },
     );
     // Email alerts (wave 3, feature #2): error spikes are evaluated from

@@ -158,6 +158,18 @@ pub struct App {
     pub asleep_since: Option<i64>,
     pub last_request_at: Option<i64>,
     pub last_deploy_sha: Option<String>,
+    /// Owner activity (any authenticated request) and collaborator tool
+    /// calls on the app (spec §7.8). Visitor traffic never touches this;
+    /// the sleep sweep reads `last_request_at` instead.
+    pub last_activity_at: i64,
+    /// When the inactivity sweep stopped the app (spec §7.8): the host
+    /// serves the `expired` page until activity during grace restores it
+    /// or grace lapses and the row is purged.
+    pub expired_at: Option<i64>,
+    /// When a downgrade stopped the app (spec §3, unix seconds like the
+    /// downgrade retention): the downgrade-retention pass owns it (purge at
+    /// day 30), not the inactivity sweep.
+    pub downgraded_stopped_at: Option<i64>,
     pub created_at: i64,
     /// Keep-warm flag (feature #6): the sweep skips the app while its owner
     /// is Pro (up to the host cap) and the warm-up restarts it when stopped.
@@ -222,8 +234,9 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visibility, \
-    asleep_since, last_request_at, last_deploy_sha, created_at, always_on, \
-    preview_sha, preview_updated_at, preview_port, preview_internal_port";
+    asleep_since, last_request_at, last_deploy_sha, last_activity_at, expired_at, \
+    downgraded_stopped_at, created_at, always_on, preview_sha, preview_updated_at, \
+    preview_port, preview_internal_port";
 
 #[derive(Debug, sqlx::FromRow)]
 struct AppRow {
@@ -238,6 +251,9 @@ struct AppRow {
     asleep_since: Option<i64>,
     last_request_at: Option<i64>,
     last_deploy_sha: Option<String>,
+    last_activity_at: i64,
+    expired_at: Option<i64>,
+    downgraded_stopped_at: Option<i64>,
     created_at: i64,
     always_on: i64,
     preview_sha: Option<String>,
@@ -267,6 +283,9 @@ impl AppRow {
             asleep_since: self.asleep_since,
             last_request_at: self.last_request_at,
             last_deploy_sha: self.last_deploy_sha,
+            last_activity_at: self.last_activity_at,
+            expired_at: self.expired_at,
+            downgraded_stopped_at: self.downgraded_stopped_at,
             created_at: self.created_at,
             always_on: self.always_on != 0,
             preview_sha: self.preview_sha,
@@ -487,6 +506,9 @@ async fn create_inner(
         asleep_since: None,
         last_request_at: None,
         last_deploy_sha: None,
+        last_activity_at: now,
+        expired_at: None,
+        downgraded_stopped_at: None,
         created_at: now,
         // New rows start cold; the MCP `create_app` path flips Pro apps
         // on right after (the plan lives with the caller, not here).

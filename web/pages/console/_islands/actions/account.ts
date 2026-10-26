@@ -200,7 +200,7 @@ export const updateAlertPrefs: ConsoleAction<Partial<AlertPrefs>, AlertPrefs> = 
   name: "update_alert_prefs",
   title: "Update email alert prefs",
   description:
-    "Flip this account's email alert toggles (deploy failures, error spikes, quota thresholds). Pass only the toggles to change; the rest stay as they are. Returns the effective toggles.",
+    "Flip this account's email alert toggles (deploy failures, error spikes, quota thresholds, inactivity reminders). Pass only the toggles to change; the rest stay as they are. Returns the effective toggles.",
   inputSchema: {
     type: "object",
     properties: {
@@ -215,6 +215,10 @@ export const updateAlertPrefs: ConsoleAction<Partial<AlertPrefs>, AlertPrefs> = 
       quota: {
         type: "boolean",
         description: "Email the account when code-change quota hits 80% and 100%.",
+      },
+      inactivity: {
+        type: "boolean",
+        description: "Email the account 30, 7, and 1 day before a Free app is deleted for inactivity.",
       },
     },
   },

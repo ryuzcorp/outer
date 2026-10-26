@@ -199,16 +199,17 @@ pub(crate) async fn guard(
         .into());
     };
     if !fetch_ok(headers) {
-        return Err(nostore_json(
+        return Err(Box::new(nostore_json(
             StatusCode::FORBIDDEN,
             "forbidden",
             "same-origin requests only",
-        )
-        .into());
+        )));
     }
+    // Any authenticated Console session request counts as owner activity
+    // (spec §7.8), throttled to one write per hour per account.
+    crate::inactivity::touch_account(&auth.pool, &account.id, crate::apps::now_ms()).await;
     Ok(account)
 }
-
 /// The app `slug` names, visible to `account` as owner or collaborator
 /// (Pro-gated: a downgrade hides the app again). Anything else is `None`,
 /// and the caller answers 404 (spec §8.2).
@@ -530,6 +531,20 @@ async fn api_apps(State(state): State<super::AppState>, headers: HeaderMap) -> R
             "status": status,
             "last_request_at": app.last_request_at,
         });
+        // Inactivity deadline (spec §7.8) when it applies; Pro-owned apps
+        // carry no key. The owner row is one indexed lookup per app.
+        let (owner_plan, owner_last) =
+            crate::inactivity::owner_clock(&mcp.pool, &app.owner_id).await;
+        if let Some(deletes_at) = crate::inactivity::deletes_at_ms(
+            app.last_activity_at,
+            owner_last,
+            &owner_plan,
+            app.expired_at,
+            app.downgraded_stopped_at,
+            mcp.inactivity,
+        ) {
+            v["deletes_at"] = json!(deletes_at);
+        }
         if let Some(last) = last {
             v["last_deploy"] = deploy_brief(&last);
         }
@@ -654,27 +669,40 @@ async fn api_app(
         }
         None => None,
     };
+    let mut v = json!({
+        "slug": app.slug,
+        "url": mcp.app_url(&app.slug),
+        "role": match role {
+            crate::collaborators::Role::Owner => "owner",
+            crate::collaborators::Role::Collaborator => "collaborator",
+        },
+        "visibility": app.visibility.as_str(),
+        "always_on": app.always_on,
+        "status": status,
+        "last_request_at": app.last_request_at,
+        "deploys": deploys,
+        "preview": preview,
+    });
+    // Inactivity deadline (spec §7.8) when it applies; Pro-owned apps
+    // carry no key.
+    let (owner_plan, owner_last) = crate::inactivity::owner_clock(&mcp.pool, &app.owner_id).await;
+    if let Some(deletes_at) = crate::inactivity::deletes_at_ms(
+        app.last_activity_at,
+        owner_last,
+        &owner_plan,
+        app.expired_at,
+        app.downgraded_stopped_at,
+        mcp.inactivity,
+    ) {
+        v["deletes_at"] = json!(deletes_at);
+    }
     (
         StatusCode::OK,
         [
             ("cache-control", "no-store"),
             ("content-type", "application/json"),
         ],
-        json!({
-            "slug": app.slug,
-            "url": mcp.app_url(&app.slug),
-            "role": match role {
-                crate::collaborators::Role::Owner => "owner",
-                crate::collaborators::Role::Collaborator => "collaborator",
-            },
-            "visibility": app.visibility.as_str(),
-            "always_on": app.always_on,
-            "status": status,
-            "last_request_at": app.last_request_at,
-            "deploys": deploys,
-            "preview": preview,
-        })
-        .to_string(),
+        v.to_string(),
     )
         .into_response()
 }
@@ -3849,5 +3877,40 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The apps list and the app overview carry the inactivity deadline
+    /// (spec §7.8) on Free accounts. Guard touches move the clock, so the
+    /// test reads the stamps back and pins the deadline to them.
+    #[tokio::test]
+    async fn console_shows_deletes_at_on_the_apps_list_and_overview() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let session = login(&pool, "ana@example.com").await;
+        async fn deadline(pool: &SqlitePool, slug: &str) -> i64 {
+            let (app_last, owner_last): (i64, i64) = sqlx::query_as(
+                "SELECT a.last_activity_at, u.lastActiveAt FROM app a \
+                 JOIN user u ON u.id = a.owner_id WHERE a.slug = ?1",
+            )
+            .bind(slug)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            app_last.max(owner_last) + 90 * 86_400_000
+        }
+        let (status, _, body) = send(&app, authed("/api/console/apps", &session)).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["apps"].as_array().unwrap().len(), 1);
+        assert_eq!(body["apps"][0]["status"], "running");
+        assert_eq!(
+            body["apps"][0]["deletes_at"],
+            deadline(&pool, "groceries").await
+        );
+        let (status, _, body) = send(&app, authed("/api/console/apps/groceries", &session)).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["deletes_at"], deadline(&pool, "groceries").await);
     }
 }

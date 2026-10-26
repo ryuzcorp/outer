@@ -843,6 +843,11 @@ function EmailAlertsCard({
       label: "Quota thresholds",
       hint: "One email per day when daily code changes hit 80% and 100%.",
     },
+    {
+      key: "inactivity",
+      label: "Inactivity reminders",
+      hint: "One email each at 30, 7, and 1 day before a Free app is deleted for inactivity.",
+    },
   ];
 
   async function flip(key: keyof AlertPrefs, value: boolean): Promise<void> {

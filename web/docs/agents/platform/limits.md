@@ -35,4 +35,11 @@ description: Track counted quotas, abuse limits, fleet caps, and overage behavio
 4. Track requests and storage against the soft caps above; request overage only triggers an email and an upgrade ask — never tell the person an app paused over quota.
 5. Inactive Free apps are deleted after 90 days with reminders; Pro apps are never deleted while subscribed.
 
+## Keep Free apps alive past 90 days
+
+1. Free apps are deleted after 90 days without owner activity, never while Pro. `whoami`, `list_apps`, and `get_app` show the deadline as `deletes_at`.
+2. Count as activity: every authenticated request by the owner (sign-ins, any tool call, Console visits) and tool calls on that app by a collaborator. Never visitor traffic.
+3. The person gets reminder emails at 30, 7, and 1 day before the deadline. After the deadline the host serves an inactivity page for 7 days; any owner activity in that week restores the app on its next request. Then it is purged and the slug is claimable again.
+4. When the person asks why an app is gone or when it goes away, read `deletes_at` and relay the countdown; to keep it, any tool call counts.
+
 For the person-side walkthrough, see [Limits and quotas](/deploy/limits).

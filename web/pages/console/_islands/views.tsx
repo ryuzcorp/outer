@@ -165,6 +165,9 @@ function statusBadge(status: string): string {
   if (status === "failed" || status === "error" || status === "blocked") {
     return "badge-error";
   }
+  if (status === "expired") {
+    return "badge-warning";
+  }
   if (status === "sleeping") {
     return "badge-ghost";
   }
@@ -2228,6 +2231,14 @@ export function SettingsView({
                 {app.last_request_at ? timeAgo(app.last_request_at) : "never"}
               </dd>
             </div>
+            {app.deletes_at != null && (
+              <div class="flex min-w-0 gap-3 text-[13px]">
+                <dt class="w-[90px] shrink-0 opacity-60">Deleted</dt>
+                <dd class="m-0 min-w-0 flex-1 truncate" title={when(app.deletes_at)}>
+                  {timeAgo(app.deletes_at)}
+                </dd>
+              </div>
+            )}
           </dl>
         </div>
       </section>

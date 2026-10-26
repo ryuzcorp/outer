@@ -773,6 +773,19 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             }
         },
     };
+    // Inactive past its deadline (spec §7.8): the app stopped at expiry and
+    // the whole host serves the `expired` page until activity during grace
+    // restores it or grace lapses and the row is purged. Before every other
+    // gate, so an expired app never wakes its fleet or serves a stale build.
+    // `no-store`: the page must not outlive the restore on the edge.
+    if app.expired_at.is_some() {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("cache-control", "no-store")
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from("This app was removed for inactivity"))
+            .unwrap();
+    }
     // No successful deploy yet: never forward. A first deploy uploads before
     // its migrations apply, so a fleet can be awake on unmigrated code while
     // the migrate step is still running — forwarding would serve it. The
@@ -1456,6 +1469,83 @@ mod tests {
             fleet.hits.load(Ordering::SeqCst),
             0,
             "an unmigrated first deploy is never forwarded, so the wake never runs"
+        );
+    }
+
+    /// An expired app (spec §7.8) serves the `expired` page on its host
+    /// instead of waking: 503 with the spec wording, `no-store` so the edge
+    /// never caches it past a restore, and the fleet stays down.
+    #[tokio::test]
+    async fn expired_apps_serve_the_inactivity_page() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-old", "old", fleet.addr.port(), "public").await;
+        sqlx::query("UPDATE app SET expired_at = ?1 WHERE id = 'app-old'")
+            .bind(1_700_000_000_000i64)
+            .execute(&fix.pool)
+            .await
+            .unwrap();
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        let req = Request::builder()
+            .uri("/items?page=2")
+            .header("host", "old.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "This app was removed for inactivity");
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            0,
+            "an expired app never wakes its fleet"
+        );
+    }
+
+    /// Visitor traffic is not owner activity (spec §7.8, Q2): a proxied
+    /// request advances `last_request_at` for the sleep sweep but leaves
+    /// `last_activity_at` alone.
+    #[tokio::test]
+    async fn visitor_traffic_does_not_count_as_activity() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-visit", "visit", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "visit.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let row: (Option<i64>, i64) = sqlx::query_as(
+            "SELECT last_request_at, last_activity_at FROM app WHERE id = 'app-visit'",
+        )
+        .fetch_one(&fix.pool)
+        .await
+        .unwrap();
+        assert!(
+            row.0.is_some(),
+            "visitor traffic still feeds the sleep sweep"
+        );
+        assert_eq!(
+            row.1, 0,
+            "visitor traffic must not move the inactivity clock"
         );
     }
 

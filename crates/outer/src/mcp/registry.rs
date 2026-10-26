@@ -183,7 +183,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<NoArgs>(
             "whoami",
-            "Your account: email, plan, usage, limits and when they reset.",
+            "Your account: email, plan, usage, limits and when they reset. deletes_at is your soonest Free-app deletion date for inactivity (null on Pro or with no apps).",
             Account, false,
         ),
         tool::<account::CreateApiKeyInput>(
@@ -233,12 +233,12 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<NoArgs>(
             "list_apps",
-            "Your apps: slug, url, role, visibility and status.",
+            "Your apps: slug, url, role, visibility, status, and deletes_at when a Free app faces deletion for inactivity (absent on Pro).",
             Account, false,
         ),
         tool::<app_inputs::GetAppInput>(
             "get_app",
-            "One app: url, role, visibility, status and its last deploy.",
+            "One app: url, role, visibility, status, its last deploy, and deletes_at when a Free app faces deletion for inactivity (absent on Pro).",
             Account, false,
         ),
         tool::<app_inputs::SetVisibilityInput>(

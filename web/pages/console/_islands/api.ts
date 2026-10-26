@@ -78,6 +78,8 @@ export interface ConsoleApp {
   always_on: boolean;
   status: string;
   last_request_at: number | null;
+  /** Inactivity deadline (spec §7.8), absent on Pro. */
+  deletes_at?: number | null;
   last_deploy?: LastDeploy;
 }
 
@@ -346,6 +348,7 @@ export interface AlertPrefs {
   deploy_failed: boolean;
   error_spike: boolean;
   quota: boolean;
+  inactivity: boolean;
 }
 
 export interface AccountSummary {

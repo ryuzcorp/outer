@@ -32,4 +32,6 @@ Storage caps refuse writes at the cap — nothing is ever deleted. Request caps 
 
 Downgrade keeps your 2 oldest apps live; the rest stop but are retained for 30 days. Collaborators beyond 1 per app become read-only.
 
+Free apps are deleted after 90 days without owner activity, counted from your last sign-in, tool call, or Console visit — or a collaborator's tool call on that app. Visiting the app doesn't count. Reminder emails go out at 30, 7, and 1 day before the deadline. `whoami`, `list_apps`, and `get_app` show the deadline as `deletes_at`; after the deadline the app stops and its address serves an inactivity page for 7 more days, during which any sign-in or tool call restores it. Then it is purged: code, data, and files go, and the name becomes claimable again. Downgrading to Free restarts the 90-day clock on that date; extra apps stopped by the downgrade follow the 30-day stopped-app retention instead.
+
 Enforcement detail lives in [Stay inside quotas and caps](/agents/platform/limits).

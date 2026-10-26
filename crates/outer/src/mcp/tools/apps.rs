@@ -255,6 +255,9 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
 }
 
 pub(crate) fn app_status(app: &App, last_status: Option<&str>) -> &'static str {
+    if app.expired_at.is_some() {
+        return "expired";
+    }
     if app.asleep_since.is_some() {
         return "sleeping";
     }
@@ -281,6 +284,20 @@ pub async fn app_summary(ctx: &Ctx<'_>, app: &App, role: Role) -> Result<Value, 
         "always_on": app.always_on,
         "status": status,
     });
+    // Inactivity deadline (spec §7.8) when it applies: Free owners see when
+    // the app goes away without activity; Pro owners are exempt (no key).
+    let (owner_plan, owner_last) =
+        crate::inactivity::owner_clock(&ctx.state.pool, &app.owner_id).await;
+    if let Some(deletes_at) = crate::inactivity::deletes_at_ms(
+        app.last_activity_at,
+        owner_last,
+        &owner_plan,
+        app.expired_at,
+        app.downgraded_stopped_at,
+        ctx.state.inactivity,
+    ) {
+        v["deletes_at"] = json!(deletes_at);
+    }
     if let Some(last) = last {
         v["last_deploy"] = json!({"sha": last.sha, "status": last.status});
     }

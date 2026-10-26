@@ -107,6 +107,7 @@ async fn api_account(State(state): State<super::AppState>, headers: HeaderMap) -
                     "deploy_failed": prefs.deploy_failed,
                     "error_spike": prefs.error_spike,
                     "quota": prefs.quota,
+                    "inactivity": prefs.inactivity,
                 },
                 "resets_at": summary.resets_at,
             })),
@@ -430,11 +431,12 @@ struct PrefsBody {
     deploy_failed: Option<bool>,
     error_spike: Option<bool>,
     quota: Option<bool>,
+    inactivity: Option<bool>,
 }
 
 /// `POST /api/console/alerts/prefs {deploy_failed?, error_spike?,
-/// quota?}`: flip the caller's email-alert toggles. At least one toggle
-/// must be present; absent toggles stay as they are. Audited as
+/// quota?, inactivity?}`: flip the caller's email-alert toggles. At least
+/// one toggle must be present; absent toggles stay as they are. Audited as
 /// `update_alert_prefs` like every other account mutation.
 async fn api_update_prefs(
     State(state): State<super::AppState>,
@@ -447,16 +449,21 @@ async fn api_update_prefs(
         Err(res) => return *res,
     };
     let started = now_ms();
-    if body.deploy_failed.is_none() && body.error_spike.is_none() && body.quota.is_none() {
+    if body.deploy_failed.is_none()
+        && body.error_spike.is_none()
+        && body.quota.is_none()
+        && body.inactivity.is_none()
+    {
         return err_json(AccountError::invalid_argument(
             "no toggles provided".to_string(),
-            "Pass at least one of deploy_failed, error_spike or quota.".to_string(),
+            "Pass at least one of deploy_failed, error_spike, quota or inactivity.".to_string(),
         ));
     }
     let patch = crate::alerts::PrefsPatch {
         deploy_failed: body.deploy_failed,
         error_spike: body.error_spike,
         quota: body.quota,
+        inactivity: body.inactivity,
     };
     let result: Result<serde_json::Value, AccountError> = async {
         let prefs = crate::alerts::set_prefs(&mcp.pool, &account.id, &patch, started)
@@ -466,6 +473,7 @@ async fn api_update_prefs(
             "deploy_failed": prefs.deploy_failed,
             "error_spike": prefs.error_spike,
             "quota": prefs.quota,
+            "inactivity": prefs.inactivity,
         }))
     }
     .await;
@@ -475,8 +483,8 @@ async fn api_update_prefs(
         &account.id,
         "update_alert_prefs",
         &format!(
-            "update_alert_prefs deploy_failed={:?} error_spike={:?} quota={:?}",
-            body.deploy_failed, body.error_spike, body.quota
+            "update_alert_prefs deploy_failed={:?} error_spike={:?} quota={:?} inactivity={:?}",
+            body.deploy_failed, body.error_spike, body.quota, body.inactivity
         ),
         outcome,
         error_code,
@@ -620,6 +628,7 @@ fn scope_label(scope: &str) -> &'static str {
         crate::alerts::KIND_DEPLOY_FAILED => "deploy failure",
         crate::alerts::KIND_ERROR_SPIKE => "error spike",
         crate::alerts::SCOPE_ALL => "alert",
+        crate::alerts::SCOPE_INACTIVITY => "inactivity reminder",
         _ => "quota",
     }
 }
@@ -1186,7 +1195,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["alerts"],
-            serde_json::json!({"deploy_failed": true, "error_spike": true, "quota": true}),
+            serde_json::json!({"deploy_failed": true, "error_spike": true, "quota": true, "inactivity": true}),
             "no row means all on"
         );
 
@@ -1218,7 +1227,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body,
-            serde_json::json!({"deploy_failed": true, "error_spike": true, "quota": false})
+            serde_json::json!({"deploy_failed": true, "error_spike": true, "quota": false, "inactivity": true})
         );
         let (status, body, _) = send(&app, get("/api/console/account", Some(&cookie), true)).await;
         assert_eq!(status, StatusCode::OK);

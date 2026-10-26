@@ -54,7 +54,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `whoami`
 
 - **Access:** signed in
-- **Description:** Your account: email, plan, usage, limits and when they reset.
+- **Description:** Your account: email, plan, usage, limits and when they reset. deletes_at is your soonest Free-app deletion date for inactivity (null on Pro or with no apps).
 
 **Input:** none.
 
@@ -148,14 +148,14 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `list_apps`
 
 - **Access:** signed in
-- **Description:** Your apps: slug, url, role, visibility and status.
+- **Description:** Your apps: slug, url, role, visibility, status, and deletes_at when a Free app faces deletion for inactivity (absent on Pro).
 
 **Input:** none.
 
 ## `get_app`
 
 - **Access:** signed in
-- **Description:** One app: url, role, visibility, status and its last deploy.
+- **Description:** One app: url, role, visibility, status, its last deploy, and deletes_at when a Free app faces deletion for inactivity (absent on Pro).
 
 **Input:**
 
