@@ -1,0 +1,18 @@
+---
+title: Back up and restore your data
+description: Daily database dumps run after activity and keep 7 days (30 on Pro); back up, download, or restore from the Console.
+---
+
+An app with a database gets a daily dump automatically once it has been active in the prior 24 hours. Dumps are full `.sql` exports, stored aside from your app's files. They keep 7 days, or 30 on [Pro](/account/plans).
+
+## How to manage backups
+
+1. Open your app in the [Console](/get-started/console-tour).
+2. Go to **Data → D1 → Backups**.
+3. Use **Back up now** for an on-demand dump, **Download** to save one as `.sql`, or **Restore** to replace the live tables with a dump.
+
+:::note
+Restore takes a fresh backup first, behind a confirmation naming that backup. A bad restore stays restorable.
+:::
+
+For the technical detail, your builder reads [Back up the database](/agents/backend/backups).

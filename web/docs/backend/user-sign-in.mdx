@@ -1,0 +1,22 @@
+---
+title: Let people sign in to your app
+description: Offer email, Google, or GitHub sign-in; sign-in keys must be set before the first auth deploy.
+---
+
+Your app can have its own sign-in, backed by your app's database. Offer email sign-in, Google, GitHub, or a mix.
+
+## How to add sign-in
+
+Ask your builder for the providers you want, such as "let people sign in with email and Google". Sign-in pages and protected pages come with the request.
+
+OAuth providers need credentials from each provider's developer console. The callback URL must point at your `<slug>.outer.now` host.
+
+## What happens with secrets
+
+Sign-in needs a signing secret plus one key pair per OAuth provider. Your builder stores them outside the code before the first sign-in deploy, and they apply on the next deploy.
+
+Test sign-in on the live link, not only locally. OAuth callbacks must match the app's public host.
+
+Keep API keys in [Save API keys as secrets](/security/secrets), never in code.
+
+For the technical detail, your builder reads [Add user sign-in](/agents/backend/auth).

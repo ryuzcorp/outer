@@ -4,14 +4,17 @@ description: A personal software forge for AI agents — your agent builds the a
 ---
 
 Outer is a personal software forge for AI agents. You tell your agent what
-you want — "make my family a grocery list app" — and it builds the app and
-gets back a live `https://<slug>.outer.now` link you can share.
+you want, like "make my family a grocery list app", and it builds the app and
+hands you a live `https://<slug>.outer.now` link you can share.
+
+These docs have two tabs. This Guide speaks to you, the person.
+The For agents tab speaks to your agent while it builds.
 
 ## Core concepts
 
 Three terms, used everywhere in these docs:
 
-- **App** — an Ilha + Void web app, live at `https://<slug>.outer.now`.
+- **App** — a web app or website your agent built, live at `https://<slug>.outer.now`.
   Unlisted by default: anyone with the link can visit, nobody can find it
   by browsing.
 - **Agent** — your AI agent (Claude, Codex, ChatGPT, …), connected to Outer
@@ -24,7 +27,7 @@ Three terms, used everywhere in these docs:
 
 <Steps>
 <Step title="Connect your agent">
-Point it at `https://outer.now/mcp` — one line per client in [Connect](/connect).
+Point it at `https://outer.now/mcp`: one line per client in [Connect your agent](/get-started/connect).
 Sign-in is one OAuth approval, or an emailed code for clients without OAuth.
 </Step>
 <Step title="Ask for an app">
@@ -33,12 +36,12 @@ a live Ilha + Void app serves in seconds.
 </Step>
 <Step title="Refine it">
 "Add a filter for who bought what." Every change ships through the same
-loop: build, review, deploy — the previous version keeps serving until the
+loop: build, review, deploy. The previous version keeps serving until the
 new one is healthy.
 </Step>
 <Step title="Share the link">
 Your agent returns the URL plus a QR code for the family chat
-(`share_app`). Open the [Console](/console) to see what it built.
+(`share_app`). Open the [Console](/get-started/console-tour) to see what it built.
 </Step>
 </Steps>
 
@@ -47,34 +50,33 @@ Your agent returns the URL plus a QR code for the family chat
 Anything the Ilha + Void template can express, backed by D1, KV, Durable
 Objects, R2, queues, cron and realtime: family tools, sign-up sheets,
 dashboards, games, chat rooms, scheduled digests. Concrete starters with
-copy-paste prompts: [What you can build](/what-you-can-build).
+copy-paste prompts: [What you can build](/get-started/what-you-can-build).
 
 :::note
-Outer is in closed beta. New accounts need an invite code (`OUTER-XXXX-XXXX`) —
-if your email is not allowed in yet and you have no code, sign-in tells you
-that you are on the waitlist. [Sign in](/sign-in) has the details.
+Outer is in closed beta. New accounts need an invite code (`OUTER-XXXX-XXXX`). If your email is not allowed in yet and you have no code, sign-in tells you
+that you are on the waitlist. [Sign in](/get-started/sign-in) has the details.
 :::
 
 ## Start here
 
 <CardGroup cols={3}>
-<Card title="Quickstart" href="/guides/quickstart" icon="rocket">
-Connect your chat app, ask for an app, see it live — about ten minutes.
+<Card title="Quickstart" href="/get-started/quickstart" icon="rocket">
+Connect your chat app, ask for an app, see it live in about ten minutes.
 </Card>
-<Card title="Connect" href="/connect" icon="plug">
+<Card title="Connect your agent" href="/get-started/connect" icon="plug">
 One line per client: Claude, Codex, ChatGPT, Gemini, Perplexity, anything else.
 </Card>
-<Card title="Console" href="/console" icon="layout-dashboard">
+<Card title="Console" href="/get-started/console-tour" icon="layout-dashboard">
 Watch your apps: deploys, logs, errors, data, secrets, settings.
 </Card>
 </CardGroup>
 
 ## Get help
 
-- Ask your agent first — it reads these docs over MCP (`docs` tool) and
+- Ask your agent first. It reads these docs over MCP (`docs` tool) and
   relays any `user_message` from a refusal verbatim. Those messages are
   written for you; don't let it improvise around them.
-- Deploy stuck? [FAQ and troubleshooting](/faq) covers the common failures:
-  sign-in, blocked deploys, held apps, sleeping fleets.
-- Prompting tips — how to ask so your agent gets it right the first time:
-  [Prompting your agent](/prompting).
+- Deploy stuck? [FAQ and troubleshooting](/help/faq) covers the common failures:
+  sign-in, blocked deploys, and cold starts.
+- Prompting tips: how to ask so your agent gets it right the first time:
+  [Prompting your agent](/get-started/prompting).

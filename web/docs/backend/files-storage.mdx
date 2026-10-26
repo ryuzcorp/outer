@@ -1,0 +1,20 @@
+---
+title: Store uploaded files
+description: Your app gets one file bucket for uploads; browse and manage files from the Console.
+---
+
+Your app gets one file bucket (R2) for uploads like images and documents. It shares the app with your single database. A second bucket fails the deploy.
+
+## What to know about uploads
+
+Uploaded images and video skip text review, so ask for your own checks when strangers can upload. Ask for uploads to download as files, never to open as pages that run code.
+
+## How to browse your files
+
+1. Open your app in the [Console](/get-started/console-tour).
+2. Go to **Data → R2**.
+3. Browse folders, preview images and text, download, upload, or delete files.
+
+Reads use the same access as your app. Writes are recorded in the activity log.
+
+For the technical detail, your builder reads [Store uploads in R2](/agents/backend/files).

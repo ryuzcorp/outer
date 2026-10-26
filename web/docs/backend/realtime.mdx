@@ -1,0 +1,16 @@
+---
+title: Show updates as they happen
+description: Live chat, scores, and feeds stay fresh over sockets or streams; clients must reconnect after deploys and idle sleep.
+---
+
+Ask for live updates, like chat rooms, live scores, and shared feeds, and your builder wires up a live connection. Two-way traffic like chat uses rooms over WebSockets. One-way streams like score tickers use server-sent events.
+
+## Why connections drop
+
+Live connections die on every deploy and when your app sleeps after about 30 minutes idle. Your builder codes the client to reconnect with backoff and re-fetch missed messages from the database.
+
+For one-way streams, the server sends a keep-alive comment every few seconds. Silent streams hit the proxy timeout and cut out.
+
+Cross-request fan-out belongs in [Background jobs](/backend/background-jobs).
+
+For the technical detail, your builder reads [Add realtime rooms](/agents/backend/websockets) and [Stream updates with SSE](/agents/backend/sse).

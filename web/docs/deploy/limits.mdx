@@ -1,0 +1,22 @@
+---
+title: Limits and quotas
+description: The enforced quotas on Free and Pro, and what happens when you hit one.
+---
+
+Your agent sees the same numbers through `whoami`, which shows usage and reset dates.
+
+| Quota | Free | Pro |
+| --- | --- | --- |
+| Apps owned | 1 | 10 |
+| Code changes per day (UTC) | 50 | 500 |
+| Collaborators per app | — | 10 |
+| Custom domains per app | — | 1 |
+| Active preview deploys | — | 1 per app |
+| Databases and file buckets per app | 1 D1, 1 R2 | 1 D1, 1 R2 |
+| Logs and metrics kept | 7 days | 30 days |
+
+The template commit that creates your app and a rollback never count as code changes. Code changes charge to the app owner, whoever makes them.
+
+When a quota is hit, the tool returns `quota_exceeded` with an upgrade link and a `user_message`. Ask your agent to relay that message word for word. Code changes reset at midnight UTC, and `whoami` shows your current counts and reset dates.
+
+Enforcement detail lives in [Stay inside quotas and caps](/agents/platform/limits).

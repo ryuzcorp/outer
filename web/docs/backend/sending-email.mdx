@@ -1,0 +1,18 @@
+---
+title: Send email from your app
+description: Apps have no built-in mailer and SMTP is blocked; send through Resend over HTTP with your own key.
+---
+
+Your app has no built-in mailer. Outbound SMTP ports (25, 465, 587) are blocked, so apps send mail through an HTTP email service such as Resend, with your own key.
+
+## How to set it up
+
+1. Create a Resend account and verify a sender domain you control.
+2. Ask your builder to store your key as a [Secret](/security/secrets). Never put it in code.
+3. Ask for the emails you want: invites, receipts, digests.
+
+Your builder validates recipient addresses before sending. Bounced spam burns your domain, so keep lists clean.
+
+There is no inbox path into `<slug>.outer.now`. Receiving mail needs a service in front that forwards to your app as HTTP.
+
+For the technical detail, your builder reads [Send email with Resend](/agents/backend/email).

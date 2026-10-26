@@ -168,7 +168,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<account::DocsInput>(
             "docs",
-"Read an Outer guide: quickstart, ilha, void, celld, d1, storage, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, previews or look. Read the ilha guide before writing any code.",
+"Read an Outer agent guide: quickstart, templates, ilha, void, website, celld, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look. Read the ilha guide before writing any code.",
             Public, false,
         ),
         tool::<account::SignInInput>(

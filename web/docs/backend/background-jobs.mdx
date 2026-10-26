@@ -1,0 +1,16 @@
+---
+title: Run work in the background
+description: Slow or flaky work runs in queues behind the scenes, with retries when a step fails.
+---
+
+Some work should not block the page: sending a batch of emails, processing uploads, retrying a flaky call. Ask for it to run in the background and your builder puts it in a queue.
+
+## How it works
+
+Your builder declares the queue, your app sends work into it, and a consumer processes each batch. Only one consumer reads a queue.
+
+Delivery is at-least-once and unordered: a message can arrive twice, and order is not guaranteed. Work should tolerate repeats.
+
+Messages that keep failing are deleted after their retry budget. There is no dead-letter queue, so ask for important failures to be logged somewhere you can see them.
+
+For the technical detail, your builder reads [Queue background work](/agents/backend/queues).

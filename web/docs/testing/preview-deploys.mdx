@@ -1,0 +1,30 @@
+---
+title: Preview changes
+description: Click through a change at a temporary Pro URL before it goes live.
+---
+
+A preview deploy trials a change at a temporary URL before it goes live. Your live app stays untouched until you approve. Previews need Pro.
+
+1. Ask your agent to trial the change as a preview.
+2. Open the preview link (it looks like `<slug>--preview.outer.now`) and click through it.
+3. Tell your agent to ship it or throw it away.
+
+## What a preview is
+
+- The preview runs the same pipeline as a live deploy, including the moderation gate.
+- It starts with empty data: anything the preview writes never touches live data, and shipping it ships code only.
+- An unlisted app's preview stays unlisted too.
+- One preview exists per app at a time. A new preview refreshes it.
+- A preview with no visits for 24 hours is discarded on its own.
+
+## Rules that carry over
+
+- A preview trial counts as a code change. Shipping it does not.
+- Shipping needs a clean line: when live moved on after the preview branched, your agent discards and re-trials first.
+- The host holds at most 20 previews (`OUTER_PREVIEW_MAX`). Past that, ask your agent to discard an idle one or wait.
+
+In the Console, the Deploys view shows the active preview with Promote and Discard buttons. How previews work under the hood: [Trial changes with preview deploys](/agents/testing/previews).
+
+:::note
+Renaming an app with an active preview refuses. Discard the preview first, then rename.
+:::

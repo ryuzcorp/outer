@@ -1,0 +1,17 @@
+---
+title: Launch a content site
+description: Content sites prerender to static HTML, so landing pages, portfolios, and blogs load fast.
+---
+
+If your project is mostly content, like a landing page, portfolio, blog, or event page, start from the website [Template](/get-started/templates). Pages prerender to static HTML, which loads fast and needs no server.
+
+## How it fits together
+
+- Each page is its own file. A new page means a new file in the site.
+- Blog posts are Markdown files with a title, description, and date. Drafts stay out of the build.
+- Interactive parts (forms, widgets) switch on where the page needs them. Until they switch on, controls should look usable or disabled, never silently dead.
+- A page that needs the [Database](/backend/database) skips prerendering. Keep such pages few and small.
+
+Sites that grow accounts or live collaboration outgrow this shape. Say so early: ask for an app instead of stretching the site.
+
+For the technical detail, your builder reads [Build content sites](/agents/frontend/website).
