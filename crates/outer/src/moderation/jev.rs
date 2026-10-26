@@ -19,6 +19,11 @@ const DEFAULT_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Tokens of chunk text per classify call, estimated as chars/4.
 const MAX_STATE_TOKENS_PER_CALL: usize = 2000;
+/// Chunks per classify call. Every chunk adds five questions, and Jev
+/// refuses a call with too many (`max_tokens_exceeded`): measured live on
+/// 2026-10-26, 256 short chunks pass and 320 fail whatever the text size.
+/// Half the passing count leaves room for longer answers.
+const MAX_CHUNKS_PER_CALL: usize = 128;
 /// Classify calls in flight at once.
 const MAX_PARALLEL_CALLS: usize = 4;
 
@@ -223,15 +228,19 @@ impl JevClient {
     }
 }
 
-/// Greedy packs of chunk indices, each ~2k tokens of state. Oversized
-/// chunks travel alone rather than blocking the batcher.
+/// Greedy packs of chunk indices, each ~2k tokens of state and at most
+/// [`MAX_CHUNKS_PER_CALL`] chunks. Oversized chunks travel alone rather
+/// than blocking the batcher.
 fn pack_batches(texts: &[String]) -> Vec<Vec<usize>> {
     let mut batches: Vec<Vec<usize>> = Vec::new();
     let mut tokens = 0;
     let mut current: Vec<usize> = Vec::new();
     for (i, text) in texts.iter().enumerate() {
         let estimate = text.chars().count() / 4;
-        if !current.is_empty() && tokens + estimate > MAX_STATE_TOKENS_PER_CALL {
+        if !current.is_empty()
+            && (tokens + estimate > MAX_STATE_TOKENS_PER_CALL
+                || current.len() == MAX_CHUNKS_PER_CALL)
+        {
             batches.push(std::mem::take(&mut current));
             tokens = 0;
         }
@@ -567,6 +576,23 @@ mod tests {
         config.api_base = base_url.to_string();
         config.timeout = Duration::from_millis(500);
         JevClient::new(config).unwrap()
+    }
+
+    /// A real app's seed (557 short UI strings, 2026-10-26) packed ~250
+    /// chunks per call by text size alone, and Jev refused the call. Short
+    /// chunks now split by count too, and every chunk still lands once.
+    #[test]
+    fn many_short_chunks_split_by_count() {
+        let texts: Vec<String> = (0..557).map(|i| format!("Add item {i}")).collect();
+        let batches = pack_batches(&texts);
+        assert!(
+            batches.iter().all(|b| b.len() <= MAX_CHUNKS_PER_CALL),
+            "{:?}",
+            batches.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(batches.len(), 5);
+        let flat: Vec<usize> = batches.into_iter().flatten().collect();
+        assert_eq!(flat, (0..557).collect::<Vec<_>>());
     }
 
     fn answer_for(question: &serde_json::Value, noul: f64, score: f64) -> serde_json::Value {
