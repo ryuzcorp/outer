@@ -760,6 +760,14 @@ export function UsageView({
                 {summary.plan === "free" && " ($4 launch price while the coupon lasts)"}
                 , tax calculated at checkout. The plan lifts on your agent's next call after payment.
               </p>
+              {summary.billing_test_mode && (
+                <div class="alert alert-info alert-soft min-w-0" role="note">
+                  <span class="min-w-0 break-words text-sm">
+                    Test mode: nothing is charged. Pay with card 4242 4242 4242 4242, any future
+                    expiry date, any CVC, and any billing address.
+                  </span>
+                </div>
+              )}
               {checkoutError() && (
                 <div class="alert alert-error alert-soft min-w-0" role="alert">
                   <span class="min-w-0 break-words text-sm">{checkoutError()}</span>

@@ -90,6 +90,37 @@ async fn api_webhook(
         .and_then(|data| data.get("object"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    // Stripe does not guarantee webhook order: an older `updated` event can
+    // arrive after a newer one, so the payload may be stale. Refetch the
+    // live object (docs: https://docs.stripe.com/api/subscriptions/retrieve)
+    // and apply that instead. Before `apply_event` opens its transaction,
+    // so no network happens inside the DB lock. A fetch failure 500s with
+    // nothing recorded, and Stripe retries; events without an object id keep
+    // the payload.
+    let mut object = object;
+    if matches!(
+        kind,
+        "customer.subscription.created" | "customer.subscription.updated"
+    ) {
+        if let Some(sub_id) = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        {
+            match mcp.billing.retrieve_subscription(&sub_id).await {
+                Some(Ok(fresh)) => object = fresh,
+                Some(Err(err)) => {
+                    tracing::warn!(event = %id, kind = %kind, "stripe webhook: refetch failed: {err:#}");
+                    return nostore_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "unavailable",
+                        "could not apply the event right now",
+                    );
+                }
+                None => {}
+            }
+        }
+    }
     let ctx = WebhookCtx {
         pool: &mcp.pool,
         sender: &mcp.auth.config.email,
@@ -399,10 +430,14 @@ mod tests {
     }
 
     /// A loopback double answering one canned Checkout Session, recording
-    /// the raw form so the route test pins the spec params end to end.
+    /// the raw form so the route test pins the spec params end to end. It
+    /// also serves `GET /v1/subscriptions/{id}` from a settable object so
+    /// the webhook refetch tests control what is current.
     struct FakeStripe {
         base: String,
         body: Arc<Mutex<Option<String>>>,
+        sub: Arc<Mutex<serde_json::Value>>,
+        fail_sub: Arc<Mutex<bool>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -414,23 +449,42 @@ mod tests {
 
     impl FakeStripe {
         async fn start() -> Self {
+            Self::start_with(serde_json::json!({
+                "id": "sub_1", "customer": "cus_1", "status": "active",
+                "cancel_at_period_end": false,
+            }))
+            .await
+        }
+
+        async fn start_with(sub: serde_json::Value) -> Self {
             use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let seen = Arc::new(Mutex::new(None));
             let body = seen.clone();
+            let sub = Arc::new(Mutex::new(sub));
+            let current = sub.clone();
+            let fail_sub = Arc::new(Mutex::new(false));
+            let failing = fail_sub.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let Ok((conn, _)) = listener.accept().await else {
                         return;
                     };
                     let seen = seen.clone();
+                    let current = current.clone();
+                    let failing = failing.clone();
                     tokio::spawn(async move {
                         let mut lines = tokio::io::BufReader::new(conn);
                         let mut request_line = String::new();
                         if lines.read_line(&mut request_line).await.is_err() {
                             return;
                         }
+                        let path = request_line
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("")
+                            .to_string();
                         let mut content_length = 0;
                         loop {
                             let mut line = String::new();
@@ -450,19 +504,42 @@ mod tests {
                         if lines.read_exact(&mut raw).await.is_err() {
                             return;
                         }
-                        *seen.lock().unwrap() = Some(String::from_utf8_lossy(&raw).into_owned());
-                        let session = "{\"id\":\"cs_test_9\",\"object\":\"checkout.session\",\"url\":\"https://checkout.stripe.com/pay/cs_test_9\"}";
-                        let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{session}", session.len());
+                        // Subscription refetches are GETs with no form body;
+                        // only the checkout/portal POSTs are recorded.
+                        let reply = if path.starts_with("/v1/subscriptions/") {
+                            if *failing.lock().unwrap() {
+                                let err = r#"{"error":{"message":"boom"}}"#;
+                                format!("HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{err}", err.len())
+                            } else {
+                                let sub = current.lock().unwrap().to_string();
+                                format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sub}", sub.len())
+                            }
+                        } else {
+                            *seen.lock().unwrap() =
+                                Some(String::from_utf8_lossy(&raw).into_owned());
+                            let session = "{\"id\":\"cs_test_9\",\"object\":\"checkout.session\",\"url\":\"https://checkout.stripe.com/pay/cs_test_9\"}";
+                            format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{session}", session.len())
+                        };
                         let mut stream = lines.into_inner();
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(reply.as_bytes()).await;
                     });
                 }
             });
             Self {
                 base: format!("http://127.0.0.1:{port}"),
                 body,
+                sub,
+                fail_sub,
                 task,
             }
+        }
+
+        fn set_subscription(&self, sub: serde_json::Value) {
+            *self.sub.lock().unwrap() = sub;
+        }
+
+        fn set_fail(&self, fail: bool) {
+            *self.fail_sub.lock().unwrap() = fail;
         }
     }
 
@@ -505,6 +582,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+    fn subscription_object(cancel_at_period_end: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "sub_1", "customer": "cus_1", "status": "active",
+            "cancel_at_period_end": cancel_at_period_end,
+        })
+    }
+
+    fn updated_payload(event_id: &str, cancel_at_period_end: bool) -> String {
+        format!(
+            "{{\"id\":\"{event_id}\",\"type\":\"customer.subscription.updated\",\
+             \"data\":{{\"object\":{}}}}}",
+            subscription_object(cancel_at_period_end),
+        )
+    }
+
+    async fn post_signed_webhook(
+        state: super::super::AppState,
+        payload: &str,
+    ) -> axum::response::Response {
+        let signature =
+            stripe::sign_test_header(SECRET, payload.as_bytes(), chrono::Utc::now().timestamp());
+        let req = Request::post("/webhooks/stripe")
+            .header("stripe-signature", signature)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        super::super::router(state).oneshot(req).await.unwrap()
+    }
+
+    async fn seed_pro_subscription(pool: &SqlitePool) {
+        seed_user(pool).await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'active', \
+             stripeSubscriptionId = 'sub_1' WHERE id = 'a1'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn plan_status(pool: &SqlitePool) -> (String, Option<String>) {
+        sqlx::query_as("SELECT plan, planStatus FROM user WHERE id = 'a1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Stripe does not promise webhook order, so the route applies the live
+    /// subscription, not the event payload. Both arrival orders land here:
+    /// each delivered event contradicts what the fake currently serves, and
+    /// the stored plan follows the fake. Without the refetch both halves
+    /// fail, storing the stale payload instead.
+    #[tokio::test]
+    async fn webhook_applies_current_subscription_not_stale_payload() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_pro_subscription(&pool).await;
+        // The portal cancel already landed, but the delivered event is the
+        // older pre-cancel version: the plan must still say `canceled`.
+        fake.set_subscription(subscription_object(true));
+        let res = post_signed_webhook(state.clone(), &updated_payload("evt_stale_1", false)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            plan_status(&pool).await,
+            ("pro".to_string(), Some("canceled".to_string()))
+        );
+        // The portal undo already landed, and the older still-flagged event
+        // arrives late: the plan stays `active`.
+        fake.set_subscription(subscription_object(false));
+        let res = post_signed_webhook(state.clone(), &updated_payload("evt_stale_2", true)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            plan_status(&pool).await,
+            ("pro".to_string(), Some("active".to_string()))
+        );
+    }
+
+    /// A failed refetch 500s with nothing recorded, so Stripe retries; the
+    /// plan is untouched and no `stripe_event` row claims the event.
+    #[tokio::test]
+    async fn webhook_refetch_failure_retries_without_recording() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_pro_subscription(&pool).await;
+        fake.set_fail(true);
+        let res = post_signed_webhook(state, &updated_payload("evt_boom", false)).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            plan_status(&pool).await,
+            ("pro".to_string(), Some("active".to_string()))
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stripe_event WHERE id = 'evt_boom'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

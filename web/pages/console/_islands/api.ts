@@ -353,6 +353,8 @@ export interface AccountSummary {
   grace_until: number | null;
   has_customer: boolean;
   billing_enabled: boolean;
+  /** Stripe sandbox keys: Checkout takes test cards, nothing is charged. */
+  billing_test_mode: boolean;
   member_since: number;
   usage: AccountUsage;
   alerts: AlertPrefs;

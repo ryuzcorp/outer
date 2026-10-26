@@ -142,6 +142,12 @@ impl StripeClient {
         })
     }
 
+    /// A sandbox key (`sk_test_…`): Checkout takes Stripe's test cards
+    /// and nothing is charged.
+    pub fn is_test_mode(&self) -> bool {
+        self.secret_key.starts_with("sk_test_")
+    }
+
     /// Tests point the client at a local double instead of Stripe.
     #[cfg(test)]
     pub fn with_base(mut self, base: String) -> Self {
@@ -175,6 +181,30 @@ impl StripeClient {
         Ok(body)
     }
 
+    /// The current subscription object, `GET /v1/subscriptions/{id}` (docs:
+    /// <https://docs.stripe.com/api/subscriptions/retrieve>). Webhook
+    /// events can arrive out of order, so the route refetches the object
+    /// for `customer.subscription.created/updated` and applies that instead
+    /// of the (possibly stale) event payload. Same auth and `Stripe-Version`
+    /// as the `post` calls above.
+    pub async fn retrieve_subscription(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        let res = self
+            .http
+            .get(format!("{}/v1/subscriptions/{id}", self.api_base))
+            .header("Authorization", self.auth())
+            .header("Stripe-Version", STRIPE_API_VERSION)
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.text().await?;
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "stripe /v1/subscriptions/{id} answered {status}: {body}"
+            ));
+        }
+        Ok(serde_json::from_str(&body)?)
+    }
+
     /// One Pro subscription checkout for `account_id` (spec §14.2). The
     /// human finishes on Stripe's page and the webhook upgrades the account;
     /// nothing here touches the `user` row.
@@ -193,7 +223,6 @@ impl StripeClient {
         );
         session_url(&self.post("/v1/checkout/sessions", &form).await?)
     }
-
     /// One Customer Portal session for an existing subscriber.
     pub async fn create_portal_session(
         &self,
