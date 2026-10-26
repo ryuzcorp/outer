@@ -550,10 +550,7 @@ async fn search_symbol(
         let mut definitions = Vec::new();
         let mut usages = Vec::new();
         for hit in &file.matches {
-            match decl_lines
-                .iter()
-                .find(|(start, _)| *start == hit.line)
-            {
+            match decl_lines.iter().find(|(start, _)| *start == hit.line) {
                 Some((start, end)) => {
                     defs += 1;
                     data.push(format!("{}:{start}:def {query}", file.path));
