@@ -374,7 +374,7 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     // its deploy fails or is blocked.
     // Charged to the app owner whoever calls (spec §3): a collaborator's
     // commit counts against the owner's daily changes.
-    let claim = claim_change(&ctx.state.pool, &app.owner_id).await?;
+    let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     let outcome = match git::commit::commit_with_outcome(
         &ctx.state.store,
         &ctx.state.git,
@@ -469,7 +469,7 @@ async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, T
             ));
         }
     }
-    let claim = claim_change(&ctx.state.pool, &app.owner_id).await?;
+    let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     let outcome = match git::commit::commit_preview(
         &ctx.state.store,
         &ctx.state.git,

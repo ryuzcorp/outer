@@ -8,6 +8,7 @@
 pub(crate) mod account;
 pub(crate) mod apps;
 pub(crate) mod backups;
+pub(crate) mod billing;
 pub(crate) mod code;
 pub(crate) mod collaborators;
 pub(crate) mod domains;
@@ -174,6 +175,18 @@ pub fn resets_at_utc() -> String {
         .unwrap_or_default()
 }
 
+/// Attach the account's `upgrade_url` to a `payment_required` or
+/// `quota_exceeded` refusal (spec §3, §8.3): a per-account
+/// checkout-starter link when billing is live, the console plan card when
+/// it is disabled (localhost dev). Pure HMAC, no network.
+pub fn with_upgrade(
+    err: ToolError,
+    billing: &crate::billing::BillingState,
+    account_id: &str,
+) -> ToolError {
+    err.with_upgrade_url(billing.upgrade_url(account_id, chrono::Utc::now().timestamp()))
+}
+
 /// The account's plan (`free` unless the row says `pro`).
 pub async fn plan_of(pool: &sqlx::SqlitePool, account_id: &str) -> Result<String, ToolError> {
     let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM user WHERE id = ?1")
@@ -215,6 +228,7 @@ pub async fn changes_used_today(
 }
 
 /// One claimed code change: the post-claim usage and the plan limit.
+#[derive(Debug)]
 pub struct Claim {
     pub used: u64,
     pub limit: u64,
@@ -226,7 +240,13 @@ pub struct Claim {
 /// §14.1); a commit that never happens must give the change back
 /// ([`refund_change`]), while a created commit counts even when its deploy
 /// fails or is blocked (spec §9.2).
-pub async fn claim_change(pool: &sqlx::SqlitePool, account_id: &str) -> Result<Claim, ToolError> {
+/// `billing` supplies the `upgrade_url` the refusal carries; the claim
+/// itself stays a pure quota check.
+pub async fn claim_change(
+    pool: &sqlx::SqlitePool,
+    billing: &crate::billing::BillingState,
+    account_id: &str,
+) -> Result<Claim, ToolError> {
     let plan = plan_of(pool, account_id).await?;
     let limit = change_limit(&plan);
     let rows = sqlx::query(
@@ -244,15 +264,21 @@ pub async fn claim_change(pool: &sqlx::SqlitePool, account_id: &str) -> Result<C
     let used = changes_used_today(pool, account_id).await?;
     if rows == 0 {
         let resets_at = resets_at_utc();
-        return Err(ToolError::quota_exceeded(
-            format!("{plan} plan: {limit} code changes per day, {used} used"),
-            format!(
-                "You've used today's {limit} code changes on your Outer {plan} plan. They reset at midnight UTC."
+        let url = billing.upgrade_url(account_id, chrono::Utc::now().timestamp());
+        return Err(with_upgrade(
+            ToolError::quota_exceeded(
+                format!("{plan} plan: {limit} code changes per day, {used} used"),
+                format!(
+                    "You've used today's {limit} code changes on your Outer {plan} plan. They reset at midnight UTC, or upgrade to Pro for {pro} a day: {url}",
+                    pro = PRO_CHANGES_PER_DAY,
+                ),
+                "code_changes_per_day",
+                limit,
+                used,
+                Some(&resets_at),
             ),
-            "code_changes_per_day",
-            limit,
-            used,
-            Some(&resets_at),
+            billing,
+            account_id,
         ));
     }
     Ok(Claim { used, limit })
@@ -319,22 +345,28 @@ pub fn app_slots_message(plan: &str, limit: u64) -> String {
     format!("You've used all {limit} {slots} on your Outer {plan} plan.")
 }
 
-/// Refuse `create_app` when the owner's app slots are full.
+/// Refuse `create_app` when the owner's app slots are full. `billing`
+/// supplies the `upgrade_url` the refusal carries.
 pub async fn check_app_quota(
     pool: &sqlx::SqlitePool,
+    billing: &crate::billing::BillingState,
     account_id: &str,
 ) -> Result<(u64, u64), ToolError> {
     let plan = plan_of(pool, account_id).await?;
     let limit = app_limit(&plan);
     let used = apps_owned(pool, account_id).await?;
     if used >= limit {
-        return Err(ToolError::quota_exceeded(
-            format!("{plan} plan: {limit} app(s) owned, {used} used"),
-            app_slots_message(&plan, limit),
-            "apps_owned",
-            limit,
-            used,
-            None,
+        return Err(with_upgrade(
+            ToolError::quota_exceeded(
+                format!("{plan} plan: {limit} app(s) owned, {used} used"),
+                app_slots_message(&plan, limit),
+                "apps_owned",
+                limit,
+                used,
+                None,
+            ),
+            billing,
+            account_id,
         ));
     }
     Ok((used, limit))
@@ -884,6 +916,12 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "delete_account" => account::delete_account(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "upgrade" => billing::upgrade(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "manage_billing" => billing::manage_billing(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "create_app" => apps::create_app(parse_args(args)?, ctx)

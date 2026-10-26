@@ -93,6 +93,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/sign-out", post(api_sign_out))
         .merge(super::console_observe::routes())
         .merge(super::console_account::routes())
+        .merge(super::console_billing::routes())
         .merge(super::console_collaborators::routes())
         .with_state(state)
 }
@@ -126,6 +127,30 @@ pub(crate) fn nostore_json_user(
             ("content-type", "application/json"),
         ],
         json!({"error": error, "message": message.into(), "user_message": user_message.into()})
+            .to_string(),
+    )
+        .into_response()
+}
+
+/// The `payment_required` / `quota_exceeded` variant: same shape as
+/// [`nostore_json_user`], plus the per-account `upgrade_url` checkout-starter
+/// link the MCP refusals carry (spec §8.3), so the UI can offer the same
+/// Upgrade button wherever a refusal names a price.
+pub(crate) fn nostore_json_refusal(
+    status: StatusCode,
+    error: &str,
+    message: impl Into<String>,
+    user_message: impl Into<String>,
+    upgrade_url: impl Into<String>,
+) -> Response {
+    (
+        status,
+        [
+            ("cache-control", "no-store"),
+            ("pragma", "no-cache"),
+            ("content-type", "application/json"),
+        ],
+        json!({"error": error, "message": message.into(), "user_message": user_message.into(), "upgrade_url": upgrade_url.into()})
             .to_string(),
     )
         .into_response()

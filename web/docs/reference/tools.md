@@ -116,6 +116,20 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `confirm` | string | yes | Type your account email again to confirm: must equal it exactly. |
 
+## `upgrade`
+
+- **Access:** signed in
+- **Description:** Upgrade to Outer Pro: returns a Checkout link for the human to open ($4/month launch price with the coupon, $8/month after; tax calculated). The plan lifts on the next call after payment.
+
+**Input:** none.
+
+## `manage_billing`
+
+- **Access:** signed in
+- **Description:** Manage Outer Pro billing: returns the Customer Portal link to update the card or cancel. Needs an existing subscription â€” call upgrade first.
+
+**Input:** none.
+
 ## `create_app`
 
 - **Access:** signed in

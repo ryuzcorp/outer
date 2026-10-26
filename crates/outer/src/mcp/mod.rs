@@ -403,6 +403,10 @@ pub struct McpState {
     pub look_tokens: crate::look_tokens::LookTokens,
     /// At most one rollback runs per app (fails fast otherwise).
     pub rollback_locks: RollbackLocks,
+    /// Stripe billing (spec §14.2): checkout/portal links, the
+    /// per-account checkout-starter links refusals carry, and webhook
+    /// state. `Disabled` on localhost dev without `STRIPE_*`.
+    pub billing: crate::billing::BillingState,
     /// What `delete_app` wipes and purges: dirs, edge host, zone.
     pub delete_cfg: crate::apps::delete::DeleteConfig,
 }
@@ -512,6 +516,9 @@ impl McpState {
             browser: None,
             look_tokens: crate::look_tokens::LookTokens::new(),
             rollback_locks: RollbackLocks::default(),
+            billing: crate::billing::BillingState::Disabled {
+                platform_base: "http://outer.localhost".to_string(),
+            },
             delete_cfg: crate::apps::delete::DeleteConfig {
                 data_dir: data_dir.clone(),
                 cgroups: None,
@@ -519,6 +526,14 @@ impl McpState {
                 cache_purge: None,
             },
         }
+    }
+
+    /// Tests override this when they need an enabled signer: the default
+    /// is disabled (no `STRIPE_*` in the test env), and refusals point at
+    /// the console plan card.
+    pub fn with_billing(mut self, billing: crate::billing::BillingState) -> Self {
+        self.billing = billing;
+        self
     }
 }
 

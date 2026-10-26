@@ -54,12 +54,16 @@ pub(crate) async fn require_pro_state(
 ) -> Result<(), ToolError> {
     let plan = plan_of(&state.pool, owner_id).await?;
     if plan != "pro" {
-        return Err(ToolError::payment_required(
-            format!("{slug} is on a Free account; {feature} {verb} a Pro feature"),
-            format!(
-                "{} {verb} a Pro feature. Upgrade to Pro to {action}.",
-                capitalize(feature)
+        return Err(super::with_upgrade(
+            ToolError::payment_required(
+                format!("{slug} is on a Free account; {feature} {verb} a Pro feature"),
+                format!(
+                    "{} {verb} a Pro feature. Upgrade to Pro to {action}.",
+                    capitalize(feature)
+                ),
             ),
+            &state.billing,
+            owner_id,
         ));
     }
     Ok(())

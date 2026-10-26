@@ -38,13 +38,22 @@ pub struct ListDomainsInput {
 
 /// A [`domains::DomainError`] as the MCP [`ToolError`] the tool and the
 /// console endpoint report (same codes, same user message).
-pub(crate) fn tool_error(err: domains::DomainError) -> ToolError {
+/// `billing` + `owner_id` supply the `upgrade_url` the Pro refusal carries.
+pub(crate) fn tool_error(
+    err: domains::DomainError,
+    billing: &crate::billing::BillingState,
+    owner_id: &str,
+) -> ToolError {
     let code = err.code();
     let message = err.to_string();
     let user = err.user_message();
     match code {
         "not_found" => ToolError::not_found(message),
-        "payment_required" => ToolError::new(code, message).with_user(user),
+        "payment_required" => super::with_upgrade(
+            ToolError::new(code, message).with_user(user),
+            billing,
+            owner_id,
+        ),
         "internal" => ToolError::internal(message).with_user(user),
         _ => ToolError::invalid_argument(message).with_user(user),
     }
@@ -89,7 +98,7 @@ pub async fn add_domain(input: AddDomainInput, ctx: &Ctx<'_>) -> Result<Value, T
         &input.hostname,
     )
     .await
-    .map_err(tool_error)?;
+    .map_err(|err| tool_error(err, &ctx.state.billing, &app.owner_id))?;
     // The POST may omit validation records, so one GET fills them in: the
     // agent relays the full DNS setup word for word.
     let summary = format!(
@@ -115,7 +124,7 @@ pub async fn remove_domain(input: RemoveDomainInput, ctx: &Ctx<'_>) -> Result<Va
         input.hostname.as_deref(),
     )
     .await
-    .map_err(tool_error)?;
+    .map_err(|err| tool_error(err, &ctx.state.billing, &app.owner_id))?;
     let message = format!("{hostname} no longer serves {}.", app.slug);
     Ok(ok(
         message.clone(),
@@ -137,11 +146,11 @@ pub async fn list_domains(input: ListDomainsInput, ctx: &Ctx<'_>) -> Result<Valu
             Err(domains::DomainError::Unavailable(_)) => {
                 domains::list_domains(&ctx.state.pool, &ctx.state.domain, &app)
                     .await
-                    .map_err(tool_error)?
+                    .map_err(|err| tool_error(err, &ctx.state.billing, &app.owner_id))?
                     .into_iter()
                     .next()
             }
-            Err(err) => return Err(tool_error(err)),
+            Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id)),
         };
     let out: Vec<Value> = view.iter().map(domain_json).collect();
     let summary = match view.as_ref() {

@@ -108,7 +108,7 @@ async fn seed_app(
         super::app_limit(&plan),
     )
     .await
-    .map_err(|err| ToolError::from_create(err, &plan))?;
+    .map_err(|err| ToolError::from_create(err, &plan, &ctx.state.billing, owner_id))?;
     // New Pro apps default to keep-warm (feature #6); Free apps start
     // cold. The flag is stored per app, so a later downgrade keeps the
     // value but the sweep ignores it until the owner upgrades again. Best
@@ -195,7 +195,7 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
             ))
         })?,
     };
-    check_app_quota(&ctx.state.pool, &caller.account_id).await?;
+    check_app_quota(&ctx.state.pool, &ctx.state.billing, &caller.account_id).await?;
     // The name check runs before any row exists and before the quota claim,
     // so refused names cost nothing and Jev never sees a name the cheap
     // checks already refused.
@@ -321,7 +321,7 @@ pub async fn set_visibility(input: SetVisibilityInput, ctx: &Ctx<'_>) -> Result<
     let plan = super::plan_of(&ctx.state.pool, &app.owner_id).await?;
     apps::set_visibility(&ctx.state.pool, &app.id, visibility, &plan)
         .await
-        .map_err(|err| visibility_tool_error(&app.slug, err))?;
+        .map_err(|err| visibility_tool_error(&app.slug, err, &ctx.state.billing, &app.owner_id))?;
     // Visibility changes `X-Robots-Tag` and `/robots.txt`, which the edge
     // caches (robots.txt for hours): purge the host so the new answer is
     // what crawlers see. Best-effort, like the deploy and delete purges.
@@ -337,15 +337,25 @@ pub async fn set_visibility(input: SetVisibilityInput, ctx: &Ctx<'_>) -> Result<
 /// MCP `isError` and the console HTTP body carry the same code and user
 /// message. Free owners get `payment_required` with a user message pointing
 /// to Pro; switching back to `unlisted` never reaches this gate.
-pub fn visibility_tool_error(slug: &str, err: crate::apps::VisibilityError) -> ToolError {
+/// `billing` + `owner_id` supply the `upgrade_url` the refusal carries.
+pub fn visibility_tool_error(
+    slug: &str,
+    err: crate::apps::VisibilityError,
+    billing: &crate::billing::BillingState,
+    owner_id: &str,
+) -> ToolError {
     match err {
-        crate::apps::VisibilityError::ProOnly => ToolError::new(
-            "payment_required",
-            format!("{slug} is on a Free account; public apps are a Pro feature"),
-        )
-        .with_user(format!(
-            "Public apps are Pro. Upgrade to Pro to make {slug} public; switching back to unlisted is always free.",
-        )),
+        crate::apps::VisibilityError::ProOnly => super::with_upgrade(
+            ToolError::new(
+                "payment_required",
+                format!("{slug} is on a Free account; public apps are a Pro feature"),
+            )
+            .with_user(format!(
+                "Public apps are Pro. Upgrade to Pro to make {slug} public; switching back to unlisted is always free.",
+            )),
+            billing,
+            owner_id,
+        ),
         crate::apps::VisibilityError::Internal(err) => internal(err),
     }
 }
@@ -360,7 +370,7 @@ pub async fn set_always_on(input: SetAlwaysOnInput, ctx: &Ctx<'_>) -> Result<Val
     let plan = super::plan_of(&ctx.state.pool, &app.owner_id).await?;
     apps::always_on::set_always_on(&ctx.state.pool, &app.id, input.on, &plan)
         .await
-        .map_err(|err| always_on_tool_error(&app.slug, err))?;
+        .map_err(|err| always_on_tool_error(&app.slug, err, &ctx.state.billing, &app.owner_id))?;
     Ok(ok(
         if input.on {
             format!("{} stays awake from now on.", app.slug)
@@ -373,15 +383,25 @@ pub async fn set_always_on(input: SetAlwaysOnInput, ctx: &Ctx<'_>) -> Result<Val
 
 /// Map the shared keep-warm refusal to the error both surfaces return:
 /// Free owners get `payment_required`; turning the flag off never fails.
-pub fn always_on_tool_error(slug: &str, err: crate::apps::always_on::AlwaysOnError) -> ToolError {
+/// `billing` + `owner_id` supply the `upgrade_url` the refusal carries.
+pub fn always_on_tool_error(
+    slug: &str,
+    err: crate::apps::always_on::AlwaysOnError,
+    billing: &crate::billing::BillingState,
+    owner_id: &str,
+) -> ToolError {
     match err {
-        crate::apps::always_on::AlwaysOnError::ProOnly { .. } => ToolError::new(
-            "payment_required",
-            format!("{slug} is on a Free account; keeping apps warm is a Pro feature"),
-        )
-        .with_user(format!(
-            "Keeping {slug} warm is Pro. Upgrade to Pro so it never sleeps; turning the flag off is always free.",
-        )),
+        crate::apps::always_on::AlwaysOnError::ProOnly { .. } => super::with_upgrade(
+            ToolError::new(
+                "payment_required",
+                format!("{slug} is on a Free account; keeping apps warm is a Pro feature"),
+            )
+            .with_user(format!(
+                "Keeping {slug} warm is Pro. Upgrade to Pro so it never sleeps; turning the flag off is always free.",
+            )),
+            billing,
+            owner_id,
+        ),
         crate::apps::always_on::AlwaysOnError::Internal(err) => internal(err),
     }
 }
@@ -495,7 +515,8 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     // the maintenance drain finishes them), so an error always means the
     // rename never happened — while a committed rename counts even when
     // its redeploy fails or is blocked.
-    let claim = super::claim_change(&ctx.state.pool, &caller.account_id).await?;
+    let claim =
+        super::claim_change(&ctx.state.pool, &ctx.state.billing, &caller.account_id).await?;
     // Serialize against a racing rollback, deploy and wake, on both slugs:
     // the wake pair sorts by slug so two renames can never ABBA.
     let rollback = ctx.state.rollback_locks.lock(&app.id).await;

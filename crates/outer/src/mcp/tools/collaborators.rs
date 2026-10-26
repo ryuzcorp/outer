@@ -65,26 +65,34 @@ pub async fn add_collaborator(
                 "collaborator": collaborator_json(&collaborator),
             }),
         )),
-        Err(AddError::NotPro) => Err(ToolError::payment_required(
-            format!("collaborators on {} need a Pro owner", app.slug),
-            "Collaborators are a Pro feature. Upgrade to Pro to invite people to your apps.",
+        Err(AddError::NotPro) => Err(super::with_upgrade(
+            ToolError::payment_required(
+                format!("collaborators on {} need a Pro owner", app.slug),
+                "Collaborators are a Pro feature. Upgrade to Pro to invite people to your apps.",
+            ),
+            &ctx.state.billing,
+            &app.owner_id,
         )),
-        Err(AddError::LimitReached) => Err(ToolError::quota_exceeded(
-            format!(
-                "app quota: {} collaborators allowed, {} on {}",
+        Err(AddError::LimitReached) => Err(super::with_upgrade(
+            ToolError::quota_exceeded(
+                format!(
+                    "app quota: {} collaborators allowed, {} on {}",
+                    collaborators::MAX_COLLABORATORS,
+                    collaborators::MAX_COLLABORATORS,
+                    app.slug
+                ),
+                format!(
+                    "{} already has the maximum {} collaborators.",
+                    app.slug,
+                    collaborators::MAX_COLLABORATORS
+                ),
+                "collaborators",
                 collaborators::MAX_COLLABORATORS,
                 collaborators::MAX_COLLABORATORS,
-                app.slug
+                None,
             ),
-            format!(
-                "{} already has the maximum {} collaborators.",
-                app.slug,
-                collaborators::MAX_COLLABORATORS
-            ),
-            "collaborators",
-            collaborators::MAX_COLLABORATORS,
-            collaborators::MAX_COLLABORATORS,
-            None,
+            &ctx.state.billing,
+            &app.owner_id,
         )),
         Err(AddError::InvalidEmail(_)) => Err(ToolError::invalid_argument(format!(
             "{:?} is not an address that can be invited to {}",

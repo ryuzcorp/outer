@@ -83,6 +83,9 @@ async fn api_account(State(state): State<super::AppState>, headers: HeaderMap) -
                 "email": summary.email,
                 "plan": summary.plan,
                 "plan_status": summary.plan_status,
+                "grace_until": summary.grace_until,
+                "has_customer": summary.has_customer,
+                "billing_enabled": mcp.billing.enabled(),
                 "member_since": summary.member_since,
                 "usage": {
                     "apps_owned": summary.apps_owned,
@@ -898,8 +901,15 @@ mod tests {
 
         // Two claimed changes plus one refunded: the summary must read 1,
         // exactly what `changes_used_today` computes for the quota check.
-        crate::mcp::tools::claim_change(&pool, &id).await.unwrap();
-        crate::mcp::tools::claim_change(&pool, &id).await.unwrap();
+        let billing = crate::billing::BillingState::Disabled {
+            platform_base: "http://outer.localhost".to_string(),
+        };
+        crate::mcp::tools::claim_change(&pool, &billing, &id)
+            .await
+            .unwrap();
+        crate::mcp::tools::claim_change(&pool, &billing, &id)
+            .await
+            .unwrap();
         crate::mcp::tools::refund_change(&pool, &id).await.unwrap();
         sqlx::query("INSERT INTO usage_month (userId, month, requests, storage_peak_bytes, egress_bytes) VALUES (?1, ?2, 7, 9, 11)")
             .bind(&id)

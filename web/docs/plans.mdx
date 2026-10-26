@@ -28,12 +28,31 @@ when it resets.
 live version or any earlier commit — from `export_code` or Settings →
 Export code. Owner only, links good for one hour.
 
-:::note
-Billing is coming — checkout, the customer portal and webhooks are not live
-yet, so every account is on Free during the closed beta. Collaborators, code
-export and custom domains arrive with billing in M2.
-:::
+## Billing
 
+Pro is **$8/month**. Early users get a **50% launch discount ($4/month)**
+through a Stripe coupon that's applied automatically at checkout while the
+promo is on. Taxes are calculated by Stripe Tax at checkout. The only way
+to pay is the Upgrade button (console → Plan) or the `upgrade` MCP tool:
+both open a Stripe Checkout page, and the plan lifts on the next call
+after payment. Nothing else upgrades an account.
+
+Manage the subscription (update the card, cancel) from the Plan card's
+Manage billing button or the `manage_billing` MCP tool: both open a
+Stripe Customer Portal page.
+
+:::::note
+A missed payment starts a **7-day grace period** as Pro (emails on day 0
+and day 5), then the account returns to Free. On downgrade the **oldest
+app stays live** and the rest stop, stamped with the downgrade date:
+stopped apps are **purged 30 days later** (warning email around day 23),
+through the same delete path as `delete_app`. The downgrade also deletes
+every custom hostname and returns public apps to unlisted. Code and data
+stay; Pro behaviors pause: collaborator access and keep-warm apply again
+on resubscribe (collaborators stay on the list, and re-upgrading before
+day 30 cancels the purge but restarts nothing), and a deploy using
+Pro-only bindings fails with a clear error until they're removed.
+:::::
 ## When a limit is hit
 
 Change, build, app and collaborator limits are hard refusals: the tool

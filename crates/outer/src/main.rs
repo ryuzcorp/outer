@@ -701,7 +701,38 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         },
         secrets_key,
         unsub_key: config.outer_secret.as_bytes().to_vec(),
+        billing: outer::billing::BillingState::from_config(
+            &config.stripe,
+            // The platform base URL the checkout-starter links and
+            // webhook mails point at: scheme + platform host (+ port
+            // off the default, localhost dev only).
+            format!(
+                "{}://{}{}",
+                scheme(&config),
+                config.domain,
+                port_suffix(config.listen, config.tls_enabled())
+            ),
+            config.outer_secret.as_bytes().to_vec(),
+        )?,
     };
+    // Past-due grace (spec §14.2): day-5 reminders and the downgrade at
+    // day 7, plus the downgrade-retention pass (day-23 warnings, day-30
+    // purges). A missed tick only delays mail and the downgrade; the next
+    // tick catches up.
+    outer::billing::spawn_grace_sweep(
+        mcp.billing.clone(),
+        pool.clone(),
+        mcp.auth.config.email.clone(),
+        outer::billing::RetentionDeps {
+            store: store.clone(),
+            git: git.clone(),
+            sync: git_sync.clone(),
+            fleets: fleets.clone(),
+            deploys: mcp.deploys.clone(),
+            rollback_locks: mcp.rollback_locks.clone(),
+            delete_cfg: mcp.delete_cfg.clone(),
+        },
+    );
     // Email alerts (wave 3, feature #2): error spikes are evaluated from
     // `error_issue` every five minutes; deploy failures and quota
     // thresholds notify inline at their trigger sites.

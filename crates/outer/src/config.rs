@@ -71,6 +71,42 @@ impl std::fmt::Debug for CloudflareConfig {
     }
 }
 
+/// Stripe billing credentials (spec §14.2, §18). Every field arrives under
+/// one `STRIPE_*` name and is read here, the only env reader. All four
+/// empty on a localhost dev domain means billing is disabled: checkout,
+/// portal and the webhook refuse cleanly and refusals point at the console
+/// plan card instead of a checkout link. Off localhost the secret, webhook
+/// secret and Pro price are required; the launch coupon is optional (unset
+/// ends the promo, and existing subscribers keep their couponed price).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeConfig {
+    /// `STRIPE_SECRET_KEY` (`sk_…`): creating Checkout and Portal sessions.
+    pub secret_key: Option<String>,
+    /// `STRIPE_WEBHOOK_SECRET` (`whsec_…`): verifying `Stripe-Signature`.
+    pub webhook_secret: Option<String>,
+    /// `STRIPE_PRICE_PRO` (`price_…`): the $8/month Pro price.
+    pub price_pro: Option<String>,
+    /// `STRIPE_LAUNCH_COUPON` (optional): the 50 % launch coupon applied at
+    /// checkout while set.
+    pub launch_coupon: Option<String>,
+}
+
+impl StripeConfig {
+    /// True when billing can run: secret, webhook secret and price present.
+    /// A set coupon alone never enables anything.
+    pub fn enabled(&self) -> bool {
+        self.secret_key.is_some() && self.webhook_secret.is_some() && self.price_pro.is_some()
+    }
+
+    /// True when nothing billing-related is configured (localhost dev).
+    pub fn empty(&self) -> bool {
+        self.secret_key.is_none()
+            && self.webhook_secret.is_none()
+            && self.price_pro.is_none()
+            && self.launch_coupon.is_none()
+    }
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -90,7 +126,7 @@ impl std::fmt::Debug for Config {
             .field("outer_secret", &"<redacted>")
             .field("oauth_access_ttl", &self.oauth_access_ttl)
             .field("oauth_refresh_ttl", &self.oauth_refresh_ttl)
-            .field("tool_wait", &self.tool_wait)
+            .field("stripe", &"<redacted>")
             .field("oxfmt_bin", &self.oxfmt_bin)
             .field("log_filter", &self.log_filter)
             .field("runtime", &self.runtime)
@@ -155,6 +191,10 @@ pub struct Config {
     pub oxfmt_bin_explicit: bool,
     /// Log filter directives (`RUST_LOG`, default `info`).
     pub log_filter: String,
+    /// Stripe billing (`STRIPE_*`): `None` fields mean billing is disabled
+    /// (localhost dev). Off localhost the secret, webhook secret and Pro
+    /// price are required.
+    pub stripe: StripeConfig,
     /// Running apps: allocation ranges, binaries, limits, sleep.
     pub runtime: RuntimeConfig,
 }
@@ -368,6 +408,13 @@ impl Config {
             ));
         }
 
+        let stripe = StripeConfig {
+            secret_key: get("STRIPE_SECRET_KEY").map(str::to_string),
+            webhook_secret: get("STRIPE_WEBHOOK_SECRET").map(str::to_string),
+            price_pro: get("STRIPE_PRICE_PRO").map(str::to_string),
+            launch_coupon: get("STRIPE_LAUNCH_COUPON").map(str::to_string),
+        };
+
         let runtime = RuntimeConfig {
             apps_domain: get("OUTER_APPS_DOMAIN")
                 .unwrap_or(domain.as_str())
@@ -462,6 +509,7 @@ impl Config {
             )),
             oxfmt_bin_explicit: get("OUTER_OXFMT_BIN").is_some(),
             log_filter,
+            stripe,
             runtime,
         };
         problems.extend(config.validate());
@@ -533,6 +581,35 @@ impl Config {
  .to_string(),
  );
         }
+        // Stripe billing (spec §14.2, §18): localhost dev runs disabled
+        // (all four empty); off localhost the secret, webhook secret and
+        // Pro price are required, and a half-set triple is a
+        // misconfiguration either way. The launch coupon is optional: set
+        // applies the 50 % promo at checkout, unset ends it (existing
+        // subscribers keep their couponed price, spec Q4).
+        if !self.is_local() {
+            for (name, present) in [
+                ("STRIPE_SECRET_KEY", self.stripe.secret_key.is_some()),
+                (
+                    "STRIPE_WEBHOOK_SECRET",
+                    self.stripe.webhook_secret.is_some(),
+                ),
+                ("STRIPE_PRICE_PRO", self.stripe.price_pro.is_some()),
+            ] {
+                if !present {
+                    problems.push(format!(
+                        "{name} is required when OUTER_DOMAIN={} is not a localhost dev domain (Stripe Tax checkout, portal and webhooks)",
+                        self.domain
+                    ));
+                }
+            }
+        } else if !self.stripe.empty() && !self.stripe.enabled() {
+            problems.push(
+                "partial Stripe config: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET and STRIPE_PRICE_PRO must all be set or all be empty (STRIPE_LAUNCH_COUPON is optional)"
+                    .to_string(),
+            );
+        }
+
         if self.oauth_access_ttl.is_zero() {
             problems.push("OUTER_OAUTH_ACCESS_TTL_S must be at least 1".to_string());
         }
@@ -847,6 +924,10 @@ mod tests {
             ("OUTER_ADMIN_EMAILS", " Owner@Example.com ,"),
             ("OUTER_SIGNUP", "closed"),
             ("OUTER_SECRET", "test-outer-secret"),
+            ("STRIPE_SECRET_KEY", "sk_test_1"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_test"),
+            ("STRIPE_PRICE_PRO", "price_pro"),
+            ("STRIPE_LAUNCH_COUPON", "coupon_test"),
         ]))
         .unwrap();
         let StoreKind::R2(r2) = &cfg.store else {
@@ -863,8 +944,11 @@ mod tests {
         assert_eq!(cfg.oauth_access_ttl, Duration::from_secs(3600));
         assert_eq!(cfg.oauth_refresh_ttl, Duration::from_secs(90 * 86400));
         let shown = format!("{cfg:?}");
+        assert!(cfg.stripe.enabled());
         assert!(!shown.contains("s3cret"), "{shown}");
         assert!(!shown.contains("cf-token"), "{shown}");
+        assert!(!shown.contains("sk_test_1"), "{shown}");
+        assert!(!shown.contains("whsec_test"), "{shown}");
         assert!(!shown.contains("test-outer-secret"), "{shown}");
     }
 

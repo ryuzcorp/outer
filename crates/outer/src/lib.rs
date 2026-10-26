@@ -7,6 +7,7 @@ pub mod accounts;
 pub mod alerts;
 pub mod apps;
 pub mod auth;
+pub mod billing;
 pub mod browser;
 pub mod cloudflare;
 pub mod collaborators;

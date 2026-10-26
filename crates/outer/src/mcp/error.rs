@@ -50,6 +50,16 @@ impl ToolError {
         Self::new("forbidden", message)
     }
 
+    /// The checkout-starter link every `payment_required` and
+    /// `quota_exceeded` refusal carries (spec §3, §8.3): a per-account
+    /// link that lands on Stripe Checkout when billing is live, the
+    /// console plan card when it is disabled (localhost dev).
+    pub fn with_upgrade_url(mut self, url: impl Into<String>) -> Self {
+        self.extra
+            .insert("upgrade_url".to_string(), json!(url.into()));
+        self
+    }
+
     pub fn payment_required(message: impl Into<String>, user_message: impl Into<String>) -> Self {
         Self::new("payment_required", message).with_user(user_message)
     }
@@ -145,7 +155,14 @@ impl ToolError {
 
     /// Map app-creation failures. A taken slug is the agent's to fix, so it
     /// is `invalid_argument`, not `conflict` (no `current_sha` exists).
-    pub fn from_create(err: crate::apps::CreateError, plan: &str) -> Self {
+    /// `billing` + `account_id` supply the `upgrade_url` the quota refusal
+    /// carries (spec §8.3).
+    pub fn from_create(
+        err: crate::apps::CreateError,
+        plan: &str,
+        billing: &crate::billing::BillingState,
+        account_id: &str,
+    ) -> Self {
         use crate::apps::CreateError as E;
         match err {
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
@@ -161,7 +178,8 @@ impl ToolError {
                 limit,
                 used,
                 None,
-            ),
+            )
+            .with_upgrade_url(billing.upgrade_url(account_id, chrono::Utc::now().timestamp())),
             E::Internal(e) => {
                 tracing::warn!("create_app internal: {e:#}");
                 Self::internal("creating the app failed on our side; try again in a minute")

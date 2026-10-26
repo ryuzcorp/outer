@@ -212,7 +212,14 @@ async fn set_app_visibility(
     let plan = plan_of(&mcp.pool, &app.owner_id).await?;
     crate::apps::set_visibility(&mcp.pool, &app.id, visibility, &plan)
         .await
-        .map_err(|err| crate::mcp::tools::apps::visibility_tool_error(&app.slug, err))?;
+        .map_err(|err| {
+            crate::mcp::tools::apps::visibility_tool_error(
+                &app.slug,
+                err,
+                &mcp.billing,
+                &app.owner_id,
+            )
+        })?;
     // Same purge as the MCP tool: visibility changes `X-Robots-Tag` and
     // `/robots.txt`, which the edge caches for hours.
     let host = format!("{}.{}", app.slug, mcp.delete_cfg.apps_domain);
@@ -253,7 +260,14 @@ async fn set_app_always_on(
     let plan = plan_of(&mcp.pool, &app.owner_id).await?;
     crate::apps::always_on::set_always_on(&mcp.pool, &app.id, on, &plan)
         .await
-        .map_err(|err| crate::mcp::tools::apps::always_on_tool_error(&app.slug, err))?;
+        .map_err(|err| {
+            crate::mcp::tools::apps::always_on_tool_error(
+                &app.slug,
+                err,
+                &mcp.billing,
+                &app.owner_id,
+            )
+        })?;
     Ok(json!({"always_on": on}))
 }
 
@@ -598,7 +612,7 @@ async fn api_rename(
         audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
         return tool_response(&err);
     }
-    if let Err(err) = claim_change(&mcp.pool, &account.id).await {
+    if let Err(err) = claim_change(&mcp.pool, &mcp.billing, &account.id).await {
         audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
         return tool_response(&err);
     }

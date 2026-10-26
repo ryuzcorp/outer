@@ -350,6 +350,9 @@ export interface AccountSummary {
   email: string;
   plan: string;
   plan_status: string | null;
+  grace_until: number | null;
+  has_customer: boolean;
+  billing_enabled: boolean;
   member_since: number;
   usage: AccountUsage;
   alerts: AlertPrefs;
