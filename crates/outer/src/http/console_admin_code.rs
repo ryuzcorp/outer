@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use super::console::{admin_guard, nostore_json, not_found};
+use super::console::admin_guard;
 use super::console_code::{compare_for, diff_for, file_for, history_for, tree_for};
 use super::AppState;
 use crate::auth::AccountRow;
@@ -43,24 +43,21 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// The session plus the admin check, plus the app by slug with no role
-/// gate: admins may inspect any app's code read-only. Unknown slugs
-/// answer 404 like the role-scoped routes.
+/// The session plus the admin check, plus the app through the single
+/// Console authorization point ([`super::console::authorized_app`]): the
+/// admin needs a recent session (step-up) for apps they have no role on,
+/// audited per read below. Unknown slugs answer 404 like the role-scoped
+/// routes; non-admins keep the `admin_guard` 403 like the other admin
+/// endpoints. Reads audit themselves, so no read label.
 async fn admin_app(
     mcp: &McpState,
     headers: &HeaderMap,
     slug: &str,
 ) -> Result<(AccountRow, crate::apps::App), Box<Response>> {
     let account = admin_guard(&mcp.auth, headers).await?;
-    match crate::apps::get_by_slug(&mcp.pool, slug).await {
-        Ok(Some(app)) => Ok((account, app)),
-        Ok(None) => Err(not_found().into()),
-        Err(_) => Err(nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+    match super::console::authorized_app(mcp, &account, headers, slug, None).await {
+        Ok(authz) => Ok((authz.account, authz.app)),
+        Err(res) => Err(res),
     }
 }
 
@@ -87,7 +84,7 @@ async fn audit(
         &app.id,
         &account.id,
         tool,
-        &format!("admin_code {tool} {}", app.slug),
+        &super::console::audit_summary(account, &format!("admin_code {tool} {}", app.slug), true),
         outcome,
         code,
         crate::auth::now_ms() - started,

@@ -902,7 +902,10 @@ export function Console() {
     );
   }
 
-  if (list.length === 0 && !accountView) {
+  // admin-all-apps branch: a pure admin owns no apps, so the rail is empty;
+  // when they open an app from the directory, the loaded detail (not the
+  // rail) decides — otherwise every foreign app renders "No apps yet".
+  if (list.length === 0 && !accountView && detailPanel.kind !== "ready") {
     return (
       <div class="console-empty" role="status">
         <OuterMark size={28} />
@@ -953,6 +956,7 @@ export function Console() {
       onRetry={reloadAccount}
       onMutated={reloadAccount}
       onOpenCode={(slug, sha) => navigate({ app: slug, view: "code", sha })}
+      onOpenApp={(slug) => navigate({ app: slug, view: "overview" })}
     />
   );
   const accountPanel = accountView ? (r.view === "admin" ? adminPanel : hubPanel) : null;
@@ -1294,10 +1298,12 @@ export function Console() {
                         <button
                           type="button"
                           class="btn btn-sm min-w-0 max-w-full shrink-0"
-                          onclick={() => navigate({ app: list[0].slug, view: "overview" })}
+                          // admin-all-apps branch: a pure admin has no rail apps;
+                          // back out to the directory instead of crashing on list[0].
+                          onclick={() => navigate(list.length > 0 ? { app: list[0].slug, view: "overview" } : { app: null, view: "admin" })}
                         >
-                          <span class="truncate" title={`Back to ${list[0].slug}`}>
-                            Back to {list[0].slug}
+                          <span class="truncate" title={list.length > 0 ? `Back to ${list[0].slug}` : "Back to Admin"}>
+                            {list.length > 0 ? `Back to ${list[0].slug}` : "Back to Admin"}
                           </span>
                         </button>
                       </div>

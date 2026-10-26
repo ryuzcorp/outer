@@ -19,8 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::console::{
-    fetch_ok, guard, nostore_json, nostore_json_refusal, nostore_json_user, not_found, ok_json,
-    visible_app,
+    fetch_ok, guard, nostore_json, nostore_json_refusal, nostore_json_user, ok_json,
 };
 use crate::auth::AccountRow;
 use crate::collaborators::{self, AddError, Role};
@@ -70,17 +69,15 @@ async fn api_collaborators(
             "same-origin requests only",
         );
     }
-    let (app, role) = match visible_app(mcp, &account, &slug).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
-    };
+    let authz =
+        match super::console::authorized_app(mcp, &account, &headers, &slug, Some("collaborators"))
+            .await
+        {
+            Ok(authz) => authz,
+            Err(res) => return *res,
+        };
+    let app = authz.app;
+    let role = authz.role;
     let rows = match collaborators::list(&mcp.pool, &app.id).await {
         Ok(rows) => rows,
         Err(_) => {
@@ -106,28 +103,25 @@ async fn api_collaborators(
 }
 
 /// The owner check behind the two mutations: no role reads 404 (spec §8.2),
-/// a collaborator reads 403 (spec §8.2 table: owner-only).
+/// a collaborator reads 403 (spec §8.2 table: owner-only). The admin
+/// override reports the owner role, so admins pass this check.
 async fn owner_app(
     mcp: &McpState,
     account: &AccountRow,
+    headers: &HeaderMap,
     slug: &str,
-) -> Result<crate::apps::App, Box<Response>> {
-    match visible_app(mcp, account, slug).await {
-        Ok(Some((app, Role::Owner))) => Ok(app),
-        Ok(Some(_)) => Err(nostore_json_user(
+) -> Result<(crate::apps::App, bool), Box<Response>> {
+    // Mutations audit themselves, so no read label.
+    match super::console::authorized_app(mcp, account, headers, slug, None).await {
+        Ok(authz) if authz.role == Role::Owner => Ok((authz.app, authz.admin)),
+        Ok(_) => Err(nostore_json_user(
             StatusCode::FORBIDDEN,
             "forbidden",
             "only the app owner manages collaborators",
             "Only the app owner can invite or remove collaborators.",
         )
         .into()),
-        Ok(None) => Err(not_found().into()),
-        Err(_) => Err(nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+        Err(res) => Err(res),
     }
 }
 
@@ -157,8 +151,8 @@ async fn api_invite(
             "that address is not usable",
         );
     }
-    let app = match owner_app(mcp, &account, &slug).await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &account, &headers, &slug).await {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     match collaborators::add(
@@ -177,7 +171,11 @@ async fn api_invite(
                 &app.id,
                 &account.id,
                 "add_collaborator",
-                &format!("add_collaborator {}", collaborator.email),
+                &super::console::audit_summary(
+                    &account,
+                    &format!("add_collaborator {}", collaborator.email),
+                    admin,
+                ),
                 "ok",
                 None,
                 0,
@@ -249,8 +247,8 @@ async fn api_remove(
             "same-origin requests only",
         );
     }
-    let app = match owner_app(mcp, &account, &slug).await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &account, &headers, &slug).await {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     let email = crate::auth::normalize_email(&body.email);
@@ -261,7 +259,11 @@ async fn api_remove(
                 &app.id,
                 &account.id,
                 "remove_collaborator",
-                &format!("remove_collaborator {email}"),
+                &super::console::audit_summary(
+                    &account,
+                    &format!("remove_collaborator {email}"),
+                    admin,
+                ),
                 "ok",
                 None,
                 0,

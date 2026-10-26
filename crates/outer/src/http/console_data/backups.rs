@@ -77,8 +77,17 @@ async fn api_list(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_backups"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     if binding.len() > 128 {
@@ -115,8 +124,9 @@ async fn api_backup_now(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &headers, &account, &slug, "this database", None).await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     if binding.len() > 128 {
@@ -154,7 +164,7 @@ async fn api_backup_now(
         &app.id,
         &account.id,
         "d1_backup",
-        &summary,
+        &crate::http::console::audit_summary(&account, &summary, admin),
         o,
         code,
         started.elapsed().as_millis().min(i64::MAX as u128) as i64,
@@ -173,8 +183,17 @@ async fn api_download(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_backups"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     let outcome = async {
@@ -230,8 +249,9 @@ async fn api_restore(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &headers, &account, &slug, "this database", None).await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     // A restore rewrites live tables, so a frozen app refuses it like any
@@ -283,7 +303,7 @@ async fn api_restore(
         &app.id,
         &account.id,
         "d1_restore",
-        &summary,
+        &crate::http::console::audit_summary(&account, &summary, admin),
         o,
         code,
         started.elapsed().as_millis().min(i64::MAX as u128) as i64,

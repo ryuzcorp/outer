@@ -28,31 +28,29 @@ pub fn routes() -> Router<super::AppState> {
 /// The session plus the visible app, plus the explicit owner check: exports
 /// are owner-only (spec §7.5), so a collaborator reads 403 with the same
 /// code and user message the MCP tool answers — never 404 (spec §8.2
-/// reserves 404 for slugs the caller has no role on).
+/// reserves 404 for slugs the caller has no role on). The admin override
+/// reports the owner role, so admins pass this check. Export audits itself,
+/// so no read label.
 async fn owner_app(
     mcp: &crate::mcp::McpState,
     headers: &HeaderMap,
     slug: &str,
-) -> Result<(crate::auth::AccountRow, crate::apps::App), Box<Response>> {
+) -> Result<(crate::auth::AccountRow, crate::apps::App, bool), Box<Response>> {
     use crate::mcp::error::ToolError;
     let account = match super::console::guard(&mcp.auth, headers).await {
         Ok(account) => account,
         Err(res) => return Err(res),
     };
-    match super::console::visible_app(mcp, &account, slug).await {
-        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok((account, app)),
-        Ok(Some(_)) => Err(super::console_actions::tool_response(
+    match super::console::authorized_app(mcp, &account, headers, slug, None).await {
+        Ok(authz) if authz.role == crate::collaborators::Role::Owner => {
+            Ok((authz.account, authz.app, authz.admin))
+        }
+        Ok(_) => Err(super::console_actions::tool_response(
             &ToolError::forbidden(format!("only the app owner may export {slug:?} this way"))
                 .with_user("Only the app owner can do that. Collaborators can read and deploy, but not change these settings."),
         )
         .into()),
-        Ok(None) => Err(super::console::not_found().into()),
-        Err(_) => Err(super::console::nostore_json(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+        Err(res) => Err(res),
     }
 }
 
@@ -73,7 +71,7 @@ async fn api_export(
 ) -> Response {
     use crate::mcp::error::ToolError;
     let started = Instant::now();
-    let (account, app) = match owner_app(&state.mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_app(&state.mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -114,7 +112,7 @@ async fn api_export(
         &app.id,
         &account.id,
         "export_code",
-        &format!("export_code {}", app.slug),
+        &super::console::audit_summary(&account, &format!("export_code {}", app.slug), admin),
         outcome_str,
         error_code,
         started.elapsed().as_millis().min(u128::from(u64::MAX)) as i64,

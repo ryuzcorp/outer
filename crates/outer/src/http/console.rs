@@ -88,7 +88,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/apps/{slug}/secrets", get(api_secrets))
         .merge(super::console_actions::routes())
         .merge(super::console_code::routes())
-        .merge(super::console_admin_code::routes())
+        .merge(super::console_admin_apps::routes())
         .merge(super::console_domains::routes())
         .merge(super::console_export::routes())
         .route("/api/console/sign-out", post(api_sign_out))
@@ -230,6 +230,176 @@ pub(crate) async fn visible_app(
     )
     .await?;
     Ok(role.map(|role| (app, role)))
+}
+/// What the caller may do with one app through the Console.
+pub(crate) struct AuthorizedApp {
+    pub account: AccountRow,
+    pub app: crate::apps::App,
+    pub role: crate::collaborators::Role,
+    /// `true` when access comes from the admin override below (an admin
+    /// acting on an app they neither own nor collaborate on). Handlers use
+    /// this to attribute the audit row to the admin and to charge the app
+    /// owner's plan, never the admin's.
+    pub admin: bool,
+}
+
+/// Cap on admin-override accesses per admin per hour (reads and mutations
+/// share it; it comfortably covers polling a few app views).
+const ADMIN_ACT_LIMIT: u32 = 5_000;
+const ADMIN_ACT_WINDOW_MS: i64 = 3_600_000;
+
+/// Mark an audit summary as an admin act so the app's owner can tell it
+/// apart in the activity log: `admin <email>: <summary>`. The `user_id`
+/// column already carries the admin; the prefix makes it visible where the
+/// log is rendered (the actions endpoint has no actor field).
+pub(crate) fn audit_summary(account: &AccountRow, summary: &str, admin: bool) -> String {
+    if admin {
+        format!("admin {}: {summary}", account.email)
+    } else {
+        summary.to_string()
+    }
+}
+/// Whose plan and quota a mutation charges: the app owner's when an admin
+/// acts through the override, else the caller's. For owners the two are the
+/// same account, so non-admin behavior is unchanged.
+pub(crate) fn billing_id<'a>(
+    account: &'a AccountRow,
+    app: &'a crate::apps::App,
+    admin: bool,
+) -> &'a str {
+    if admin {
+        &app.owner_id
+    } else {
+        &account.id
+    }
+}
+
+/// The single authorization point for Console app access (spec §15.3 admin
+/// model): the owner/collaborator roles from [`visible_app`] as before, plus
+/// one admin override. An admin whose session started inside
+/// [`crate::auth::ADMIN_STEP_UP_MS`] (a fresh sign-in mints a fresh session
+/// row) gets owner-equivalent access to any app. MCP tool calls never pass
+/// through here, so the override is Console-only by construction.
+///
+/// `read_action` labels the audit row for a read (`None` for mutations: the
+/// handler audits those itself). Reads on the caller's own apps are not
+/// audited, exactly like today.
+pub(crate) async fn authorized_app(
+    mcp: &McpState,
+    account: &AccountRow,
+    headers: &HeaderMap,
+    slug: &str,
+    read_action: Option<&'static str>,
+) -> Result<AuthorizedApp, Box<Response>> {
+    match visible_app(mcp, account, slug).await {
+        Ok(Some((app, role))) => Ok(AuthorizedApp {
+            account: account.clone(),
+            app,
+            role,
+            admin: false,
+        }),
+        Ok(None) => {
+            if !crate::auth::is_admin(&mcp.auth.config, &account.email) {
+                return Err(not_found().into());
+            }
+            // Step-up: the admin must have signed in recently. The sign-in
+            // flow mints a new session, so this turns into "sign in again".
+            let created_at = match crate::auth::session_from_headers(headers) {
+                Some(session) => crate::auth::session_created_at(&mcp.pool, &session)
+                    .await
+                    .map_err(|_| {
+                        Box::new(nostore_json(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "unavailable",
+                            "could not check the session right now",
+                        ))
+                    })?,
+                None => None,
+            };
+            let fresh = created_at.is_some_and(|created_at| {
+                crate::auth::now_ms() - created_at <= crate::auth::ADMIN_STEP_UP_MS
+            });
+            if !fresh {
+                return Err(nostore_json_user(
+                    StatusCode::UNAUTHORIZED,
+                    "reverify",
+                    "admin session is stale; sign in again",
+                    "Sign in again to continue viewing apps as an admin.",
+                )
+                .into());
+            }
+            admin_rate_limit(&mcp.pool, &account.email).await?;
+            let Some(app) = crate::apps::get_by_slug(&mcp.pool, slug)
+                .await
+                .map_err(|_| {
+                    Box::new(nostore_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "unavailable",
+                        "could not load the app right now",
+                    ))
+                })?
+            else {
+                return Err(not_found().into());
+            };
+            if let Some(action) = read_action {
+                crate::mcp::actions::record_console(
+                    &mcp.pool,
+                    &app.id,
+                    &account.id,
+                    action,
+                    &format!("admin {}: {action} {slug}", account.email),
+                    "ok",
+                    None,
+                    0,
+                )
+                .await;
+            }
+            Ok(AuthorizedApp {
+                account: account.clone(),
+                app,
+                role: crate::collaborators::Role::Owner,
+                admin: true,
+            })
+        }
+        Err(_) => Err(nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not load the app right now",
+        )
+        .into()),
+    }
+}
+
+/// The per-admin rate limit for override accesses (both directions of the
+/// `rate_limit_events` ledger's subject/action pair). Over the limit answers
+/// 429; a ledger failure answers 500 rather than silently skipping the
+/// limit.
+async fn admin_rate_limit(pool: &sqlx::SqlitePool, admin_email: &str) -> Result<(), Box<Response>> {
+    let now = crate::auth::now_ms();
+    match crate::auth::limits::check_and_record(
+        pool,
+        &format!("admin-act:{admin_email}"),
+        "console_admin_act",
+        ADMIN_ACT_LIMIT,
+        ADMIN_ACT_WINDOW_MS,
+        now,
+    )
+    .await
+    {
+        Ok(None) => Ok(()),
+        Ok(Some(retry_after_s)) => Err(nostore_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            &format!("slow down and try again in {retry_after_s}s"),
+        )
+        .into()),
+        Err(_) => Err(nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not check the rate limit right now",
+        )
+        .into()),
+    }
 }
 
 async fn api_me(State(state): State<super::AppState>, headers: HeaderMap) -> Response {
@@ -593,17 +763,12 @@ async fn api_app(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let (app, role) = match visible_app(mcp, &account, &slug).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("app")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
+    let role = authz.role;
     let last = latest_deploy(&mcp.pool, &app.id).await.unwrap_or(None);
     let status =
         crate::mcp::tools::apps::app_status(&app, last.as_ref().map(|r| r.status.as_str()));
@@ -696,6 +861,7 @@ async fn api_app(
     ) {
         v["deletes_at"] = json!(deletes_at);
     }
+    v["admin"] = json!(authz.admin);
     (
         StatusCode::OK,
         [
@@ -796,17 +962,11 @@ async fn api_logs(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let (app, _role) = match visible_app(mcp, &account, &slug).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("logs")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     let (filter, cursor, limit) = match logs_query(&query) {
         Ok(parsed) => parsed,
         Err(res) => return *res,
@@ -849,17 +1009,11 @@ async fn api_errors(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let (app, _role) = match visible_app(mcp, &account, &slug).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("errors")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     let status = query.get("status").map(String::as_str);
     if let Some(status) = status {
         if !matches!(status, "open" | "resolved" | "ignored") {
@@ -933,17 +1087,11 @@ async fn api_secrets(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let (app, _role) = match visible_app(mcp, &account, &slug).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load secrets right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("secrets")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     match crate::secrets::list(&mcp.pool, &app.id).await {
         Ok(secrets) => ok_json(json!({
             "secrets": secrets.iter().map(|s| json!({
@@ -976,17 +1124,11 @@ async fn api_actions(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let (app, _role) = match visible_app(mcp, &account, &slug).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("actions")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     let limit = query
         .get("limit")
         .and_then(|s| s.parse::<u64>().ok())
@@ -1043,7 +1185,7 @@ async fn api_actions(
 
 /// Parse the opaque `before` cursor back into the `(created_at, id)` pair
 /// that `actions::list` pages on. Anything else is a 400.
-fn parse_action_cursor(raw: &str) -> Option<(i64, String)> {
+pub(crate) fn parse_action_cursor(raw: &str) -> Option<(i64, String)> {
     let (at, id) = raw.split_once(':')?;
     let at: i64 = at.parse().ok()?;
     if at < 0 || id.is_empty() || id.contains(':') {
@@ -1053,7 +1195,7 @@ fn parse_action_cursor(raw: &str) -> Option<(i64, String)> {
 }
 
 /// Render one `actions::list` page edge as the opaque `before` cursor.
-fn action_cursor(created_at: i64, id: &str) -> String {
+pub(crate) fn action_cursor(created_at: i64, id: &str) -> String {
     format!("{created_at}:{id}")
 }
 
@@ -1070,17 +1212,11 @@ async fn api_metrics(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let (app, _role) = match visible_app(mcp, &account, &slug).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("metrics")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     let hours: i64 = match query.get("hours").and_then(|s| s.parse().ok()) {
         Some(hours @ (24 | 168 | 720)) => hours,
         _ => {

@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 
-use super::console::{guard, nostore_json, not_found, ok_json, visible_app};
+use super::console::{guard, nostore_json, ok_json};
 use crate::git::local;
 use crate::mcp::McpState;
 
@@ -54,22 +54,19 @@ const MAX_TREE_FILES: usize = 5000;
 
 /// The caller's app, or the response to answer when it isn't theirs. Reads
 /// admit collaborators (spec §7.4: code and history), so this is the shared
-/// role-scoped lookup: no role answers 404 exactly like a missing slug.
+/// role-scoped lookup: no role answers 404 exactly like a missing slug. An
+/// admin with a recent session reads any app here (see `authorized_app`),
+/// audited under `read_action`.
 async fn app_ctx(
     mcp: &McpState,
     headers: &HeaderMap,
     slug: &str,
+    read_action: &'static str,
 ) -> Result<crate::apps::App, Box<Response>> {
     let account = guard(&mcp.auth, headers).await?;
-    match visible_app(mcp, &account, slug).await {
-        Ok(Some((app, _))) => Ok(app),
-        Ok(None) => Err(not_found().into()),
-        Err(_) => Err(nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+    match super::console::authorized_app(mcp, &account, headers, slug, Some(read_action)).await {
+        Ok(authz) => Ok(authz.app),
+        Err(res) => Err(res),
     }
 }
 
@@ -131,7 +128,7 @@ async fn api_tree(
     Path(slug): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let app = match app_ctx(&state.mcp, &headers, &slug).await {
+    let app = match app_ctx(&state.mcp, &headers, &slug, "code_tree").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -202,7 +199,7 @@ async fn api_file(
     Path(slug): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let app = match app_ctx(&state.mcp, &headers, &slug).await {
+    let app = match app_ctx(&state.mcp, &headers, &slug, "code_file").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -327,7 +324,7 @@ async fn api_history(
     Path(slug): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Response {
-    let app = match app_ctx(&state.mcp, &headers, &slug).await {
+    let app = match app_ctx(&state.mcp, &headers, &slug, "code_history").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -400,7 +397,7 @@ async fn api_diff(
     Path(slug): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let app = match app_ctx(&state.mcp, &headers, &slug).await {
+    let app = match app_ctx(&state.mcp, &headers, &slug, "code_diff").await {
         Ok(app) => app,
         Err(res) => return *res,
     };
@@ -476,7 +473,7 @@ async fn api_compare(
     Path(slug): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let app = match app_ctx(&state.mcp, &headers, &slug).await {
+    let app = match app_ctx(&state.mcp, &headers, &slug, "code_compare").await {
         Ok(app) => app,
         Err(res) => return *res,
     };

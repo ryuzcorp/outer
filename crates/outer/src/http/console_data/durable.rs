@@ -250,7 +250,7 @@ async fn api_classes(
     headers: HeaderMap,
     State(state): State<super::AppState>,
 ) -> Response {
-    let (_account, app) = match console_app(&state, &headers, &slug).await {
+    let (_account, app, _) = match console_app(&state, &headers, &slug, Some("data_do")).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -266,7 +266,7 @@ async fn api_instances(
     State(state): State<super::AppState>,
     Query(query): Query<InstancesQuery>,
 ) -> Response {
-    let (_account, app) = match console_app(&state, &headers, &slug).await {
+    let (_account, app, _) = match console_app(&state, &headers, &slug, Some("data_do")).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -319,7 +319,7 @@ async fn api_probe(
     State(state): State<super::AppState>,
     Query(query): Query<ProbeQuery>,
 ) -> Response {
-    let (_account, app) = match console_app(&state, &headers, &slug).await {
+    let (_account, app, _) = match console_app(&state, &headers, &slug, Some("data_do")).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };

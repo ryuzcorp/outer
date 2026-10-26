@@ -582,7 +582,7 @@ async fn api_buckets(
     headers: HeaderMap,
     State(state): State<super::AppState>,
 ) -> Response {
-    let (_account, app) = match console_app(&state, &headers, &slug).await {
+    let (_account, app, _) = match console_app(&state, &headers, &slug, Some("data_r2")).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -622,7 +622,7 @@ async fn api_list(
     State(state): State<super::AppState>,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    let (account, app) = match console_app(&state, &headers, &slug).await {
+    let (account, app, _) = match console_app(&state, &headers, &slug, Some("data_r2")).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -693,7 +693,7 @@ async fn api_file(
     State(state): State<super::AppState>,
     Query(query): Query<KeyQuery>,
 ) -> Response {
-    let (_account, app) = match console_app(&state, &headers, &slug).await {
+    let (_account, app, _) = match console_app(&state, &headers, &slug, Some("data_r2")).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -745,7 +745,7 @@ async fn api_raw(
     State(state): State<super::AppState>,
     Query(query): Query<KeyQuery>,
 ) -> Response {
-    let (_account, app) = match console_app(&state, &headers, &slug).await {
+    let (_account, app, _) = match console_app(&state, &headers, &slug, Some("data_r2")).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -900,7 +900,7 @@ async fn api_put(
     Query(query): Query<KeyQuery>,
     body: Body,
 ) -> Response {
-    let (account, app) = match console_app(&state, &headers, &slug).await {
+    let (account, app, admin) = match console_app(&state, &headers, &slug, None).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -948,7 +948,11 @@ async fn api_put(
                 &app.id,
                 &account.id,
                 "r2_put",
-                &format!("r2_put {} {} ({} bytes)", query.bucket, query.key, size),
+                &super::super::console::audit_summary(
+                    &account,
+                    &format!("r2_put {} {} ({} bytes)", query.bucket, query.key, size),
+                    admin,
+                ),
                 "ok",
                 None,
                 0,
@@ -963,7 +967,11 @@ async fn api_put(
                 &app.id,
                 &account.id,
                 "r2_put",
-                &format!("r2_put {} {}", query.bucket, query.key),
+                &super::super::console::audit_summary(
+                    &account,
+                    &format!("r2_put {} {}", query.bucket, query.key),
+                    admin,
+                ),
                 "error",
                 None,
                 0,
@@ -1018,7 +1026,7 @@ async fn api_delete(
     State(state): State<super::AppState>,
     body: axum::Json<DeleteBody>,
 ) -> Response {
-    let (account, app) = match console_app(&state, &headers, &slug).await {
+    let (account, app, admin) = match console_app(&state, &headers, &slug, None).await {
         Ok(pair) => pair,
         Err(res) => return res,
     };
@@ -1034,7 +1042,11 @@ async fn api_delete(
                 &app.id,
                 &account.id,
                 "r2_delete",
-                &format!("r2_delete {} ({} keys)", body.bucket, count),
+                &super::super::console::audit_summary(
+                    &account,
+                    &format!("r2_delete {} ({} keys)", body.bucket, count),
+                    admin,
+                ),
                 "ok",
                 None,
                 0,
@@ -1049,7 +1061,11 @@ async fn api_delete(
                 &app.id,
                 &account.id,
                 "r2_delete",
-                &format!("r2_delete {}", body.bucket),
+                &super::super::console::audit_summary(
+                    &account,
+                    &format!("r2_delete {}", body.bucket),
+                    admin,
+                ),
                 "error",
                 None,
                 0,

@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::console::{guard, nostore_json, not_found, ok_json, visible_app};
+use super::console::{authorized_app, guard, ok_json};
 use super::AppState;
 use crate::auth::AccountRow;
 use crate::mcp::error::ToolError;
@@ -85,68 +85,65 @@ pub(crate) fn tool_response(err: &ToolError) -> Response {
 /// The session plus the visible app, or the error response. Every mutating
 /// console endpoint starts here: a foreign or missing slug answers 404
 /// exactly like a missing one (spec §8.2), and cross-site requests never
-/// reach the mutation (the same-origin check inside [`guard`]).
+/// reach the mutation (the same-origin check inside [`guard`]). An admin
+/// with a recent session acts here with owner-equivalent access (see
+/// [`authorized_app`]); collaborators keep their role.
 async fn mutation_app(
     mcp: &McpState,
     headers: &HeaderMap,
     slug: &str,
-) -> Result<(AccountRow, crate::apps::App), Box<Response>> {
+) -> Result<(AccountRow, crate::apps::App, bool), Box<Response>> {
     let account = match guard(&mcp.auth, headers).await {
         Ok(account) => account,
         Err(res) => return Err(res),
     };
-    match visible_app(mcp, &account, slug).await {
-        Ok(Some((app, _))) => Ok((account, app)),
-        Ok(None) => Err(not_found().into()),
-        Err(_) => Err(nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+    // Mutations audit themselves (see `audited`), so no read label.
+    match authorized_app(mcp, &account, headers, slug, None).await {
+        Ok(authz) => Ok((authz.account, authz.app, authz.admin)),
+        Err(res) => Err(res),
     }
 }
 
 /// [`mutation_app`] plus the owner check: visibility, delete and secret
 /// writes stay owner-only (spec §7.4), so a collaborator reads 403 with the
 /// same code and user message the MCP tool answers — never 404 (spec §8.2
-/// reserves 404 for slugs the caller has no role on).
+/// reserves 404 for slugs the caller has no role on). The admin override
+/// reports the owner role, so admins pass this check.
 async fn owner_mutation_app(
     mcp: &McpState,
     headers: &HeaderMap,
     slug: &str,
-) -> Result<(AccountRow, crate::apps::App), Box<Response>> {
+) -> Result<(AccountRow, crate::apps::App, bool), Box<Response>> {
     let account = match guard(&mcp.auth, headers).await {
         Ok(account) => account,
         Err(res) => return Err(res),
     };
-    match visible_app(mcp, &account, slug).await {
-        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok((account, app)),
-        Ok(Some(_)) => Err(tool_response(
+    // Mutations audit themselves (see `audited`), so no read label.
+    match authorized_app(mcp, &account, headers, slug, None).await {
+        Ok(authz) if authz.role == crate::collaborators::Role::Owner => {
+            Ok((authz.account, authz.app, authz.admin))
+        }
+        Ok(_) => Err(tool_response(
             &ToolError::forbidden(format!(
                 "only the app owner may change {slug:?} this way"
             ))
             .with_user("Only the app owner can do that. Collaborators can read and deploy, but not change these settings."),
         )
         .into()),
-        Ok(None) => Err(not_found().into()),
-        Err(_) => Err(nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+        Err(res) => Err(res),
     }
 }
 
 /// Record the console mutation under its MCP tool name, then render the
 /// result. Successes and refusals both land in `agent_action` (like the MCP
 /// log); both `consent_id` and `apikey_id` stay NULL, so the log labels the
-/// client "Console".
+/// client "Console". Admin-override rows carry the `admin <email>:` prefix
+/// (see [`authorized_app`]) so the owner can tell them apart.
 async fn audited(
     mcp: &McpState,
     account: &AccountRow,
     app: &crate::apps::App,
+    admin: bool,
     tool: &str,
     summary: &str,
     result: Result<serde_json::Value, ToolError>,
@@ -160,7 +157,7 @@ async fn audited(
         &app.id,
         &account.id,
         tool,
-        summary,
+        &super::console::audit_summary(account, summary, admin),
         outcome,
         error_code,
         0,
@@ -187,7 +184,7 @@ async fn api_visibility(
     Json(body): Json<VisibilityBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -199,7 +196,16 @@ async fn api_visibility(
             "visibility must be unlisted or public, got {other:?}"
         ))),
     };
-    audited(mcp, &account, &app, "set_visibility", &summary, result).await
+    audited(
+        mcp,
+        &account,
+        &app,
+        admin,
+        "set_visibility",
+        &summary,
+        result,
+    )
+    .await
 }
 
 /// The domain call plus the edge purge, shared by the visibility endpoint's
@@ -242,13 +248,22 @@ async fn api_always_on(
     Json(body): Json<AlwaysOnBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
     let summary = format!("set_always_on {}", if body.on { "on" } else { "off" });
     let result = set_app_always_on(mcp, &app, body.on).await;
-    audited(mcp, &account, &app, "set_always_on", &summary, result).await
+    audited(
+        mcp,
+        &account,
+        &app,
+        admin,
+        "set_always_on",
+        &summary,
+        result,
+    )
+    .await
 }
 
 /// The domain call, shared by the always-on endpoint's single input.
@@ -287,7 +302,7 @@ async fn api_delete(
     Json(body): Json<DeleteBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (_, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (_, app, _) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -359,13 +374,13 @@ async fn api_secret_put(
     Json(body): Json<SecretValueBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
     let summary = format!("set_secret {name}");
     let result = set_app_secret(mcp, &app, &name, &body.value).await;
-    audited(mcp, &account, &app, "set_secret", &summary, result).await
+    audited(mcp, &account, &app, admin, "set_secret", &summary, result).await
 }
 
 async fn set_app_secret(
@@ -406,7 +421,7 @@ async fn api_secret_delete(
     Path((slug, name)): Path<(String, String)>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -425,7 +440,7 @@ async fn api_secret_delete(
         Ok(json!({"name": name, "applies": "next deploy"}))
     }
     .await;
-    audited(mcp, &account, &app, "unset_secret", &summary, result).await
+    audited(mcp, &account, &app, admin, "unset_secret", &summary, result).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -444,7 +459,7 @@ async fn api_rollback(
     Json(body): Json<RollbackBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -471,7 +486,7 @@ async fn api_rollback(
         }))
     }
     .await;
-    audited(mcp, &account, &app, "rollback", &summary, result).await
+    audited(mcp, &account, &app, admin, "rollback", &summary, result).await
 }
 
 /// `POST /api/console/apps/:slug/preview/promote`: the MCP
@@ -485,7 +500,7 @@ async fn api_preview_promote(
     Path(slug): Path<String>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -502,6 +517,7 @@ async fn api_preview_promote(
         mcp,
         &account,
         &app,
+        admin,
         "promote_preview",
         "promote preview to live",
         result,
@@ -517,7 +533,7 @@ async fn api_preview_discard(
     Path(slug): Path<String>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -533,6 +549,7 @@ async fn api_preview_discard(
         mcp,
         &account,
         &app,
+        admin,
         "discard_preview",
         "discard preview",
         result,
@@ -553,7 +570,7 @@ async fn api_rename(
 ) -> Response {
     let started = std::time::Instant::now();
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -564,7 +581,7 @@ async fn api_rename(
         let pool = mcp.pool.clone();
         let app_id = app.id.clone();
         let account_id = account.id.clone();
-        let summary = summary.to_string();
+        let summary = super::console::audit_summary(&account, summary, admin);
         let outcome = outcome.to_string();
         let error_code = error_code.map(str::to_string);
         let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -612,7 +629,9 @@ async fn api_rename(
         audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
         return tool_response(&err);
     }
-    if let Err(err) = claim_change(&mcp.pool, &mcp.billing, &account.id).await {
+    // Quota follows the app owner, never the admin acting on their behalf.
+    let billing = super::console::billing_id(&account, &app, admin);
+    if let Err(err) = claim_change(&mcp.pool, &mcp.billing, billing).await {
         audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
         return tool_response(&err);
     }
@@ -674,7 +693,7 @@ async fn api_rename(
         Err(err) => {
             // Any domain error is pre-commit (post-commit steps never fail),
             // so the rename never happened: refund the claimed change.
-            let _ = refund_change(&mcp.pool, &account.id).await;
+            let _ = refund_change(&mcp.pool, billing).await;
             let err = ToolError::from_rename(err);
             audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
             return tool_response(&err);
