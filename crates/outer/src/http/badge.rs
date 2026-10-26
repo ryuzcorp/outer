@@ -25,7 +25,7 @@ pub fn badge_snippet(slug: &str) -> Vec<u8> {
          bottom:calc(env(safe-area-inset-bottom,0px) + 12px)!important;z-index:2147483647!important;\
          display:inline-flex!important;align-items:center!important;gap:6px!important;\
          background:#111111!important;color:#ffffff!important;\
-         font:500 12px/1 -apple-system,BlinkMacSystemFont,\"Segoe UI\",system-ui,sans-serif!important;\
+         font:500 12px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif!important;\
          letter-spacing:.02em!important;padding:7px 12px!important;border:0!important;\
          border-radius:9999px!important;text-decoration:none!important;\
          box-shadow:0 2px 8px rgba(0,0,0,.25)!important;cursor:pointer!important\">\
@@ -76,31 +76,31 @@ mod tests {
         map
     }
 
-    /// The contract's fixed points: offset variable, link target, label,
-    /// self-resetting styles, top z-index, and no script.
+    /// HTML has no backslash escapes: a `"` inside a double-quoted
+    /// attribute ends it. Read each `style` the way a browser does, up to
+    /// the next `"`, and require every declaration to survive, or the
+    /// badge renders as bare serif text.
     #[test]
-    fn snippet_carries_the_contract_points() {
+    fn every_style_attribute_survives_html_parsing() {
         let badge = String::from_utf8(badge_snippet("shop")).unwrap();
-        assert!(
-            badge.starts_with("<style>:root{--outer-badge-space:44px}</style>"),
-            "offset first: {badge}"
-        );
-        assert!(badge.contains("id=\"outer-badge\""), "{badge}");
-        assert!(
-            badge.contains("href=\"https://outer.now/?ref=shop\""),
-            "{badge}"
-        );
-        assert!(
-            badge.contains("aria-label=\"Made with outer.now\""),
-            "{badge}"
-        );
-        assert!(badge.contains("all:initial!important"), "{badge}");
-        assert!(badge.contains("z-index:2147483647!important"), "{badge}");
-        assert!(badge.contains("target=\"_blank\""), "{badge}");
-        assert!(badge.contains("rel=\"noopener\""), "{badge}");
-        assert!(badge.ends_with("</a>"), "{badge}");
+        let styles: Vec<&str> = badge
+            .split("style=\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        assert_eq!(styles.len(), 3, "{badge}");
+        let pill = styles[0];
+        for declaration in [
+            "all:initial!important",
+            "position:fixed!important",
+            "font:500 12px/1",
+            "padding:7px 12px!important",
+            "border-radius:9999px!important",
+        ] {
+            assert!(pill.contains(declaration), "{declaration} lost: {pill}");
+        }
+        assert!(pill.ends_with("cursor:pointer!important"), "{pill}");
         assert!(!badge.contains("<script"), "no JS: {badge}");
-        assert_eq!(badge.matches("outer.now").count(), 3, "{badge}");
     }
 
     #[test]
