@@ -9,12 +9,20 @@ The discount applies as a Stripe coupon at checkout, automatically, while the pr
 
 | | Free | Pro |
 | --- | --- | --- |
-| Apps owned | 1 | 10 |
-| Code changes per day (UTC) | 50 | 500 |
-| Sleep | Sleeps when idle | Sleeps when idle, plus keep-warm |
-| Collaborators, export, custom domains | — | Up to 10 per app, zip export, one hostname per app |
+| Apps owned | 2 | 20 |
+| Code changes per day (UTC) | 40 | 1000 (fair use) |
+| Build minutes per day | 30 | 300 |
+| Sleep | Sleeps after 15 min idle | Keep-warm; without keep-warm, 30 min |
+| Visibility | Unlisted only | Public + indexable |
+| Collaborators per app | 1 | 10 |
+| Custom domains, preview deploys | — | One hostname per app, preview deploys |
+| Code export | Yes, everyone (owner only) | Yes |
 | "outer.now" badge | Small badge, bottom-right of its pages | Removed — clean pages on Pro |
+| Logs and errors | 24 hours | 30 days |
+| Backups | Daily, keep 3 | Daily, keep 30 + any-day restore |
+| Database / files | 100 MB / 250 MB | 5 GB / 25 GB |
+| Requests per month | Soft 100k (email + upgrade ask, keeps serving) | Soft 5M (never pause a live app) |
 
-Requests, storage, and outbound traffic appear in your usage with no caps.
+Storage caps refuse writes at the cap and never delete. Downgrade keeps your 2 oldest apps live; the rest stop but are retained for 30 days.
 
 Full numbers live in [limits and quotas](/deploy/limits). Billing detail lives in [Manage billing](/account/billing).

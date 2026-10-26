@@ -531,46 +531,80 @@ impl S3Backend {
         let mut keys = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
-            // Header-signed (see `list_request`): R2 rejects the session
-            // token as a presigned LIST query parameter.
-            let token = continuation.take();
-            let mut params = vec![
-                ("encoding-type", "url"),
-                ("list-type", "2"),
-                ("prefix", prefix),
-            ];
-            if let Some(token) = token.as_deref() {
-                params.push(("continuation-token", token));
-            }
-            let resp = match self
-                .list_request(&params)
-                .timeout(Duration::from_secs(20))
-                .send()
-                .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    return Err(S3Fail::Retryable(anyhow::anyhow!(
-                        "s3 list {prefix} transport: {e:#}"
-                    )));
-                }
-            };
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
-                return Err(classify_status("list", prefix, status, &body));
-            }
-            let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
-                .await
-                .map_err(S3Fail::Final)?;
-            let (page_keys, next) = list_page_from_xml(&text).map_err(S3Fail::Final)?;
-            keys.extend(page_keys);
+            let (page, next) = self.fetch_list_page(prefix, continuation).await?;
+            keys.extend(page.into_iter().map(|(key, _)| key));
             continuation = next;
             if continuation.is_none() {
                 break;
             }
         }
         Ok(keys)
+    }
+
+    /// All `(key, size)` pairs under `prefix`, paginated internally. Same
+    /// retry discipline as [`S3Backend::list`]: a retry restarts from the
+    /// first page.
+    pub async fn list_sizes(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        with_s3_retry("list", prefix, || self.list_sizes_once(prefix)).await
+    }
+
+    async fn list_sizes_once(&self, prefix: &str) -> Result<Vec<(String, u64)>, S3Fail> {
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let (page, next) = self.fetch_list_page(prefix, continuation).await?;
+            out.extend(page);
+            continuation = next;
+            if continuation.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// One LIST page: the `(key, size)` pairs on it plus the token that
+    /// continues it (`None` when the listing is complete). Header-signed
+    /// (see `list_request`): R2 rejects the session token as a presigned
+    /// LIST query parameter.
+    async fn fetch_list_page(
+        &self,
+        prefix: &str,
+        continuation: Option<String>,
+    ) -> Result<(Vec<(String, u64)>, Option<String>), S3Fail> {
+        // Header-signed (see `list_request`): R2 rejects the session
+        // token as a presigned LIST query parameter.
+        let token = continuation;
+        let mut params = vec![
+            ("encoding-type", "url"),
+            ("list-type", "2"),
+            ("prefix", prefix),
+        ];
+        if let Some(token) = token.as_deref() {
+            params.push(("continuation-token", token));
+        }
+        let resp = match self
+            .list_request(&params)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(S3Fail::Retryable(anyhow::anyhow!(
+                    "s3 list {prefix} transport: {e:#}"
+                )));
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
+            return Err(classify_status("list", prefix, status, &body));
+        }
+        let text = bounded_text(resp, Duration::from_secs(20), "s3 LIST body")
+            .await
+            .map_err(S3Fail::Final)?;
+        let (page, next) = list_page_from_xml(&text).map_err(S3Fail::Final)?;
+        Ok((page, next))
     }
 
     /// One bounded LIST request with a delimiter: `prefixes` are the folders
@@ -752,13 +786,19 @@ impl S3Backend {
     }
 }
 
-/// One LIST page parsed from its XML: the keys on this page plus the token
-/// that continues it (`None` when the listing is complete).
-fn list_page_from_xml(text: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
+/// One LIST page parsed from its XML: the `(key, size)` pairs on this page
+/// plus the token that continues it (`None` when the listing is complete).
+type ListPage = (Vec<(String, u64)>, Option<String>);
+
+fn list_page_from_xml(text: &str) -> anyhow::Result<ListPage> {
     let parsed = rusty_s3::actions::ListObjectsV2::parse_response(text)
         .with_context(|| "s3 LIST XML parse")?;
     Ok((
-        parsed.contents.into_iter().map(|o| o.key).collect(),
+        parsed
+            .contents
+            .into_iter()
+            .map(|o| (o.key, o.size))
+            .collect(),
         parsed.next_continuation_token,
     ))
 }
@@ -1149,7 +1189,10 @@ mod tests {
         let (keys, next) = list_page_from_xml(first).expect("page 1 parses");
         assert_eq!(
             keys,
-            vec!["git/demo/MANIFEST.json", "git/demo/main/abc.bundle"]
+            vec![
+                ("git/demo/MANIFEST.json".to_string(), 12),
+                ("git/demo/main/abc.bundle".to_string(), 34)
+            ]
         );
         assert_eq!(next.as_deref(), Some("tok-page-2"));
 
@@ -1160,7 +1203,7 @@ mod tests {
 <Contents><Key>git/demo/main/def.bundle</Key><LastModified>2026-10-22T00:02:00.000Z</LastModified><ETag>"c"</ETag><Size>56</Size></Contents>
 </ListBucketResult>"#;
         let (keys, next) = list_page_from_xml(last).expect("page 2 parses");
-        assert_eq!(keys, vec!["git/demo/main/def.bundle"]);
+        assert_eq!(keys, vec![("git/demo/main/def.bundle".to_string(), 56)]);
         assert_eq!(next, None);
 
         assert!(list_page_from_xml("<garbage").is_err());

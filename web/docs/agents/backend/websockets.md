@@ -40,7 +40,7 @@ Events are JSON with a validated shape: no raw string/binary frames. Valibot sch
 
 ## Reconnect with backoff — required
 
-Sockets die on deploy and on fleet sleep: every deploy moves the fleet, and an idle fleet stops after ~30 minutes. Your client must reconnect with backoff and re-fetch missed messages from D1. Hibernated Durable Object sockets survive short idles but never a move. Code for the disconnect.
+Sockets die on deploy and on fleet sleep: every deploy moves the fleet, and an idle fleet stops after ~15 minutes on Free (~30 on Pro without keep-warm). Your client must reconnect with backoff and re-fetch missed messages from D1. Hibernated Durable Object sockets survive short idles but never a move. Code for the disconnect.
 
 ## Keep route identity on moves
 

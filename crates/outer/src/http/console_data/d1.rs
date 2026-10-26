@@ -1654,6 +1654,13 @@ async fn api_write(
         Ok(app) => app,
         Err(res) => return *res,
     };
+    // Frozen apps stay writable only for deletes (the escape hatch back
+    // under the cap): inserts and updates are refused at the storage cap.
+    if !matches!(body.op, D1WriteOp::Delete) {
+        if let Some(res) = super::storage_frozen_refusal(mcp, &app).await {
+            return res;
+        }
+    }
     let ctx = D1Ctx::from_state(&state);
     let outcome = write_row(&ctx, &app, &binding, &table, &body).await;
     let op = match body.op {
@@ -3007,6 +3014,64 @@ exit 0
         // Unknown slug: same 404.
         let (status, _) = authed_get(&app, "/api/console/apps/nope/data/d1/DB/tables", &ana).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn frozen_restore_refuses_before_touching_backups() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let (app, _health) = router_app(&pool, &state).await;
+        let ana = login(&pool, "ana@example.com").await;
+        sqlx::query(
+            "UPDATE app SET storage_frozen_at = 1, storage_frozen_detail = 'D1 over cap' \
+             WHERE slug = 'acme'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Even a well-formed confirm never reaches the restore: the app is
+        // read-only until it drops back under the cap.
+        let (status, _, body) = send(
+            &app,
+            same_origin(
+                Request::post("/api/console/apps/acme/data/d1/DB/backups/b1/restore")
+                    .header("cookie", &ana)
+                    .header("content-type", "application/json"),
+            )
+            .body(Body::from(r#"{"confirm":"b1"}"#))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["quota"], "storage_bytes");
+    }
+
+    #[tokio::test]
+    async fn r2_upload_refuses_up_front_past_the_cap() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let (app, _health) = router_app(&pool, &state).await;
+        let ana = login(&pool, "ana@example.com").await;
+        // The sweep measured a full Free R2 allowance: any upload refuses.
+        sqlx::query("UPDATE app SET r2_measured_bytes = ?1 WHERE slug = 'acme'")
+            .bind(crate::limits::FREE_R2_BYTES as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, body) = send(
+            &app,
+            same_origin(
+                Request::put("/api/console/apps/acme/data/r2/object?bucket=files&key=a.txt")
+                    .header("cookie", &ana),
+            )
+            .body(Body::from("hello"))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["quota"], "storage_bytes");
     }
 
     #[tokio::test]

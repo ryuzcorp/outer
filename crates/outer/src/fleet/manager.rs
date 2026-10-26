@@ -796,11 +796,28 @@ impl FleetManager {
             // are never exempt: a quiet preview sleeps like any idle fleet
             // (its row keeps the preview state for wake-on-request), and a
             // preview idle past the TTL is discarded by the expiry step.
+            // Idle timeout follows the app owner's plan (spec §3, owner-set
+            // 2026-10-26): Free fleets sleep after 15 minutes; Pro keeps the
+            // configured host idle time (keep-warm apps are exempt above).
+            let owner_plan =
+                match crate::apps::always_on::owner_plan(pool, &wake_app.owner_id).await {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        tracing::warn!(
+                            slug = %slug,
+                            error = %format!("{err:#}"),
+                            "sleep sweep: owner plan lookup failed; keeping the fleet awake"
+                        );
+                        continue;
+                    }
+                };
+            let sleep_after = crate::limits::sleep_after(&owner_plan, self.inner.sleep_after);
             let idle = should_sleep(
                 idle_since,
                 created_at,
                 now,
                 live.started.elapsed(),
+                sleep_after,
                 self.inner.sleep_after,
             );
             if idle && (is_preview || !exempt.contains(&slug)) {
@@ -997,22 +1014,25 @@ async fn prune_retention(pool: &SqlitePool, store: &crate::store::Store) {
 }
 
 /// Whether the fleet should sleep: its newest activity
-/// (`max(last_request_at, created_at)`) is strictly older than `sleep_after`,
-/// and the fleet itself is at least that old. The uptime guard keeps a
-/// just-started fleet alive while its first requests are still in flight,
-/// when the activity row can still look stale.
+/// (`max(last_request_at, created_at)`) is strictly older than `idle_after`,
+/// and the fleet itself is at least `uptime_guard` old. The uptime guard
+/// keeps a just-started fleet alive while its first requests are still in
+/// flight, when the activity row can still look stale. The guard stays on
+/// the host value while the idle timeout follows the app owner's plan
+/// (spec §3: Free 15 min, Pro the host default).
 pub fn should_sleep(
     last_request_at: Option<i64>,
     created_at: i64,
     now_ms: i64,
     uptime: Duration,
-    sleep_after: Duration,
+    idle_after: Duration,
+    uptime_guard: Duration,
 ) -> bool {
-    if uptime < sleep_after {
+    if uptime < uptime_guard {
         return false;
     }
     let activity = last_request_at.unwrap_or(created_at).max(created_at);
-    now_ms.saturating_sub(activity) as i128 > sleep_after.as_millis() as i128
+    now_ms.saturating_sub(activity) as i128 > idle_after.as_millis() as i128
 }
 
 /// The excess past `max` keep-warm fleets that may still sleep: the
@@ -1046,25 +1066,35 @@ mod tests {
         let after = Duration::from_secs(300);
         let old = Duration::from_secs(301);
         // Fresh activity stays awake.
-        assert!(!should_sleep(Some(1_000), 0, 1_000, old, after));
+        assert!(!should_sleep(Some(1_000), 0, 1_000, old, after, after));
         // Missing requests fall back to creation time.
-        assert!(!should_sleep(None, 1_000, 1_000, old, after));
-        assert!(should_sleep(None, 0, 301_000, old, after));
+        assert!(!should_sleep(None, 1_000, 1_000, old, after, after));
+        assert!(should_sleep(None, 0, 301_000, old, after, after));
         // Exactly at the bound is still awake: strictly older sleeps.
-        assert!(!should_sleep(Some(0), 0, 300_000, old, after));
-        assert!(should_sleep(Some(0), 0, 300_001, old, after));
+        assert!(!should_sleep(Some(0), 0, 300_000, old, after, after));
+        assert!(should_sleep(Some(0), 0, 300_001, old, after, after));
         // The newest of request and creation wins either way.
-        assert!(!should_sleep(Some(500_000), 0, 500_000, old, after));
-        assert!(!should_sleep(Some(0), 500_000, 500_000, old, after));
-        assert!(should_sleep(Some(0), 500_000, 800_001, old, after));
+        assert!(!should_sleep(Some(500_000), 0, 500_000, old, after, after));
+        assert!(!should_sleep(Some(0), 500_000, 500_000, old, after, after));
+        assert!(should_sleep(Some(0), 500_000, 800_001, old, after, after));
         // A young fleet stays awake even with stale activity: its first
-        // requests may still be in flight.
-        assert!(!should_sleep(Some(0), 0, 300_001, Duration::ZERO, after));
+        // requests may still be in flight. The guard is independent of the
+        // idle timeout: a short guard with a long timeout still sleeps
+        // stale fleets.
+        assert!(!should_sleep(
+            Some(0),
+            0,
+            300_001,
+            Duration::ZERO,
+            after,
+            after
+        ));
         assert!(!should_sleep(
             Some(0),
             0,
             300_001,
             Duration::from_secs(299),
+            after,
             after
         ));
         assert!(should_sleep(
@@ -1072,7 +1102,16 @@ mod tests {
             0,
             300_001,
             Duration::from_secs(300),
+            after,
             after
+        ));
+        assert!(should_sleep(
+            Some(0),
+            0,
+            900_001,
+            Duration::ZERO,
+            Duration::from_secs(900),
+            Duration::ZERO
         ));
     }
 

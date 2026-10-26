@@ -616,6 +616,24 @@ async fn api_rename(
         audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
         return tool_response(&err);
     }
+    // The rename redeploys a running app, so the redeploy's plan admission
+    // runs here too, before the move: a capped build budget or a frozen app
+    // refuses with the quota shape and the rename never happens (the claimed
+    // change is refunded). The inner `run_deploy` gate backstops the quota
+    // spent after this check.
+    if let Err(err) =
+        crate::mcp::tools::check_build_quota(&mcp.pool, &mcp.billing, &account.id).await
+    {
+        let _ = refund_change(&mcp.pool, &account.id).await;
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return tool_response(&err);
+    }
+    if let Err(err) = crate::mcp::tools::check_storage_writable(&mcp.pool, &mcp.billing, &app).await
+    {
+        let _ = refund_change(&mcp.pool, &account.id).await;
+        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        return tool_response(&err);
+    }
     // Same locks as the MCP tool, in the same order (deploy, rollback, then
     // the wake pair sorted by slug so two renames can never ABBA).
     let rollback = mcp.rollback_locks.lock(&app.id).await;
@@ -673,6 +691,9 @@ async fn api_rename(
                 .and_then(|s| s.as_str())
                 .unwrap_or("building")
                 .to_string(),
+            // The shared admission gate backstops the pre-move checks: a
+            // refusal here keeps the `quota_exceeded` deploy status.
+            Err(err) if err.code == "quota_exceeded" => "quota_exceeded".to_string(),
             Err(_) => "failed".to_string(),
         },
         None => "ok".to_string(),

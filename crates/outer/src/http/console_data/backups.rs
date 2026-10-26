@@ -106,6 +106,10 @@ async fn api_backup_now(
     headers: HeaderMap,
     Path((slug, binding)): Path<(String, String)>,
 ) -> Response {
+    // Deliberately NOT storage-gated: a backup never changes live data — it
+    // is the escape hatch that lets an owner read a frozen database out.
+    // Its bytes feed the next sweep sizing, so a frozen app stays frozen
+    // until the owner frees space elsewhere.
     let mcp = &state.mcp;
     let account = match guard(&mcp.auth, &headers).await {
         Ok(account) => account,
@@ -230,6 +234,11 @@ async fn api_restore(
         Ok(app) => app,
         Err(res) => return *res,
     };
+    // A restore rewrites live tables, so a frozen app refuses it like any
+    // other write (deletes stay the escape hatch back under the cap).
+    if let Some(res) = super::storage_frozen_refusal(mcp, &app).await {
+        return res;
+    }
     if binding.len() > 128 || body.confirm != id {
         return d1_response(Err(D1Error::BadQuery(
             "confirm must equal the backup id".to_string(),

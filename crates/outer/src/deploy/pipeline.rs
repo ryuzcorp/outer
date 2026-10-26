@@ -894,6 +894,12 @@ impl Deployer {
                 return Err(StepEnd::Failed(StepFailed::plain("worktree", &e)));
             }
         }
+        // 2. Install + 3. Build, charged to the owner's daily build minutes
+        // (spec §3, owner-set 2026-10-26: Free 30 min, Pro 300 min a day).
+        // The pre-build check at the call sites refuses new builds at the
+        // cap; a build in flight always finishes and charges here, success
+        // or failure. Accounting never fails the deploy.
+        let build_started = Instant::now();
         // 2. Install.
         let started = Instant::now();
         match self.install(app, deploy_id).await {
@@ -902,6 +908,7 @@ impl Deployer {
             }
             Err(e) => {
                 push_step(steps, log, "install", started, false, &format!("{e:#}"));
+                charge_build_minutes(pool, &app.owner_id, build_started.elapsed()).await;
                 return Err(StepEnd::Failed(StepFailed::sandboxed("install", &e)));
             }
         }
@@ -914,9 +921,11 @@ impl Deployer {
             }
             Err(e) => {
                 push_step(steps, log, "build", started, false, &format!("{e:#}"));
+                charge_build_minutes(pool, &app.owner_id, build_started.elapsed()).await;
                 return Err(StepEnd::Failed(StepFailed::sandboxed("build", &e)));
             }
         }
+        charge_build_minutes(pool, &app.owner_id, build_started.elapsed()).await;
 
         // 4. Review: the pre-live profanity gate (spec §15.1). A block
         // stops the pipeline here: nothing is uploaded, the fleet is
@@ -2024,6 +2033,19 @@ fn push_step(
         log.push('\n');
     }
     ms
+}
+
+/// Charge install+build wall time to the owner's daily build minutes (spec
+/// §3: Free 30 min, Pro 300 min a day). Accounting never fails the deploy:
+/// a charge failure warns and the pipeline continues.
+async fn charge_build_minutes(pool: &SqlitePool, owner_id: &str, elapsed: std::time::Duration) {
+    let ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    if let Err(err) = crate::limits::add_build_ms(pool, owner_id, ms).await {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            "build minute charge failed; usage stays under-counted"
+        );
+    }
 }
 
 fn steps_json(steps: &[Step]) -> String {

@@ -7,7 +7,7 @@ Ask for live updates, like chat rooms, live scores, and shared feeds, and your b
 
 ## Why connections drop
 
-Live connections die on every deploy and when your app sleeps after about 30 minutes idle. Your builder codes the client to reconnect with backoff and re-fetch missed messages from the database.
+Live connections die on every deploy and when your app sleeps after about 15 minutes idle (30 on Pro without keep-warm). Your builder codes the client to reconnect with backoff and re-fetch missed messages from the database.
 
 For one-way streams, the server sends a keep-alive comment every few seconds. Silent streams hit the proxy timeout and cut out.
 

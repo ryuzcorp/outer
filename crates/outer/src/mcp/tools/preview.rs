@@ -103,6 +103,11 @@ pub async fn promote_preview_to(
         "promote a preview to live",
     )
     .await?;
+    // Fail fast before the fast-forward and the trial-state wipe below: a
+    // capped or frozen app refuses here with the quota shape, and the inner
+    // `run_deploy` gate backstops the quota spent in between.
+    super::check_build_quota(&state.pool, &state.billing, &app.owner_id).await?;
+    super::check_storage_writable(&state.pool, &state.billing, app).await?;
     let preview = preview_of(app)
         .ok_or_else(|| ToolError::not_found(format!("no active preview for {:?}", app.slug)))?;
     let row = latest_preview_deploy(&state.pool, &app.id).await?;

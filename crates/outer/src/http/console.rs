@@ -3637,12 +3637,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn console_collaborator_invite_needs_a_pro_owner() {
+    async fn console_collaborator_invite_free_gets_one() {
         let (app, pool, _, _) = test_app().await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         let owner = login(&pool, "ana@example.com").await;
-        let (status, _, body) = send(
+        let (status, _, _) = send(
             &app,
             post_json(
                 "/api/console/apps/groceries/collaborators",
@@ -3651,10 +3651,20 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators",
+                &owner,
+                serde_json::json!({"email": "cara@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         let refused: serde_json::Value = body.parse().unwrap();
-        assert_eq!(refused["error"], "payment_required");
-        assert!(refused["user_message"].as_str().unwrap().contains("Pro"));
+        assert_eq!(refused["error"], "quota_exceeded");
+        assert!(refused["upgrade_url"].as_str().is_some());
     }
 
     #[tokio::test]

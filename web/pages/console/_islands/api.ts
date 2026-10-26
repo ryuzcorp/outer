@@ -333,9 +333,11 @@ export interface AccountUsage {
   code_changes_today: number;
   code_changes_limit: number;
   build_ms_today: number;
+  build_minutes_limit: number;
   rollbacks: RollbackUsage[];
   rollback_limit: number;
   requests_month: number;
+  requests_limit: number;
   storage_peak_bytes: number;
   egress_bytes_month: number;
 }

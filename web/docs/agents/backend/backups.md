@@ -3,7 +3,7 @@ title: Back up the database
 description: Daily D1 dumps, retention, on-demand backup, download, and restore — in Console and over MCP.
 ---
 
-An app with a database gets a daily dump automatically once it has been active in the prior 24 hours (a request or a successful deploy). Each dump is a full `.sql` export stored off to the side, never inside the app's own files. Dumps are kept 7 days, 30 on Pro. The person-facing guide is [Back up and restore your data](/backend/backups).
+An app with a database gets a daily dump automatically once it has been active in the prior 24 hours (a request or a successful deploy). Each dump is a full `.sql` export stored off to the side, never inside the app's own files. Dumps are kept 3 days on Free, 30 on Pro with any-day restore. The person-facing guide is [Back up and restore your data](/backend/backups).
 
 ## Restore from Console
 

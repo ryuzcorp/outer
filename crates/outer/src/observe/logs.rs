@@ -28,8 +28,8 @@ use crate::fleet::supervisor::{LogEntry, SharedLogRing};
 
 /// Persisted lines kept per app (spec §13: last 2,000 lines).
 pub const MAX_PERSISTED_LINES: i64 = 2000;
-/// Grouped errors kept this long after their last sighting (spec §13: 30 d).
-pub const ERROR_RETENTION_MS: i64 = 30 * 86_400_000;
+/// Grouped-error retention is per plan (spec §3, owner-set 2026-10-26) and
+/// lives in [`crate::limits`]; see [`prune_errors`].
 /// Most issues one `app_errors` answer carries.
 pub const MAX_ISSUES: usize = 50;
 /// Most grouped issues kept per app (spec §13 flood bound): once an app
@@ -1174,15 +1174,31 @@ pub async fn s5xx_last_hour(pool: &SqlitePool, app_id: &str, now_ms: i64) -> any
     Ok(sum)
 }
 
-/// Delete grouped errors whose last sighting is older than
-/// [`ERROR_RETENTION_MS`] (spec §13: 30 d). Returns the rows removed.
+/// Delete grouped errors whose last sighting is older than the owning
+/// account's plan retention (spec §3, owner-set 2026-10-26: 24 h Free,
+/// 30 d Pro). Returns the rows removed.
 pub async fn prune_errors(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<u64> {
-    let rows = sqlx::query("DELETE FROM error_issue WHERE last_seen < ?1")
-        .bind(now_ms - ERROR_RETENTION_MS)
-        .execute(pool)
-        .await?
-        .rows_affected();
-    Ok(rows)
+    let free_cutoff = now_ms - crate::limits::FREE_LOG_RETENTION_MS;
+    let pro_cutoff = now_ms - crate::limits::PRO_LOG_RETENTION_MS;
+    let pro = sqlx::query(
+        "DELETE FROM error_issue WHERE last_seen < ?1 AND app_id IN \
+         (SELECT app.id FROM app JOIN user ON user.id = app.owner_id \
+          WHERE user.plan = 'pro')",
+    )
+    .bind(pro_cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let rest = sqlx::query(
+        "DELETE FROM error_issue WHERE last_seen < ?1 AND app_id NOT IN \
+         (SELECT app.id FROM app JOIN user ON user.id = app.owner_id \
+          WHERE user.plan = 'pro')",
+    )
+    .bind(free_cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(pro + rest)
 }
 
 #[cfg(test)]
@@ -1429,8 +1445,8 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(issues(&pool, "missing", None).await.unwrap().is_empty());
-        // Prune keeps the 30 d window.
-        let old: i64 = crate::apps::now_ms() - ERROR_RETENTION_MS - 1;
+        // Prune keeps the plan window (no app row reads as Free: 24 h).
+        let old: i64 = crate::apps::now_ms() - crate::limits::FREE_LOG_RETENTION_MS - 1;
         sqlx::query("UPDATE error_issue SET last_seen = ?1 WHERE app_id = ?2")
             .bind(old)
             .bind(app_id)

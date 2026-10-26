@@ -32,6 +32,6 @@ The build carries `triggers.crons` into `dist/wrangler.json`. On deploy Outer re
 | One at a time | Handlers for one app run one at a time; a slow handler delays the next occurrence. Keep jobs short or fan out to a [Queue background work](/agents/backend/queues) |
 | Throw retries | A throw retries with backoff; give up after 6 failures or at the next occurrence; `controller.noRetry()` stops retries |
 | One missed occurrence | After downtime Outer runs one missed occurrence and skips the rest — no catch-up storm; design jobs idempotent anyway |
-| Plan floors | Free: hourly or slower; Pro: down to 1 min (spec, not yet enforced in code). Stay inside your plan's floor regardless |
+| No plan floors | Any valid 5-field cron expression registers; there is no per-plan minimum interval. Keep jobs short regardless |
 
 Test locally with `POST /__void/scheduled` and Void's dev trigger token; schedules never fire from the dev server on their own.

@@ -62,4 +62,4 @@ Open the app in Console and go to **Data → D1**. The editor opens the app's si
 
 ## Back up the database
 
-Apps with a database get automatic daily dumps once active in the prior 24 hours, kept 7 days (30 on Pro). Console offers back up now, download, and restore; MCP offers `list_backups`, `backup_database`, and `restore_backup` (all owner-only). Full detail lives at [Backups](/agents/backend/backups).
+Apps with a database get automatic daily dumps once active in the prior 24 hours, kept 3 days on Free (30 on Pro with any-day restore). Console offers back up now, download, and restore; MCP offers `list_backups`, `backup_database`, and `restore_backup` (all owner-only). Full detail lives at [Backups](/agents/backend/backups).

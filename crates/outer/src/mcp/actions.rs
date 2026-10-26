@@ -41,10 +41,6 @@ use sqlx::SqlitePool;
 use crate::auth::{now_ms, Credential, Principal};
 use crate::mcp::tools::CallError;
 
-/// Log retention by plan (spec §3): 7 d Free, 30 d Pro.
-pub const FREE_RETENTION_MS: i64 = 7 * 86_400_000;
-pub const PRO_RETENTION_MS: i64 = 30 * 86_400_000;
-
 /// Tools that write an `agent_action` row. Everything else (account tools,
 /// `list_apps`, `delete_app`) writes nothing.
 const LOGGED_TOOLS: &[&str] = &[
@@ -461,12 +457,13 @@ pub async fn record_console(
     }
 }
 
-/// Delete rows older than the owning account's plan retention (spec §3).
+/// Delete rows older than the owning account's plan retention (spec §3,
+/// owner-set 2026-10-26: 24 h Free, 30 d Pro; numbers in [`crate::limits`]).
 /// Returns the rows removed.
 pub async fn prune(pool: &SqlitePool, now: i64) -> anyhow::Result<u64> {
-    let free_cutoff = now - FREE_RETENTION_MS;
-    let pro_cutoff = now - PRO_RETENTION_MS;
-    // Set-based, on the `created_at` index: Pro apps keep 30 d, the rest 7 d.
+    let free_cutoff = now - crate::limits::FREE_LOG_RETENTION_MS;
+    let pro_cutoff = now - crate::limits::PRO_LOG_RETENTION_MS;
+    // Set-based, on the `created_at` index: Pro apps keep 30 d, the rest 24 h.
     let pro = sqlx::query(
         "DELETE FROM agent_action WHERE created_at < ?1 AND app_id IN \
            (SELECT app.id FROM app JOIN user ON user.id = app.owner_id \

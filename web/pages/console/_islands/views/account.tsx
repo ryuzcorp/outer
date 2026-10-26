@@ -713,7 +713,7 @@ export function UsageView({
               </span>
               <span class="shrink-0 font-mono text-sm">{formatMinutes(usage.build_ms_today)}</span>
             </div>
-            <p class="m-0 min-w-0 text-xs opacity-60">Tracked, not yet capped.</p>
+            <p class="m-0 min-w-0 text-xs opacity-60">{usage.build_minutes_limit} min per day on your plan · Resets at {summary.resets_at}</p>
           </div>
         </div>
       </section>
@@ -722,8 +722,8 @@ export function UsageView({
           <h2 class="card-title m-0 text-base">This month</h2>
           <dl class="m-0 grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
             <div class="min-w-0">
-              <dt class="truncate text-xs opacity-60" title="App requests served this month">Requests</dt>
-              <dd class="m-0 truncate font-mono text-lg" title={String(usage.requests_month)}>
+              <dt class="truncate text-xs opacity-60" title={`App requests served this month (soft cap ${usage.requests_limit.toLocaleString()})`}>Requests</dt>
+              <dd class="m-0 truncate font-mono text-lg" title={`${usage.requests_month} of ${usage.requests_limit} soft cap`}>
                 {usage.requests_month.toLocaleString()}
               </dd>
             </div>
@@ -741,16 +741,18 @@ export function UsageView({
             </div>
           </dl>
           <p class="m-0 min-w-0 text-xs opacity-60">
-            Metering is still being wired up — these counts are tracked, not billed.
+            Metered from your apps' traffic. Over the soft cap ({usage.requests_limit.toLocaleString()}/month) the apps keep serving; the owner gets one upgrade email a month.
           </p>
         </div>
       </section>
       {upgradeOpen() && (
         <ShellModal label="Outer Pro" onClose={() => upgradeOpen.set(false)}>
           <ul class="m-0 min-w-0 list-disc space-y-1 pl-5 text-sm">
-            <li>10 app slots, 500 code changes a day</li>
-            <li>Public visibility, collaborators and custom domains</li>
-            <li>Code export, R2 file uploads, longer log retention</li>
+            <li>20 app slots, 1,000 code changes and 300 build minutes a day</li>
+            <li>Public visibility, 10 collaborators and custom domains</li>
+            <li>Code export, R2 file uploads, 30-day log and error history</li>
+            <li>Daily backups kept 30 days with any-day restore</li>
+            <li>5 GB database, 25 GB files, 5M-request soft cap</li>
             <li>No outer.now badge on your apps</li>
           </ul>
           {summary.billing_enabled ? (

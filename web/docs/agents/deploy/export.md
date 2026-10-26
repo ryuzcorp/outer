@@ -1,12 +1,12 @@
 ---
 title: Export app code as a zip
-description: Download any owned commit as a time-limited zip (Pro, owner-only).
+description: Download any owned commit as a time-limited zip (every plan, owner-only).
 ---
 
 ## Export one version
 
 1. Run `export_code {app, sha?}`; `sha` defaults to `main`.
-2. Require the owner's Pro plan; Free accounts get `payment_required`.
+2. Require the owner role; export works on every plan.
 3. Download from the returned `url` with its `sha`, `bytes`, and `expires_at`.
 4. Expect the zip to hold exactly the committed tree under `<slug>-<shortsha>/`.
 5. Stay under 256 MiB; larger trees refuse with a clear error.

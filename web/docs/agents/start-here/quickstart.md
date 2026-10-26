@@ -39,4 +39,4 @@ Call `share_app {app}` for the URL, share text, and QR code. Check [Look](/agent
 | No strong profanity | Page text, seed data, SQL literals, and app names — blocked deploys keep the old version serving ([Moderation](/agents/security/moderation)) |
 | Check errors after server code | Read `app_errors` after every server-side deploy |
 | Relay refusals verbatim | Pass `user_message` to your person unchanged |
-| Watch quotas | Free gives 1 app and 50 code changes a day ([Limits](/agents/platform/limits)) |
+| Watch quotas | Free gives 2 apps and 40 code changes a day ([Limits](/agents/platform/limits)) |

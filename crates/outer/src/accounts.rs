@@ -144,12 +144,15 @@ pub struct AccountSummary {
     pub code_changes_limit: u64,
     /// Wall time the deploy pipeline charged today (ms, `usage_day`).
     pub build_ms_today: u64,
+    /// Daily build-minutes cap on the account's plan (spec §3).
+    pub build_minutes_limit: u64,
     pub rollbacks: Vec<RollbackUsage>,
     pub rollback_limit: u64,
     /// This month's proxy counts (`usage_month`); zero when nothing was
-    /// tracked yet. No plan caps are shown for these: no quota check
-    /// enforces them in code, and the UI must not invent numbers.
+    /// tracked yet. The soft cap emails but never pauses (spec §3).
     pub requests_month: u64,
+    /// Soft monthly request cap on the account's plan (spec §3).
+    pub requests_limit: u64,
     pub storage_peak_bytes: u64,
     pub egress_bytes_month: u64,
     pub resets_at: String,
@@ -235,9 +238,11 @@ pub async fn account_summary(
         code_changes_today,
         code_changes_limit: tools::change_limit(&plan),
         build_ms_today: build_ms_today.unwrap_or(0).max(0) as u64,
+        build_minutes_limit: crate::limits::build_minutes_limit(&plan),
         rollbacks,
         rollback_limit: tools::ROLLBACKS_PER_DAY,
         requests_month,
+        requests_limit: crate::limits::requests_cap(&plan),
         storage_peak_bytes,
         egress_bytes_month,
         resets_at: tools::resets_at_utc(),

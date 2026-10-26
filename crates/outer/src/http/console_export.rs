@@ -94,13 +94,11 @@ async fn api_export(
     }
     let outcome = crate::mcp::tools::export::export_for_owner(
         &state.mcp.pool,
-        &state.mcp.billing,
         &state.mcp.store,
         &state.mcp.git,
         &state.mcp.sync,
         &app.slug,
         &app.id,
-        &app.owner_id,
         raw.sha.as_deref(),
         chrono::Utc::now(),
     )
@@ -259,24 +257,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_needs_pro_and_returns_a_download() {
+    async fn export_is_free_and_returns_a_download() {
         let (app, pool, cookie, sha) = harness("free").await;
         let path = "/api/console/apps/groceries/export";
 
-        // Free owner: the MCP code and a human message pointing at Pro.
-        let (status, body) = send(&app, post(path, &cookie, serde_json::json!({}))).await;
-        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
-        let body: serde_json::Value = body.parse().unwrap();
-        assert_eq!(body["error"], "payment_required");
-        assert!(
-            body["user_message"].as_str().unwrap().contains("Pro"),
-            "{body}"
-        );
-
-        sqlx::query("UPDATE user SET plan = 'pro' WHERE id = 'acct-ana@example.com'")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Free owner: export works (owner-only stays, no Pro gate).
         let (status, body) = send(&app, post(path, &cookie, serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let body: serde_json::Value = body.parse().unwrap();
@@ -316,7 +301,7 @@ mod tests {
         );
         assert!(rows.iter().any(|(_, outcome, _)| outcome == "ok"));
         assert!(rows.iter().any(|(_, outcome, code)| outcome == "error"
-            && *code == Some("payment_required".to_string())));
+            && *code == Some("invalid_argument".to_string())));
     }
 
     fn json_sha(sha: &str) -> serde_json::Value {
@@ -380,39 +365,5 @@ mod tests {
         // The owner still downloads.
         let (status, body) = send(&app, post(path, &cookie, serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-    }
-
-    /// A plan-lookup failure is `internal`, never a Free-plan refusal: the
-    /// console endpoint shares the MCP tool's gate, and a transient DB
-    /// error must not bill the owner as a Free refusal in the audit log.
-    #[tokio::test]
-    async fn export_plan_lookup_failure_is_internal_not_free() {
-        let (config, _codes) = test_config();
-        let pool = test_pool().await;
-        let auth = AuthState {
-            pool: pool.clone(),
-            config: config.clone(),
-        };
-        let mcp = McpState::for_tests(pool.clone(), auth);
-        seed(&pool, &mcp, "pro").await;
-        // Sabotage the plan lookup with a pool that has no tables: the
-        // query fails, which must surface as an internal error — never as
-        // a Free-plan refusal.
-        let bare = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        let err = crate::mcp::tools::export::export_for_owner(
-            &bare,
-            &mcp.billing,
-            &mcp.store,
-            &mcp.git,
-            &mcp.sync,
-            "groceries",
-            "app-groceries",
-            "acct-ana@example.com",
-            None,
-            chrono::Utc::now(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.code, "internal");
     }
 }

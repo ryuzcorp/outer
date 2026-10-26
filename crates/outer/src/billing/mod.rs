@@ -6,13 +6,13 @@
 //! checkout-starter links refusals carry, the `user` row transitions, the
 //! downgrade path, and the past-due grace sweep.
 //!
-//! Downgrade (spec §3, details in `downgrade.rs`): the oldest app stays
+//! Downgrade (spec §3, details in `downgrade.rs`): the two oldest apps stay
 //! live and the rest stop (`desired_state`), stamped with the downgrade
 //! date for the 30-day retention. Custom hostnames are deleted on every
 //! owned app, public apps go back to `unlisted` (stored `public` must not
 //! survive on Free), and Pro bindings fail the next deploy with the usual
-//! clear error. Collaborator rows stay but grant nothing until re-upgrade
-//! (enforced by `collaborators::role`); keep-warm flags stay stored but
+//! clear error. Collaborator rows stay; only the oldest keeps access on
+//! Free (enforced by `collaborators::role`); keep-warm flags stay stored but
 //! ignored on Free.
 pub mod downgrade;
 pub mod stripe;
@@ -410,7 +410,7 @@ impl PendingEffects {
             // change stands, like the collaborator invite.
             let upgrade = billing.upgrade_url(account_id, now_secs);
             let text = format!(
-                "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (10 apps, 500 changes a day): {upgrade}\n\nAfter 7 days your account returns to Free: every app but your oldest stops, and Pro features pause until you resubscribe. Your code and data stay."
+                "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (20 apps, 1,000 changes a day): {upgrade}\n\nAfter 7 days your account returns to Free: every app but your two oldest stops, and Pro features pause until you resubscribe. Your code and data stay."
             );
             if let Err(err) = sender
                 .send_text(email, "Outer Pro payment failed — 7 days to update", &text)
@@ -655,7 +655,7 @@ async fn apply_subscription(
         return Ok(Transition::kept(None));
     };
     let event_sub = if id.is_empty() { None } else { Some(id) };
-    // A downgrade stops every app but the oldest; the route stops their
+    // A downgrade stops every app but the two oldest; the route stops their
     // fleets from the returned slugs.
     let mut stopped = Vec::new();
     match status {
@@ -858,7 +858,7 @@ async fn apply_payment_failed(
 }
 
 /// Downgrade to Free (spec §3): custom hostnames go and public apps go
-/// back to unlisted on every owned app, the oldest app stays live and
+/// back to unlisted on every owned app, the two oldest apps stay live and
 /// the rest stop, stamped with the downgrade date for the 30-day
 /// retention. The subscription link clears, the customer id stays for
 /// resubscribe and the portal. `expected_sub` guards against a stale
@@ -944,8 +944,11 @@ async fn plan_downgrade(
         hostname: String,
         cf_custom_hostname_id: Option<String>,
     }
+    // Oldest-first by creation time; `id` is a random UUID, so same-
+    // millisecond apps tie on both — `rowid` breaks the tie by insertion
+    // order, keeping the kept/stopped split stable.
     let apps: Vec<ProApp> = sqlx::query_as(
-        "SELECT id, slug, visibility FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC",
+        "SELECT id, slug, visibility FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC, rowid ASC",
     )
     .bind(account_id)
     .fetch_all(&mut *conn)
@@ -984,14 +987,15 @@ async fn plan_downgrade(
         slug: String,
     }
     let apps: Vec<AppRow> = sqlx::query_as(
-        "SELECT id, slug FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC",
+        "SELECT id, slug FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC, rowid ASC",
     )
     .bind(account_id)
     .fetch_all(&mut *conn)
     .await?;
-    // The kept oldest app leaves retention: a previously stamped app that
-    // is now the oldest (the rest were deleted) has its purge canceled.
-    if let Some(kept) = apps.first() {
+    // The two kept oldest apps leave retention: previously stamped apps that
+    // are now kept (the rest were deleted) have their purge canceled. Free
+    // allows 2 apps (spec §3, owner-set 2026-10-26).
+    for kept in apps.iter().take(2) {
         sqlx::query(
             "UPDATE app SET downgraded_stopped_at = NULL, \
              downgrade_purge_warned_at = NULL WHERE id = ?1",
@@ -1001,7 +1005,7 @@ async fn plan_downgrade(
         .await?;
     }
     let mut stopped = Vec::new();
-    for app in apps.iter().skip(1) {
+    for app in apps.iter().skip(2) {
         sqlx::query(
             "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = ?1, \
              downgrade_purge_warned_at = NULL WHERE id = ?2",
@@ -1062,7 +1066,7 @@ pub async fn run_grace_sweep(
             downgraded += 1;
             let upgrade = billing.upgrade_url(&user.id, now_secs);
             let text = format!(
-                "Your Outer Pro grace period ended and your account is back on Free: every app but your oldest stopped, and Pro features paused. Your code and data are kept. Resubscribe anytime: {upgrade}"
+                "Your Outer Pro grace period ended and your account is back on Free: every app but your two oldest stopped, and Pro features paused. Your code and data are kept. Resubscribe anytime: {upgrade}"
             );
             if let Err(err) = sender
                 .send_text(&user.email, "Outer Pro ended — you're on Free", &text)
@@ -1328,7 +1332,8 @@ mod tests {
         .await
         .unwrap();
         seed_app(&pool, "app1", "old", "a1", 1).await;
-        seed_app(&pool, "app2", "new", "a1", 2).await;
+        seed_app(&pool, "app2", "mid", "a1", 2).await;
+        seed_app(&pool, "app3", "new", "a1", 3).await;
         let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "canceled"});
         let first = apply(
             &pool,
@@ -1342,9 +1347,9 @@ mod tests {
         let ApplyOutcome::Applied { stopped, .. } = first else {
             panic!("expected applied, got {first:?}");
         };
-        // Oldest (`old`) stays live, `new` stops.
+        // Two oldest (`old`, `mid`) stay live, `new` stops.
         assert_eq!(stopped, vec!["new".to_string()]);
-        let state: String = sqlx::query_scalar("SELECT desired_state FROM app WHERE id = 'app2'")
+        let state: String = sqlx::query_scalar("SELECT desired_state FROM app WHERE id = 'app3'")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1468,9 +1473,7 @@ mod tests {
             object,
         )
         .await;
-        assert!(
-            matches!(outcome, ApplyOutcome::Applied { stopped, .. } if stopped == vec!["new".to_string()])
-        );
+        assert!(matches!(outcome, ApplyOutcome::Applied { stopped, .. } if stopped.is_empty()));
         assert_eq!(
             plan_of(&pool, "a1").await,
             ("free".to_string(), Some("canceled".to_string()), None)
@@ -1517,7 +1520,7 @@ mod tests {
             match outcome {
                 ApplyOutcome::Applied { stopped, .. } => {
                     applied += 1;
-                    assert_eq!(stopped, vec!["new".to_string()]);
+                    assert!(stopped.is_empty(), "two apps fit the Free allowance");
                 }
                 ApplyOutcome::Duplicate => duplicates += 1,
             }
@@ -2008,7 +2011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fifty_first_change_is_refused_with_an_upgrade_url() {
+    async fn forty_first_change_is_refused_with_an_upgrade_url() {
         use crate::mcp::tools::{change_limit, claim_change};
         let pool = pool().await;
         let billing = enabled_billing();
@@ -2065,6 +2068,7 @@ mod tests {
         .unwrap();
         seed_app(pool, "app1", "old", "a1", 1).await;
         seed_app(pool, "app2", "new", "a1", 2).await;
+        seed_app(pool, "app3", "newer", "a1", 3).await;
     }
 
     async fn app_state_of(
@@ -2109,9 +2113,9 @@ mod tests {
             object,
         )
         .await;
-        // Oldest stays live, `new` stops.
+        // Two oldest stay live, `newer` stops; extras are stripped everywhere.
         assert!(
-            matches!(outcome, ApplyOutcome::Applied { stopped, .. } if stopped == vec!["new".to_string()])
+            matches!(outcome, ApplyOutcome::Applied { stopped, .. } if stopped == vec!["newer".to_string()])
         );
         assert_eq!(
             app_state_of(&pool, "app1").await,
@@ -2120,13 +2124,8 @@ mod tests {
         );
         assert_eq!(
             app_state_of(&pool, "app2").await,
-            (
-                "stopped".to_string(),
-                "unlisted".to_string(),
-                Some(NOW),
-                None
-            ),
-            "public goes back to unlisted and the stop is stamped for retention"
+            ("running".to_string(), "unlisted".to_string(), None, None),
+            "the second kept app stays live; public still goes back to unlisted"
         );
         let domains: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_domain")
             .fetch_one(&pool)
@@ -2343,5 +2342,64 @@ mod tests {
             "stopped",
             "re-upgrading restarts nothing"
         );
+    }
+    #[tokio::test]
+    async fn downgrade_keeps_the_two_oldest_same_millisecond_apps() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'past_due', stripeSubscriptionId = 'sub_1' \
+             WHERE id = 'a1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Five apps born in the same millisecond: `created_at` ties and the
+        // random-UUID `id` ties with it, so insertion order (`rowid`)
+        // decides which two stay live.
+        for (i, slug) in ["one", "two", "three", "four", "five"].iter().enumerate() {
+            let i = i as i64;
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+                 last_activity_at, created_at) \
+                 VALUES (?1, ?2, 'a1', ?3, ?4, ?5, 0, 1)",
+            )
+            .bind(format!("app{i}"))
+            .bind(slug)
+            .bind(300001 + i)
+            .bind(20100 + i * 2)
+            .bind(20101 + i * 2)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "unpaid"});
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_tie",
+            "customer.subscription.updated",
+            object,
+        )
+        .await;
+        let ApplyOutcome::Applied { stopped, .. } = outcome else {
+            panic!("downgrade applies");
+        };
+        assert_eq!(
+            stopped,
+            vec!["three".to_string(), "four".to_string(), "five".to_string()],
+            "the three youngest same-millisecond apps stop, in insertion order"
+        );
+        for slug in ["one", "two"] {
+            let state: String = sqlx::query_scalar("SELECT desired_state FROM app WHERE slug = ?1")
+                .bind(slug)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(state, "running", "{slug} is one of the two kept oldest");
+        }
     }
 }
