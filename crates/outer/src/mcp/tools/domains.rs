@@ -38,15 +38,22 @@ pub struct ListDomainsInput {
 
 /// A [`domains::DomainError`] as the MCP [`ToolError`] the tool and the
 /// console endpoint report (same codes, same user message).
-/// `billing` + `owner_id` supply the `upgrade_url` the Pro refusal carries.
-pub(crate) fn tool_error(
+/// `billing` + `owner_id` supply the `upgrade_url` the Pro refusal carries;
+/// `billing` also supplies the live promo state the $4 mention gates on.
+pub(crate) async fn tool_error(
     err: domains::DomainError,
     billing: &crate::billing::BillingState,
     owner_id: &str,
 ) -> ToolError {
     let code = err.code();
     let message = err.to_string();
-    let user = err.user_message();
+    // The promo lookup hits Stripe: only pay for it on the path that names
+    // the launch price. Every other refusal keeps today's wording.
+    let user = if code == "payment_required" {
+        err.user_message(billing.launch_discount_active().await)
+    } else {
+        err.user_message(false)
+    };
     match code {
         "not_found" => ToolError::not_found(message),
         "payment_required" => super::with_upgrade(
@@ -88,7 +95,7 @@ fn dns_help(view: &domains::DomainView) -> String {
 pub async fn add_domain(input: AddDomainInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owner_app(ctx, &input.app).await?;
     let plan = plan_of(&ctx.state.pool, &app.owner_id).await?;
-    let view = domains::add_domain(
+    let view = match domains::add_domain(
         &ctx.state.pool,
         cf(ctx).as_ref(),
         &ctx.state.domain,
@@ -98,7 +105,10 @@ pub async fn add_domain(input: AddDomainInput, ctx: &Ctx<'_>) -> Result<Value, T
         &input.hostname,
     )
     .await
-    .map_err(|err| tool_error(err, &ctx.state.billing, &app.owner_id))?;
+    {
+        Ok(view) => view,
+        Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await),
+    };
     // The POST may omit validation records, so one GET fills them in: the
     // agent relays the full DNS setup word for word.
     let summary = format!(
@@ -116,7 +126,7 @@ pub async fn add_domain(input: AddDomainInput, ctx: &Ctx<'_>) -> Result<Value, T
 
 pub async fn remove_domain(input: RemoveDomainInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let app = owner_app(ctx, &input.app).await?;
-    let hostname = domains::remove_domain(
+    let hostname = match domains::remove_domain(
         &ctx.state.pool,
         cf(ctx).as_ref(),
         ctx.state.delete_cfg.cache_purge.as_ref(),
@@ -124,7 +134,10 @@ pub async fn remove_domain(input: RemoveDomainInput, ctx: &Ctx<'_>) -> Result<Va
         input.hostname.as_deref(),
     )
     .await
-    .map_err(|err| tool_error(err, &ctx.state.billing, &app.owner_id))?;
+    {
+        Ok(hostname) => hostname,
+        Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await),
+    };
     let message = format!("{hostname} no longer serves {}.", app.slug);
     Ok(ok(
         message.clone(),
@@ -144,13 +157,14 @@ pub async fn list_domains(input: ListDomainsInput, ctx: &Ctx<'_>) -> Result<Valu
             Ok(view) => Some(view),
             Err(domains::DomainError::NotFound(_, _)) => None,
             Err(domains::DomainError::Unavailable(_)) => {
-                domains::list_domains(&ctx.state.pool, &ctx.state.domain, &app)
-                    .await
-                    .map_err(|err| tool_error(err, &ctx.state.billing, &app.owner_id))?
-                    .into_iter()
-                    .next()
+                match domains::list_domains(&ctx.state.pool, &ctx.state.domain, &app).await {
+                    Ok(rows) => rows.into_iter().next(),
+                    Err(err) => {
+                        return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await)
+                    }
+                }
             }
-            Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id)),
+            Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await),
         };
     let out: Vec<Value> = view.iter().map(domain_json).collect();
     let summary = match view.as_ref() {

@@ -757,7 +757,7 @@ export function UsageView({
             <div class="flex min-w-0 flex-col gap-2">
               <p class="m-0 min-w-0 break-words text-sm opacity-60">
                 Pro is $8/month
-                {summary.plan === "free" && " ($4 launch price while the coupon lasts)"}
+                {summary.plan === "free" && summary.launch_discount_active && " ($4 launch price while the coupon lasts)"}
                 , tax calculated at checkout. The plan lifts on your agent's next call after payment.
               </p>
               {summary.billing_test_mode && (

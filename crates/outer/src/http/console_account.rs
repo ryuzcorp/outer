@@ -87,6 +87,7 @@ async fn api_account(State(state): State<super::AppState>, headers: HeaderMap) -
                 "has_customer": summary.has_customer,
                 "billing_enabled": mcp.billing.enabled(),
                 "billing_test_mode": mcp.billing.test_mode(),
+                "launch_discount_active": mcp.billing.launch_discount_active().await,
                 "member_since": summary.member_since,
                 "usage": {
                     "apps_owned": summary.apps_owned,

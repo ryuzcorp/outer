@@ -75,9 +75,9 @@ impl std::fmt::Debug for CloudflareConfig {
 /// one `STRIPE_*` name and is read here, the only env reader. All four
 /// empty on a localhost dev domain means billing is disabled: checkout,
 /// portal and the webhook refuse cleanly and refusals point at the console
-/// plan card instead of a checkout link. Off localhost the secret, webhook
-/// secret and Pro price are required; the launch coupon is optional (unset
-/// ends the promo, and existing subscribers keep their couponed price).
+/// secret and Pro price are required; the launch coupon is optional (unset,
+/// deleted or expired in Stripe ends the promo, and existing subscribers
+/// keep whatever Stripe says).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeConfig {
     /// `STRIPE_SECRET_KEY` (`sk_…`): creating Checkout and Portal sessions.
@@ -86,8 +86,8 @@ pub struct StripeConfig {
     pub webhook_secret: Option<String>,
     /// `STRIPE_PRICE_PRO` (`price_…`): the $8/month Pro price.
     pub price_pro: Option<String>,
-    /// `STRIPE_LAUNCH_COUPON` (optional): the 50 % launch coupon applied at
-    /// checkout while set.
+    /// `STRIPE_LAUNCH_COUPON` (optional): the 50 % launch coupon id, applied
+    /// at checkout only while the coupon is live in Stripe.
     pub launch_coupon: Option<String>,
 }
 
@@ -584,9 +584,10 @@ impl Config {
         // Stripe billing (spec §14.2, §18): localhost dev runs disabled
         // (all four empty); off localhost the secret, webhook secret and
         // Pro price are required, and a half-set triple is a
-        // misconfiguration either way. The launch coupon is optional: set
-        // applies the 50 % promo at checkout, unset ends it (existing
-        // subscribers keep their couponed price, spec Q4).
+        // misconfiguration either way. The launch coupon is optional: a
+        // live coupon in Stripe applies the 50 % promo at checkout, and
+        // the owner ends the promo there (existing subscribers keep
+        // whatever Stripe says, spec Q4).
         if !self.is_local() {
             for (name, present) in [
                 ("STRIPE_SECRET_KEY", self.stripe.secret_key.is_some()),

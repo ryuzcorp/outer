@@ -132,29 +132,29 @@ async fn api_list(
     // Live state when Cloudflare answers; the stored row when it doesn't.
     // A missing domain is `{domains: []}`, never a 404: the card shows the
     // empty state with the add form.
-    let view =
-        match domains::refresh_domain(
-            &state.mcp.pool,
-            cf(&state).as_ref(),
-            &state.mcp.domain,
-            &app,
-        )
-        .await
-        {
-            Ok(view) => Some(view),
-            Err(domains::DomainError::NotFound(_, _)) => None,
-            Err(domains::DomainError::Unavailable(_)) => {
-                domains::list_domains(&state.mcp.pool, &state.mcp.domain, &app)
-                    .await
-                    .map(|mut v| v.pop())
-                    .unwrap_or(None)
-            }
-            Err(err) => {
-                return super::console_actions::tool_response(
-                    &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id),
-                );
-            }
-        };
+    let view = match domains::refresh_domain(
+        &state.mcp.pool,
+        cf(&state).as_ref(),
+        &state.mcp.domain,
+        &app,
+    )
+    .await
+    {
+        Ok(view) => Some(view),
+        Err(domains::DomainError::NotFound(_, _)) => None,
+        Err(domains::DomainError::Unavailable(_)) => {
+            domains::list_domains(&state.mcp.pool, &state.mcp.domain, &app)
+                .await
+                .map(|mut v| v.pop())
+                .unwrap_or(None)
+        }
+        Err(err) => {
+            return super::console_actions::tool_response(
+                &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id)
+                    .await,
+            );
+        }
+    };
     let out: Vec<serde_json::Value> = view.iter().map(domain_json).collect();
     super::console::ok_json(json!({"plan": plan, "role": "owner", "domains": out}))
 }
@@ -228,11 +228,9 @@ async fn api_add(
     .await;
     match outcome {
         Ok(view) => super::console::ok_json(json!({"domain": domain_json(&view)})),
-        Err(err) => super::console_actions::tool_response(&crate::mcp::tools::domains::tool_error(
-            err,
-            &state.mcp.billing,
-            &app.owner_id,
-        )),
+        Err(err) => super::console_actions::tool_response(
+            &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id).await,
+        ),
     }
 }
 
@@ -257,11 +255,9 @@ async fn api_refresh(
         Err(domains::DomainError::NotFound(_, _)) => {
             super::console::ok_json(json!({"domain": serde_json::Value::Null}))
         }
-        Err(err) => super::console_actions::tool_response(&crate::mcp::tools::domains::tool_error(
-            err,
-            &state.mcp.billing,
-            &app.owner_id,
-        )),
+        Err(err) => super::console_actions::tool_response(
+            &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id).await,
+        ),
     }
 }
 
@@ -299,10 +295,8 @@ async fn api_remove(
     .await;
     match outcome {
         Ok(hostname) => super::console::ok_json(json!({"removed": hostname})),
-        Err(err) => super::console_actions::tool_response(&crate::mcp::tools::domains::tool_error(
-            err,
-            &state.mcp.billing,
-            &app.owner_id,
-        )),
+        Err(err) => super::console_actions::tool_response(
+            &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id).await,
+        ),
     }
 }

@@ -505,8 +505,13 @@ mod tests {
                             return;
                         }
                         // Subscription refetches are GETs with no form body;
-                        // only the checkout/portal POSTs are recorded.
-                        let reply = if path.starts_with("/v1/subscriptions/") {
+                        // only the checkout/portal POSTs are recorded. The
+                        // promo switch reads the coupon here: live, so the
+                        // starter test pins the couponed checkout end to end.
+                        let reply = if path.starts_with("/v1/coupons/") {
+                            let coupon = "{\"id\":\"launch50\",\"object\":\"coupon\",\"valid\":true,\"percent_off\":50,\"duration\":\"forever\"}";
+                            format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{coupon}", coupon.len())
+                        } else if path.starts_with("/v1/subscriptions/") {
                             if *failing.lock().unwrap() {
                                 let err = r#"{"error":{"message":"boom"}}"#;
                                 format!("HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{err}", err.len())
