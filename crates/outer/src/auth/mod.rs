@@ -63,6 +63,7 @@ pub struct AuthState {
     pub config: AuthConfig,
 }
 
+#[derive(Debug, Clone)]
 pub struct Principal {
     pub account_id: String,
     pub email: String,
@@ -70,6 +71,7 @@ pub struct Principal {
     pub credential: Credential,
 }
 
+#[derive(Debug, Clone)]
 pub enum Credential {
     ApiKey { key_id: String },
     OAuth { grant_id: String },

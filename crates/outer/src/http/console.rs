@@ -78,6 +78,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         )
         .route("/api/console/admin/waitlist", get(api_admin_waitlist))
         .merge(super::console_admin::routes())
+        .merge(super::console_admin_telemetry::routes())
         .route("/api/console/apps", get(api_apps))
         .route("/api/console/apps/{slug}", get(api_app))
         .route("/api/console/apps/{slug}/actions", get(api_actions))

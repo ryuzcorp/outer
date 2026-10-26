@@ -7,8 +7,8 @@ use serde_json::Value;
 use crate::mcp::tools::{
     account, apps as app_inputs, backups as backup_inputs, code as code_inputs,
     collaborators as collab_inputs, domains as domain_inputs, export as export_inputs,
-    look as look_inputs, preview as preview_inputs, runtime as runtime_inputs,
-    secrets as secrets_inputs, NoArgs,
+    look as look_inputs, open_app as open_app_inputs, preview as preview_inputs,
+    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -88,10 +88,10 @@ impl Hints {
 pub fn hints_for(name: &str) -> Option<Hints> {
     Some(match name {
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
-        | "get_app" | "share_app" | "look_at_app" | "list_files" | "read_files" | "search_code"
-        | "history" | "show_commit" | "deploy_status" | "deploy_log" | "app_logs"
-        | "app_errors" | "list_secrets" | "list_collaborators" | "list_domains" | "export_code"
-        | "list_backups" => Hints::READ,
+        | "get_app" | "share_app" | "look_at_app" | "open_app" | "list_files" | "read_files"
+        | "search_code" | "history" | "show_commit" | "deploy_status" | "deploy_log"
+        | "app_logs" | "app_errors" | "list_secrets" | "list_collaborators" | "list_domains"
+        | "export_code" | "list_backups" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
         | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" => Hints::WRITE,
@@ -301,6 +301,11 @@ pub fn registry() -> Vec<ToolDef> {
             "Download your app's whole code as a zip (Pro, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.",
             Account, false,
         ),
+        tool::<open_app_inputs::OpenAppInput>(
+            "open_app",
+            "Orient on an app in one call: head sha, role-tagged tree, routes, D1 tables, bindings, brand, AGENTS.md digest, last deploy, open errors and quota. Start here, then read_files (batched ranges), search_code, commit edits.",
+            Account, false,
+        ),
         tool::<code_inputs::ListFilesInput>(
             "list_files",
             "List an app's files at a commit: {app, sha?, path_prefix?}.",
@@ -442,7 +447,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 51);
+        assert_eq!(tools.len(), 52);
     }
 }
 

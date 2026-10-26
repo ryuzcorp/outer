@@ -786,6 +786,19 @@ pub fn spawn_sweep(pool: SqlitePool, agg: MetricsAgg) -> tokio::task::JoinHandle
                         tracing::warn!(error = %err, "metrics prune failed; retrying on the next tick");
                     }
                 }
+                // Tool telemetry (migration 0015): 30-day retention, pruned
+                // by this same sweep. Independent of the metrics prune above:
+                // one failing never blocks the other.
+                match crate::mcp::telemetry::prune(&pool, crate::apps::now_ms()).await {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            tracing::info!(removed, "pruned expired tool telemetry rows");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "tool telemetry prune failed; retrying on the next tick");
+                    }
+                }
             }
         }
     })

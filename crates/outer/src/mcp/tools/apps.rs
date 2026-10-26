@@ -234,10 +234,15 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     )
     .await?;
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
-    let summary = format!("{} is live at {}.", app.slug, ctx.state.app_url(&app.slug));
+    let summary = format!(
+        "{} is live at {}. Open it with open_app to keep working.",
+        app.slug,
+        ctx.state.app_url(&app.slug)
+    );
     let structured = json!({
         "app": {"slug": app.slug, "url": ctx.state.app_url(&app.slug), "visibility": app.visibility.as_str()},
         "deploy": deploy,
+        "next": "open_app {app} to orient, then read_files (batched ranges), search_code, commit edits",
     });
     Ok(super::ok_deploy(
         summary,

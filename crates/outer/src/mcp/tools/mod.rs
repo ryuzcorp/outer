@@ -14,6 +14,7 @@ pub(crate) mod collaborators;
 pub(crate) mod domains;
 pub(crate) mod export;
 pub(crate) mod look;
+pub(crate) mod open_app;
 pub(crate) mod preview;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
@@ -964,6 +965,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "list_domains" => domains::list_domains(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "open_app" => open_app::open_app_impl(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "list_files" => code::list_files(parse_args(args)?, ctx)

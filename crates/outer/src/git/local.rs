@@ -507,6 +507,76 @@ pub async fn blob_sha(
     Ok((sha, out.trim().to_string()))
 }
 
+/// Line counts for every text file at `rev`, in one `git grep` pass:
+/// `--count` with an empty pattern counts every line, `-I` skips binary
+/// blobs. Returns the resolved sha and `path -> lines`. Files `grep`
+/// skips (binary, empty) are absent: callers treat a missing entry as
+/// unknown, not zero.
+pub async fn line_counts(
+    bare: &Path,
+    rev: Option<&str>,
+) -> anyhow::Result<(String, std::collections::HashMap<String, u64>)> {
+    let Some(sha) = resolve_rev(bare, rev).await? else {
+        anyhow::bail!("app has no commits yet");
+    };
+    let gd = git_dir(bare);
+    let run = run_capped(
+        &[&gd, "grep", "--count", "-I", "-e", "", &sha, "--", "."],
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .await?;
+    // Exit 1 is "no matches" (an empty tree): not a failure.
+    if run.failed() && run.status.code() != Some(1) {
+        anyhow::bail!("git grep --count failed\n{}", run.stderr);
+    }
+    let mut counts = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&run.stdout).lines() {
+        // `<sha>:<path>:<count>`.
+        let rest = line.strip_prefix(&sha).and_then(|r| r.strip_prefix(':'));
+        let Some(rest) = rest else { continue };
+        let Some(colon) = rest.rfind(':') else {
+            continue;
+        };
+        let (path, count) = rest.split_at(colon);
+        if let Ok(n) = count[1..].parse::<u64>() {
+            counts.insert(path.to_string(), n);
+        }
+    }
+    Ok((sha, counts))
+}
+
+/// Name-status pairs (`path`, status char) between two commits, in
+/// `git diff` order. Renames land on the new path with status `R`;
+/// callers map the codes they care about.
+pub async fn changed_paths(
+    bare: &Path,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<Vec<(String, char)>> {
+    for rev in [from, to] {
+        validate_sha(rev)?;
+    }
+    let gd = git_dir(bare);
+    let out = run_git(
+        &[&gd, "diff", "--no-ext-diff", "--name-status", from, to],
+        &[],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let mut out_paths = Vec::new();
+    for line in out.lines() {
+        let mut parts = line.split('\t');
+        let Some(code) = parts.next() else { continue };
+        let status = code.chars().next().unwrap_or('M');
+        // Renames carry `old new`: the change lands on the new path.
+        let path = parts.next_back().unwrap_or("").to_string();
+        if !path.is_empty() {
+            out_paths.push((path, status));
+        }
+    }
+    Ok(out_paths)
+}
+
 /// Largest single git stdout kept in memory: `grep`, `ls-tree` and `show`
 /// stream through this cap and kill the child when it fills, so a hostile
 /// tree cannot OOM the platform through an unbounded `wait_with_output`.
