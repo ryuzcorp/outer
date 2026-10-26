@@ -84,7 +84,7 @@ fn render_error(err: crate::browser::RenderError, url: &str) -> ToolError {
 
 /// Render the app page and return the screenshot as an MCP image block
 /// plus the navigation status/title, console errors and failed requests.
-/// Untrusted like `read_file`: the pixels and the console entries render
+/// Untrusted like `read_files`: the pixels and the console entries render
 /// app or visitor content. The recorder runs only on the tokened navigation
 /// (see `look_tokens`); when it cannot run, the answer says exactly why
 /// and points at `app_logs` / `app_errors` for server-side failures.

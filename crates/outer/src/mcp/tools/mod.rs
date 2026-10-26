@@ -972,7 +972,7 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "export_code" => export::export_code(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
-        "read_file" => code::read_file(parse_args(args)?, ctx)
+        "read_files" => code::read_files(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "search_code" => code::search_code(parse_args(args)?, ctx)

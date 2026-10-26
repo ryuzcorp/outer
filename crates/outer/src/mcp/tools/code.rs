@@ -1,4 +1,4 @@
-//! The code tools: `list_files`, `read_file`, `search_code`, `commit`,
+//! The code tools: `list_files`, `read_files`, `search_code`, `commit`,
 //! `history`, `show_commit`, `rollback`.
 
 use schemars::JsonSchema;
@@ -25,18 +25,29 @@ pub struct ListFilesInput {
     pub path_prefix: Option<String>,
 }
 
+/// One file inside a `read_files` call.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadFileInput {
-    /// The app slug.
-    pub app: String,
+pub struct ReadFileEntry {
     /// Repo-relative path.
     pub path: String,
+    /// First line to return (1-based, default 1). Not with `symbol`.
+    pub start_line: Option<u64>,
+    /// Last line to return, inclusive (default: end of file). Not with `symbol`.
+    pub end_line: Option<u64>,
+    /// A top-level function, class, const or type to return instead of a
+    /// line range (`.ts/.tsx/.js/.jsx/.mjs/.cjs/.mts/.cts`, or `.astro`
+    /// frontmatter). Ambiguous names are refused: use lines instead.
+    pub symbol: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadFilesInput {
+    /// The app slug.
+    pub app: String,
     /// A commit sha (default: the tip of main).
     pub sha: Option<String>,
-    /// First line to return (1-based, default 1).
-    pub start_line: Option<u64>,
-    /// Last line to return, inclusive (default: end of file).
-    pub end_line: Option<u64>,
+    /// 1-20 files to read. A bad file fails inline without failing the call.
+    pub files: Vec<ReadFileEntry>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -45,8 +56,22 @@ pub struct SearchCodeInput {
     pub app: String,
     /// Text to find (fixed string unless regex is true).
     pub query: String,
-    /// Treat the query as an extended regular expression.
+    /// Treat the query as an extended regular expression (text only).
     pub regex: Option<bool>,
+    /// Only files matching these globs (`*`, `?`, `**`; no `/` matches the
+    /// basename at any depth). At most 20.
+    pub paths: Option<Vec<String>>,
+    /// Surrounding lines per match, 0-5 (default 0).
+    pub context: Option<u8>,
+    /// Match `Query`, `QUERY` and the rest too.
+    pub case_insensitive: Option<bool>,
+    /// Match whole words only.
+    pub word: Option<bool>,
+    /// `text` (default) or `symbol`: one identifier's definitions and usages.
+    pub kind: Option<String>,
+    /// Search generated files too (`node_modules/`, `dist/`, lockfiles are
+    /// skipped by default).
+    pub include_generated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -172,139 +197,396 @@ pub async fn list_files(input: ListFilesInput, ctx: &Ctx<'_>) -> Result<Value, T
     ))
 }
 
-pub async fn read_file(input: ReadFileInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    if let (Some(start), Some(end)) = (input.start_line, input.end_line) {
-        if start < 1 || end < start {
-            return Err(ToolError::invalid_argument(
-                "start_line is 1-based and end_line must not precede it",
-            ));
-        }
+/// Most files one `read_files` call takes.
+pub const MAX_READ_FILES: usize = 20;
+/// Total numbered-text bytes one `read_files` call returns; the rest is cut
+/// with `truncated`, and files past the budget fail inline.
+pub const MAX_READ_OUTPUT_BYTES: usize = 200 * 1024;
+
+/// Cut `s` at `cap` bytes on a UTF-8 boundary.
+fn truncate_utf8(s: &str, cap: usize) -> &str {
+    let mut end = cap.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+pub async fn read_files(input: ReadFilesInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    if input.files.is_empty() || input.files.len() > MAX_READ_FILES {
+        return Err(ToolError::invalid_argument(format!(
+            "files holds 1-{MAX_READ_FILES} entries"
+        )));
     }
     let (app, _) = visible_app(ctx, &input.app).await?;
     if let Some(rev) = input.sha.as_deref() {
         check_rev("sha", rev)?;
     }
     let bare = mirror(ctx, &app.slug).await?;
-    let (sha, bytes) = crate::git::local::read_blob(&bare, input.sha.as_deref(), &input.path)
+    let head = crate::git::local::resolve_rev(&bare, input.sha.as_deref())
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ToolError::not_found("app has no commits yet"))?;
+    let mut used = 0usize;
+    let mut budget_spent = false;
+    let mut truncated = false;
+    let mut ok_count = 0usize;
+    let mut files = Vec::with_capacity(input.files.len());
+    let mut data = Vec::with_capacity(input.files.len());
+    for entry in &input.files {
+        if budget_spent {
+            files.push(json!({
+                "path": entry.path,
+                "code": "invalid_argument",
+                "error": "skipped: the 200 KB output budget is exhausted by earlier files",
+            }));
+            data.push(format!(
+                "--- {}: skipped (output budget exhausted)",
+                entry.path
+            ));
+            truncated = true;
+            continue;
+        }
+        match read_one(&bare, &head, entry).await {
+            Ok((mut file, numbered)) => {
+                if used + numbered.len() > MAX_READ_OUTPUT_BYTES {
+                    let room = MAX_READ_OUTPUT_BYTES.saturating_sub(used);
+                    let cut = truncate_utf8(&numbered, room);
+                    // A file cut to nothing is an inline skip, not an empty read.
+                    if cut.is_empty() {
+                        files.push(json!({
+                            "path": entry.path,
+                            "code": "invalid_argument",
+                            "error": "skipped: the 200 KB output budget is exhausted by earlier files",
+                        }));
+                        data.push(format!(
+                            "--- {}: skipped (output budget exhausted)",
+                            entry.path
+                        ));
+                    } else {
+                        file["text"] = json!(cut);
+                        file["truncated"] = json!(true);
+                        files.push(file);
+                        data.push(format!(
+                            "--- {}: truncated at the 200 KB output budget\n{cut}",
+                            entry.path
+                        ));
+                        ok_count += 1;
+                    }
+                    used = MAX_READ_OUTPUT_BYTES;
+                    budget_spent = true;
+                    truncated = true;
+                } else {
+                    used += numbered.len();
+                    file["text"] = json!(numbered);
+                    files.push(file);
+                    data.push(format!("--- {}\n{numbered}", entry.path));
+                    ok_count += 1;
+                }
+            }
+            Err((code, message)) => {
+                files.push(json!({"path": entry.path, "code": code, "error": message}));
+                data.push(format!("--- {}: {message}", entry.path));
+            }
+        }
+    }
+    let short = &head[..12.min(head.len())];
+    let summary = if truncated {
+        format!(
+            "{ok_count} of {} file(s) at {short} (truncated).",
+            input.files.len()
+        )
+    } else {
+        format!("{ok_count} of {} file(s) at {short}.", input.files.len())
+    };
+    Ok(ok_untrusted(
+        summary,
+        data.join("\n"),
+        json!({"sha": head, "files": files, "truncated": truncated}),
+    ))
+}
+
+/// Read one entry: `Ok` carries the structured file (without `text`) plus
+/// the numbered text; `Err` carries the inline `(code, message)`.
+async fn read_one(
+    bare: &std::path::Path,
+    head: &str,
+    entry: &ReadFileEntry,
+) -> Result<(Value, String), (&'static str, String)> {
+    if let (Some(start), Some(end)) = (entry.start_line, entry.end_line) {
+        if start < 1 || end < start {
+            return Err((
+                "invalid_argument",
+                "start_line is 1-based and end_line must not precede it".to_string(),
+            ));
+        }
+    }
+    if entry.symbol.is_some() && (entry.start_line.is_some() || entry.end_line.is_some()) {
+        return Err((
+            "invalid_argument",
+            "symbol cannot be combined with start_line/end_line".to_string(),
+        ));
+    }
+    if let Err(e) = crate::git::local::validate_read_path(&entry.path) {
+        return Err(("invalid_argument", e.to_string()));
+    }
+    let (_, bytes) = crate::git::local::read_blob(bare, Some(head), &entry.path)
         .await
         .map_err(|e| {
             let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("no commits") {
-                ToolError::not_found(msg)
+            if msg.contains("not found") {
+                ("not_found", msg)
             } else if msg.contains("over the") || msg.contains("must") || msg.contains("path") {
+                ("invalid_argument", msg)
+            } else {
+                (
+                    "invalid_argument",
+                    format!("cannot read {}: {msg}", entry.path),
+                )
+            }
+        })?;
+    if bytes.contains(&0) {
+        return Err((
+            "invalid_argument",
+            format!("{} is binary ({} bytes)", entry.path, bytes.len()),
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|e| {
+        (
+            "invalid_argument",
+            format!("{} is not UTF-8: {e}", entry.path),
+        )
+    })?;
+    let total = text.lines().count() as u64;
+    let blob = crate::git::local::blob_sha(bare, Some(head), &entry.path)
+        .await
+        .map(|(_, blob)| blob)
+        .unwrap_or_default();
+    if let Some(symbol) = entry.symbol.as_deref() {
+        let decl = crate::git::symbol::extract_symbol(&entry.path, &text, symbol)
+            .map_err(|e| ("invalid_argument", e.to_string()))?;
+        let numbered = number_lines(&text, decl.start_line, decl.end_line);
+        let file = json!({
+            "path": entry.path,
+            "blob": blob,
+            "total_lines": total,
+            "start_line": decl.start_line,
+            "end_line": decl.end_line,
+            "symbol": symbol,
+        });
+        return Ok((file, numbered));
+    }
+    let start = entry.start_line.unwrap_or(1).max(1);
+    let end = entry.end_line.unwrap_or(u64::MAX).min(total);
+    let numbered = number_lines(&text, start, end);
+    let file = json!({
+        "path": entry.path,
+        "blob": blob,
+        "total_lines": total,
+        "start_line": start,
+        "end_line": end.min(total),
+    });
+    Ok((file, numbered))
+}
+
+/// Lines `start..=end` (1-based, already clamped) numbered as `N│ line`.
+fn number_lines(text: &str, start: u64, end: u64) -> String {
+    if end < start {
+        return String::new();
+    }
+    text.lines()
+        .enumerate()
+        .skip(start.saturating_sub(1) as usize)
+        .take(end.saturating_sub(start.saturating_sub(1)) as usize)
+        .map(|(i, line)| format!("{}│ {line}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A `word` identifier for `kind: "symbol"`: ASCII letters, digits, `_`
+/// and `$`, not starting with a digit.
+fn is_symbol_query(query: &str) -> bool {
+    let mut chars = query.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    query
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+pub async fn search_code(input: SearchCodeInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let symbol = match input.kind.as_deref() {
+        None | Some("text") => false,
+        Some("symbol") => true,
+        Some(other) => {
+            return Err(ToolError::invalid_argument(format!(
+                "kind is \"text\" or \"symbol\", not {other:?}"
+            )));
+        }
+    };
+    let context = input.context.unwrap_or(0);
+    if context > 5 {
+        return Err(ToolError::invalid_argument("context is 0-5"));
+    }
+    if input.paths.as_ref().is_some_and(|p| p.len() > 20) {
+        return Err(ToolError::invalid_argument("at most 20 path globs"));
+    }
+    if symbol {
+        if input.regex.unwrap_or(false) {
+            return Err(ToolError::invalid_argument(
+                "regex has no effect with kind: \"symbol\"",
+            ));
+        }
+        if !is_symbol_query(&input.query) {
+            return Err(ToolError::invalid_argument(
+                "kind: \"symbol\" needs one identifier (letters, digits, _ and $, not starting with a digit)",
+            ));
+        }
+    }
+    let (app, _) = visible_app(ctx, &input.app).await?;
+    let bare = mirror(ctx, &app.slug).await?;
+    let opts = crate::git::local::GrepOptions {
+        regex: input.regex.unwrap_or(false) && !symbol,
+        case_insensitive: input.case_insensitive.unwrap_or(false),
+        word: input.word.unwrap_or(false) || symbol,
+        paths: input.paths.clone().unwrap_or_default(),
+        include_generated: input.include_generated.unwrap_or(false),
+        context,
+    };
+    let (sha, files, truncated) = crate::git::local::grep_search(&bare, None, &input.query, &opts)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("query")
+                || msg.contains("regex")
+                || msg.contains("context")
+                || msg.contains("glob")
+            {
                 ToolError::invalid_argument(msg)
             } else {
                 internal(e)
             }
         })?;
-    let total_lines;
-    let (text, base64) = if bytes.contains(&0) {
-        total_lines = None;
-        (
-            None,
-            Some(base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                &bytes,
-            )),
+    if symbol {
+        return search_symbol(
+            &bare,
+            &sha,
+            files,
+            truncated,
+            &input.query,
+            opts.case_insensitive,
         )
-    } else {
-        let text = String::from_utf8(bytes).map_err(internal)?;
-        total_lines = Some(text.lines().count() as u64);
-        let start = input.start_line.unwrap_or(1).max(1) as usize;
-        let end = input.end_line.map(|e| e as usize).unwrap_or(usize::MAX);
-        let picked: Vec<&str> = text
-            .lines()
-            .skip(start - 1)
-            .take(end.saturating_sub(start - 1))
-            .collect();
-        let picked = picked.join("\n");
-        (Some(picked), None)
-    };
-    let (body, truncated) = match &text {
-        Some(t) if t.len() > 64 * 1024 => {
-            let mut end = 64 * 1024;
-            while !t.is_char_boundary(end) {
-                end -= 1;
+        .await;
+    }
+    let mut structured_files = Vec::with_capacity(files.len());
+    let mut data = Vec::new();
+    let mut total = 0usize;
+    for file in &files {
+        let mut matches = Vec::with_capacity(file.matches.len());
+        for hit in &file.matches {
+            total += 1;
+            data.push(format!("{}:{}:{}", file.path, hit.line, hit.text));
+            let mut m = json!({"line": hit.line, "text": hit.text});
+            if !hit.before.is_empty() {
+                m["before"] = json!(hit.before);
             }
-            (t[..end].to_string(), true)
+            if !hit.after.is_empty() {
+                m["after"] = json!(hit.after);
+            }
+            matches.push(m);
         }
-        Some(t) => (t.clone(), false),
-        None => (String::new(), false),
-    };
-    let mut structured = json!({
-        "path": input.path,
-        "sha": sha,
-        "truncated": truncated,
-    });
-    if let Some(text) = text {
-        structured["text"] = json!(body);
-        let _ = text;
-    } else if let Some(encoded) = base64 {
-        structured["binary"] = json!(encoded);
+        structured_files.push(json!({"path": file.path, "matches": matches}));
     }
-    if let Some(total) = total_lines {
-        structured["total_lines"] = json!(total);
-    }
-    if input.start_line.is_some() {
-        structured["start_line"] = json!(input.start_line);
-    }
-    if input.end_line.is_some() {
-        structured["end_line"] = json!(input.end_line);
-    }
-    let summary = format!("{} at {}.", input.path, &sha[..12.min(sha.len())]);
-    let data = match structured.get("text").and_then(Value::as_str) {
-        Some(t) => t.to_string(),
-        None => format!(
-            "<binary, {} bytes base64>",
-            structured["binary"].as_str().map_or(0, str::len)
-        ),
-    };
-    Ok(ok_untrusted(summary, data, structured))
-}
-
-pub async fn search_code(input: SearchCodeInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let (app, _) = visible_app(ctx, &input.app).await?;
-    let bare = mirror(ctx, &app.slug).await?;
-    let (sha, hits, truncated) = crate::git::local::grep(
-        &bare,
-        None,
-        &input.query,
-        input.regex.unwrap_or(false),
-        None,
-    )
-    .await
-    .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("query") || msg.contains("regex") {
-            ToolError::invalid_argument(msg)
-        } else {
-            internal(e)
-        }
-    })?;
-    let matches: Vec<Value> = hits
-        .iter()
-        .map(|h| json!({"path": h.path, "line": h.line, "text": h.text}))
-        .collect();
-    let data = matches
-        .iter()
-        .map(|m| {
-            format!(
-                "{}:{}:{}",
-                m["path"].as_str().unwrap_or(""),
-                m["line"].as_u64().unwrap_or(0),
-                m["text"].as_str().unwrap_or("")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     Ok(ok_untrusted(
-        format!("{} match(es).", matches.len()),
+        format!("{total} match(es) in {} file(s).", files.len()),
         if data.is_empty() {
             "(no matches)".to_string()
         } else {
-            data
+            data.join("\n")
         },
-        json!({"sha": sha, "matches": matches, "truncated": truncated}),
+        json!({"sha": sha, "files": structured_files, "truncated": truncated}),
+    ))
+}
+
+/// Split word matches into definitions (declaration lines for `query`) and
+/// usages (every other match). Files the parser refuses contribute usages
+/// only — an unparseable file never hides a hit.
+async fn search_symbol(
+    bare: &std::path::Path,
+    sha: &str,
+    files: Vec<crate::git::local::FileHits>,
+    truncated: bool,
+    query: &str,
+    case_insensitive: bool,
+) -> Result<Value, ToolError> {
+    let same = |name: &str| {
+        if case_insensitive {
+            name.eq_ignore_ascii_case(query)
+        } else {
+            name == query
+        }
+    };
+    let mut structured_files = Vec::with_capacity(files.len());
+    let mut data = Vec::new();
+    let mut defs = 0usize;
+    let mut uses = 0usize;
+    for file in &files {
+        let mut decl_lines: Vec<(u64, u64)> = Vec::new();
+        if let Ok((_, bytes)) = crate::git::local::read_blob(bare, Some(sha), &file.path).await {
+            if !bytes.contains(&0) {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    if let Ok(decls) = crate::git::symbol::top_level_decls(&file.path, &text) {
+                        decl_lines = decls
+                            .iter()
+                            .filter(|d| same(&d.name))
+                            .map(|d| (d.start_line, d.end_line))
+                            .collect();
+                    }
+                }
+            }
+        }
+        let mut definitions = Vec::new();
+        let mut usages = Vec::new();
+        for hit in &file.matches {
+            match decl_lines
+                .iter()
+                .find(|(start, _)| *start == hit.line)
+            {
+                Some((start, end)) => {
+                    defs += 1;
+                    data.push(format!("{}:{start}:def {query}", file.path));
+                    definitions.push(json!({"line": start, "end_line": end}));
+                }
+                None => {
+                    uses += 1;
+                    data.push(format!("{}:{}:{}", file.path, hit.line, hit.text));
+                    let mut m = json!({"line": hit.line, "text": hit.text});
+                    if !hit.before.is_empty() {
+                        m["before"] = json!(hit.before);
+                    }
+                    if !hit.after.is_empty() {
+                        m["after"] = json!(hit.after);
+                    }
+                    usages.push(m);
+                }
+            }
+        }
+        structured_files
+            .push(json!({"path": file.path, "definitions": definitions, "usages": usages}));
+    }
+    Ok(ok_untrusted(
+        format!(
+            "{defs} definition(s), {uses} usage(s) in {} file(s).",
+            files.len()
+        ),
+        if data.is_empty() {
+            "(no matches)".to_string()
+        } else {
+            data.join("\n")
+        },
+        json!({"sha": sha, "files": structured_files, "truncated": truncated}),
     ))
 }
 
