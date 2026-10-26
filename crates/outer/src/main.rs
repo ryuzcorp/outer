@@ -736,6 +736,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         inactivity: outer::inactivity::Windows::new(rt.inactive_days, rt.inactive_grace_days),
         jev,
         rollback_locks: outer::mcp::RollbackLocks::default(),
+        crawl: config.crawl.clone(),
         browser: browser_render(&config),
         look_tokens: look_tokens.clone(),
         delete_cfg: outer::apps::delete::DeleteConfig {
@@ -826,6 +827,26 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         unsub_key: mcp.unsub_key.clone(),
         billing: mcp.billing.clone(),
     });
+    // After-live moderation (spec §15.2): the proxy's report path and the
+    // periodic sweep share the Jev client, the crawl config and the effect
+    // deps (mailbox, fleet handle, edge purge).
+    let crawl_effects = outer::moderation::crawl::EffectDeps {
+        sender: mcp.auth.config.email.clone(),
+        apps_domain: rt.apps_domain.clone(),
+        fleets: fleets.clone(),
+        purge: cache_purge(&config),
+    };
+    let crawl_hooks = http::proxy::CrawlHooks {
+        jev: mcp.jev.clone(),
+        cfg: config.crawl.clone(),
+        effects: crawl_effects.clone(),
+    };
+    outer::moderation::crawl::spawn_sweep(outer::moderation::crawl::SweepDeps {
+        pool: pool.clone(),
+        cfg: config.crawl.clone(),
+        jev: mcp.jev.clone(),
+        effects: crawl_effects,
+    });
     let app = http::app(
         http::AppState {
             pool: pool.clone(),
@@ -846,7 +867,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             config.tls_enabled(),
             metrics.clone(),
         )
-        .with_look_tokens(look_tokens),
+        .with_look_tokens(look_tokens)
+        .with_crawl_hooks(crawl_hooks),
         config.domain.clone(),
     );
     tracing::info!(

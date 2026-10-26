@@ -106,6 +106,45 @@ impl StripeConfig {
             && self.launch_coupon.is_none()
     }
 }
+/// After-live moderation crawl (spec §15.2). Parsed here — the only env
+/// reader — from `OUTER_CRAWL_*` plus `OUTER_MODERATION_BAD_HOSTS` and
+/// `OUTER_REPORTS_PER_HOUR`; owned by [`Config::crawl`], shared by the
+/// post-deploy hook, the report path and the periodic sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlConfig {
+    /// Extra same-origin pages fetched per crawl after `/` (`OUTER_CRAWL_PAGES`, default 10).
+    pub max_pages: usize,
+    /// Per-page fetch timeout (`OUTER_CRAWL_TIMEOUT_S`, default 5, spec §15.2).
+    pub page_timeout: Duration,
+    /// Re-crawl awake public apps at least this often (`OUTER_CRAWL_PUBLIC_S`,
+    /// default 86400: daily, spec §15.2).
+    pub public_interval: Duration,
+    /// Re-crawl awake unlisted apps at least this often (`OUTER_CRAWL_UNLISTED_S`,
+    /// default 604800: weekly — the spec only mandates public, so unlisted
+    /// gets a quieter sensible default; see the §15 dated note).
+    pub unlisted_interval: Duration,
+    /// Link hosts treated as known-bad for the phishing rules
+    /// (`OUTER_MODERATION_BAD_HOSTS`, comma-separated, default empty: v1 has
+    /// no feed, so only the operator's entries count; the brand+credential
+    /// and off-origin-form signals work without it).
+    pub bad_hosts: Vec<String>,
+    /// Abuse reports accepted per client IP per hour on `/.outer/report`
+    /// (`OUTER_REPORTS_PER_HOUR`, default 5).
+    pub reports_per_hour: u32,
+}
+
+impl Default for CrawlConfig {
+    fn default() -> Self {
+        Self {
+            max_pages: 10,
+            page_timeout: Duration::from_secs(5),
+            public_interval: Duration::from_secs(86_400),
+            unlisted_interval: Duration::from_secs(7 * 86_400),
+            bad_hosts: Vec::new(),
+            reports_per_hour: 5,
+        }
+    }
+}
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,6 +236,9 @@ pub struct Config {
     pub stripe: StripeConfig,
     /// Running apps: allocation ranges, binaries, limits, sleep.
     pub runtime: RuntimeConfig,
+    /// After-live moderation crawl (spec §15.2): page budget, timeouts,
+    /// re-crawl cadences, the bad-host list and the report rate limit.
+    pub crawl: CrawlConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +555,46 @@ impl Config {
                 &mut problems,
             ),
         };
+        let crawl = CrawlConfig {
+            max_pages: parse_num(
+                get("OUTER_CRAWL_PAGES"),
+                "OUTER_CRAWL_PAGES",
+                10,
+                &mut problems,
+            ),
+            page_timeout: Duration::from_secs(parse_num(
+                get("OUTER_CRAWL_TIMEOUT_S"),
+                "OUTER_CRAWL_TIMEOUT_S",
+                5,
+                &mut problems,
+            )),
+            public_interval: Duration::from_secs(parse_num(
+                get("OUTER_CRAWL_PUBLIC_S"),
+                "OUTER_CRAWL_PUBLIC_S",
+                86_400,
+                &mut problems,
+            )),
+            unlisted_interval: Duration::from_secs(parse_num(
+                get("OUTER_CRAWL_UNLISTED_S"),
+                "OUTER_CRAWL_UNLISTED_S",
+                7 * 86_400,
+                &mut problems,
+            )),
+            bad_hosts: get("OUTER_MODERATION_BAD_HOSTS")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|part| part.trim().to_ascii_lowercase())
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            reports_per_hour: parse_num(
+                get("OUTER_REPORTS_PER_HOUR"),
+                "OUTER_REPORTS_PER_HOUR",
+                5,
+                &mut problems,
+            ),
+        };
 
         let config = Config {
             domain,
@@ -543,6 +625,7 @@ impl Config {
             log_filter,
             stripe,
             runtime,
+            crawl,
         };
         problems.extend(config.validate());
         if problems.is_empty() {
@@ -597,6 +680,18 @@ impl Config {
         if self.runtime.inactive_days == 0 {
             problems.push(
                 "OUTER_INACTIVE_DAYS=0 would delete Free apps at once; it must be at least 1"
+                    .to_string(),
+            );
+        }
+        if self.crawl.page_timeout.is_zero() {
+            problems.push(
+                "OUTER_CRAWL_TIMEOUT_S=0 would fail every page fetch at once; it must be at least 1"
+                    .to_string(),
+            );
+        }
+        if self.crawl.reports_per_hour == 0 {
+            problems.push(
+                "OUTER_REPORTS_PER_HOUR=0 would refuse every abuse report; it must be at least 1"
                     .to_string(),
             );
         }

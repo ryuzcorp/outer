@@ -858,6 +858,17 @@ async fn run_deploy_inner(
     let sender = state.auth.config.email.clone();
     let issuer = state.auth.config.issuer.clone();
     let unsub_key = state.unsub_key.clone();
+    // The after-live crawl (spec §15.2) runs right after a successful live
+    // deploy, in its own detached task: the deploy response must never wait
+    // on the crawl, and a Jev outage fails the crawl open (logged, retried
+    // by the sweep) without touching the just-deployed app.
+    let crawl_jev = state.jev.clone();
+    let crawl_cfg = state.crawl.clone();
+    let crawl_sender = state.auth.config.email.clone();
+    let crawl_fleets = state.fleets.clone();
+    let crawl_apps_domain = state.apps_domain.clone();
+    let crawl_purge = state.delete_cfg.cache_purge.clone();
+    let crawl_pool = state.pool.clone();
     let handle = tokio::spawn(async move {
         let outcome = match kind {
             crate::deploy::DeployKind::Main => {
@@ -887,6 +898,55 @@ async fn run_deploy_inner(
                     crate::auth::now_ms(),
                 )
                 .await;
+            }
+        }
+        // Crawl the fresh deploy (spec §15.2): live apps only, in a detached
+        // task so the deploy response above never waits on it.
+        if !kind.is_preview() {
+            if let Ok(done) = &outcome {
+                if done.status == "success" {
+                    let pool = crawl_pool.clone();
+                    let app = app_owned.clone();
+                    let jev = crawl_jev.clone();
+                    let cfg = crawl_cfg.clone();
+                    let sender = crawl_sender.clone();
+                    let fleets = crawl_fleets.clone();
+                    let apps_domain = crawl_apps_domain.clone();
+                    let purge = crawl_purge.clone();
+                    tokio::spawn(async move {
+                        let Ok(fetch) = crate::moderation::crawl::LoopbackFetch::new(
+                            app.port,
+                            cfg.page_timeout,
+                        ) else {
+                            return;
+                        };
+                        let now = crate::apps::now_ms();
+                        match crate::moderation::crawl::crawl_app(
+                            &pool,
+                            &app,
+                            &fetch,
+                            jev.as_ref(),
+                            &cfg,
+                            now,
+                        )
+                        .await
+                        {
+                            Ok((_result, effects)) => {
+                                let deps = crate::moderation::crawl::EffectDeps {
+                                    sender,
+                                    apps_domain,
+                                    fleets,
+                                    purge,
+                                };
+                                crate::moderation::crawl::apply_effects(&deps, &app, &effects)
+                                    .await;
+                            }
+                            Err(err) => {
+                                tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "post-deploy crawl failed");
+                            }
+                        }
+                    });
+                }
             }
         }
         (app_owned, outcome)

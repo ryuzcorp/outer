@@ -1,13 +1,16 @@
-//! The pre-live gate (spec §15.1, step 6 of the pipeline).
+//! Content moderation: the pre-live gate (spec §15.1, step 6 of the pipeline)
+//! and the after-live crawl engine (spec §15.2).
 //!
 //! Source strings, content files, prerendered HTML and app metadata are
 //! extracted ([`extract`]) and classified by TypeSafe Jev through Cloudflare
 //! AI Gateway ([`jev`]); the per-chunk scores are decided ([`gate`]).
 //! There is no handwritten profanity machinery: no normalization, no
-//! wordlists, no masking. Jev is the only classifier, and when it is
-//! unreachable the deploy fails closed (`review_unavailable`).
+//! wordlists, no masking. Jev is the only pre-live classifier, and when it
+//! is unreachable the deploy fails closed (`review_unavailable`).
+//! Live pages are re-read by [`crawl`], which fails open on a Jev outage.
 
 pub mod admin;
+pub mod crawl;
 pub mod extract;
 pub mod gate;
 pub mod jev;
