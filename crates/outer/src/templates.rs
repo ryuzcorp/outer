@@ -74,6 +74,22 @@ impl Template {
     }
 }
 
+/// Write (overwriting) the fresh tree's `brand.json` for a new app
+/// (BRANDING.md Contract 1): `name` defaults to the slug title-cased
+/// (`kalkulator-pizzy` → `Kalkulator Pizzy`), `description` defaults to
+/// `name`, and `accent` is deterministic per slug. Creation paths call this
+/// right after [`materialize`], before the first commit, so the seed commit
+/// carries the brand. It overwrites the template's own `brand.json`.
+pub fn write_brand(
+    tree: &Path,
+    slug: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> anyhow::Result<()> {
+    let brand = crate::brand::resolve_brand(slug, name, description)?;
+    crate::brand::write_brand_file(tree, &brand)
+}
+
 /// Key of the vendored bundle for `sha` in the store.
 fn bundle_key(sha: &str) -> String {
     format!("outer/templates/{sha}.bundle")

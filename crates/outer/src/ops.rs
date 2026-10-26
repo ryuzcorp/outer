@@ -41,12 +41,14 @@ pub fn noreply_author(account_id: &str, email: &str, domain: &str) -> Author {
 /// deploy it. The template is materialized before the app row exists, so a
 /// missing `outer templates sync` fails without leaving anything behind; a
 /// failure after the row exists removes the row and the repo again (without
-/// quarantining the slug: nobody ever saw it).
+/// quarantining the slug: nobody ever saw it). The seed commit carries the
+/// app's `brand.json`, and the app row keeps the same display name.
 pub async fn create_app(
     p: &Platform,
     owner_email: &str,
     slug: &str,
     name: Option<&str>,
+    description: Option<&str>,
     template: templates::Template,
 ) -> anyhow::Result<(App, DeployOutcome)> {
     let scratch = tempfile::tempdir().context("template scratch dir")?;
@@ -57,7 +59,14 @@ pub async fn create_app(
     // missing client on localhost dev logs a warning and passes — exactly
     // like the gate. Failures here abort before the app row exists.
     apps::validate_slug(slug)?;
-    apps::check_slug_profanity(p.deployer.settings().jev.as_ref(), slug, name).await?;
+    // The seed commit carries the brand: it overwrites the template's own
+    // `brand.json` with the new app's values, resolved here so the row
+    // below keeps the same display name.
+    let display_name = crate::brand::resolve_brand(slug, name, description)
+        .map(|brand| brand.name)
+        .context("resolving the app brand")?;
+    crate::templates::write_brand(&tree, slug, name, description)?;
+    apps::check_slug_profanity(p.deployer.settings().jev.as_ref(), slug, name, description).await?;
     let owner_id = apps::ensure_account(&p.pool, owner_email).await?;
     let plan: Option<String> = sqlx::query_scalar("SELECT plan FROM user WHERE id = ?1")
         .bind(&owner_id)
@@ -67,7 +76,7 @@ pub async fn create_app(
         &p.pool,
         &owner_id,
         slug,
-        name,
+        Some(&display_name),
         &p.alloc,
         apps::app_limit_for_plan(&plan.clone().unwrap_or_default()),
     )
@@ -252,6 +261,7 @@ mod tests {
             &p,
             "pro@example.com",
             "warmshop",
+            None,
             None,
             crate::templates::Template::App,
         )

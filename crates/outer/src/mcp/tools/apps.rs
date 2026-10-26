@@ -22,9 +22,15 @@ pub struct CreateAppInput {
     /// are refused; without a Jev client (localhost dev) the content check
     /// is skipped.
     pub slug: String,
-    /// Display name (defaults to the slug). Checked by the same content
-    /// check as the slug.
+    /// Display name, 1–60 chars, no control chars (defaults to the slug
+    /// title-cased: `kalkulator-pizzy` → `Kalkulator Pizzy`). Written to the
+    /// repo's `brand.json` with the accent; the app row keeps the same name.
+    /// Checked by the same content check as the slug.
     pub name: Option<String>,
+    /// One-line pitch, 1–160 chars, no control chars (defaults to the name).
+    /// Written to the repo's `brand.json`. Checked by the same content
+    /// check as the slug, with the same refusal.
+    pub description: Option<String>,
     /// Which starter to seed from: "app" (interactive Ilha + Void app) or
     /// "website" (Astro + Ilha-islands content site). Defaults to "app";
     /// any other value is refused. Pick "website" for landing pages,
@@ -91,19 +97,29 @@ async fn seed_app(
     owner_email: &str,
     slug: &str,
     name: Option<&str>,
+    description: Option<&str>,
     template: crate::templates::Template,
 ) -> Result<(App, String), ToolError> {
+    // Cheap brand-shape checks before template bytes move or any row exists,
+    // so a refused name or description costs nothing.
+    let display_name = crate::brand::resolve_brand(slug, name, description)
+        .map(|brand| brand.name)
+        .map_err(|err| ToolError::invalid_argument(err.to_string()))?;
     let scratch = tempfile::tempdir().map_err(internal)?;
     let tree = scratch.path().join("tree");
     let reference = crate::templates::materialize(&ctx.state.store, template, &tree)
         .await
         .map_err(internal)?;
+    // The seed commit carries the brand: it overwrites the template's own
+    // `brand.json` with the new app's values.
+    crate::templates::write_brand(&tree, slug, name, description)
+        .map_err(|err| ToolError::invalid_argument(err.to_string()))?;
     let plan = super::plan_of(&ctx.state.pool, owner_id).await?;
     let mut app = apps::create(
         &ctx.state.pool,
         owner_id,
         slug,
-        name,
+        Some(&display_name),
         &ctx.state.alloc,
         super::app_limit(&plan),
     )
@@ -196,18 +212,24 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         })?,
     };
     check_app_quota(&ctx.state.pool, &ctx.state.billing, &caller.account_id).await?;
-    // The name check runs before any row exists and before the quota claim,
-    // so refused names cost nothing and Jev never sees a name the cheap
-    // checks already refused.
-    apps::check_slug_profanity(ctx.state.jev.as_ref(), &input.slug, input.name.as_deref())
-        .await
-        .map_err(ToolError::from_profanity)?;
+    // The name and description checks run before any row exists and before
+    // the quota claim, so refused text costs nothing and Jev never sees a
+    // name the cheap checks already refused.
+    apps::check_slug_profanity(
+        ctx.state.jev.as_ref(),
+        &input.slug,
+        input.name.as_deref(),
+        input.description.as_deref(),
+    )
+    .await
+    .map_err(ToolError::from_profanity)?;
     let (app, sha) = seed_app(
         ctx,
         &caller.account_id,
         &caller.email,
         &input.slug,
         input.name.as_deref(),
+        input.description.as_deref(),
         template,
     )
     .await?;
@@ -507,7 +529,7 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     apps::validate_slug(&input.slug).map_err(|e| ToolError::invalid_argument(e.to_string()))?;
     // After the cheap checks, before the quota claim: a refused name costs
     // nothing and Jev never runs for a malformed, reserved or brand slug.
-    apps::check_slug_profanity(ctx.state.jev.as_ref(), &input.slug, None)
+    apps::check_slug_profanity(ctx.state.jev.as_ref(), &input.slug, None, None)
         .await
         .map_err(ToolError::from_profanity)?;
     // Claimed before the move; refunded on any error. The domain rename

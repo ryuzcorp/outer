@@ -720,6 +720,136 @@ async fn create_app_template_selects_the_starter() {
     assert_eq!(result(&site)["structuredContent"]["app"]["slug"], "site");
 }
 
+/// Read `path` at `sha` from the app's seeded repo.
+async fn show_seed_file(state: &McpState, slug: &str, sha: &str, path: &str) -> String {
+    let bare = crate::git::manifest::ensure_synced(&state.store, &state.git, &state.sync, slug)
+        .await
+        .unwrap();
+    let git_dir = format!("--git-dir={}", bare.display());
+    crate::git::manifest::run_git(
+        &[&git_dir, "show", &format!("{sha}:{path}")],
+        &[],
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn create_app_seed_commit_carries_brand_json() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "pizza", "name": "Pizza Calculator",
+                "description": "Split pizza orders fairly between friends."}),
+    )
+    .await;
+    assert_eq!(
+        result(&body)["structuredContent"]["deploy"]["status"],
+        "success",
+        "create failed: {body}"
+    );
+    let sha = result(&body)["structuredContent"]["deploy"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The first commit carries the given brand, overwriting the template's.
+    let shown = show_seed_file(&state, "pizza", &sha, "brand.json").await;
+    let brand: serde_json::Value = serde_json::from_str(shown.trim()).unwrap();
+    assert_eq!(brand["name"], "Pizza Calculator");
+    assert_eq!(brand["shortName"], "Pizza");
+    assert_eq!(
+        brand["description"],
+        "Split pizza orders fairly between friends."
+    );
+    assert_eq!(brand["accent"], crate::brand::accent_for_slug("pizza"));
+    // The app row keeps the same display name.
+    let row: Option<String> = sqlx::query_scalar("SELECT name FROM app WHERE slug = 'pizza'")
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(row.as_deref(), Some("Pizza Calculator"));
+}
+
+#[tokio::test]
+async fn create_app_brand_defaults_from_the_slug() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "kalkulator-pizzy"}),
+    )
+    .await;
+    assert_eq!(
+        result(&body)["structuredContent"]["deploy"]["status"],
+        "success",
+        "create failed: {body}"
+    );
+    let sha = result(&body)["structuredContent"]["deploy"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let shown = show_seed_file(&state, "kalkulator-pizzy", &sha, "brand.json").await;
+    let brand: serde_json::Value = serde_json::from_str(shown.trim()).unwrap();
+    assert_eq!(brand["name"], "Kalkulator Pizzy");
+    assert_eq!(brand["shortName"], "Kalkulator");
+    assert_eq!(brand["description"], "Kalkulator Pizzy");
+    assert_eq!(
+        brand["accent"],
+        crate::brand::accent_for_slug("kalkulator-pizzy")
+    );
+    let row: Option<String> =
+        sqlx::query_scalar("SELECT name FROM app WHERE slug = 'kalkulator-pizzy'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.as_deref(), Some("Kalkulator Pizzy"));
+}
+
+#[tokio::test]
+async fn create_app_refuses_overlong_name_and_description() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    // A 161-char description refuses naming the 160 cap, before any row.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "pizza", "description": "d".repeat(161)}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(
+        err["message"].as_str().unwrap().contains("160"),
+        "refusal names the cap: {body}"
+    );
+    // A 61-char name refuses the same way.
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "pizza", "name": "n".repeat(61)}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(
+        err["message"].as_str().unwrap().contains("60"),
+        "refusal names the cap: {body}"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE slug = 'pizza'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "refused creates leave no row");
+}
+
 #[tokio::test]
 async fn free_plan_caps_changes_per_day() {
     let (state, _) = setup().await;
