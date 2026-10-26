@@ -965,10 +965,10 @@ impl FleetManager {
 
 /// Daily retention prunes: the agent action log per plan (spec §3), the
 /// rate-limit ledger, expired email codes and web sessions, expired OAuth
-/// leftovers and stale DCR clients, releasable slug quarantines (spec §17),
-/// deploys past the last 50 per app (spec §13), and code exports older
-/// than 24 h (spec §7.5). Each prune logs its own failure and the rest
-/// still run, so one bad table never blocks the others.
+/// leftovers and stale DCR clients, deploys past the last 50 per app
+/// (spec §13), and code exports older than 24 h (spec §7.5). Each prune
+/// logs its own failure and the rest still run, so one bad table never
+/// blocks the others.
 async fn prune_retention(pool: &SqlitePool, store: &crate::store::Store) {
     let now = crate::auth::now_ms();
     if let Err(err) = crate::mcp::actions::prune(pool, now).await {
@@ -984,9 +984,6 @@ async fn prune_retention(pool: &SqlitePool, store: &crate::store::Store) {
     }
     if let Err(err) = crate::auth::oauth::prune_expired(pool, now).await {
         tracing::warn!(error = %format!("{err:#}"), "oauth prune failed");
-    }
-    if let Err(err) = crate::apps::prune_quarantine(pool, now).await {
-        tracing::warn!(error = %format!("{err:#}"), "slug_quarantine prune failed");
     }
     if let Err(err) = crate::deploy::prune_old(pool).await {
         tracing::warn!(error = %format!("{err:#}"), "deploy prune failed");

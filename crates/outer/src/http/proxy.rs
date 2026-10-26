@@ -124,8 +124,9 @@ fn slug_for(host: &str, apps_domain: &str) -> Option<String> {
 }
 
 /// A 308 to the renamed app's hostname, preserving any dev port on the
-/// authority and the request's path + query. The old hostname's quarantine
-/// guarantees nobody else can take it while this answers.
+/// authority and the request's path + query. The redirect row never blocks
+/// a claim: a live app on the slug is served before this lookup runs, and
+/// claiming the slug drops the redirect.
 fn redirect_to_slug(state: &ProxyState, raw_host: &str, target: &str, req: &Request) -> Response {
     let rest = raw_host
         .split_once('.')
@@ -726,23 +727,18 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             Ok(Some(app)) => (app, false),
             // A live preview's key (`foo--preview`) is not an app slug, so
             // the row lookup misses: resolve it to the preview fleet before
-            // falling through to the rename quarantine below.
+            // falling through to the rename redirect below.
             Ok(None) => match resolve_preview(&state.pool, &slug).await {
                 Ok(Some(preview)) => (preview, true),
-                Ok(None) => match apps::quarantine_lookup(&state.pool, &slug).await {
-                    // A renamed-away slug redirects only while its quarantine holds
-                    // (`until` in the future — the same live-set definition as
-                    // `prune_quarantine`); past expiry it 404s exactly like a
-                    // plain-deleted (or never-existing) slug.
-                    Ok(Some(quarantine)) => match quarantine.renamed_to {
-                        Some(target) if quarantine.until > apps::now_ms() => {
-                            return redirect_to_slug(&state, &raw_host, &target, &req);
-                        }
-                        _ => return text(StatusCode::NOT_FOUND, "no such app"),
-                    },
+                Ok(None) => match apps::redirect_lookup(&state.pool, &slug).await {
+                    // A renamed-away slug redirects to its new host; a
+                    // plain-deleted (or never-existing) slug 404s.
+                    Ok(Some(target)) => {
+                        return redirect_to_slug(&state, &raw_host, &target, &req);
+                    }
                     Ok(None) => return text(StatusCode::NOT_FOUND, "no such app"),
                     Err(err) => {
-                        tracing::warn!(slug = %slug, error = %err, "quarantine lookup failed");
+                        tracing::warn!(slug = %slug, error = %err, "redirect lookup failed");
                         return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
                     }
                 },
@@ -2097,22 +2093,10 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-new", "new", fleet.addr.port(), "public").await;
-        let until = crate::apps::now_ms() + 30 * 24 * 60 * 60 * 1000;
-        sqlx::query(
-            "INSERT INTO slug_quarantine (slug, until, renamed_to) VALUES ('old', ?1, 'new')",
-        )
-        .bind(until)
-        .execute(&fix.pool)
-        .await
-        .unwrap();
-        // A plain-deleted slug carries no target and keeps its 404.
-        sqlx::query(
-            "INSERT INTO slug_quarantine (slug, until, renamed_to) VALUES ('gone', ?1, NULL)",
-        )
-        .bind(until)
-        .execute(&fix.pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO slug_redirect (slug, renamed_to) VALUES ('old', 'new')")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
         let state = ProxyState::new(
             fix.pool.clone(),
             manager(fix._dir.path()),
@@ -2141,37 +2125,31 @@ mod tests {
             headers.get("location").and_then(|v| v.to_str().ok()),
             Some("http://new.outer.test:8080/")
         );
-        // Deleted and unknown slugs still 404.
+        // Deleted and unknown slugs still 404: a plain delete leaves no
+        // redirect behind.
         let (status, _, body) = get(&state, "gone.outer.test", "/").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, "no such app");
         let (status, _, _) = get(&state, "ghost.outer.test", "/").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        // The new hostname itself is untouched by the quarantine row.
+        // The new hostname itself is untouched by the redirect row.
         let (status, _, _) = get(&state, "new.outer.test", "/ok").await;
         assert_eq!(status, StatusCode::OK);
     }
     #[tokio::test]
-    async fn expired_rename_quarantine_stops_redirecting() {
+    async fn live_app_wins_over_a_stale_redirect() {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
+        let fleet_old = start_fake_fleet().await;
         insert_app(&fix.pool, "app-new", "new", fleet.addr.port(), "public").await;
-        let live_until = crate::apps::now_ms() + 30 * 24 * 60 * 60 * 1000;
-        sqlx::query(
-            "INSERT INTO slug_quarantine (slug, until, renamed_to) VALUES ('old', ?1, 'new')",
-        )
-        .bind(live_until)
-        .execute(&fix.pool)
-        .await
-        .unwrap();
-        // Same shape, but the quarantine expired: the redirect must stop.
-        sqlx::query(
-            "INSERT INTO slug_quarantine (slug, until, renamed_to) VALUES ('stale', ?1, 'new')",
-        )
-        .bind(crate::apps::now_ms() - 1)
-        .execute(&fix.pool)
-        .await
-        .unwrap();
+        insert_app(&fix.pool, "app-old", "old", fleet_old.addr.port(), "public").await;
+        // The redirect still names the rename target, but the slug is live
+        // again (a claim normally deletes the row; this plants the stale
+        // shape to prove the lookup order).
+        sqlx::query("INSERT INTO slug_redirect (slug, renamed_to) VALUES ('old', 'new')")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
         let state = ProxyState::new(
             fix.pool.clone(),
             manager(fix._dir.path()),
@@ -2187,17 +2165,9 @@ mod tests {
                 .unwrap();
             body_text(router(state.clone()).oneshot(req).await.unwrap()).await
         }
-        // Live quarantine: still redirects.
-        let (status, headers, _) = get(&state, "old.outer.test", "/items/42").await;
-        assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(
-            headers.get("location").and_then(|v| v.to_str().ok()),
-            Some("http://new.outer.test/items/42")
-        );
-        // Expired quarantine: 404s exactly like a deleted slug.
-        let (status, _, body) = get(&state, "stale.outer.test", "/items/42").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body, "no such app");
+        // The live app serves; it never 308s to the redirect target.
+        let (status, _, _) = get(&state, "old.outer.test", "/ok").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

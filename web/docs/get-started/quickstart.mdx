@@ -28,7 +28,7 @@ Paste a scoped first prompt. One screen, no login, no database yet:
 2. Your agent calls `create_app` with that slug.
 3. Open the live link it returns: `https://<your-slug>.outer.now`.
 
-Taken slugs are rejected, and deleted names stay reserved for 30 days.
+Taken slugs are rejected, and deleted names are free to claim again immediately.
 A live Ilha + Void app serves in seconds. Unlisted by default: not indexed,
 reachable by link. Building a landing page, portfolio, or blog instead? Say so
 in the prompt. The agent passes `template: "website"` for the content-site
@@ -54,5 +54,5 @@ Code is formatted before the change lands. If a deploy fails, your agent names t
 
 - Ask for the building blocks by name. Your agent reads the Ilha and Void guides before writing code, and it reads Agents → [Quickstart](/agents/start-here/quickstart) for the full loop.
 - No strong profanity in page text, seed data, or the app name. The deploy is blocked and the previous version keeps serving. See [Moderation](/security/moderation).
-- After each change, ask your agent what it checked. To undo, ask for a rollback, which never counts as a change. To delete, confirm with your slug typed again. The name stays reserved for 30 days.
+- After each change, ask your agent what it checked. To undo, ask for a rollback, which never counts as a change. To delete, confirm with your slug typed again. The name is free to claim again immediately.
 - Free gives 1 app and 50 code changes a day ([Limits](/deploy/limits)). When your agent reports a refusal, its message is written for you. Ask it to relay that message word for word.

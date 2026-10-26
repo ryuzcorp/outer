@@ -290,10 +290,11 @@ pub struct DeleteAccountOutput {
 /// Delete the account (spec §8.2 `delete_account`): `confirm` must equal
 /// the account email exactly (normalized like every email comparison).
 /// Deletes owned apps through the SAME [`crate::apps::delete::delete_app`]
-/// path the MCP tool uses (fleet stopped, bucket prefixes wiped, slug
-/// quarantined), leaves apps the account only collaborates on
-/// (`app_collaborator.userId` goes NULL), then deletes the sessions, usage
-/// rows and the user row (API keys, OAuth grants and tokens cascade).
+/// path the MCP tool uses (fleet stopped, bucket prefixes wiped, rows
+/// dropped — freed slugs are claimable again immediately), leaves apps the
+/// account only collaborates on (`app_collaborator.userId` goes NULL), then
+/// deletes the sessions, usage rows and the user row (API keys, OAuth grants
+/// and tokens cascade).
 /// The `account_action` row for the deletion itself is written first and
 /// survives, since it carries no foreign key.
 pub async fn delete_account(

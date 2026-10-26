@@ -70,7 +70,6 @@ export interface DeleteAppInput {
 export interface DeleteAppOutput {
   deleted: boolean;
   slug: string;
-  quarantined_until: number;
   user_message?: string;
 }
 
@@ -167,7 +166,7 @@ const deleteApp: ConsoleAction<DeleteAppInput, DeleteAppOutput> = {
   name: "delete_app",
   title: "Delete app",
   description:
-    "Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. The name stays reserved for 30 days. Pass confirm equal to the slug. Returns {deleted, slug, quarantined_until}.",
+    "Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. The name is free to claim again immediately. Pass confirm equal to the slug. Returns {deleted, slug}.",
   inputSchema: {
     type: "object",
     properties: {

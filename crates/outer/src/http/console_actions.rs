@@ -323,9 +323,8 @@ async fn api_delete(
             ok_json(json!({
                 "deleted": true,
                 "slug": out.slug,
-                "quarantined_until": out.quarantined_until,
                 "user_message": format!(
-                    "{host} is deleted. The name stays reserved for 30 days."
+                    "{host} is deleted. The name is free to claim again."
                 ),
             }))
         }

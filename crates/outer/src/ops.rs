@@ -40,8 +40,8 @@ pub fn noreply_author(account_id: &str, email: &str, domain: &str) -> Author {
 /// Create `slug` for `owner_email` from the vendored `template` starter and
 /// deploy it. The template is materialized before the app row exists, so a
 /// missing `outer templates sync` fails without leaving anything behind; a
-/// failure after the row exists removes the row and the repo again (without
-/// quarantining the slug: nobody ever saw it). The seed commit carries the
+/// failure after the row exists removes the row and the repo again (the slug
+/// was never visible, so it stays claimable). The seed commit carries the
 /// app's `brand.json`, and the app row keeps the same display name.
 pub async fn create_app(
     p: &Platform,
@@ -101,8 +101,8 @@ pub async fn create_app(
         // under this now-unclaimed slug. The row insert above is the claim
         // and nothing local is written yet, so wipe before `init_repo`. A
         // wipe failure lands in the row-removing cleanup below (nobody ever
-        // saw the slug: no quarantine). The stale in-memory manifest seq
-        // goes too, or the sync could read it as already-applied.
+        // saw the slug). The stale in-memory manifest seq goes too, or the
+        // sync could read it as already-applied.
         crate::apps::local::remove_local_state(&p.data_dir, &p.git, p.cgroups.as_deref(), slug)
             .await?;
         p.sync.forget(slug).await;

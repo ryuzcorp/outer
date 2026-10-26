@@ -2685,8 +2685,8 @@ function DangerZone({
               Delete {app.slug}?
             </h3>
             <p class="m-0 min-w-0 break-words text-sm opacity-70">
-              Deletes the app, its code, data and files. The name stays
-              reserved for 30 days.
+              Deletes the app, its code, data and files. The name is free
+              to claim again immediately.
             </p>
             <label class="form-control mt-3 min-w-0">
               <span class="label">

@@ -3230,20 +3230,18 @@ mod tests {
         assert_eq!(out["slug"], "pantry");
         assert_eq!(out["url"], "http://pantry.outer.localhost");
 
-        // The row flipped and the old slug is quarantined with its target.
+        // The row flipped and the old slug keeps a non-blocking redirect.
         let id: String = sqlx::query_scalar("SELECT id FROM app WHERE slug = 'pantry'")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(id, "app-groceries");
-        let row: (i64, Option<String>) = sqlx::query_as(
-            "SELECT until, renamed_to FROM slug_quarantine WHERE slug = 'groceries'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(row.0 > now);
-        assert_eq!(row.1.as_deref(), Some("pantry"));
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT renamed_to FROM slug_redirect WHERE slug = 'groceries'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.as_deref(), Some("pantry"));
         // Never deployed: nothing redeployed, so no new deploy rows.
         let deploys: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM deploy WHERE app_id = 'app-groceries'")
@@ -3364,8 +3362,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // The exact slug deletes: the rail drops the app and the slug
-        // quarantines.
+        // The exact slug deletes: the rail drops the app and frees the slug
+        // at once — no redirect, no reservation.
         let (status, _, body) = send(
             &app,
             post_json(path, &ana, serde_json::json!({"confirm": "groceries"})),
@@ -3377,12 +3375,12 @@ mod tests {
         let (status, _, body) = send(&app, authed("/api/console/apps", &ana)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body.contains("groceries"), "{body}");
-        let quarantined: Option<i64> =
-            sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = 'groceries'")
+        let redirect: Option<String> =
+            sqlx::query_scalar("SELECT renamed_to FROM slug_redirect WHERE slug = 'groceries'")
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
-        assert!(quarantined.is_some_and(|until| until > now));
+        assert_eq!(redirect, None);
     }
 
     #[tokio::test]

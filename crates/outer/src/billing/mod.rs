@@ -2273,14 +2273,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing, None);
-        let quarantined: Option<i64> =
-            sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = 'new'")
+        let redirect: Option<String> =
+            sqlx::query_scalar("SELECT renamed_to FROM slug_redirect WHERE slug = 'new'")
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
-        assert!(
-            quarantined.is_some_and(|until| until > NOW + 7 * 24 * 3600),
-            "the purge quarantines the slug like delete_app"
+        assert_eq!(
+            redirect, None,
+            "the purge leaves no redirect behind for the freed slug"
         );
     }
 
