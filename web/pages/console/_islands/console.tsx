@@ -28,6 +28,7 @@ import {
   type WaitlistSummary,
 } from "./api.ts";
 import type { AdminStats, ModerationQueue } from "./actions/admin-moderation.ts";
+import { fetchTelemetry, type TelemetrySummary } from "./views/telemetry.tsx";
 import {
   AccountIcon,
   ActionsIcon,
@@ -222,6 +223,7 @@ export function Console() {
   const waitlist = atom<Panel<WaitlistSummary>>({ kind: "loading" });
   const moderationQueue = atom<Panel<ModerationQueue>>({ kind: "loading" });
   const adminStats = atom<Panel<AdminStats>>({ kind: "loading" });
+  const telemetry = atom<Panel<TelemetrySummary>>({ kind: "loading" });
   const detail = atom<Panel<AppDetail>>({ kind: "loading" });
   const metrics = atom<Panel<{ hours: number; summary: MetricsSummary }>>({
     kind: "loading",
@@ -481,13 +483,15 @@ export function Console() {
       waitlist.set({ kind: "loading" });
       moderationQueue.set({ kind: "loading" });
       adminStats.set({ kind: "loading" });
+      telemetry.set({ kind: "loading" });
       // Each panel stands alone: a failing moderation endpoint must not
       // wipe the invite-code or waitlist panels (or vice versa).
-      const [page, list, queue, stats] = await Promise.allSettled([
+      const [page, list, queue, stats, calls] = await Promise.allSettled([
         api<AdminInvitesPage>("/api/console/admin/invites?limit=50"),
         api<WaitlistSummary>("/api/console/admin/waitlist?limit=100"),
         api<ModerationQueue>("/api/console/admin/moderation/queue"),
         api<AdminStats>("/api/console/admin/stats"),
+        fetchTelemetry(),
       ]);
       if (fresh()) {
         const settle = <T,>(res: PromiseSettledResult<T>): Panel<T> =>
@@ -498,6 +502,7 @@ export function Console() {
         waitlist.set(settle(list));
         moderationQueue.set(settle(queue));
         adminStats.set(settle(stats));
+        telemetry.set(settle(calls));
         setTitle(route(), null);
       }
       return;
@@ -925,6 +930,7 @@ export function Console() {
       waitlist={waitlist()}
       queue={moderationQueue()}
       stats={adminStats()}
+      telemetry={telemetry()}
       isAdmin={isAdmin()}
       onGenerate={(count, note) => generateCodes(count, note)}
       onRevoke={(code) => revokeCode(code)}
