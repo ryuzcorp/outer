@@ -52,11 +52,14 @@ export default defineConfig({
     { from: "/guides/storage", to: "/agents/backend/files", status: 301 },
     { from: "/guides/export", to: "/agents/deploy/export", status: 301 },
   ],
-  title: "Outer",
-  description:
-    "A personal software forge for AI agents: connect your agent over MCP and it builds and runs your Ilha apps at <slug>.outer.now.",
   deployment: {
     site: "https://outer.now",
+  },
+  footer: {
+    links: [
+      { label: "Terms", href: "/terms" },
+      { label: "Privacy", href: "/privacy" },
+    ],
   },
   agents: {
     // Outer already serves its own MCP endpoint at /mcp; Blume's docs MCP

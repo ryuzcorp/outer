@@ -1,0 +1,97 @@
+---
+title: Terms of service
+description: The rules for using Outer — accounts, acceptable use, content review, plans, billing, and limits of liability.
+---
+
+{/* Draft, pending owner approval: this text is not final and takes effect only when the owner approves it. */}
+
+::::note
+**Draft, pending owner approval.** This page is not final. Nothing here takes effect until the owner approves it.
+::::
+
+Outer is a personal software forge for AI agents. You ask your agent for an app, and Outer builds and serves it at `https://<slug>.outer.now`. These terms cover your account, what you may do with Outer, how content review works, and what you pay.
+
+Outer is run by [OWNER: legal entity name] ("we"). Contact us at [OWNER: legal contact email]. To report abuse, write to `abuse@outer.now`.
+
+Outer is in closed beta and under active development. Behavior may change, and parts of these terms describe where the service is heading rather than a finished product.
+
+## Your account
+
+One account is one email address. There are two ways in, and both end at the same account:
+
+1. OAuth sign-in with Claude, Codex, ChatGPT, Gemini, or Perplexity. Your client opens Outer's sign-in page, where you enter your email and the emailed code.
+2. The emailed-code fallback for clients without OAuth. Your agent starts sign-in with your email, you read the 6-digit code from your inbox (it expires after 10 minutes), and your agent verifies it to get an API key.
+
+During the closed beta, a new email gets in only if it is allowlisted or carries an invite code (`OUTER-XXXX-XXXX`). One code admits one account. Joiners who arrive with a code get 3 codes of their own to share.
+
+On first sign-in you accept these Terms and the [Privacy Policy](/privacy). We store the acceptance with the terms version. When the terms change, you accept again at your next sign-in.
+
+You are responsible for everything done with your account, including what your agent does with your API keys and OAuth grants. Revoke a client or a key any time in Console → Connections & keys. Never share a secret: API keys and app secrets are shown once and never again.
+
+## Acceptable use
+
+You may use Outer to build and share apps. You may not:
+
+- Break the law, or build apps that do.
+- Phish, deceive, or harvest credentials. Slugs that imitate brands or account pages are refused at claim time, because every app shares `outer.now` with the platform and one phishing app hurts everyone.
+- Ship malware or attack other systems. Apps may call the internet, but they may not send email over SMTP and may not reach private networks.
+- Post or serve illegal content, including sexual content involving minors.
+
+We enforce these rules with the content review below and with suspension and termination.
+
+## Content review
+
+Every deploy passes a pre-live gate before it can serve anything:
+
+- Strong profanity, slurs, masked spellings, and the most severe content block the deploy. Mild words ("damn", "hell", "crap") pass.
+- A blocked deploy keeps the old version serving. Fix the flagged lines and commit again. A blocked deploy counts as a code change and is never a rollback target.
+- Deploys over the review caps (3000 files, 256 KiB each, 8 MiB total) are blocked as too large to review.
+- When the classifier is unavailable, the deploy fails closed: nothing unchecked goes live, and the old version keeps serving.
+
+Deploy text is classified by Jev. See the [Privacy Policy](/privacy) for what is sent and where it goes.
+
+After going live, rendered pages can be re-checked after each deploy. An app that fails review can be held or suspended until it is fixed. Anyone can report an app through `abuse@outer.now` or the report page on every app host.
+
+There is no self-serve override. If your deploy was blocked or your app was held, ask your agent for `request_review` with a note. The platform owner works the review queue daily.
+
+## Plans and billing
+
+Outer has two plans: Free and Pro at $8/month. Early users pay $4/month through a 50% launch discount, applied automatically as a Stripe coupon at checkout while the promotion runs. The owner ends the promotion in Stripe; existing subscribers keep whatever Stripe says. Stripe Tax calculates tax at checkout.
+
+- Upgrade from the Console Plan card or by asking your agent. Both open a Stripe Checkout page. Your plan lifts on the next call after payment.
+- Manage payment (update the card, cancel) from the Plan card's Manage billing button. Cancel any time; cancellation takes effect through the billing portal and your plan changes at the end of the paid period.
+- A missed payment starts a 7-day grace period as Pro, with emails on day 0 and day 5, then the downgrade rules below apply.
+- Downgrading returns you to Free: your 2 oldest apps stay live and the rest stop, stamped with the date. Stopped apps are purged 30 days later, with a warning email around day 23. The downgrade also removes every custom hostname, returns public apps to unlisted, and pauses collaborator access beyond the oldest per app. Code and data stay, but Pro behaviors pause until you resubscribe. The downgrade also restarts the 90-day inactivity clock.
+- Quotas refuse with a message your agent relays word for word. Request caps are soft: at 100% you get an email plus an upgrade ask, and the app keeps serving. A live app is never paused over quota. Full numbers live in [Limits and quotas](/deploy/limits).
+
+## Suspension and termination
+
+We may hold or suspend an app that breaks these terms, and we may ban an account for serious or repeated abuse. A ban stops every app you own and refuses sign-in.
+
+You may leave any time:
+
+1. Export your code first: Console → Settings → Export code, or ask your agent for `export_code`. The download link works for one hour and the stored zip is deleted after 24 hours.
+2. Open Console → Account → delete-account and type your account email to confirm.
+3. Every session signs out, apps you own are deleted, and collaborations stay with their owners.
+
+Free apps are also deleted after 90 days without owner activity: your sign-ins, tool calls, and Console visits, or a collaborator's tool call on the app. Visiting the app does not count. Reminder emails go out at 30, 7, and 1 day before the deadline. After the deadline the app stops and its address serves an inactivity page for 7 more days, during which any sign-in or tool call restores it. Then it is purged: code, data, and files go, and the name becomes claimable again. A deleted slug stays quarantined for 30 days before anyone may claim it.
+
+## Your code and data
+
+Your code stays yours. On every plan, as owner, you may download any owned app as a zip at any commit. Your app's data (databases, files) is covered in the [Privacy Policy](/privacy) and in [Own your code and data](/security/data-ownership).
+
+## No warranty
+
+Outer is a prototype. We provide it "as is", without warranties of any kind. We do not promise uninterrupted service, successful deploys, or that your apps will always be reachable. Sleep, cold starts, failed builds, and failed closed reviews are part of the service.
+
+## Limitation of liability
+
+To the maximum extent the law allows, [OWNER: legal entity name] is not liable for indirect or consequential loss from your use of Outer or your apps. Our total liability is limited to [OWNER: liability cap, e.g. fees paid in the prior 12 months].
+
+## Changes to these terms
+
+We may update these terms. The sign-in page always shows the current version, and a new version asks you to accept again at your next sign-in. Material changes to billing or data handling will also be announced by email before they take effect.
+
+## Governing law
+
+These terms are governed by [OWNER: governing law and venue].
