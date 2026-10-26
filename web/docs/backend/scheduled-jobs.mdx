@@ -1,0 +1,17 @@
+---
+title: Run work on a schedule
+description: Ask for repeating tasks like hourly digests; Outer registers the schedule and wakes your app each time.
+---
+
+Ask for repeating work — an hourly digest, a nightly cleanup — and your builder writes a schedule file. Outer registers it on deploy and wakes your app at each occurrence.
+
+## Rules worth knowing
+
+- Jobs for one app run one at a time. A slow job delays the next one.
+- A failing job retries with backoff, then gives up after 6 failures or at the next occurrence.
+- After downtime, Outer runs one missed occurrence and skips the rest. Jobs should tolerate repeats.
+- Schedule floors depend on your plan: hourly or slower on Free, down to every minute on [Pro](/account/plans).
+
+Long or flaky work should fan out to [Background jobs](/backend/background-jobs).
+
+For the technical detail, your builder reads [Cron](/agents/backend/cron).

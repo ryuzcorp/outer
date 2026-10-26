@@ -1,62 +1,103 @@
-//! The `docs` topics: Markdown embedded from `web/docs/guides/*.md`.
+//! The `docs` topics: Markdown embedded from `web/docs/agents/**/*.md`.
 //!
-//! The guides carry Blume frontmatter (`title`/`description`) for the
+//! The agent pages carry Blume frontmatter (`title`/`description`) for the
 //! website; the MCP tool serves them as plain Markdown with that block
-//! stripped, so agents see exactly what the page says.
+//! stripped, so agents see exactly what the page says. Topics serve agent
+//! pages only — never human Guide pages.
 
 /// Topic name → Markdown, in `tools/list` order.
 pub const TOPICS: &[(&str, &str)] = &[
     (
         "quickstart",
-        include_str!("../../../../web/docs/guides/quickstart.md"),
+        include_str!("../../../../web/docs/agents/start-here/quickstart.md"),
     ),
-    ("ilha", include_str!("../../../../web/docs/guides/ilha.md")),
-    ("void", include_str!("../../../../web/docs/guides/void.md")),
+    (
+        "templates",
+        include_str!("../../../../web/docs/agents/start-here/templates.md"),
+    ),
+    (
+        "ilha",
+        include_str!("../../../../web/docs/agents/frontend/ilha.md"),
+    ),
+    (
+        "void",
+        include_str!("../../../../web/docs/agents/frontend/void.md"),
+    ),
+    (
+        "website",
+        include_str!("../../../../web/docs/agents/frontend/website.md"),
+    ),
     (
         "celld",
-        include_str!("../../../../web/docs/guides/celld.md"),
+        include_str!("../../../../web/docs/agents/platform/celld.md"),
     ),
-    ("d1", include_str!("../../../../web/docs/guides/d1.md")),
+    (
+        "d1",
+        include_str!("../../../../web/docs/agents/backend/database.md"),
+    ),
     (
         "storage",
-        include_str!("../../../../web/docs/guides/storage.md"),
+        include_str!("../../../../web/docs/agents/backend/files.md"),
+    ),
+    (
+        "backups",
+        include_str!("../../../../web/docs/agents/backend/backups.md"),
     ),
     (
         "limits",
-        include_str!("../../../../web/docs/guides/limits.md"),
+        include_str!("../../../../web/docs/agents/platform/limits.md"),
     ),
     (
         "moderation",
-        include_str!("../../../../web/docs/guides/moderation.md"),
+        include_str!("../../../../web/docs/agents/security/moderation.md"),
     ),
     (
         "custom-domains",
-        include_str!("../../../../web/docs/guides/custom-domains.md"),
+        include_str!("../../../../web/docs/agents/deploy/custom-domains.md"),
     ),
-    ("auth", include_str!("../../../../web/docs/guides/auth.md")),
-    ("cron", include_str!("../../../../web/docs/guides/cron.md")),
+    (
+        "export",
+        include_str!("../../../../web/docs/agents/deploy/export.md"),
+    ),
+    (
+        "auth",
+        include_str!("../../../../web/docs/agents/backend/auth.md"),
+    ),
+    (
+        "cron",
+        include_str!("../../../../web/docs/agents/backend/cron.md"),
+    ),
     (
         "queues",
-        include_str!("../../../../web/docs/guides/queues.md"),
+        include_str!("../../../../web/docs/agents/backend/queues.md"),
     ),
     (
         "websockets",
-        include_str!("../../../../web/docs/guides/websockets.md"),
+        include_str!("../../../../web/docs/agents/backend/websockets.md"),
     ),
-    ("sse", include_str!("../../../../web/docs/guides/sse.md")),
-    ("kv", include_str!("../../../../web/docs/guides/kv.md")),
+    (
+        "sse",
+        include_str!("../../../../web/docs/agents/backend/sse.md"),
+    ),
+    (
+        "kv",
+        include_str!("../../../../web/docs/agents/backend/kv.md"),
+    ),
     (
         "email",
-        include_str!("../../../../web/docs/guides/email.md"),
+        include_str!("../../../../web/docs/agents/backend/email.md"),
     ),
     (
         "sandboxes",
-        include_str!("../../../../web/docs/guides/sandboxes.md"),
+        include_str!("../../../../web/docs/agents/backend/sandboxes.md"),
     ),
-    ("look", include_str!("../../../../web/docs/guides/look.md")),
+    (
+        "look",
+        include_str!("../../../../web/docs/agents/testing/look.md"),
+    ),
     (
         "previews",
-        include_str!("../../../../web/docs/guides/previews.md"),
+        include_str!("../../../../web/docs/agents/testing/previews.md"),
     ),
 ];
 
@@ -99,7 +140,7 @@ mod tests {
 
     #[test]
     fn every_topic_is_nonempty() {
-        assert_eq!(TOPICS.len(), 19);
+        assert_eq!(TOPICS.len(), 23);
         for (name, md) in TOPICS {
             let stripped = strip_frontmatter(md);
             assert!(stripped.trim().len() > 200, "{name} is suspiciously short");

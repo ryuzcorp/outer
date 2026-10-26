@@ -1,0 +1,18 @@
+---
+title: What your app cannot do yet
+description: Code-execution sandboxes are not available on Outer; use build-time work, queues, or an external API instead.
+---
+
+Code-execution sandboxes are not available. Do not ask for features that run untrusted code inside your app — there is no container runtime behind apps today.
+
+## What to ask for instead
+
+| You want | Ask for |
+| --- | --- |
+| Run code at request time | Compute it at build time and ship the result as static data |
+| Slow or flaky work | A [Background job](/backend/background-jobs) with retries |
+| Call a code runner | An HTTP call to an external execution API, with the key in [Secrets](/security/secrets) |
+
+If container support lands, this page will say so.
+
+For the technical detail, your builder reads [Sandboxes](/agents/backend/sandboxes).

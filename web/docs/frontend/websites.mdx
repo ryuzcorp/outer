@@ -1,0 +1,17 @@
+---
+title: Build a fast website
+description: Content sites prerender to static HTML; interactive parts hydrate as islands and server routes opt out per route.
+---
+
+If your project is mostly content — a landing page, portfolio, blog, event page — start from the website [Template](/get-started/templates). Pages prerender to static HTML, which loads fast and needs no server.
+
+## How it fits together
+
+- Each file in the pages folder is a route. A new page is a new file.
+- Blog posts are Markdown files with a title, description, and date. Drafts stay out of the build.
+- Interactive parts (forms, widgets) hydrate as islands where the page says so. Until they hydrate, controls should look usable or disabled — never silently dead.
+- A route that needs the [Database](/backend/database) opts out of prerendering. Keep server routes few and small.
+
+Sites that grow accounts or live collaboration outgrow this shape. Say so early: they want an app, not more islands.
+
+For the technical detail, your builder reads [Website](/agents/frontend/website).

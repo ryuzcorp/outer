@@ -1,0 +1,14 @@
+---
+title: Keep page text shippable
+description: Strong profanity blocks your deploy and keeps the old version live; mild words pass.
+---
+
+The review gate reads your app's rendered text, including seed data and database text baked into code. Strong profanity blocks the deploy.
+
+## What happens when text is blocked
+
+A blocked deploy never goes live. The previous version keeps serving. Fix the flagged lines and ask for another deploy.
+
+Mild words pass the gate. When in doubt, choose plainer wording — it ships faster. See [Moderation](/security/moderation) for what counts.
+
+For the technical detail, your builder reads [Page text](/agents/design/page-text).

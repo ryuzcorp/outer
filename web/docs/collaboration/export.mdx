@@ -1,0 +1,16 @@
+---
+title: Export your code
+description: Download any version of your Pro app's code as a zip.
+---
+
+Export is for Pro owners. You can export your app at the live version or any earlier SHA.
+
+1. Open Console → Settings → Export code.
+2. Pick a version, live first.
+3. Press Download .zip.
+
+The zip holds exactly the committed tree under `<slug>-<shortsha>/`. Exports up to 256 MiB pass; anything bigger is refused with a clear error.
+
+Download links work for one hour. The stored zip is deleted after 24 hours. There is no git push — your agent changes code with `commit`.
+
+Agent reference: [export](/agents/deploy/export).

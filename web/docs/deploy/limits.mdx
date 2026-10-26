@@ -1,0 +1,31 @@
+---
+title: Limits and quotas
+description: Every enforced quota on Free and Pro, and what happens when you hit one.
+---
+
+Your agent sees the same numbers through `whoami`, which shows usage and reset dates.
+
+| Quota | Free | Pro |
+| --- | --- | --- |
+| Apps owned | 1 | 10 |
+| Code changes per day (UTC) | 50 | 500 |
+| Build minutes per day | 60 | 600 |
+| Concurrent builds | 1 | 2 |
+| Fleet memory | 512 MiB | 1 GiB |
+| Fleet CPU | 0.5 | 1 |
+| Idle sleep | 30 min | 24 h |
+| Requests per month | 250k | 5M |
+| App storage | 500 MB | 25 GB |
+| Outbound traffic per month | 5 GB | 100 GB |
+| Bindings | D1, KV, Durable Objects | Adds R2 uploads, Queues, Workflows |
+| Cron interval | 1 hour | 1 minute |
+| API keys | 5 | 20 |
+| Logs and metrics kept | 7 days | 30 days |
+
+The template commit that creates your app and a rollback never count as code changes. Code changes charge to the app owner, whoever makes them.
+
+When a quota is hit, the tool returns `quota_exceeded` with an upgrade link and a `user_message`. Ask your agent to relay that message word for word.
+
+On Free, requests, storage, or outbound traffic at 100% pause the app until the month resets. Your data stays. Code-change, build, app, and collaborator quotas refuse immediately instead.
+
+Enforcement detail lives in [platform limits](/agents/platform/limits).

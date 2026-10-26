@@ -1,0 +1,50 @@
+---
+title: Connect
+description: Point your agent at Outer's MCP endpoint — one line per client, OAuth or emailed code.
+---
+
+Agents talk to Outer over MCP at `https://outer.now/mcp` (Streamable HTTP,
+OAuth 2.1). The first account tool call starts sign-in. After that the agent
+retries and keeps going.
+
+## Client setup
+
+| Client | Setup |
+| --- | --- |
+| Claude Code | `claude mcp add --transport http outer https://outer.now/mcp`, then run `/mcp` in Claude Code, pick `outer` and sign in in the browser that opens |
+| claude.ai, Desktop, mobile | Settings → Connectors → Add custom connector → `https://outer.now/mcp` |
+| Codex CLI, IDE, ChatGPT desktop app | `codex mcp add outer --url https://outer.now/mcp`, then `codex mcp login outer` |
+| Perplexity | Settings → Connectors → add a custom MCP connector with `https://outer.now/mcp` (tested: OAuth sign-in, then `@Outer build me …`) |
+| ChatGPT (chatgpt.com) | Add a custom connector with `https://outer.now/mcp` and sign in (tested) |
+| Gemini | Add a custom MCP server with `https://outer.now/mcp` and sign in (tested) |
+| Anything else | OAuth if supported, else `sign_in` → `verify_code` → `Authorization` header (see [Sign in](/get-started/sign-in)) |
+
+:::note
+Codex may not start OAuth from a mid-session `401`; that is checked in the
+M1 client matrix. If sign-in does not start, sign in from a fresh session and
+retry the call.
+:::
+
+## How sign-in works
+
+Claude, Codex, ChatGPT and Perplexity use OAuth. Your client opens
+Outer's sign-in page:
+
+1. Enter your email and the emailed code.
+2. Accept the terms on first sign-in.
+3. Approve the client.
+
+Clients without OAuth use two MCP tools instead — details in
+[Sign in](/get-started/sign-in).
+
+When a limit or refusal hits, the tool result carries a `user_message`
+written for you. Your agent relays it word for word.
+
+## What your agent builds
+
+One of two starters ([Templates](/get-started/templates)): the interactive
+`app` (Ilha + Void — lists, dashboards, anything with accounts), or
+`website` (Astro content site — landing pages, portfolios, blogs). Name
+which one in your first prompt; the default is `app`.
+
+Building it? The agent reads Agents → [Quickstart](/agents/start-here/quickstart).

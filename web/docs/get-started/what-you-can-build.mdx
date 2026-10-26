@@ -1,0 +1,122 @@
+---
+title: What you can build
+description: A catalog of app ideas with copy-paste starter prompts — and which guides each one needs.
+---
+
+Every example below fits one of the two [templates](/get-started/templates) and
+Outer's bindings. Copy a prompt, swap in your own idea, and tell your agent
+which guides to read.
+
+Building it? The agent reads Agents → [Quickstart](/agents/start-here/quickstart).
+
+## Start here
+
+<CardGroup cols={2}>
+ <Card title="Family dashboard" href="/agents/frontend/ilha" icon="layout-grid">
+ Links, birthdays, a dinner poll — static pages plus one form. Reads: quickstart, Ilha.
+ </Card>
+
+</CardGroup>
+
+> Build a family dashboard on Outer: links to everyone's school pages, a
+> birthday list, and a Friday-dinner poll with three options. One page per
+> section, daisyUI cards. Read the Outer quickstart and Ilha guides first.
+
+## Data-backed apps
+
+D1 is on by default — loaders read it, one action per page writes it
+([D1 guide](/backend/database)). KV fits sessions, counters and flags
+([Files and storage](/backend/files-storage)).
+
+<CardGroup cols={2}>
+<Card title="Sign-up sheet" href="/backend/database" icon="clipboard-list">
+Rows in D1, one form per slot. Reads: quickstart, Ilha, D1.
+</Card>
+<Card title="Book club votes" href="/backend/database" icon="book-open">
+Nominations plus a tally, seeded from a migration. Reads: D1.
+</Card>
+</CardGroup>
+
+> Build a potluck sign-up sheet: 12 slots, each takes a name and a dish.
+> Store it in D1 with a migration, seed the 12 empty slots. Read the Outer
+> D1 guide first.
+
+## Scheduled and background work
+
+Cron wakes a sleeping app and runs a `scheduled` handler ([Cron](/backend/scheduled-jobs)).
+Queues fan out slow work like sending messages ([Queues](/backend/background-jobs)).
+
+<CardGroup cols={2}>
+<Card title="Morning digest" href="/backend/scheduled-jobs" icon="alarm-clock">
+A cron job emails the day's items every morning. Reads: cron, email.
+</Card>
+<Card title="Welcome messages" href="/backend/background-jobs" icon="inbox">
+A form enqueues a job; the queue consumer sends it. Reads: queues.
+</Card>
+</CardGroup>
+
+> Every weekday at 7am, read the grocery table and email the open items to
+> the family via Resend. Read the Outer cron and email guides first, and
+> ask me for the Resend key before creating the app.
+
+## Realtime
+
+Chat rooms and live updates over WebSockets, one-way streams over SSE
+([Realtime](/backend/realtime)). Both ride the same app — no extra services.
+
+<CardGroup cols={2}>
+<Card title="Family chat" href="/backend/realtime" icon="messages-square">
+One room per channel, names required to join. Reads: websockets, auth.
+</Card>
+<Card title="Live scoreboard" href="/backend/realtime" icon="activity">
+Scores stream to every viewer without polling. Reads: SSE.
+</Card>
+</CardGroup>
+
+> Build a family chat room: one room, nicknames, message history in D1.
+> Read the Outer websockets guide first. No login yet — nicknames only, and
+> keep it to non-private chatter: unlisted apps open for anyone with the
+> link. Add sign-in ([Auth](/backend/user-sign-in)) before any private messages.
+
+## Files and accounts
+
+Uploads land in R2 ([Storage](/backend/files-storage)); sign-in for your app's own
+users runs on Better Auth + D1 ([Auth](/backend/user-sign-in)).
+
+<CardGroup cols={2}>
+<Card title="Photo wall" href="/backend/files-storage" icon="image">
+Uploads in R2, thumbnails on the page. Reads: storage.
+</Card>
+<Card title="Members area" href="/backend/user-sign-in" icon="key-round">
+Email + Google sign-in for readers, public pages stay open. Reads: auth, D1.
+</Card>
+</CardGroup>
+
+> Build a holiday photo wall: uploads go to R2, the front page shows the
+> latest 20. Add a members page behind email sign-in. Read the Outer
+> storage and auth guides first.
+
+## Content sites
+
+Prerendered pages on the `website` template ([Website](/frontend/websites)):
+mostly static, one island per interactive part, and server routes only where a page needs data (the starter ships one).
+
+<CardGroup cols={2}>
+<Card title="Portfolio + blog" href="/frontend/websites" icon="newspaper">
+Markdown posts, newest first, one island for the newsletter form. Reads: quickstart, website.
+</Card>
+<Card title="Event page" href="/frontend/websites" icon="calendar-days">
+Static schedule plus a D1-backed RSVP form. Reads: website, D1.
+</Card>
+</CardGroup>
+
+> Build a portfolio site on Outer with the website template: a landing
+> page, a Markdown blog, and a newsletter form that saves to D1. Read the
+> Outer website guide first.
+
+## Not yet
+
+- **Code execution sandboxes** — not available.
+- **AI in your app** (Workers AI, Vectorize) — not available; no binding key passes deploy validation.
+- **Native email sending** — use Resend over HTTP ([Email](/backend/sending-email)).
+- Native mobile apps, branches/preview environments, git push — out of scope ([Limits](/deploy/limits)).

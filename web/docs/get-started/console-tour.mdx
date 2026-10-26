@@ -1,0 +1,106 @@
+---
+title: Console tour
+description: Watch your apps in the browser — deploys, logs, errors, data, secrets, settings, and the command palette.
+---
+
+The Console is read-mostly: it shows what your agent did to your apps and
+how they are used. Changes stay agent-driven — the Console edits data and
+settings, never code. Open it from the site header. Pick an app, or your
+account, in the sidebar. The command palette jumps anywhere.
+
+Building it? The agent reads Agents → [Quickstart](/agents/start-here/quickstart).
+
+## One app
+
+### Overview
+
+The app's health at a glance: latest deploy, latest agent actions, open
+errors, and the request, visitor, error-rate, and p95 cards. When something
+looks wrong, this page tells you which of the views below to open.
+
+### Metrics
+
+Requests over time with errors for comparison, daily or hourly buckets, top
+paths, and the same stat cards as Overview. Pick the range (`?r=`) to match
+the incident window.
+
+### Agent actions
+
+Every tool call your agent made on this app — who ran it, what it did, and
+the outcome badge — newest first. When a deploy surprises you, this is the
+audit trail.
+
+### Deploys
+
+Every deploy with its status badge, short SHA, and age. Expand one for the
+full SHA, findings, the live URL, and — for failures — the error message.
+
+1. Open the Deploys view for your app.
+2. Expand a deploy to read its findings and error message.
+3. To undo one, pick an earlier successful deploy and confirm Roll back.
+
+**Rollback lives here**: any earlier successful deploy has a Roll back button behind
+a confirm modal. Rollbacks never count as code changes. A "what changed"
+link jumps to the Code view's changes tab for that SHA.
+
+### Code
+
+Browse the app's files at any SHA, and diff what a deploy changed (the
+changes tab, `?view=code&ct=changes`). Read-only — edits go through your
+agent's `commit`.
+
+### Logs
+
+The fleet's stdout and stderr, newest first. Build output lives on the deploy,
+not here — for a failed deploy, expand it in Deploys or ask
+your agent for `deploy_log`.
+
+### Errors
+
+Crashes grouped by fingerprint with counts and last-seen times — the same
+groups your agent reads via `app_errors`. Triage (`resolve`, `ignore`,
+`reopen`) happens over MCP; the Console shows the state.
+
+### Secrets
+
+API keys and tokens the app reads as Worker env vars (`env.MY_KEY`).
+Add, replace, or remove them here, or have your agent use
+`set_secret`/`unset_secret`. Names match `^[A-Z_][A-Z0-9_]{0,63}$`, values
+hold at most 4 KiB, 50 per app. Values are never shown again after saving.
+Secrets apply on the next deploy — setting one never touches the running
+fleet.
+
+### Settings
+
+Slug, URL, status, your role, and last request — then, owner-only:
+
+- **Visibility** — Unlisted (anyone with the link) or Public. Public is Pro ([Who can see your app](/security/who-can-see)).
+- **Custom domain** — one hostname per app, Pro ([Custom domains](/deploy/custom-domains)).
+- **Collaborators** — invite by email, up to 10 per app, Pro. Pending until they sign in ([Collaborators](/collaboration/collaborators)).
+- **Danger zone** — rename (counts as a code change, redeploys) and delete
+  (code, data and files go; the name stays reserved for 30 days).
+
+### Data
+
+Owner-only browsers over the app's live bindings:
+
+- **D1** — the app's database: tables and rows on the **Tables** tab
+  (owners can insert, edit and delete rows), daily dumps on **Backups**
+  (back up now, download a dump, restore one).
+- **R2** — browse folders, preview text and images, download, upload, and
+  delete. Reads use the same scoped credentials as the app; writes go
+  through celld and are recorded in the agent action log.
+- **Durable Objects** — list instances (read-only). Selecting one shows
+  what the app's own `?read=1` handler returns — implement that read-only
+  branch in your class to preview state.
+
+## Your account
+
+- **Connections & keys** — OAuth grants per client (revoke any time) and API
+  key metadata: names and prefixes, never secrets.
+- **Usage & plan** — plan, usage against quota, reset dates (`whoami` shows
+  the same over MCP). See [Plans](/account/plans) and [Limits](/deploy/limits).
+- **Account** — email, terms, delete-account.
+- **Invite codes** — your `OUTER-XXXX-XXXX` codes during the closed beta: who
+  redeemed them, which are spent. Admins generate codes in bulk on the Admin
+  page instead and see the waitlist there.

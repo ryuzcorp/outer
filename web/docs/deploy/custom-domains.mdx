@@ -1,0 +1,23 @@
+---
+title: Use a custom domain
+description: Serve your Pro app from your own hostname with Cloudflare for SaaS.
+---
+
+Custom domains are a Pro feature, with one hostname per app. Only the app owner can manage them, in Console → Settings → Custom domain.
+
+1. Add the domain in the Console card.
+2. At your DNS provider, point a CNAME from your hostname to `domains.outer.now`.
+3. Add the TXT ownership and certificate records exactly as shown.
+4. Press Refresh until the status turns active.
+
+| Status | What it means |
+| --- | --- |
+| pending | The hostname or certificate is not validated yet. Check the DNS records, then refresh. |
+| active | The domain serves your app. |
+| failed | Validation stalled. The reason names the fix — repair DNS and refresh, or remove and re-add. |
+
+The status badges read live from Cloudflare. Subdomains work anywhere; an apex domain needs a provider with CNAME flattening.
+
+Renaming your app keeps its domain, since the binding follows the app. Downgrading to Free or deleting the app removes it.
+
+Agent reference: [custom domains](/agents/deploy/custom-domains).

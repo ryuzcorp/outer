@@ -1,0 +1,18 @@
+---
+title: How deploys work
+description: Every change runs build, content gate, then live — and a failed deploy never touches serving traffic.
+---
+
+Every change you make goes through the same three stages: build, content gate, then live. Your agent runs them for you.
+
+1. Ask your agent for a change.
+2. It builds the new version and runs the content gate.
+3. The new version goes live and the URL serves it.
+
+If a deploy fails, your old version keeps serving. Nothing half-built reaches visitors.
+
+Your first deploy shows a building page until it succeeds. Ask your agent for the deploy status if it takes longer than a minute.
+
+When your app idles with no requests, its fleet sleeps — after about 30 minutes on Free, or 24 hours on Pro. The next request wakes it, and it wakes on the newest deploy.
+
+Technical detail for your agent lives in [the deploy pipeline](/agents/deploy/pipeline).
