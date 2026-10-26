@@ -1,6 +1,7 @@
 //! HTTP surface: the platform host (operator probes now; MCP and OAuth
 //! later) and every app host through [`proxy`].
 
+pub mod badge;
 pub mod client_ip;
 pub mod console;
 pub mod console_account;
