@@ -28,6 +28,7 @@ export default defineConfig({
     { from: "/plans", to: "/account/plans", status: 301 },
     { from: "/faq", to: "/help/faq", status: 301 },
     { from: "/moderation", to: "/security/moderation", status: 301 },
+    { from: "/agents", to: "/agents/start-here", status: 301 },
     { from: "/guides/quickstart", to: "/agents/start-here/quickstart", status: 301 },
     { from: "/guides/templates", to: "/agents/start-here/templates", status: 301 },
     { from: "/guides/d1", to: "/agents/backend/database", status: 301 },
