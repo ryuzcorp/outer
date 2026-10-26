@@ -21,7 +21,7 @@ use crate::store::Store;
 pub const TEMPLATES_URL: &str = "https://github.com/ryuzcorp/outer-templates";
 /// The pinned commit `outer templates sync` vendors. Repinning is a
 /// one-line change, then `outer templates sync`.
-pub const TEMPLATES_SHA: &str = "4d271d4c86bb6ddaacda01439ddb274e93d5a297";
+pub const TEMPLATES_SHA: &str = "1ae125f38bc58c1fbe3cfa8925990a761ed092a6";
 
 /// The store pointer to the vendored bundle.
 const CURRENT_KEY: &str = "outer/templates/current.json";
@@ -77,7 +77,9 @@ impl Template {
 /// Write (overwriting) the fresh tree's `brand.json` for a new app
 /// (BRANDING.md Contract 1): `name` defaults to the slug title-cased
 /// (`kalkulator-pizzy` → `Kalkulator Pizzy`), `description` defaults to
-/// `name`, and `accent` is deterministic per slug. Creation paths call this
+/// `name`, and `accent` is deterministic per slug (a purplish-blue band:
+/// HSL with hue 230 + FNV-1a(slug) mod 60, saturation 62%, lightness
+/// 48%). Creation paths call this
 /// right after [`materialize`], before the first commit, so the seed commit
 /// carries the brand. It overwrites the template's own `brand.json`.
 pub fn write_brand(

@@ -7,7 +7,7 @@ Every `create_app` seeds from one of two pinned starters. The default is `app`. 
 
 ## Brand the app at creation
 
-Pass `name` (1–60 chars) and `description` (1–160 chars) to `create_app`: both land in the repo-root `brand.json` with a deterministic accent colour, and the app's pages, manifest and icons pick them up. Leave them out and the name defaults to the slug title-cased (`grocery-list` → `Grocery List`) with the description matching it. Both are content-checked like the slug, with the same refusal.
+Pass `name` (1–60 chars) and `description` (1–160 chars) to `create_app`: both land in the repo-root `brand.json` with a deterministic accent colour in a purplish-blue band (HSL with hue 230 + FNV-1a(slug) mod 60, saturation 62%, lightness 48%), and the app's pages, manifest and icons pick them up. Leave them out and the name defaults to the slug title-cased (`grocery-list` → `Grocery List`) with the description matching it. Both are content-checked like the slug, with the same refusal.
 
 `brand.json` is the one place to rename or rebrand an app: edit it with `commit`, never the generated outputs.
 

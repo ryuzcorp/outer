@@ -153,10 +153,11 @@ fn hsl_to_hex(hue_deg: u32, saturation: f64, lightness: f64) -> String {
     )
 }
 
-/// The deterministic accent for `slug`: hue = FNV-1a 32-bit(slug) mod 360,
-/// then `HSL(hue, 62%, 48%)`.
+/// The deterministic accent for `slug`: hue = 230 + FNV-1a 32-bit(slug)
+/// mod 60, so the band is 230–289 (purplish-blue), then
+/// `HSL(hue, 62%, 48%)`.
 pub fn accent_for_slug(slug: &str) -> String {
-    hsl_to_hex(fnv1a_32(slug.as_bytes()) % 360, 0.62, 0.48)
+    hsl_to_hex(230 + fnv1a_32(slug.as_bytes()) % 60, 0.62, 0.48)
 }
 
 /// Resolve the brand for a new app: explicit values win when valid, else
@@ -241,14 +242,20 @@ mod tests {
 
     #[test]
     fn accent_pin_computed_by_hand() {
-        // FNV-1a 32-bit("groceries") = 1784649060; 1784649060 mod 360 = 180.
-        // HSL(180, 62%, 48%): chroma = 0.5952, second = 0.5952, shift = 0.1824,
-        // sector 180..240 is (0, second, chroma): r = 0.1824*255 = 46.5 -> 47,
-        // g = b = 0.7776*255 = 198.3 -> 198, i.e. #2fc6c6.
+        // FNV-1a 32-bit("groceries") = 1784649060; 1784649060 mod 60 = 0
+        // (60 * 29744151 = 1784649060), so hue = 230 + 0 = 230.
+        // HSL(230, 62%, 48%): chroma = (1 - |2*0.48 - 1|) * 0.62 = 0.5952,
+        // H' = 230/60 = 3.83, second = 0.5952 * (1 - |3.83 mod 2 - 1|)
+        // = 0.5952 * 0.1667 = 0.0992, shift = 0.48 - 0.5952/2 = 0.1824.
+        // H' in [3, 4) is blue-dominant (0, second, chroma):
+        // r = 0.1824*255 = 46.5 -> 47, g = 0.2816*255 = 71.8 -> 72,
+        // b = 0.7776*255 = 198.3 -> 198, i.e. #2f48c6.
+        // Old code gave hue 1784649060 mod 360 = 180 (#2fc6c6), so this
+        // pin fails on main.
         assert_eq!(fnv1a_32(b""), 0x811c_9dc5);
         assert_eq!(fnv1a_32(b"a"), 0xe40c_292c);
         assert_eq!(fnv1a_32(b"groceries"), 1784649060);
-        assert_eq!(accent_for_slug("groceries"), "#2fc6c6");
+        assert_eq!(accent_for_slug("groceries"), "#2f48c6");
     }
 
     #[test]
