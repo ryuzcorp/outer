@@ -183,51 +183,17 @@ mod tests {
         // A minimal deployable template: no package.json (install and build
         // skip), no D1 (migrate skips), a valid deploy root for the upload.
         let store = Store::memory();
-        let src = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(src.path().join("dist")).unwrap();
-        std::fs::create_dir_all(src.path().join("pages")).unwrap();
-        std::fs::write(
-            src.path().join("dist/wrangler.json"),
-            "{\"name\":\"t\",\"main\":\"index.js\",\"compatibility_date\":\"2026-01-01\"}",
-        )
-        .unwrap();
-        std::fs::write(src.path().join("pages/index.tsx"), "<h1>hi</h1>\n").unwrap();
-        let git_out = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .current_dir(src.path())
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8(out.stdout).unwrap()
-        };
-        git_out(&["init", "-b", "main"]);
-        git_out(&["add", "-A"]);
-        git_out(&[
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-m",
-            "seed",
-        ]);
-        let sha = git_out(&["rev-parse", "HEAD"]);
-        let bundle = src.path().join("template.bundle");
-        git_out(&["bundle", "create", bundle.to_str().unwrap(), "main"]);
-        crate::templates::put_test_template(
+        crate::templates::vendor_test_templates(
             &store,
-            crate::templates::Template::App,
-            sha.trim(),
-            &bundle,
+            &[
+                (
+                    "dist/wrangler.json",
+                    "{\"name\":\"t\",\"main\":\"index.js\",\"compatibility_date\":\"2026-01-01\"}",
+                ),
+                ("pages/index.tsx", "<h1>hi</h1>\n"),
+            ],
         )
-        .await
-        .unwrap();
+        .await;
 
         // A fake celld that answers the upload; no other step runs celld.
         let state = tempfile::tempdir().unwrap();

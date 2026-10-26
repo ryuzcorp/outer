@@ -5,7 +5,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
-    // Ilha's automatic JSX runtime, as in Outer apps (outer-template):
+    // Ilha's automatic JSX runtime, as in Outer apps (outer-templates, templates/app):
     // islands compile without importing anything.
     "jsx": "react-jsx",
     "jsxImportSource": "ilha",

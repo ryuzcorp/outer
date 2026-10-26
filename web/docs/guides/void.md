@@ -112,8 +112,8 @@ has its own guide with Outer's support verdict: [Auth](/guides/auth),
 
 
 - The template's pages (loader, intent action, forms, daisyUI):
-  <https://github.com/ryuzcorp/outer-template/blob/32d413655a4f050485c14d04e9476325619f2b32/pages/index.server.ts>,
-  <https://github.com/ryuzcorp/outer-template/blob/32d413655a4f050485c14d04e9476325619f2b32/pages/index.tsx>
+  <https://github.com/ryuzcorp/outer-templates/blob/e4953cb237072d5ac11373a98c17fa9bfc76d771/templates/app/pages/index.server.ts>,
+  <https://github.com/ryuzcorp/outer-templates/blob/e4953cb237072d5ac11373a98c17fa9bfc76d771/templates/app/pages/index.tsx>
 - Island and command reference in the template's `AGENTS.md`:
-  <https://github.com/ryuzcorp/outer-template/blob/32d413655a4f050485c14d04e9476325619f2b32/AGENTS.md>
+  <https://github.com/ryuzcorp/outer-templates/blob/e4953cb237072d5ac11373a98c17fa9bfc76d771/templates/app/AGENTS.md>
 - The integration reference: <https://ilha.build/guide/void>
