@@ -29,5 +29,6 @@ Reach for daisyUI component classes before utilities:
 6. Wrap wide tables in `overflow-x-auto`.
 7. Use `btn` tap targets for primary actions and `w-full` inputs.
 8. Prefer `min-h-dvh` over `min-h-screen` so mobile browser bars never cut content.
+9. Keep fixed bottom UI (bottom nav, FABs, toasts, cookie bars) clear of the Free badge: offset with `bottom: calc(env(safe-area-inset-bottom) + var(--outer-badge-space, 0px))`. The proxy appends the badge (`#outer-badge`) to Free apps; Pro pages unset the variable so it falls back to 0. Never hide, cover, or restyle the badge.
 
 For the person-side walkthrough, see [Start from phones](/design/phones-first).

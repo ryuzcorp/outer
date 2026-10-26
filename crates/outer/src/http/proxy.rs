@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use crate::apps;
 use crate::browser::MAX_LOOK_HTML_BYTES;
 use crate::fleet::manager::FleetManager;
+use crate::http::badge;
 use crate::http::client_ip::{cf_connecting_ip, client_ip};
 use crate::look_tokens::{LookTokens, LOOK_HEADER};
 use crate::observe::metrics::{MetricsAgg, RequestRecord};
@@ -457,6 +458,78 @@ fn prepend_look_stream(
     Body::from_stream(head.chain(tail))
 }
 
+/// Append `suffix` bytes to the end of an already-streaming body: trailer
+/// bytes (the Free badge) ride the open stream without buffering it. The
+/// caller drops or fixes `content-length` so the framing stays honest.
+fn chain_suffix(body: Body, suffix: Vec<u8>) -> Body {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    let head = body.into_data_stream().map_err(std::io::Error::other);
+    let tail = futures::stream::iter([Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(
+        suffix,
+    ))]);
+    Body::from_stream(head.chain(tail))
+}
+
+/// The Free-badge path (Contract 2): plain HTML only, streamed — the badge
+/// is chained after the last upstream byte, so the first chunk leaves before
+/// upstream finishes. Anything else (non-HTML, still-encoded bodies, HEAD,
+/// and bodyless statuses) passes through untouched with the normal header
+/// filtering.
+async fn badge_response(
+    upstream: hyper::Response<hyper::body::Incoming>,
+    is_unlisted: bool,
+    badge: &[u8],
+    head: bool,
+) -> Response {
+    let (mut parts, body) = upstream.into_parts();
+    let is_html = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/html"))
+        });
+    // The request asked for identity above; anything still encoded means
+    // upstream encoded anyway, and encoded bytes must never be edited.
+    let encoded = parts
+        .headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|encoding| {
+            !encoding.is_empty() && !encoding.trim().eq_ignore_ascii_case("identity")
+        });
+    let bodyless = head
+        || parts.status.is_informational()
+        || matches!(
+            parts.status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED | StatusCode::PARTIAL_CONTENT
+        );
+    if !is_html || encoded || bodyless {
+        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted);
+    }
+    // A declared length grows by exactly the badge: the framing stays exact
+    // and keep-alive survives. Undeclared lengths chunk, as before.
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse::<usize>().ok());
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    let mut out = copy_response_headers(
+        Response::builder().status(parts.status),
+        &mut parts.headers,
+        is_unlisted,
+    );
+    if let Some(len) = declared {
+        out = out.header("content-length", len + badge.len());
+    }
+    out.body(chain_suffix(Body::new(body), badge.to_vec()))
+        .unwrap()
+}
+
 /// Buffer the upstream body up to one byte past [`MAX_LOOK_HTML_BYTES`]:
 /// the bytes plus `None` fit; the bytes plus `Some` overflowed and carry
 /// the still-open remainder for the streaming oversize path. `Err` means
@@ -494,10 +567,13 @@ async fn read_look_body(
 /// The look-token path: buffer HTML (bounded), inject the recorder or a
 /// skip marker, and fix `Content-Length`. Non-HTML and unexpectedly encoded
 /// bodies pass through untouched with the normal header filtering; oversize
-/// HTML streams with a marker prepended.
+/// HTML streams with a marker prepended. `badge` (the Free badge, if the
+/// app's owner is not on Pro) rides along and lands after the injected
+/// page, so screenshots of Free apps show it — which is accurate.
 async fn look_response(
     upstream: hyper::Response<hyper::body::Incoming>,
     is_unlisted: bool,
+    badge: Option<&[u8]>,
 ) -> Response {
     let (mut parts, body) = upstream.into_parts();
     let is_html = parts
@@ -538,20 +614,19 @@ async fn look_response(
         // Oversize on paper: never buffer, stream the body with the marker
         // in front and a corrected length.
         use http_body_util::BodyExt as _;
-        let total = declared.unwrap_or(0) + LOOK_SKIP_OVERSIZE.len();
+        let total = declared.unwrap_or(0) + LOOK_SKIP_OVERSIZE.len() + badge.map_or(0, <[u8]>::len);
         parts.headers.remove(axum::http::header::CONTENT_LENGTH);
         let out = copy_response_headers(
             Response::builder().status(parts.status),
             &mut parts.headers,
             is_unlisted,
         );
-        return out
-            .header("content-length", total)
-            .body(prepend_look_stream(
-                LOOK_SKIP_OVERSIZE.to_vec(),
-                body.boxed(),
-            ))
-            .unwrap();
+        let streamed = prepend_look_stream(LOOK_SKIP_OVERSIZE.to_vec(), body.boxed());
+        let streamed = match badge {
+            Some(suffix) => chain_suffix(streamed, suffix.to_vec()),
+            None => streamed,
+        };
+        return out.header("content-length", total).body(streamed).unwrap();
     }
     match read_look_body(body).await {
         Err(_) => text(StatusCode::BAD_GATEWAY, "app unavailable"),
@@ -559,9 +634,16 @@ async fn look_response(
             if csp_blocks_inline(&parts.headers) {
                 let mut marked = LOOK_SKIP_CSP.to_vec();
                 marked.extend_from_slice(&buf);
+                if let Some(suffix) = badge {
+                    marked.extend_from_slice(suffix);
+                }
                 rebuild_look_body(parts, is_unlisted, &marked)
             } else {
-                rebuild_look_body(parts, is_unlisted, &inject_look_snippet(&buf))
+                let mut page = inject_look_snippet(&buf);
+                if let Some(suffix) = badge {
+                    page.extend_from_slice(suffix);
+                }
+                rebuild_look_body(parts, is_unlisted, &page)
             }
         }
         Ok((buf, Some(rest))) => {
@@ -574,7 +656,12 @@ async fn look_response(
             );
             let mut prefix = LOOK_SKIP_OVERSIZE.to_vec();
             prefix.extend_from_slice(&buf);
-            out.body(prepend_look_stream(prefix, rest)).unwrap()
+            let streamed = prepend_look_stream(prefix, rest);
+            let streamed = match badge {
+                Some(suffix) => chain_suffix(streamed, suffix.to_vec()),
+                None => streamed,
+            };
+            out.body(streamed).unwrap()
         }
     }
 }
@@ -749,11 +836,31 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         touch_once(&state, &app.id).await;
     }
 
+    // The Free badge (Contract 2): the owner's live plan, read on every
+    // request from the same `user` row every other Pro gate uses — no cache,
+    // so a plan change (upgrade webhook, downgrade) flips the very next
+    // response. A lookup failure serves without the badge rather than
+    // risking one on a Pro page.
+    let badge: Option<Vec<u8>> = match crate::apps::always_on::owner_plan(
+        &state.pool,
+        &app.owner_id,
+    )
+    .await
+    {
+        Ok(plan) if plan != "pro" => Some(badge::badge_snippet(&app.slug)),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "badge plan lookup failed; serving without badge");
+            None
+        }
+    };
+
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
     let upgrade = wants_upgrade(req.headers());
+    let is_head = req.method() == axum::http::Method::HEAD;
     let cf_ip = cf_connecting_ip(req.headers());
     let client_ip = client_ip(req.headers(), state.origin_locked, peer);
     // Grabbed before the request is split: the future resolves once the
@@ -806,6 +913,10 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         .get(LOOK_HEADER)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|token| state.look_tokens.claim(bare, token));
+    // The badge needs plain HTML too, but only when the client would take
+    // HTML at all: API and asset fetches keep their encoding and pass
+    // through untouched below.
+    let badge_identity = badge.is_some() && badge::accepts_html(&parts.headers);
     for (name, value) in parts.headers.iter() {
         if *name == axum::http::header::HOST {
             continue;
@@ -822,9 +933,10 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         if name.as_str() == LOOK_HEADER {
             continue;
         }
-        // With a live token the recorder needs plain HTML below, so the
-        // client's encoding preference is replaced by identity.
-        if look_armed && name == axum::http::header::ACCEPT_ENCODING {
+        // With a live token the recorder needs plain HTML below, as does
+        // the Free badge on an HTML-accepting request, so the client's
+        // encoding preference is replaced by identity.
+        if (look_armed || badge_identity) && name == axum::http::header::ACCEPT_ENCODING {
             continue;
         }
         if (is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()))
@@ -851,7 +963,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         "x-forwarded-proto",
         if state.origin_locked { "https" } else { "http" },
     );
-    if look_armed {
+    if look_armed || badge_identity {
         outbound = outbound.header(axum::http::header::ACCEPT_ENCODING, "identity");
     }
     let outbound = match outbound.body(body) {
@@ -900,7 +1012,17 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         let status = upstream.status();
         let bytes_out = response_bytes(&upstream);
         let latency_ms = upstream_start.elapsed().as_millis() as u64;
-        let response = look_response(upstream, is_unlisted).await;
+        let response = look_response(upstream, is_unlisted, badge.as_deref()).await;
+        meter(status.as_u16(), latency_ms, bytes_out);
+        return response;
+    }
+    if let Some(snippet) = badge {
+        // Free HTML pages stream with the badge chained after the last
+        // upstream byte; everything else passes through untouched.
+        let status = upstream.status();
+        let bytes_out = response_bytes(&upstream);
+        let latency_ms = upstream_start.elapsed().as_millis() as u64;
+        let response = badge_response(upstream, is_unlisted, &snippet, is_head).await;
         meter(status.as_u16(), latency_ms, bytes_out);
         return response;
     }
@@ -1023,6 +1145,59 @@ mod tests {
                         .header("content-type", "text/html")
                         .header("content-encoding", "gzip")
                         .body(Body::from("opaque-not-really-gzip"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/asset.css",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/css")
+                        .body(Body::from("body{color:red}"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/pixel.png",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "image/png")
+                        .body(Body::from("PNG-DATA"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/slow-html",
+                axum::routing::get(|| async {
+                    // First chunk now, the rest after a beat: proves the
+                    // badge path streams instead of buffering the page.
+                    use futures::stream::StreamExt as _;
+                    let first = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"<html><body>slow-",
+                        ))
+                    });
+                    let rest = futures::stream::once(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"-tail</body></html>",
+                        ))
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html")
+                        .body(Body::from_stream(first.chain(rest)))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/not-modified",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .body(Body::empty())
                         .unwrap()
                 }),
             )
@@ -2111,6 +2286,8 @@ mod tests {
         expected.push_str(
             "<title>T</title></head><body>hi<!--ae:identity leaked:false--></body></html>",
         );
+        // The fixture owner is Free: the badge rides after the recorder page.
+        expected.push_str(&String::from_utf8(badge::badge_snippet("shop")).unwrap());
         assert_eq!(
             body, expected,
             "recorder injected, token stripped, identity asked"
@@ -2191,6 +2368,8 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        // Pro owner: isolates the look path from the Free badge.
+        set_plan(&fix.pool, "pro").await;
         let state = look_state(
             fix.pool.clone(),
             fix._dir.path(),
@@ -2264,6 +2443,8 @@ mod tests {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        // Pro owner: isolates the look path from the Free badge.
+        set_plan(&fix.pool, "pro").await;
         let tokens = crate::look_tokens::LookTokens::new();
         let stale = tokens.mint_expired("shop.outer.test");
         let state = look_state(fix.pool.clone(), fix._dir.path(), tokens);
@@ -2356,7 +2537,12 @@ mod tests {
             body.starts_with("<!--__outer_look:oversize-->"),
             "marker first"
         );
-        assert!(body.ends_with("</body></html>"), "tail intact");
+        // The fixture owner is Free: the streamed tail ends with the badge.
+        assert!(body.contains("</body></html>"), "page whole");
+        assert!(
+            body.ends_with(&String::from_utf8(badge::badge_snippet("shop")).unwrap()),
+            "badge last"
+        );
         assert!(
             !body.contains("id=\"__outer_look\""),
             "no recorder: oversize"
@@ -2423,5 +2609,326 @@ mod tests {
         let (_, _, plain) = body_text(router(state).oneshot(req).await.unwrap()).await;
         assert_eq!(tokened, plain, "non-HTML untouched");
         assert!(!tokened.contains("__outer_look"), "{tokened}");
+    }
+
+    /// Flip the fixture owner's plan between requests.
+    async fn set_plan(pool: &sqlx::SqlitePool, plan: &str) {
+        sqlx::query("UPDATE user SET plan = ?1 WHERE id = 'a1'")
+            .bind(plan)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn badge_state(pool: sqlx::SqlitePool, dir: &std::path::Path) -> ProxyState {
+        ProxyState::new(
+            pool,
+            manager(dir),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        )
+    }
+
+    fn content_len(headers: &HeaderMap) -> Option<usize> {
+        headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|text| text.parse().ok())
+    }
+
+    fn shop_badge() -> String {
+        String::from_utf8(badge::badge_snippet("shop")).unwrap()
+    }
+
+    fn shop_html(path: &str) -> Request {
+        Request::builder()
+            .uri(path)
+            .header("host", "shop.outer.test")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A Free owner's HTML page gets exactly one badge at the end, with a
+    /// corrected length, and upstream saw the identity request.
+    #[tokio::test]
+    async fn badge_free_page_gets_exactly_one_badge_at_end() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let (status, headers, body) = body_text(
+            router(state)
+                .oneshot(shop_html("/look-html"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.ends_with(&shop_badge()), "badge last: {body}");
+        assert_eq!(
+            body.matches("id=\"outer-badge\"").count(),
+            1,
+            "exactly one badge: {body}"
+        );
+        assert!(body.contains("?ref=shop"), "{body}");
+        assert!(
+            body.contains("<!--ae:identity leaked:false-->"),
+            "identity asked so the page arrives plain: {body}"
+        );
+        assert_eq!(content_len(&headers), Some(body.len()));
+    }
+
+    /// A Pro owner's page is byte-for-byte what upstream sent: no badge,
+    /// and no identity override on the encoding.
+    #[tokio::test]
+    async fn badge_pro_owner_page_untouched() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        set_plan(&fix.pool, "pro").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let (status, headers, body) = body_text(
+            router(state)
+                .oneshot(shop_html("/look-html"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            "<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>"
+        );
+        assert!(!body.contains("outer-badge"), "{body}");
+        assert_eq!(content_len(&headers), Some(body.len()));
+    }
+
+    /// The plan is read per request, so an upgrade or downgrade flips the
+    /// next response with nothing to invalidate.
+    #[tokio::test]
+    async fn badge_plan_flip_applies_on_next_request() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let (_, _, free) = body_text(
+            router(state.clone())
+                .oneshot(shop_html("/look-html"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(free.ends_with(&shop_badge()), "{free}");
+        set_plan(&fix.pool, "pro").await;
+        let (_, _, pro) = body_text(
+            router(state.clone())
+                .oneshot(shop_html("/look-html"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!pro.contains("outer-badge"), "{pro}");
+        set_plan(&fix.pool, "free").await;
+        let (_, _, free_again) = body_text(
+            router(state)
+                .oneshot(shop_html("/look-html"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(free_again.ends_with(&shop_badge()), "{free_again}");
+    }
+
+    /// CSS, images, and JSON pass through byte-identical: only `text/html`
+    /// is ever touched, and API fetches keep their encoding.
+    #[tokio::test]
+    async fn badge_non_html_byte_identical() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let req = Request::builder()
+            .uri("/asset.css")
+            .header("host", "shop.outer.test")
+            .header("accept", "text/css")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "body{color:red}");
+        assert_eq!(content_len(&headers), Some(body.len()));
+
+        let req = Request::builder()
+            .uri("/pixel.png")
+            .header("host", "shop.outer.test")
+            .header("accept", "image/png")
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, body) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(body, "PNG-DATA");
+        assert!(!body.contains("outer-badge"), "{body}");
+
+        let req = Request::builder()
+            .uri("/items?page=2")
+            .header("host", "shop.outer.test")
+            .header("accept", "application/json")
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert!(!body.contains("outer-badge"), "{body}");
+        let echoed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(echoed["headers"]["accept-encoding"], "gzip");
+    }
+
+    /// Upstream may ignore the identity request and encode anyway: encoded
+    /// bytes pass through untouched, badge or no badge.
+    #[tokio::test]
+    async fn badge_gzip_upstream_passes_through() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let req = Request::builder()
+            .uri("/look-gzip")
+            .header("host", "shop.outer.test")
+            .header("accept", "text/html")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "opaque-not-really-gzip");
+        assert!(!body.contains("outer-badge"), "{body}");
+        assert_eq!(
+            headers
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+    }
+
+    /// HEAD answers carry no badge and keep the page's own length; a 304
+    /// stays an empty 304.
+    #[tokio::test]
+    async fn badge_head_and_304_untouched() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let (_, _, get_body) = body_text(
+            router(state.clone())
+                .oneshot(shop_html("/look-html"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(get_body.ends_with(&shop_badge()), "{get_body}");
+        let head = Request::builder()
+            .method("HEAD")
+            .uri("/look-html")
+            .header("host", "shop.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, head_body) =
+            body_text(router(state.clone()).oneshot(head).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(head_body.is_empty());
+        assert_eq!(
+            content_len(&headers),
+            Some(get_body.len() - shop_badge().len()),
+            "the page's own length, not the badged one"
+        );
+
+        let (status, _, body) = body_text(
+            router(state)
+                .oneshot(shop_html("/not-modified"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert!(body.is_empty());
+    }
+
+    /// The first chunk leaves before upstream finishes: the badge is
+    /// chained onto the open stream, never buffered.
+    #[tokio::test]
+    async fn badge_first_chunk_streams_before_upstream_finishes() {
+        use http_body_util::BodyExt as _;
+
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let response = router(state)
+            .oneshot(shop_html("/slow-html"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "no declared length: chunked"
+        );
+        let started = Instant::now();
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("first chunk arrives while upstream still sleeps")
+            .expect("upstream open")
+            .expect("a frame, not the end")
+            .into_data()
+            .expect("data, not trailers");
+        let first_elapsed = started.elapsed();
+        assert_eq!(&first[..], b"<html><body>slow-");
+        let mut tail = Vec::new();
+        while let Some(next) = body.frame().await {
+            if let Ok(data) = next.expect("upstream open").into_data() {
+                tail.extend_from_slice(&data);
+            }
+        }
+        let gap = started.elapsed() - first_elapsed;
+        let mut page = b"<html><body>slow-".to_vec();
+        page.extend_from_slice(&tail);
+        assert_eq!(
+            String::from_utf8(page).unwrap(),
+            format!("<html><body>slow--tail</body></html>{}", shop_badge())
+        );
+        assert!(
+            gap >= Duration::from_millis(300),
+            "the tail waited on upstream: {gap:?}"
+        );
+    }
+
+    /// With a live look token on a Free app, the recorder and the badge
+    /// coexist: the badge closes the page.
+    #[tokio::test]
+    async fn badge_coexists_with_look_recorder() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let token = tokens.mint("shop.outer.test");
+        let state = look_state(fix.pool.clone(), fix._dir.path(), tokens);
+
+        let (status, headers, body) = body_text(
+            router(state)
+                .oneshot(look_html_request(Some(&token)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("id=\"__outer_look\""), "{body}");
+        assert!(body.ends_with(&shop_badge()), "badge closes the page");
+        assert_eq!(content_len(&headers), Some(body.len()));
     }
 }

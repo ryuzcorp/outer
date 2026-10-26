@@ -751,6 +751,7 @@ export function UsageView({
             <li>10 app slots, 500 code changes a day</li>
             <li>Public visibility, collaborators and custom domains</li>
             <li>Code export, R2 file uploads, longer log retention</li>
+            <li>No outer.now badge on your apps</li>
           </ul>
           {summary.billing_enabled ? (
             <div class="flex min-w-0 flex-col gap-2">
