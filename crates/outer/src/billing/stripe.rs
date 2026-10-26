@@ -105,13 +105,24 @@ pub fn session_url(body: &str) -> anyhow::Result<CheckoutSession> {
 
 /// Stripe API calls with the secret key. `api_base` is
 /// `https://api.stripe.com` in production and a test double in tests.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StripeClient {
     http: reqwest::Client,
     secret_key: String,
     price_pro: String,
     launch_coupon: Option<String>,
     api_base: String,
+}
+
+impl std::fmt::Debug for StripeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StripeClient")
+            .field("price_pro", &self.price_pro)
+            .field("secret_key", &"<redacted>")
+            .field("launch_coupon", &self.launch_coupon)
+            .field("api_base", &self.api_base)
+            .finish()
+    }
 }
 
 impl StripeClient {
@@ -594,5 +605,18 @@ mod tests {
             "{}",
             call.body
         );
+    }
+
+    #[test]
+    fn debug_redacts_the_secret_key() {
+        let client = StripeClient::new(
+            "sk_live_redact_me".to_string(),
+            "price_pro".to_string(),
+            None,
+        )
+        .unwrap();
+        let shown = format!("{client:?}");
+        assert!(!shown.contains("sk_live_redact_me"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 }

@@ -40,7 +40,7 @@ pub const REMINDER_HIGH_SECS: i64 = 48 * 3600;
 
 /// Billing as the tools, console and webhook see it. Built once in `main`
 /// from config; never global.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum BillingState {
     /// `STRIPE_*` unset (localhost dev): checkout, portal and the webhook
     /// refuse, and refusals point at the console plan card.
@@ -53,6 +53,28 @@ pub enum BillingState {
         platform_base: String,
         sign_key: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for BillingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled { platform_base } => f
+                .debug_struct("Disabled")
+                .field("platform_base", platform_base)
+                .finish(),
+            Self::Enabled {
+                client,
+                platform_base,
+                ..
+            } => f
+                .debug_struct("Enabled")
+                .field("client", client)
+                .field("webhook_secret", &"<redacted>")
+                .field("platform_base", platform_base)
+                .field("sign_key", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl BillingState {
@@ -244,7 +266,22 @@ impl Transition {
     }
 }
 
-/// Record the event idempotently, then apply its transition (spec §14.2).
+/// Apply one webhook event exactly once (spec §14.2). The event row and
+/// every plan transition land in one transaction, so a failed apply leaves
+/// no row and the handler 500s so Stripe retries; a retry then re-applies
+/// the whole transition instead of hitting a row the first attempt left
+/// behind. Concurrent duplicates still apply exactly once: the second
+/// inserter blocks on the first's write lock, then sees the row and
+/// returns `Duplicate`.
+///
+/// Side effects outside the database (Cloudflare hostname deletes, edge
+/// purges, the day-0 past-due mail; fleet stops ride the route after
+/// `Applied`) run only after the commit, so they never fire for a
+/// rolled-back transition and never twice for one event. They are all
+/// best-effort (`warn`, never `Err` — the precedent is the day-0 mail and
+/// `remove_all_for_app`'s "drop the row anyway"): a 5xx therefore always
+/// means nothing was applied and no side effect ran, and the retry
+/// re-runs the full transition including its side effects.
 /// Unknown types are recorded and ignored so a new Stripe event never 500s.
 /// Every handler resolves the account the same way: checkout objects carry
 /// the account id, subscription/invoice objects resolve through the stored
@@ -256,6 +293,7 @@ pub async fn apply_event(
     object: &serde_json::Value,
     now_secs: i64,
 ) -> anyhow::Result<ApplyOutcome> {
+    let mut tx = ctx.pool.begin().await?;
     let inserted = sqlx::query(
         "INSERT INTO stripe_event (id, type, received_at) VALUES (?1, ?2, ?3) \
          ON CONFLICT(id) DO NOTHING",
@@ -263,34 +301,103 @@ pub async fn apply_event(
     .bind(event_id)
     .bind(event_type)
     .bind(now_secs)
-    .execute(ctx.pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if inserted == 0 {
+        tx.rollback().await?;
         return Ok(ApplyOutcome::Duplicate);
     }
+    let mut pending = PendingEffects::default();
     let transition = match event_type {
-        "checkout.session.completed" => apply_checkout_completed(ctx.pool, object).await?,
+        "checkout.session.completed" => apply_checkout_completed(&mut tx, object).await?,
         "customer.subscription.created" | "customer.subscription.updated" => {
-            apply_subscription(ctx, object, now_secs).await?
+            apply_subscription(&mut tx, &mut pending, &ctx.apps_domain, object, now_secs).await?
         }
         "customer.subscription.deleted" => {
-            apply_subscription_deleted(ctx, object, now_secs).await?
+            apply_subscription_deleted(&mut tx, &mut pending, &ctx.apps_domain, object, now_secs)
+                .await?
         }
-        "invoice.paid" => apply_invoice_paid(ctx.pool, object).await?,
-        "invoice.payment_failed" => apply_payment_failed(ctx, object, now_secs).await?,
+        "invoice.paid" => apply_invoice_paid(&mut tx, object).await?,
+        "invoice.payment_failed" => {
+            apply_payment_failed(&mut tx, &mut pending, object, now_secs).await?
+        }
         _ => Transition::kept(None),
     };
+    tx.commit().await?;
+    pending
+        .run_after_commit(
+            ctx.saas.as_ref(),
+            ctx.purge.as_ref(),
+            ctx.sender,
+            ctx.billing,
+            now_secs,
+        )
+        .await;
     Ok(ApplyOutcome::Applied {
         account_id: transition.account_id,
         stopped: transition.stopped,
     })
 }
 
+/// Work the webhook owes the outside world after its transaction commits.
+/// Collected inside the transaction (ids and hostnames are read from the
+/// rows the transaction is about to change), executed after the commit.
+#[derive(Default)]
+struct PendingEffects {
+    /// `(cf_custom_hostname_id, hostname)`: best-effort SaaS deletes.
+    cf_deletes: Vec<(String, String)>,
+    /// Edge hosts to purge (custom hostnames and app hosts).
+    purges: Vec<String>,
+    /// Day-0 past-due mail: `(account_id, email)`.
+    past_due_mail: Option<(String, String)>,
+}
+
+impl PendingEffects {
+    async fn run_after_commit(
+        &self,
+        saas: Option<&crate::cloudflare::CustomHostnames>,
+        purge: Option<&crate::cloudflare::CachePurge>,
+        sender: &EmailSender,
+        billing: &BillingState,
+        now_secs: i64,
+    ) {
+        for (cf_id, hostname) in &self.cf_deletes {
+            if let Some(saas) = saas {
+                if let Err(err) = saas.delete(cf_id).await {
+                    tracing::warn!(
+                        hostname = %hostname,
+                        error = %format!("{err:#}"),
+                        "stripe webhook: custom hostname delete failed after commit; row is already dropped"
+                    );
+                }
+            }
+        }
+        for host in &self.purges {
+            crate::cloudflare::purge_host_cache(purge, host).await;
+        }
+        if let Some((account_id, email)) = &self.past_due_mail {
+            // Day-0 mail (spec §14.2): the send may fail and the plan
+            // change stands, like the collaborator invite.
+            let upgrade = billing.upgrade_url(account_id, now_secs);
+            let text = format!(
+                "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (10 apps, 500 changes a day): {upgrade}\n\nAfter 7 days your account returns to Free: every app but your oldest stops, and Pro features pause until you resubscribe. Your code and data stay."
+            );
+            if let Err(err) = sender
+                .send_text(email, "Outer Pro payment failed — 7 days to update", &text)
+                .await
+            {
+                tracing::warn!(account = %account_id, "past-due day-0 email failed: {err:#}");
+            }
+        }
+    }
+}
+
 struct UserBilling {
     id: String,
     email: String,
     grace_until: Option<i64>,
+    subscription: Option<String>,
 }
 
 /// A Stripe id-or-object field: `"cus_1"` or `{"id": "cus_1"}`.
@@ -302,13 +409,16 @@ fn str_or_id(value: &serde_json::Value) -> Option<&str> {
     }
 }
 
-/// One `user` row as the transitions read it.
+/// One `user` row as the transitions read it. Everything runs inside the
+/// event transaction, so the readers take the open connection.
 #[derive(sqlx::FromRow)]
 struct UserRow {
     id: String,
     email: String,
     #[sqlx(rename = "graceUntil")]
     grace_until: Option<i64>,
+    #[sqlx(rename = "stripeSubscriptionId")]
+    subscription: Option<String>,
 }
 
 fn to_billing(row: UserRow) -> UserBilling {
@@ -316,27 +426,34 @@ fn to_billing(row: UserRow) -> UserBilling {
         id: row.id,
         email: row.email,
         grace_until: row.grace_until,
+        subscription: row.subscription,
     }
 }
 
-async fn user_by_id(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<UserBilling>> {
-    let row: Option<UserRow> =
-        sqlx::query_as("SELECT id, email, graceUntil FROM user WHERE id = ?1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+async fn user_by_id(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> anyhow::Result<Option<UserBilling>> {
+    let row: Option<UserRow> = sqlx::query_as(
+        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user WHERE id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await?;
     Ok(row.map(to_billing))
 }
 
 async fn user_by_customer(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     customer: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
-    let row: Option<UserRow> =
-        sqlx::query_as("SELECT id, email, graceUntil FROM user WHERE stripeCustomerId = ?1")
-            .bind(customer)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<UserRow> = sqlx::query_as(
+        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user \
+         WHERE stripeCustomerId = ?1",
+    )
+    .bind(customer)
+    .fetch_optional(conn)
+    .await?;
     Ok(row.map(to_billing))
 }
 
@@ -344,24 +461,30 @@ fn object_str<'o>(object: &'o serde_json::Value, key: &str) -> Option<&'o str> {
     object.get(key).and_then(serde_json::Value::as_str)
 }
 
-async fn user_by_email(pool: &SqlitePool, email: &str) -> anyhow::Result<Option<UserBilling>> {
-    let row: Option<UserRow> =
-        sqlx::query_as("SELECT id, email, graceUntil FROM user WHERE email = ?1")
-            .bind(email.to_ascii_lowercase())
-            .fetch_optional(pool)
-            .await?;
+async fn user_by_email(
+    conn: &mut sqlx::SqliteConnection,
+    email: &str,
+) -> anyhow::Result<Option<UserBilling>> {
+    let row: Option<UserRow> = sqlx::query_as(
+        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user WHERE email = ?1",
+    )
+    .bind(email.to_ascii_lowercase())
+    .fetch_optional(conn)
+    .await?;
     Ok(row.map(to_billing))
 }
 
 async fn user_by_subscription(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     subscription: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
-    let row: Option<UserRow> =
-        sqlx::query_as("SELECT id, email, graceUntil FROM user WHERE stripeSubscriptionId = ?1")
-            .bind(subscription)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<UserRow> = sqlx::query_as(
+        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user \
+         WHERE stripeSubscriptionId = ?1",
+    )
+    .bind(subscription)
+    .fetch_optional(conn)
+    .await?;
     Ok(row.map(to_billing))
 }
 
@@ -370,7 +493,7 @@ async fn user_by_subscription(
 /// Re-upgrading cancels a pending downgrade purge (the stamps clear) but
 /// restarts nothing: stopped apps stay stopped until the owner wakes one.
 async fn set_pro(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     account_id: &str,
     customer: Option<&str>,
     subscription: Option<&str>,
@@ -384,20 +507,32 @@ async fn set_pro(
     .bind(account_id)
     .bind(customer)
     .bind(subscription)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     sqlx::query(
         "UPDATE app SET downgraded_stopped_at = NULL, \
          downgrade_purge_warned_at = NULL WHERE owner_id = ?1",
     )
     .bind(account_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
+/// Stale-event guard for upgrades, symmetric to the downgrade guard: skip
+/// when the row names a different subscription than the event (a delayed
+/// `active`/`paid` for a canceled subscription must not re-promote the
+/// account). `None` on either side proceeds: a first subscription, or an
+/// object without the field, keeps today's behavior.
+fn upgrade_is_stale(current: Option<&str>, event: Option<&str>) -> bool {
+    match (current, event) {
+        (Some(current), Some(event)) => current != event,
+        _ => false,
+    }
+}
+
 async fn apply_checkout_completed(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     object: &serde_json::Value,
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
@@ -408,36 +543,39 @@ async fn apply_checkout_completed(
             .and_then(|meta| object_str(meta, "account_id"))
     });
     let user = match account {
-        Some(id) => user_by_id(pool, id).await?,
+        Some(id) => user_by_id(&mut *conn, id).await?,
         None => None,
     };
     let user = match user {
         Some(user) => Some(user),
         None => match customer {
-            Some(customer) => user_by_customer(pool, customer).await?,
+            Some(customer) => user_by_customer(&mut *conn, customer).await?,
             None => None,
         },
     };
     let user = match user {
         Some(user) => Some(user),
         None => match object_str(object, "customer_email") {
-            Some(email) => user_by_email(pool, email).await?,
+            Some(email) => user_by_email(&mut *conn, email).await?,
             None => None,
         },
     };
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
-    set_pro(pool, &user.id, customer, subscription).await?;
+    // The resubscribe path: a new checkout for a new subscription upgrades
+    // unconditionally, so no staleness guard here.
+    set_pro(&mut *conn, &user.id, customer, subscription).await?;
     Ok(Transition::kept(Some(user.id)))
 }
 
 async fn apply_subscription(
-    ctx: &WebhookCtx<'_>,
+    conn: &mut sqlx::SqliteConnection,
+    pending: &mut PendingEffects,
+    apps_domain: &str,
     object: &serde_json::Value,
     now_secs: i64,
 ) -> anyhow::Result<Transition> {
-    let pool = ctx.pool;
     let id = object_str(object, "id").unwrap_or_default();
     let customer = object.get("customer").and_then(str_or_id);
     let status = object_str(object, "status").unwrap_or_default();
@@ -446,7 +584,7 @@ async fn apply_subscription(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let user = match customer {
-        Some(customer) => user_by_customer(ctx.pool, customer).await?,
+        Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
     };
     let user = match user {
@@ -455,21 +593,28 @@ async fn apply_subscription(
             if id.is_empty() {
                 None
             } else {
-                user_by_subscription(ctx.pool, id).await?
+                user_by_subscription(&mut *conn, id).await?
             }
         }
     };
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
+    let event_sub = if id.is_empty() { None } else { Some(id) };
     // A downgrade stops every app but the oldest; the route stops their
     // fleets from the returned slugs.
     let mut stopped = Vec::new();
     match status {
         "active" | "trialing" => {
-            set_pro(ctx.pool, &user.id, customer, Some(id)).await?;
+            if upgrade_is_stale(user.subscription.as_deref(), event_sub) {
+                return Ok(Transition::kept(Some(user.id)));
+            }
+            set_pro(&mut *conn, &user.id, customer, event_sub).await?;
         }
         "past_due" => {
+            if upgrade_is_stale(user.subscription.as_deref(), event_sub) {
+                return Ok(Transition::kept(Some(user.id)));
+            }
             // First past-due event starts the 7-day grace clock; a repeat
             // keeps the earlier deadline instead of extending it.
             let grace = match user.grace_until {
@@ -484,9 +629,9 @@ async fn apply_subscription(
             )
             .bind(&user.id)
             .bind(customer)
-            .bind(if id.is_empty() { None } else { Some(id) })
+            .bind(event_sub)
             .bind(grace)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         }
         "canceled" => {
@@ -495,17 +640,33 @@ async fn apply_subscription(
                 // arrives, visibly marked so the plan card can say so.
                 sqlx::query("UPDATE user SET planStatus = 'canceled' WHERE id = ?1")
                     .bind(&user.id)
-                    .execute(pool)
+                    .execute(&mut *conn)
                     .await?;
             } else {
-                stopped = downgrade_account(ctx, &user.id, Some(id), now_secs).await?;
+                stopped = plan_downgrade(
+                    &mut *conn,
+                    pending,
+                    apps_domain,
+                    &user.id,
+                    event_sub,
+                    now_secs,
+                )
+                .await?;
             }
         }
         // `unpaid` means Stripe exhausted its retries: the grace the
         // `invoice.payment_failed` events started is over in practice, so
         // the downgrade rules apply now (documented choice).
         "unpaid" => {
-            stopped = downgrade_account(ctx, &user.id, Some(id), now_secs).await?;
+            stopped = plan_downgrade(
+                &mut *conn,
+                pending,
+                apps_domain,
+                &user.id,
+                event_sub,
+                now_secs,
+            )
+            .await?;
         }
         // `incomplete`, `incomplete_expired`, `paused` and anything new:
         // recorded above, no plan change.
@@ -518,15 +679,16 @@ async fn apply_subscription(
 }
 
 async fn apply_subscription_deleted(
-    ctx: &WebhookCtx<'_>,
+    conn: &mut sqlx::SqliteConnection,
+    pending: &mut PendingEffects,
+    apps_domain: &str,
     object: &serde_json::Value,
     now_secs: i64,
 ) -> anyhow::Result<Transition> {
-    let pool = ctx.pool;
     let id = object_str(object, "id").unwrap_or_default();
     let customer = object.get("customer").and_then(str_or_id);
     let user = match customer {
-        Some(customer) => user_by_customer(pool, customer).await?,
+        Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
     };
     let user = match user {
@@ -535,14 +697,23 @@ async fn apply_subscription_deleted(
             if id.is_empty() {
                 None
             } else {
-                user_by_subscription(pool, id).await?
+                user_by_subscription(&mut *conn, id).await?
             }
         }
     };
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
-    let stopped = downgrade_account(ctx, &user.id, Some(id), now_secs).await?;
+    let event_sub = if id.is_empty() { None } else { Some(id) };
+    let stopped = plan_downgrade(
+        &mut *conn,
+        pending,
+        apps_domain,
+        &user.id,
+        event_sub,
+        now_secs,
+    )
+    .await?;
     Ok(Transition {
         account_id: Some(user.id),
         stopped,
@@ -550,50 +721,57 @@ async fn apply_subscription_deleted(
 }
 
 async fn apply_invoice_paid(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     object: &serde_json::Value,
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
     let subscription = object.get("subscription").and_then(str_or_id);
     let user = match customer {
-        Some(customer) => user_by_customer(pool, customer).await?,
+        Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
     };
     let user = match user {
         Some(user) => Some(user),
         None => match subscription {
-            Some(subscription) => user_by_subscription(pool, subscription).await?,
+            Some(subscription) => user_by_subscription(&mut *conn, subscription).await?,
             None => None,
         },
     };
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
-    set_pro(pool, &user.id, customer, subscription).await?;
+    if upgrade_is_stale(user.subscription.as_deref(), subscription) {
+        return Ok(Transition::kept(Some(user.id)));
+    }
+    set_pro(&mut *conn, &user.id, customer, subscription).await?;
     Ok(Transition::kept(Some(user.id)))
 }
 
 async fn apply_payment_failed(
-    ctx: &WebhookCtx<'_>,
+    conn: &mut sqlx::SqliteConnection,
+    pending: &mut PendingEffects,
     object: &serde_json::Value,
     now_secs: i64,
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
     let subscription = object.get("subscription").and_then(str_or_id);
     let user = match customer {
-        Some(customer) => user_by_customer(ctx.pool, customer).await?,
+        Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
     };
     let user = match user {
         Some(user) => Some(user),
         None => match subscription {
-            Some(subscription) => user_by_subscription(ctx.pool, subscription).await?,
+            Some(subscription) => user_by_subscription(&mut *conn, subscription).await?,
             None => None,
         },
     };
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
+    if upgrade_is_stale(user.subscription.as_deref(), subscription) {
+        return Ok(Transition::kept(Some(user.id)));
+    }
     let grace = match user.grace_until {
         Some(existing) => existing,
         None => now_secs + GRACE_SECS,
@@ -608,48 +786,70 @@ async fn apply_payment_failed(
     .bind(customer)
     .bind(subscription)
     .bind(grace)
-    .execute(ctx.pool)
+    .execute(&mut *conn)
     .await?;
-    // Day-0 mail (spec §14.2): the send may fail and the plan change stands,
-    // like the collaborator invite.
-    let upgrade = ctx.billing.upgrade_url(&user.id, now_secs);
-    let text = format!(
-        "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (10 apps, 500 changes a day): {upgrade}\n\nAfter 7 days your account returns to Free: every app but your oldest stops, and Pro features pause until you resubscribe. Your code and data stay."
-    );
-    if let Err(err) = ctx
-        .sender
-        .send_text(
-            &user.email,
-            "Outer Pro payment failed — 7 days to update",
-            &text,
-        )
-        .await
-    {
-        tracing::warn!(account = %user.id, "past-due day-0 email failed: {err:#}");
-    }
+    // The mail goes out after the commit (see `PendingEffects`).
+    pending.past_due_mail = Some((user.id.clone(), user.email.clone()));
     Ok(Transition::kept(Some(user.id)))
 }
 
 /// Downgrade to Free (spec §3): custom hostnames go and public apps go
-/// back to unlisted on every owned app (`downgrade::strip_pro_extras`),
-/// the oldest app stays live and the rest stop, stamped with the downgrade
-/// date for the 30-day retention. The subscription link clears, the
-/// customer id stays for resubscribe and the portal. `expected_sub`
-/// guards against a stale event clobbering a newer subscription: skip when
-/// the row names a different subscription. Returns the stopped slugs so
-/// the caller can stop their fleets.
+/// back to unlisted on every owned app, the oldest app stays live and
+/// the rest stop, stamped with the downgrade date for the 30-day
+/// retention. The subscription link clears, the customer id stays for
+/// resubscribe and the portal. `expected_sub` guards against a stale
+/// event clobbering a newer subscription: skip when the row names a
+/// different subscription. Owns its transaction and runs the Cloudflare
+/// deletes and edge purges after the commit; the webhook path calls
+/// `plan_downgrade` inside the event transaction instead. Returns the
+/// stopped slugs so the caller can stop their fleets.
 pub async fn downgrade_account(
     ctx: &WebhookCtx<'_>,
     account_id: &str,
     expected_sub: Option<&str>,
     now_secs: i64,
 ) -> anyhow::Result<Vec<String>> {
-    let pool = ctx.pool;
+    let mut tx = ctx.pool.begin().await?;
+    let mut pending = PendingEffects::default();
+    let stopped = plan_downgrade(
+        &mut tx,
+        &mut pending,
+        &ctx.apps_domain,
+        account_id,
+        expected_sub,
+        now_secs,
+    )
+    .await?;
+    tx.commit().await?;
+    pending
+        .run_after_commit(
+            ctx.saas.as_ref(),
+            ctx.purge.as_ref(),
+            ctx.sender,
+            ctx.billing,
+            now_secs,
+        )
+        .await;
+    Ok(stopped)
+}
+
+/// The database half of a downgrade: every row change lands in the
+/// caller's transaction and every outside call is collected into
+/// `pending` for after the commit. See `apply_event` for why the split
+/// matters (a failed apply must leave no event row and run nothing).
+async fn plan_downgrade(
+    conn: &mut sqlx::SqliteConnection,
+    pending: &mut PendingEffects,
+    apps_domain: &str,
+    account_id: &str,
+    expected_sub: Option<&str>,
+    now_secs: i64,
+) -> anyhow::Result<Vec<String>> {
     if let Some(expected) = expected_sub {
         let current: Option<Option<String>> =
             sqlx::query_scalar("SELECT stripeSubscriptionId FROM user WHERE id = ?1")
                 .bind(account_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await?;
         if let Some(Some(current)) = current {
             if current != expected {
@@ -662,16 +862,56 @@ pub async fn downgrade_account(
          stripeSubscriptionId = NULL WHERE id = ?1",
     )
     .bind(account_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    downgrade::strip_pro_extras(
-        pool,
-        ctx.saas.as_ref(),
-        ctx.purge.as_ref(),
-        &ctx.apps_domain,
-        account_id,
+    // The row half of `downgrade::strip_pro_extras`: drop every custom
+    // hostname row and unlist every public app now; the SaaS deletes and
+    // edge purges run after the commit from `pending`.
+    #[derive(sqlx::FromRow)]
+    struct ProApp {
+        id: String,
+        slug: String,
+        visibility: String,
+    }
+    #[derive(sqlx::FromRow)]
+    struct StoredDomain {
+        hostname: String,
+        cf_custom_hostname_id: Option<String>,
+    }
+    let apps: Vec<ProApp> = sqlx::query_as(
+        "SELECT id, slug, visibility FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC",
     )
+    .bind(account_id)
+    .fetch_all(&mut *conn)
     .await?;
+    for app in &apps {
+        let domains: Vec<StoredDomain> = sqlx::query_as(
+            "SELECT hostname, cf_custom_hostname_id FROM app_domain WHERE app_id = ?1",
+        )
+        .bind(&app.id)
+        .fetch_all(&mut *conn)
+        .await?;
+        for domain in &domains {
+            if let Some(cf_id) = domain.cf_custom_hostname_id.as_deref() {
+                pending
+                    .cf_deletes
+                    .push((cf_id.to_string(), domain.hostname.clone()));
+            }
+            sqlx::query("DELETE FROM app_domain WHERE hostname = ?1")
+                .bind(&domain.hostname)
+                .execute(&mut *conn)
+                .await?;
+            pending.purges.push(domain.hostname.clone());
+        }
+        if app.visibility == crate::apps::Visibility::Public.as_str() {
+            // `unlisted` is never gated, so the plan argument is inert.
+            sqlx::query("UPDATE app SET visibility = 'unlisted' WHERE id = ?1")
+                .bind(&app.id)
+                .execute(&mut *conn)
+                .await?;
+            pending.purges.push(format!("{}.{}", app.slug, apps_domain));
+        }
+    }
     #[derive(sqlx::FromRow)]
     struct AppRow {
         id: String,
@@ -681,7 +921,7 @@ pub async fn downgrade_account(
         "SELECT id, slug FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC",
     )
     .bind(account_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     // The kept oldest app leaves retention: a previously stamped app that
     // is now the oldest (the rest were deleted) has its purge canceled.
@@ -691,7 +931,7 @@ pub async fn downgrade_account(
              downgrade_purge_warned_at = NULL WHERE id = ?1",
         )
         .bind(&kept.id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     let mut stopped = Vec::new();
@@ -702,7 +942,7 @@ pub async fn downgrade_account(
         )
         .bind(now_secs)
         .bind(&app.id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         stopped.push(app.slug.clone());
     }
@@ -1085,6 +1325,238 @@ mod tests {
         .await;
         // Still Pro on the new subscription.
         assert_eq!(plan_of(&pool, "a1").await.0, "pro");
+    }
+
+    async fn sub_of(pool: &SqlitePool, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT stripeSubscriptionId FROM user WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn debug_redacts_billing_secrets() {
+        let billing = enabled_billing();
+        let shown = format!("{billing:?}");
+        for secret in ["sk_test_1", "whsec_test", "test-sign-key"] {
+            assert!(!shown.contains(secret), "leaked {secret}: {shown}");
+        }
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("https://outer.now"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn failed_apply_records_nothing_and_retry_applies() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'active', stripeCustomerId = 'cus_1', \
+             stripeSubscriptionId = 'sub_1' WHERE id = 'a1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_app(&pool, "app1", "old", "a1", 1).await;
+        seed_app(&pool, "app2", "new", "a1", 2).await;
+        // Sabotage the plan write: the old record-first code leaves the
+        // event row behind, so the retry answers `Duplicate` and the
+        // account stays Pro.
+        sqlx::query(
+            "CREATE TRIGGER billing_no_user_update BEFORE UPDATE ON user \
+             BEGIN SELECT RAISE(ABORT, 'billing-test'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "canceled"});
+        let failed = apply_event(
+            &ctx(&pool, &sender, &billing),
+            "evt_31",
+            "customer.subscription.deleted",
+            &object,
+            NOW,
+        )
+        .await;
+        assert!(failed.is_err(), "expected the sabotaged apply to fail");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stripe_event WHERE id = 'evt_31'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "a failed apply must leave no event row");
+        sqlx::query("DROP TRIGGER billing_no_user_update")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Stripe's retry re-applies the whole transition instead of
+        // hitting `Duplicate`.
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_31",
+            "customer.subscription.deleted",
+            object,
+        )
+        .await;
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { stopped, .. } if stopped == vec!["new".to_string()])
+        );
+        assert_eq!(
+            plan_of(&pool, "a1").await,
+            ("free".to_string(), Some("canceled".to_string()), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_deliveries_apply_once() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'active', stripeCustomerId = 'cus_1', \
+             stripeSubscriptionId = 'sub_1' WHERE id = 'a1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_app(&pool, "app1", "old", "a1", 1).await;
+        seed_app(&pool, "app2", "new", "a1", 2).await;
+        let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "canceled"});
+        let (first, second) = tokio::join!(
+            apply(
+                &pool,
+                &sender,
+                &billing,
+                "evt_32",
+                "customer.subscription.deleted",
+                object.clone()
+            ),
+            apply(
+                &pool,
+                &sender,
+                &billing,
+                "evt_32",
+                "customer.subscription.deleted",
+                object
+            )
+        );
+        let mut applied = 0;
+        let mut duplicates = 0;
+        for outcome in [first, second] {
+            match outcome {
+                ApplyOutcome::Applied { stopped, .. } => {
+                    applied += 1;
+                    assert_eq!(stopped, vec!["new".to_string()]);
+                }
+                ApplyOutcome::Duplicate => duplicates += 1,
+            }
+        }
+        assert_eq!((applied, duplicates), (1, 1));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stripe_event WHERE id = 'evt_32'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+    }
+
+    async fn canceled_then_resubscribed(
+        pool: &SqlitePool,
+        sender: &EmailSender,
+        billing: &BillingState,
+    ) {
+        seed_user(pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'active', stripeCustomerId = 'cus_1', \
+             stripeSubscriptionId = 'sub_1' WHERE id = 'a1'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        apply(
+            pool,
+            sender,
+            billing,
+            "evt_40",
+            "customer.subscription.deleted",
+            serde_json::json!({"id": "sub_1", "customer": "cus_1"}),
+        )
+        .await;
+        assert_eq!(sub_of(pool, "a1").await.as_deref(), None);
+        // A genuine resubscribe mints a new subscription through checkout.
+        apply(
+            pool,
+            sender,
+            billing,
+            "evt_41",
+            "checkout.session.completed",
+            serde_json::json!({
+                "id": "cs_9", "client_reference_id": "a1",
+                "customer": "cus_1", "subscription": "sub_2",
+            }),
+        )
+        .await;
+        assert_eq!(plan_of(pool, "a1").await.0, "pro");
+        assert_eq!(sub_of(pool, "a1").await.as_deref(), Some("sub_2"));
+    }
+
+    #[tokio::test]
+    async fn resubscribe_upgrades_again() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        canceled_then_resubscribed(&pool, &sender, &billing).await;
+    }
+
+    #[tokio::test]
+    async fn stale_active_after_resubscribe_does_not_clobber() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        canceled_then_resubscribed(&pool, &sender, &billing).await;
+        // The delayed `active` for the deleted subscription must not
+        // demote the account back onto the old subscription id.
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_42",
+            "customer.subscription.updated",
+            serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "active"}),
+        )
+        .await;
+        assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
+        assert_eq!(plan_of(&pool, "a1").await.0, "pro");
+        assert_eq!(sub_of(&pool, "a1").await.as_deref(), Some("sub_2"));
+    }
+
+    #[tokio::test]
+    async fn stale_invoice_paid_after_resubscribe_does_not_clobber() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        canceled_then_resubscribed(&pool, &sender, &billing).await;
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_43",
+            "invoice.paid",
+            serde_json::json!({"id": "in_9", "customer": "cus_1", "subscription": "sub_1"}),
+        )
+        .await;
+        assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
+        assert_eq!(
+            plan_of(&pool, "a1").await,
+            ("pro".to_string(), Some("active".to_string()), None)
+        );
+        assert_eq!(sub_of(&pool, "a1").await.as_deref(), Some("sub_2"));
     }
 
     #[tokio::test]
@@ -1531,9 +2003,19 @@ mod tests {
             apps_domain: "outer.now".to_string(),
         };
         let object = serde_json::json!({"id": "sub_1", "customer": "cus_1"});
-        apply_subscription_deleted(&ctx, &object, NOW)
-            .await
-            .unwrap();
+        let outcome = apply_event(
+            &ctx,
+            "evt_22",
+            "customer.subscription.deleted",
+            &object,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { .. }),
+            "expected applied, got {outcome:?}"
+        );
         assert_eq!(
             fake.calls("DELETE").len(),
             1,
