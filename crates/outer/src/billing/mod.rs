@@ -139,6 +139,17 @@ impl BillingState {
         }
     }
 
+    /// Whether the launch promo is live in Stripe right now (spec §14.2):
+    /// the same cached lookup checkout uses, so every surface advertises
+    /// the $4 price only while it applies. Disabled billing never runs a
+    /// promo.
+    pub async fn launch_discount_active(&self) -> bool {
+        match self {
+            Self::Disabled { .. } => false,
+            Self::Enabled { client, .. } => client.launch_discount_active().await,
+        }
+    }
+
     /// Mint a live Checkout Session URL for the human to open (the MCP
     /// `upgrade` tool and the console Plan card). `None` when disabled.
     pub async fn checkout_url(

@@ -9,23 +9,36 @@ use super::{authed, internal, ok, Ctx, NoArgs};
 use crate::mcp::error::ToolError;
 
 /// `upgrade`: one Pro Checkout Session for the caller (spec §14.2). The
-/// response URL is live the moment it is minted — the human pays $4 with
-/// the launch coupon in test mode (or $8 without it), tax calculated, and
-/// the next tool call sees Pro.
+/// response URL is live the moment it is minted — the human pays the
+/// launch price while the Stripe promo runs ($4 with the coupon) or
+/// $8/month after, tax calculated, and the next tool call sees Pro.
 pub async fn upgrade(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let caller = authed(ctx)?;
-    match ctx.state.billing.checkout_url(&caller.account_id, &caller.email).await {
+    match ctx
+        .state
+        .billing
+        .checkout_url(&caller.account_id, &caller.email)
+        .await
+    {
         None => Err(ToolError::internal(
             "billing is not enabled on this host; upgrade from the console plan card once it is",
         )),
         Some(Err(err)) => Err(internal(err.context("creating the checkout session"))),
-        Some(Ok(session)) => Ok(ok(
-            format!(
-                "Open {} to upgrade to Outer Pro (launch price $4/month with the coupon, then $8/month; tax calculated at checkout).",
-                session.url
-            ),
-            json!({"checkout_url": session.url}),
-        )),
+        Some(Ok(session)) => {
+            let promo = ctx.state.billing.launch_discount_active().await;
+            let text = if promo {
+                format!(
+                    "Open {} to upgrade to Outer Pro (launch price $4/month with the coupon, then $8/month; tax calculated at checkout).",
+                    session.url
+                )
+            } else {
+                format!(
+                    "Open {} to upgrade to Outer Pro ($8/month; tax calculated at checkout).",
+                    session.url
+                )
+            };
+            Ok(ok(text, json!({"checkout_url": session.url})))
+        }
     }
 }
 

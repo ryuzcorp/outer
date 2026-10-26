@@ -45,8 +45,8 @@ pub fn form_encode(raw: &str) -> String {
 /// The `POST /v1/checkout/sessions` body (spec §14.2): subscription mode,
 /// the Pro price, the account as client reference and metadata, the payer's
 /// email, Stripe Tax on, billing address required, and the launch coupon
-/// while `STRIPE_LAUNCH_COUPON` is set. Pure so tests pin the exact params
-/// against a fake Stripe instead of the network.
+/// when one is passed (only while the promo runs in Stripe). Pure so tests
+/// pin the exact params against a fake Stripe instead of the network.
 pub fn checkout_form(
     price: &str,
     account_id: &str,
@@ -103,6 +103,20 @@ pub fn session_url(body: &str) -> anyhow::Result<CheckoutSession> {
     })
 }
 
+/// How long a coupon lookup stays cached inside the client (spec §14.2):
+/// the promo switch reads Stripe, not config, but a checkout must never
+/// wait on Stripe twice in a row for the same answer.
+const PROMO_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The last coupon lookup: whether the launch promo was live, and when
+/// Stripe said so. Lives inside [`StripeClient`] (shared through its
+/// `Arc`), never global.
+#[derive(Debug, Clone, Copy)]
+struct PromoCache {
+    active: bool,
+    at: Option<std::time::Instant>,
+}
+
 /// Stripe API calls with the secret key. `api_base` is
 /// `https://api.stripe.com` in production and a test double in tests.
 #[derive(Clone)]
@@ -112,6 +126,7 @@ pub struct StripeClient {
     price_pro: String,
     launch_coupon: Option<String>,
     api_base: String,
+    promo: std::sync::Arc<std::sync::Mutex<PromoCache>>,
 }
 
 impl std::fmt::Debug for StripeClient {
@@ -139,6 +154,10 @@ impl StripeClient {
             price_pro,
             launch_coupon,
             api_base: "https://api.stripe.com".to_string(),
+            promo: std::sync::Arc::new(std::sync::Mutex::new(PromoCache {
+                active: false,
+                at: None,
+            })),
         })
     }
 
@@ -205,22 +224,98 @@ impl StripeClient {
         Ok(serde_json::from_str(&body)?)
     }
 
+    /// Whether the launch promo is live in Stripe right now: a coupon id is
+    /// configured and `GET /v1/coupons/{id}` says `valid: true` (docs:
+    /// <https://docs.stripe.com/api/coupons/retrieve>). The owner ends the
+    /// promo in Stripe (delete or expire the coupon); this read is the only
+    /// switch. A 404 or `valid: false` means the promo is over, and any
+    /// other failure (network, 5xx, unparseable body) also reads as over
+    /// with a `warn`: a promo must never block a sale. Lookups cache for
+    /// [`PROMO_CACHE_TTL`] inside the client, never globally.
+    pub async fn launch_discount_active(&self) -> bool {
+        let id = match self.launch_coupon.as_deref() {
+            Some(id) => id.to_string(),
+            None => return false,
+        };
+        if let Ok(cache) = self.promo.lock() {
+            if let Some(at) = cache.at {
+                if at.elapsed() < PROMO_CACHE_TTL {
+                    return cache.active;
+                }
+            }
+        }
+        let active = self.coupon_is_valid(&id).await;
+        if let Ok(mut cache) = self.promo.lock() {
+            *cache = PromoCache {
+                active,
+                at: Some(std::time::Instant::now()),
+            };
+        }
+        active
+    }
+
+    /// One coupon read behind [`Self::launch_discount_active`]: true only
+    /// on a 200 whose body says `valid: true`. Never errors — every failure
+    /// mode logs and reads as "promo over".
+    async fn coupon_is_valid(&self, id: &str) -> bool {
+        let res = self
+            .http
+            .get(format!("{}/v1/coupons/{id}", self.api_base))
+            .header("Authorization", self.auth())
+            .header("Stripe-Version", STRIPE_API_VERSION)
+            .send()
+            .await;
+        let res = match res {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::warn!(
+                    "stripe coupon lookup failed: {err:#}; checkout proceeds at full price"
+                );
+                return false;
+            }
+        };
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // Deleted in the dashboard: the promo is over, quietly.
+            return false;
+        }
+        if !status.is_success() {
+            tracing::warn!(
+                "stripe coupon lookup answered {status}: {body}; checkout proceeds at full price"
+            );
+            return false;
+        }
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) => value
+                .get("valid")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            Err(err) => {
+                tracing::warn!(
+                    "stripe coupon lookup unparseable: {err:#}; checkout proceeds at full price"
+                );
+                false
+            }
+        }
+    }
+
     /// One Pro subscription checkout for `account_id` (spec §14.2). The
     /// human finishes on Stripe's page and the webhook upgrades the account;
-    /// nothing here touches the `user` row.
+    /// nothing here touches the `user` row. The launch coupon rides along
+    /// only while [`Self::launch_discount_active`] says the promo runs.
     pub async fn create_checkout_session(
         &self,
         account_id: &str,
         email: &str,
         success_url: &str,
     ) -> anyhow::Result<CheckoutSession> {
-        let form = checkout_form(
-            &self.price_pro,
-            account_id,
-            email,
-            success_url,
-            self.launch_coupon.as_deref(),
-        );
+        let coupon = if self.launch_discount_active().await {
+            self.launch_coupon.as_deref()
+        } else {
+            None
+        };
+        let form = checkout_form(&self.price_pro, account_id, email, success_url, coupon);
         session_url(&self.post("/v1/checkout/sessions", &form).await?)
     }
     /// One Customer Portal session for an existing subscriber.
@@ -454,9 +549,21 @@ mod tests {
         body: String,
     }
 
+    /// What the fake's `GET /v1/coupons/{id}` answers: the promo states the
+    /// lookup must distinguish (live, deleted, expired, Stripe outage).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CouponReply {
+        Valid,
+        Deleted,
+        Invalid,
+        Broken,
+    }
+
     struct FakeStripe {
         base: String,
         calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+        coupon_calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+        coupon_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -468,28 +575,36 @@ mod tests {
 
     impl FakeStripe {
         async fn start() -> Self {
+            Self::start_with(CouponReply::Valid).await
+        }
+
+        async fn start_with(coupon: CouponReply) -> Self {
             use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let coupon_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let seen = calls.clone();
+            let seen_coupons = coupon_calls.clone();
+            let seen_hits = hits.clone();
             let task = tokio::spawn(async move {
                 loop {
                     let Ok((conn, _)) = listener.accept().await else {
                         return;
                     };
                     let seen = seen.clone();
+                    let seen_coupons = seen_coupons.clone();
+                    let seen_hits = seen_hits.clone();
                     tokio::spawn(async move {
                         let mut lines = tokio::io::BufReader::new(conn);
                         let mut request_line = String::new();
                         if lines.read_line(&mut request_line).await.is_err() {
                             return;
                         }
-                        let path = request_line
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap_or_default()
-                            .to_string();
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or_default().to_string();
+                        let path = parts.next().unwrap_or_default().to_string();
                         let mut auth = None;
                         let mut version = None;
                         let mut content_length = 0;
@@ -517,6 +632,26 @@ mod tests {
                         if lines.read_exact(&mut body).await.is_err() {
                             return;
                         }
+                        // The promo switch reads here; checkout POSTs record below.
+                        if method == "GET" && path.starts_with("/v1/coupons/") {
+                            seen_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            seen_coupons.lock().unwrap().push(RecordedCall {
+                                path,
+                                auth,
+                                version,
+                                body: String::new(),
+                            });
+                            let (status, payload) = match coupon {
+                                CouponReply::Valid => ("HTTP/1.1 200 OK", "{\"id\":\"launch50\",\"object\":\"coupon\",\"valid\":true,\"percent_off\":50,\"duration\":\"forever\"}".to_string()),
+                                CouponReply::Deleted => ("HTTP/1.1 404 Not Found", "{\"error\":{\"message\":\"No such coupon: 'launch50'\",\"type\":\"invalid_request_error\"}}".to_string()),
+                                CouponReply::Invalid => ("HTTP/1.1 200 OK", "{\"id\":\"launch50\",\"object\":\"coupon\",\"valid\":false,\"percent_off\":50,\"duration\":\"forever\"}".to_string()),
+                                CouponReply::Broken => ("HTTP/1.1 500 Internal Server Error", "{\"error\":{\"message\":\"boom\"}}".to_string()),
+                            };
+                            let response = format!("{status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}", payload.len());
+                            let mut stream = lines.into_inner();
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            return;
+                        }
                         seen.lock().unwrap().push(RecordedCall {
                             path,
                             auth,
@@ -533,6 +668,8 @@ mod tests {
             Self {
                 base: format!("http://127.0.0.1:{port}"),
                 calls,
+                coupon_calls,
+                coupon_hits: hits,
                 task,
             }
         }
@@ -543,6 +680,21 @@ mod tests {
                 calls.len(),
                 1,
                 "expected one Stripe call, got {}",
+                calls.len()
+            );
+            calls.pop().unwrap()
+        }
+
+        fn coupon_lookups(&self) -> usize {
+            self.coupon_hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn coupon_only(&self) -> RecordedCall {
+            let mut calls = self.coupon_calls.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "expected one coupon lookup, got {}",
                 calls.len()
             );
             calls.pop().unwrap()
@@ -615,6 +767,117 @@ mod tests {
             "{}",
             call.body
         );
+    }
+
+    /// A live coupon in Stripe rides on the checkout, and the lookup reuses
+    /// the checkout auth and pinned API version.
+    #[tokio::test]
+    async fn checkout_applies_a_live_coupon() {
+        let fake = FakeStripe::start_with(CouponReply::Valid).await;
+        let client = test_client(fake.base.clone(), Some("launch50"));
+        assert!(client.launch_discount_active().await);
+        let session = client
+            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .await
+            .unwrap();
+        assert_eq!(session.url, "https://checkout.stripe.com/pay/cs_test_1");
+        let lookup = fake.coupon_only();
+        assert_eq!(lookup.path, "/v1/coupons/launch50");
+        let expected_auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("sk_test_1:")
+        );
+        assert_eq!(lookup.auth.as_deref(), Some(expected_auth.as_str()));
+        assert_eq!(lookup.version.as_deref(), Some(STRIPE_API_VERSION));
+        let call = fake.only();
+        assert_eq!(call.path, "/v1/checkout/sessions");
+        assert!(
+            call.body.contains("discounts%5B0%5D%5Bcoupon%5D=launch50"),
+            "{}",
+            call.body
+        );
+    }
+
+    /// The owner deleted the coupon in the dashboard: checkout still
+    /// succeeds, at full price.
+    #[tokio::test]
+    async fn checkout_ignores_a_deleted_coupon() {
+        let fake = FakeStripe::start_with(CouponReply::Deleted).await;
+        let client = test_client(fake.base.clone(), Some("launch50"));
+        assert!(!client.launch_discount_active().await);
+        let session = client
+            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .await
+            .unwrap();
+        assert_eq!(session.url, "https://checkout.stripe.com/pay/cs_test_1");
+        let call = fake.only();
+        assert!(
+            !call.body.contains("coupon"),
+            "unexpected coupon in {}",
+            call.body
+        );
+        assert!(
+            call.body.contains("automatic_tax%5Benabled%5D=true"),
+            "{}",
+            call.body
+        );
+    }
+
+    /// An expired coupon (`valid: false`) ends the promo the same way.
+    #[tokio::test]
+    async fn checkout_ignores_an_invalid_coupon() {
+        let fake = FakeStripe::start_with(CouponReply::Invalid).await;
+        let client = test_client(fake.base.clone(), Some("launch50"));
+        assert!(!client.launch_discount_active().await);
+        client
+            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .await
+            .unwrap();
+        let call = fake.only();
+        assert!(
+            !call.body.contains("coupon"),
+            "unexpected coupon in {}",
+            call.body
+        );
+    }
+
+    /// A Stripe 500 on the coupon lookup never blocks the sale: full price,
+    /// checkout still minted.
+    #[tokio::test]
+    async fn checkout_survives_a_coupon_lookup_outage() {
+        let fake = FakeStripe::start_with(CouponReply::Broken).await;
+        let client = test_client(fake.base.clone(), Some("launch50"));
+        assert!(!client.launch_discount_active().await);
+        let session = client
+            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .await
+            .unwrap();
+        assert_eq!(session.url, "https://checkout.stripe.com/pay/cs_test_1");
+        let call = fake.only();
+        assert!(
+            !call.body.contains("coupon"),
+            "unexpected coupon in {}",
+            call.body
+        );
+    }
+
+    /// Back-to-back checkouts share one coupon lookup while the cache is
+    /// fresh: the promo switch costs one Stripe read, not one per sale.
+    #[tokio::test]
+    async fn coupon_lookup_caches_inside_the_client() {
+        let fake = FakeStripe::start_with(CouponReply::Valid).await;
+        let client = test_client(fake.base.clone(), Some("launch50"));
+        for _ in 0..2 {
+            client
+                .create_checkout_session(
+                    "acct-1",
+                    "me@example.com",
+                    "https://outer.now/billing/done",
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(fake.coupon_lookups(), 1);
     }
 
     #[tokio::test]

@@ -119,7 +119,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `upgrade`
 
 - **Access:** signed in
-- **Description:** Upgrade to Outer Pro: returns a Checkout link for the human to open ($4/month launch price with the coupon, $8/month after; tax calculated). The plan lifts on the next call after payment.
+- **Description:** Upgrade to Outer Pro: returns a Checkout link for the human to open (Pro is $8/month, with a $4/month launch price while the promotion runs; tax calculated). The plan lifts on the next call after payment.
 
 **Input:** none.
 

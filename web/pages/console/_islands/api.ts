@@ -355,6 +355,8 @@ export interface AccountSummary {
   billing_enabled: boolean;
   /** Stripe sandbox keys: Checkout takes test cards, nothing is charged. */
   billing_test_mode: boolean;
+  /** Live Stripe coupon state: the $4 launch price applies while true. */
+  launch_discount_active: boolean;
   member_since: number;
   usage: AccountUsage;
   alerts: AlertPrefs;
