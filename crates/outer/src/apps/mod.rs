@@ -900,7 +900,7 @@ mod tests {
             port_range: (18000, 18020),
         };
         for i in 0..8 {
-            let (pool, owner, alloc) = (pool.clone(), owner.clone(), wide.clone());
+            let (pool, owner, alloc) = (pool.clone(), owner.clone(), wide);
             tasks.push(tokio::spawn(async move {
                 create(&pool, &owner, &format!("quota-racer-{i}"), None, &alloc, 3).await
             }));
