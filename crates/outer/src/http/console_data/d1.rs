@@ -3048,6 +3048,33 @@ exit 0
     }
 
     #[tokio::test]
+    async fn r2_upload_refuses_up_front_past_the_cap() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let (app, _health) = router_app(&pool, &state).await;
+        let ana = login(&pool, "ana@example.com").await;
+        // The sweep measured a full Free R2 allowance: any upload refuses.
+        sqlx::query("UPDATE app SET r2_measured_bytes = ?1 WHERE slug = 'acme'")
+            .bind(crate::limits::FREE_R2_BYTES as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, body) = send(
+            &app,
+            same_origin(
+                Request::put("/api/console/apps/acme/data/r2/object?bucket=files&key=a.txt")
+                    .header("cookie", &ana),
+            )
+            .body(Body::from("hello"))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["quota"], "storage_bytes");
+    }
+
+    #[tokio::test]
     async fn d1_stays_owner_only_for_collaborators() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
