@@ -17,7 +17,7 @@
 //! Read-only. Role-scoped like the console app endpoints and the MCP read
 //! tools (spec §7.4: owners and collaborators read code and history): a
 //! slug the caller has no role on answers 404 like a missing one. Every read goes through
-//! the same [`crate::git::local`] functions the MCP `list_files`/`read_file`
+//! the same [`crate::git::local`] functions the MCP `list_files`/`read_files`
 //! tools use — no second implementation, same bounds (256 KiB blob cap,
 //! 64 KiB patch/text caps) and the same binary detection.
 
@@ -47,7 +47,7 @@ pub fn routes() -> Router<super::AppState> {
 }
 
 /// Text longer than this is cut with `truncated: true`, the same ceiling the
-/// MCP `read_file` tool reports.
+/// MCP `read_files` tool reports.
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Most files one tree listing carries before `truncated` is set.
 const MAX_TREE_FILES: usize = 5000;

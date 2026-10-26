@@ -13,7 +13,7 @@ use super::manifest::run_git;
 /// Largest blob [`read_blob`] loads: same ceiling as commit text files, so a
 /// read can never hold more than a single commit file would.
 pub const MAX_READ_BYTES: usize = 256 * 1024;
-/// Most matches [`grep`] returns (spec §8.2: `git grep` matches, ≤ 200).
+/// Most matches [`grep_search`] returns (spec §8.2: `git grep` matches, ≤ 200).
 pub const MAX_GREP_MATCHES: usize = 200;
 /// Most commits [`log`] returns per call.
 pub const MAX_LOG_COMMITS: usize = 50;
@@ -29,12 +29,31 @@ pub struct FileEntry {
     pub size: u64,
 }
 
-/// One `git grep` hit.
+/// One `git grep` hit, with its context lines (`search_code` `context`).
 #[derive(Debug, Clone)]
-pub struct GrepMatch {
-    pub path: String,
+pub struct GrepHit {
     pub line: u64,
     pub text: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+}
+
+/// One file's hits, in `git grep` order.
+#[derive(Debug, Clone)]
+pub struct FileHits {
+    pub path: String,
+    pub matches: Vec<GrepHit>,
+}
+
+/// Options for [`grep_search`].
+#[derive(Debug, Clone, Default)]
+pub struct GrepOptions {
+    pub regex: bool,
+    pub case_insensitive: bool,
+    pub word: bool,
+    pub paths: Vec<String>,
+    pub include_generated: bool,
+    pub context: u8,
 }
 
 /// One commit in `main`'s history.
@@ -228,29 +247,35 @@ async fn run_git_raw(args: &[&str], timeout: Duration) -> anyhow::Result<Vec<u8>
     Ok(output.stdout)
 }
 
-/// `git grep` for `pattern` at `rev` (default: head). `regex` selects `-E`,
-/// otherwise the query is a fixed string. Returns at most
-/// [`MAX_GREP_MATCHES`] hits plus whether more existed.
-pub async fn grep(
+/// `git grep` for `pattern` at `rev` (default: head), grouped by file.
+/// `regex` selects `-E` (otherwise the query is a fixed string),
+/// `case_insensitive` adds `-i`, `word` adds `-w`. `paths` are globs
+/// (`*`, `?`, `**`; a glob without `/` matches the basename at any depth);
+/// generated files (`node_modules/`, `dist/`, lockfiles) are skipped unless
+/// `include_generated`. `context` (0-5) attaches surrounding lines read back
+/// from each matched blob. Returns at most [`MAX_GREP_MATCHES`] hits plus
+/// whether more existed (or the fetch hit its internal scan cap).
+pub async fn grep_search(
     bare: &Path,
     rev: Option<&str>,
     pattern: &str,
-    regex: bool,
-    pathspec: Option<&str>,
-) -> anyhow::Result<(String, Vec<GrepMatch>, bool)> {
+    opts: &GrepOptions,
+) -> anyhow::Result<(String, Vec<FileHits>, bool)> {
     anyhow::ensure!(!pattern.is_empty(), "query must not be empty");
     anyhow::ensure!(pattern.len() <= 1024, "query exceeds 1024 characters");
-    if regex {
-        regex::Regex::new(pattern).map_err(|e| anyhow::anyhow!("bad regex: {e}"))?;
+    anyhow::ensure!(opts.context <= 5, "context is 0-5");
+    anyhow::ensure!(opts.paths.len() <= 20, "at most 20 path globs");
+    for glob in &opts.paths {
+        validate_glob(glob)?;
     }
-    if let Some(pathspec) = pathspec {
-        validate_read_path(pathspec)?;
+    if opts.regex {
+        regex::Regex::new(pattern).map_err(|e| anyhow::anyhow!("bad regex: {e}"))?;
     }
     let Some(sha) = resolve_rev(bare, rev).await? else {
         anyhow::bail!("app has no commits yet");
     };
     let gd = git_dir(bare);
-    let flag = if regex { "-E" } else { "-F" };
+    let flag = if opts.regex { "-E" } else { "-F" };
     let mut args = vec![
         gd.as_str(),
         "grep",
@@ -260,21 +285,18 @@ pub async fn grep(
         flag,
         "-e",
         pattern,
-        &sha,
     ];
-    let prefix_arg;
-    if let Some(pathspec) = pathspec {
-        prefix_arg = format!("{}/", pathspec.trim_end_matches('/'));
-        args.push("--");
-        args.push(&prefix_arg);
-    } else {
-        args.push("--");
-        args.push(".");
+    if opts.case_insensitive {
+        args.push("-i");
     }
+    if opts.word {
+        args.push("-w");
+    }
+    args.push(&sha);
     // `git grep` exits 1 on no matches: that is an empty result, not a failure.
-    // The stream is capped: the child dies at 1 MiB and parsing stops at 200
-    // hits, so both paths mark `truncated`.
-    let run = run_capped(&args, MAX_GIT_OUTPUT_BYTES).await?;
+    // The stream is capped: the child dies at 1 MiB and parsing stops at the
+    // scan cap, so both paths mark `truncated`.
+    let run = run_capped(&[&args[..], &["--", "."]].concat(), MAX_GIT_OUTPUT_BYTES).await?;
     let out = if run.failed() {
         if run.status.code() == Some(1) {
             String::new()
@@ -284,11 +306,13 @@ pub async fn grep(
     } else {
         String::from_utf8_lossy(&run.stdout).into_owned()
     };
-    let mut hits = Vec::new();
-    let mut truncated = run.truncated;
+    // Raw hits in output order: filtering (generated, globs) runs after the
+    // fetch, so the fetch scans past the 200-match reporting cap.
+    let mut raw: Vec<(String, u64, String)> = Vec::new();
+    let mut scan_cut = false;
     for line in out.lines() {
-        if hits.len() >= MAX_GREP_MATCHES {
-            truncated = true;
+        if raw.len() >= MAX_GREP_SCAN {
+            scan_cut = true;
             break;
         }
         // `<sha>:<path>:<line>:<text>`.
@@ -303,14 +327,184 @@ pub async fn grep(
             continue;
         };
         let (lineno, text) = rest.split_at(colon);
-        let text = text[1..].chars().take(500).collect::<String>();
-        hits.push(GrepMatch {
-            path: path.to_string(),
-            line: lineno.parse().unwrap_or(0),
-            text,
-        });
+        raw.push((
+            path.to_string(),
+            lineno.parse().unwrap_or(0),
+            text[1..].chars().take(500).collect(),
+        ));
     }
-    Ok((sha, hits, truncated))
+    let mut total = 0usize;
+    let mut files: Vec<FileHits> = Vec::new();
+    let mut truncated = scan_cut || run.truncated;
+    for (path, line, text) in raw {
+        if !opts.include_generated && is_generated(&path) {
+            continue;
+        }
+        if !opts.paths.is_empty() && !opts.paths.iter().any(|g| match_glob(g, &path)) {
+            continue;
+        }
+        if total >= MAX_GREP_MATCHES {
+            truncated = true;
+            break;
+        }
+        total += 1;
+        match files.last_mut() {
+            Some(f) if f.path == path => f.matches.push(GrepHit {
+                line,
+                text,
+                before: Vec::new(),
+                after: Vec::new(),
+            }),
+            _ => files.push(FileHits {
+                path,
+                matches: vec![GrepHit {
+                    line,
+                    text,
+                    before: Vec::new(),
+                    after: Vec::new(),
+                }],
+            }),
+        }
+    }
+    if opts.context > 0 {
+        attach_context(bare, rev, &mut files, opts.context).await;
+    }
+    Ok((sha, files, truncated))
+}
+
+/// Most raw hits parsed before generated/glob filtering; the reporting cap
+/// ([`MAX_GREP_MATCHES`]) applies after filtering.
+const MAX_GREP_SCAN: usize = 2000;
+
+/// Fill `before`/`after` for every hit by reading each matched blob once.
+/// Blobs over the read cap or binary blobs keep their matches with empty
+/// context: the hit stands, the surroundings don't.
+async fn attach_context(bare: &Path, rev: Option<&str>, files: &mut [FileHits], context: u8) {
+    let radius = context as usize;
+    for file in files.iter_mut() {
+        let Ok((_, bytes)) = read_blob(bare, rev, &file.path).await else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for hit in file.matches.iter_mut() {
+            let at = hit.line.saturating_sub(1) as usize;
+            let lo = at.saturating_sub(radius);
+            let hi = (at + radius + 1).min(lines.len());
+            hit.before = lines[lo..at.min(lines.len())]
+                .iter()
+                .map(|s| s.chars().take(500).collect())
+                .collect();
+            hit.after = lines[at.saturating_add(1).min(lines.len())..hi]
+                .iter()
+                .map(|s| s.chars().take(500).collect())
+                .collect();
+        }
+    }
+}
+
+/// Basenames never worth searching unless `include_generated` opts back in.
+const LOCKFILES: &[&str] = &[
+    "package-lock.json",
+    "bun.lock",
+    "bun.lockb",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "Gemfile.lock",
+    "poetry.lock",
+    "composer.lock",
+    "Pipfile.lock",
+];
+
+/// Generated files are skipped by default: vendored deps, build output and
+/// lockfiles — matches there drown the app's own code.
+pub fn is_generated(path: &str) -> bool {
+    if path
+        .split('/')
+        .any(|seg| seg == "node_modules" || seg == "dist")
+    {
+        return true;
+    }
+    let base = path.rsplit('/').next().unwrap_or(path);
+    LOCKFILES.contains(&base)
+}
+
+/// One user glob against one repo-relative path. `*` and `?` stay inside a
+/// segment when the glob holds a `/` (`src/*.ts` is one level);
+/// `**/` crosses segments, and a glob without `/` matches the basename at
+/// any depth (`*.ts` finds `src/a.ts`).
+pub fn match_glob(glob: &str, path: &str) -> bool {
+    let full = glob.contains('/');
+    let haystack = if full {
+        path
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    };
+    let mut re = String::from("^");
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        re.push_str("(.*/)?");
+                    } else {
+                        re.push_str(".*");
+                    }
+                } else if full {
+                    re.push_str("[^/]*");
+                } else {
+                    re.push_str(".*");
+                }
+            }
+            '?' => re.push_str(if full { "[^/]" } else { "." }),
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    re.push('$');
+    regex::Regex::new(&re)
+        .map(|r| r.is_match(haystack))
+        .unwrap_or(false)
+}
+
+/// Globs ride into a Rust match, never into git, so the rules are only
+/// about shape: relative, bounded, no escapes.
+fn validate_glob(glob: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!glob.is_empty(), "path globs must not be empty");
+    anyhow::ensure!(glob.len() <= 256, "path glob exceeds 256 characters");
+    anyhow::ensure!(!glob.starts_with('/'), "path glob must be relative");
+    anyhow::ensure!(
+        !glob.split('/').any(|seg| seg == ".."),
+        "path glob must not escape (..)"
+    );
+    Ok(())
+}
+
+/// The blob id at `rev:path`: the per-file handle `read_files` reports so
+/// later edits can check one file instead of the whole head.
+pub async fn blob_sha(
+    bare: &Path,
+    rev: Option<&str>,
+    path: &str,
+) -> anyhow::Result<(String, String)> {
+    validate_read_path(path)?;
+    let Some(sha) = resolve_rev(bare, rev).await? else {
+        anyhow::bail!("app has no commits yet");
+    };
+    let gd = git_dir(bare);
+    let spec = format!("{sha}:{path}");
+    let out = run_git(&[&gd, "rev-parse", "--verify", &spec], &[], GIT_TIMEOUT)
+        .await
+        .map_err(|_| anyhow::anyhow!("{path} not found"))?;
+    Ok((sha, out.trim().to_string()))
 }
 
 /// Largest single git stdout kept in memory: `grep`, `ls-tree` and `show`
@@ -858,11 +1052,14 @@ mod tests {
     async fn grep_log_show_roundtrip() {
         let (dir, cfg, store, sync) = seed().await;
         let bare = bare(&dir, &cfg, &store, &sync).await;
-        let (sha, hits, truncated) = grep(&bare, None, "Groceries", false, None).await.unwrap();
-        assert!(!truncated && hits.len() == 1);
-        assert_eq!(hits[0].path, "pages/index.tsx");
-        assert_eq!(hits[0].line, 1);
-        let (_, none, _) = grep(&bare, None, "zzz-no-match", false, None)
+        let (sha, files, truncated) =
+            grep_search(&bare, None, "Groceries", &GrepOptions::default())
+                .await
+                .unwrap();
+        assert!(!truncated && files.len() == 1);
+        assert_eq!(files[0].path, "pages/index.tsx");
+        assert_eq!(files[0].matches[0].line, 1);
+        let (_, none, _) = grep_search(&bare, None, "zzz-no-match", &GrepOptions::default())
             .await
             .unwrap();
         assert!(none.is_empty());
@@ -907,13 +1104,17 @@ mod tests {
         .await
         .unwrap();
         let bare = bare(&dir, &cfg, &store, &sync).await;
-        let (flood_sha, hits, truncated) =
-            grep(&bare, None, "match me", false, None).await.unwrap();
+        let (flood_sha, files, truncated) =
+            grep_search(&bare, None, "match me", &GrepOptions::default())
+                .await
+                .unwrap();
+        let hits: Vec<_> = files.iter().flat_map(|f| &f.matches).collect();
         assert_eq!(hits.len(), MAX_GREP_MATCHES);
         assert!(truncated, "the 1 MiB stream cap must cut the flood");
         assert!(
-            hits.iter()
-                .all(|h| h.path.starts_with("big") && h.text == "match me"),
+            files.iter().all(
+                |f| f.path.starts_with("big") && f.matches.iter().all(|h| h.text == "match me")
+            ),
             "only whole lines before the cap count as hits"
         );
         // The same flood through `show`: the streamed patch is cut too.
@@ -1066,5 +1267,39 @@ mod tests {
         assert!(bin.binary && bin.status == 'A');
         let missing = blob_size(&bare, None, "nope.bin").await.unwrap_err();
         assert!(missing.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn glob_matching_rules() {
+        // No `/`: the basename matches at any depth.
+        assert!(match_glob("*.ts", "a.ts"));
+        assert!(match_glob("*.ts", "src/nested/a.ts"));
+        assert!(!match_glob("*.tsx", "src/a.ts.bak"));
+        // With `/`: `*` stays inside one segment, `**/` crosses.
+        assert!(match_glob("src/*.ts", "src/a.ts"));
+        assert!(!match_glob("src/*.ts", "src/nested/a.ts"));
+        assert!(match_glob("src/**/*.ts", "src/nested/a.ts"));
+        assert!(match_glob("**/*.ts", "a.ts"));
+        assert!(match_glob("**/*.ts", "src/a.ts"));
+        assert!(match_glob("a?c", "abc"));
+        assert!(!match_glob("a?c", "ac"));
+        assert!(validate_glob("src/*.ts").is_ok());
+        assert!(validate_glob("").is_err());
+        assert!(validate_glob("/abs").is_err());
+        assert!(validate_glob("../x").is_err());
+        assert!(validate_glob(&"x/".repeat(200)).is_err());
+    }
+
+    #[test]
+    fn generated_detection() {
+        assert!(is_generated("node_modules/pkg/index.js"));
+        assert!(is_generated("dist/bundle.js"));
+        assert!(is_generated("a/dist/b.js"));
+        assert!(is_generated("package-lock.json"));
+        assert!(is_generated("sub/Cargo.lock"));
+        assert!(is_generated("bun.lockb"));
+        assert!(!is_generated("src/app.ts"));
+        assert!(!is_generated("distribute/x.js"));
+        assert!(!is_generated("package.json"));
     }
 }

@@ -6,6 +6,7 @@ pub mod export;
 pub mod format;
 pub mod local;
 pub mod manifest;
+pub mod symbol;
 pub use commit::{
     Author, CommitError, CommitOutcome, CommitRequest, Edit, FileWrite, Move, WriteBody,
 };

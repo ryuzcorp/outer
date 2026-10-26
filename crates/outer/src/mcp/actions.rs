@@ -23,7 +23,7 @@
 //! - `share_app`: `share_app`
 //! - `get_app`: `get_app`
 //! - `list_files`: `list_files [prefix=<p>] [sha=<short>]`
-//! - `read_file`: `read_file <path> [lines <start>-<end>]`
+//! - `read_files`: `read_files <n> file(s) [paths...]`
 //! - `search_code`: `search_code "<query, 200 chars>" [regex]`
 //! - `history`: `history [path=<p>] [skip=<n>]`
 //! - `show_commit`: `show_commit <sha>`
@@ -57,7 +57,7 @@ const LOGGED_TOOLS: &[&str] = &[
     "share_app",
     "get_app",
     "list_files",
-    "read_file",
+    "read_files",
     "search_code",
     "history",
     "show_commit",
@@ -238,16 +238,19 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             }
             s
         }
-        "read_file" => {
-            let mut s = format!("read_file {}", arg_str(args, "path").unwrap_or("?"));
-            match (
-                args.get("start_line").and_then(Value::as_u64),
-                args.get("end_line").and_then(Value::as_u64),
-            ) {
-                (Some(start), Some(end)) => s.push_str(&format!(" lines {start}-{end}")),
-                (Some(start), None) => s.push_str(&format!(" lines {start}-")),
-                (None, Some(end)) => s.push_str(&format!(" lines -{end}")),
-                (None, None) => {}
+        "read_files" => {
+            let files = args.get("files").and_then(Value::as_array);
+            let n = files.map_or(0, Vec::len);
+            let mut s = format!("read_files {n} file(s)");
+            if let Some(fs) = files {
+                for f in fs.iter().take(2) {
+                    if let Some(p) = f.get("path").and_then(Value::as_str) {
+                        s.push_str(&format!(" {p}"));
+                    }
+                }
+                if n > 2 {
+                    s.push_str(&format!(" +{}", n - 2));
+                }
             }
             s
         }

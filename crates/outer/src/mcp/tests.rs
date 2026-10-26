@@ -386,7 +386,7 @@ async fn registry_schemas_are_valid_json_schema() {
     assert_eq!(
         untrusted,
         vec![
-            "read_file",
+            "read_files",
             "search_code",
             "show_commit",
             "deploy_log",
@@ -423,15 +423,22 @@ async fn create_commit_read_history_roundtrip() {
     let (_, read) = call(
         &state,
         Some(&token),
-        "read_file",
-        json!({"app": "groceries", "path": "pages/index.tsx"}),
+        "read_files",
+        json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
     )
     .await;
     let read = result(&read);
-    assert!(read["structuredContent"]["text"]
-        .as_str()
-        .unwrap()
-        .contains("Groceries"));
+    let files = read["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "pages/index.tsx");
+    // Numbered lines, exact at the boundaries: the file's single line.
+    assert!(files[0]["text"].as_str().unwrap().starts_with("1│ "));
+    assert!(files[0]["text"].as_str().unwrap().contains("Groceries"));
+    assert_eq!(files[0]["total_lines"], 1);
+    assert_eq!(files[0]["start_line"], 1);
+    assert_eq!(files[0]["end_line"], 1);
+    assert_eq!(files[0]["blob"].as_str().unwrap().len(), 40);
+    assert!(read["structuredContent"].get("truncated").is_some());
     // Untrusted content rides behind the §8.4 notice as its own block.
     let blocks = read["content"].as_array().unwrap();
     assert_eq!(blocks.len(), 2);
@@ -439,7 +446,6 @@ async fn create_commit_read_history_roundtrip() {
         .as_str()
         .unwrap()
         .starts_with("The following was produced by your app and its visitors."));
-
     let (_, commit) = call(
         &state,
         Some(&token),
@@ -469,13 +475,10 @@ async fn create_commit_read_history_roundtrip() {
     )
     .await;
     let search = result(&search);
-    assert_eq!(
-        search["structuredContent"]["matches"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    let sfiles = search["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(sfiles.len(), 1);
+    assert_eq!(sfiles[0]["path"], "pages/index.tsx");
+    assert_eq!(sfiles[0]["matches"].as_array().unwrap().len(), 1);
     assert!(search["content"].as_array().unwrap()[1]["text"]
         .as_str()
         .unwrap()
@@ -636,8 +639,8 @@ async fn strangers_app_is_not_found_never_forbidden() {
     for (tool, args) in [
         ("get_app", json!({"app": "groceries"})),
         (
-            "read_file",
-            json!({"app": "groceries", "path": "pages/index.tsx"}),
+            "read_files",
+            json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
         ),
         ("list_files", json!({"app": "groceries"})),
         ("history", json!({"app": "groceries"})),
@@ -1609,8 +1612,8 @@ async fn git_tools_reject_bad_revs_without_server_paths() {
             json!({"app": "groceries", "sha": "not-a-sha!!"}),
         ),
         (
-            "read_file",
-            json!({"app": "groceries", "path": "pages/index.tsx", "sha": "../../etc"}),
+            "read_files",
+            json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}], "sha": "../../etc"}),
         ),
         ("show_commit", json!({"app": "groceries", "sha": "-5"})),
         ("history", json!({"app": "groceries", "path": "../x"})),
@@ -2180,19 +2183,23 @@ async fn agent_action_foreign_app_writes_nothing_and_failures_log_error() {
     assert_eq!(shape["error"]["code"], -32602);
     assert_eq!(action_rows(&state, "groceries").await.len(), 2);
 
-    // A refused call's arguments were never length-checked: the stored
-    // summary is still bounded.
+    // A bad file fails inline without failing the call, and the stored
+    // summary is still bounded even though the path was never length-checked.
     let huge = "p".repeat(100_000);
     let (_, long) = call(
         &state,
         Some(&ana),
-        "read_file",
-        json!({"app": "groceries", "path": huge}),
+        "read_files",
+        json!({"app": "groceries", "files": [{"path": huge}]}),
     )
     .await;
-    assert_eq!(is_error(&long)["error"], "invalid_argument");
+    let long = result(&long);
+    assert_eq!(
+        long["structuredContent"]["files"][0]["code"],
+        "invalid_argument"
+    );
     let rows = action_rows(&state, "groceries").await;
-    assert_eq!(rows[0].tool, "read_file");
+    assert_eq!(rows[0].tool, "read_files");
     assert!(
         rows[0].summary.chars().count() <= 2003,
         "{}",
@@ -2841,8 +2848,8 @@ async fn collaborator_calls_allowed_tools_and_is_refused_owner_only_ones() {
         ("share_app", json!({"app": "groceries"})),
         ("list_files", json!({"app": "groceries"})),
         (
-            "read_file",
-            json!({"app": "groceries", "path": "pages/index.tsx"}),
+            "read_files",
+            json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
         ),
         (
             "search_code",
@@ -4712,8 +4719,8 @@ async fn export_code_zip_matches_the_tree_at_sha() {
         let mut expected = std::collections::BTreeMap::new();
         for file in &files {
             let path = file["path"].as_str().unwrap();
-            // Ground truth is the blob itself: `read_file` trims a trailing
-            // newline for display, so it cannot serve as the oracle here.
+            // Ground truth is the blob itself: `read_files` numbers lines
+            // for display, so it cannot serve as the oracle here.
             expected.insert(
                 format!("groceries-{short}/{path}"),
                 blob_bytes(&state, sha, path),
@@ -5296,4 +5303,497 @@ async fn preview_guards_rename_and_slug_shape() {
         .as_str()
         .unwrap()
         .contains("discard the preview"));
+}
+/// `read_files` batch reads with ranges: line numbers are exact at the
+/// boundaries, and each file carries its blob sha and true total.
+#[tokio::test]
+async fn read_files_batch_ranges_and_numbering() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Five lines",
+               "writes": [{"path": "a.txt", "content": "l1\nl2\nl3\nl4\nl5\n"},
+                          {"path": "b.txt", "content": "only\n"}]}),
+    )
+    .await;
+    assert!(result(&committed).get("isError").is_none());
+
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [
+            {"path": "a.txt", "start_line": 2, "end_line": 3},
+            {"path": "b.txt"},
+            {"path": "a.txt", "start_line": 4, "end_line": 99},
+        ]}),
+    )
+    .await;
+    let read = result(&read);
+    assert!(read.get("isError").is_none(), "{read}");
+    let files = read["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 3);
+    // Exact at the boundaries: middle slice.
+    assert_eq!(files[0]["text"], "2│ l2\n3│ l3");
+    assert_eq!(files[0]["total_lines"], 5);
+    assert_eq!(files[0]["start_line"], 2);
+    assert_eq!(files[0]["end_line"], 3);
+    // Whole file defaults to 1..total.
+    assert_eq!(files[1]["text"], "1│ only");
+    assert_eq!(files[1]["total_lines"], 1);
+    assert_eq!(files[1]["start_line"], 1);
+    assert_eq!(files[1]["end_line"], 1);
+    // A range past EOF is clamped to the true end.
+    assert_eq!(files[2]["text"], "4│ l4\n5│ l5");
+    assert_eq!(files[2]["start_line"], 4);
+    assert_eq!(files[2]["end_line"], 5);
+    // Blob shas are per-file handles, distinct per content.
+    let blob_a = files[0]["blob"].as_str().unwrap();
+    let blob_b = files[1]["blob"].as_str().unwrap();
+    assert_eq!(blob_a.len(), 40);
+    assert_ne!(blob_a, blob_b);
+    assert_eq!(read["structuredContent"]["truncated"], false);
+}
+
+/// One bad file never fails the call: missing, binary and bad ranges report
+/// inline while the good file reads.
+#[tokio::test]
+async fn read_files_error_isolation() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Good and binary",
+               "writes": [{"path": "ok.txt", "content": "fine\n"},
+                          {"path": "img.bin", "base64": "iVBORwAB"}]}),
+    )
+    .await;
+    assert!(result(&committed).get("isError").is_none());
+
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [
+            {"path": "ok.txt"},
+            {"path": "missing.txt"},
+            {"path": "img.bin"},
+            {"path": "ok.txt", "start_line": 3, "end_line": 2},
+            {"path": "ok.txt", "start_line": 1, "symbol": "Nope"},
+        ]}),
+    )
+    .await;
+    let read = result(&read);
+    assert!(read.get("isError").is_none(), "{read}");
+    let files = read["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 5);
+    assert_eq!(files[0]["text"], "1│ fine");
+    assert_eq!(files[1]["code"], "not_found");
+    assert!(files[1]["error"].as_str().unwrap().contains("not found"));
+    assert!(files[2]["error"].as_str().unwrap().contains("binary"));
+    assert_eq!(files[3]["code"], "invalid_argument");
+    assert!(files[4]["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be combined"));
+}
+
+/// The ~200 KB output budget: the file crossing it is cut with `truncated`,
+/// later files fail inline, and the total stays within budget.
+#[tokio::test]
+async fn read_files_budget_truncation() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let big = "x".repeat(80 * 1024);
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Big files",
+               "writes": [{"path": "f1.txt", "content": big},
+                          {"path": "f2.txt", "content": big},
+                          {"path": "f3.txt", "content": big},
+                          {"path": "small.txt", "content": "s\n"}]}),
+    )
+    .await;
+    assert!(result(&committed).get("isError").is_none());
+
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [
+            {"path": "f1.txt"}, {"path": "f2.txt"},
+            {"path": "f3.txt"}, {"path": "small.txt"},
+        ]}),
+    )
+    .await;
+    let read = result(&read);
+    assert!(read.get("isError").is_none(), "{read}");
+    assert_eq!(read["structuredContent"]["truncated"], true);
+    let files = read["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 4);
+    assert!(files[0].get("truncated").is_none());
+    assert!(files[1].get("truncated").is_none());
+    assert_eq!(files[2]["truncated"], true);
+    assert!(files[3]["error"]
+        .as_str()
+        .unwrap()
+        .contains("budget is exhausted"));
+    let total: usize = files
+        .iter()
+        .filter_map(|f| f.get("text").and_then(Value::as_str))
+        .map(str::len)
+        .sum();
+    assert!(total <= 200 * 1024, "{total}");
+}
+
+/// `symbol` returns just the declaration's numbered lines on template-shaped
+/// files, and refuses ambiguous, missing and unsupported lookups inline.
+#[tokio::test]
+async fn read_files_symbol_extraction() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let card = "import { Island } from \"@outer/ilha\";\n\
+                import { count } from \"./store\";\n\
+                \n\
+                const PAGE_SIZE = 25;\n\
+                \n\
+                export function Card({ title }: { title: string }) {\n\
+                \x20 return <Island><h1>{title}</h1></Island>;\n\
+                }\n\
+                \n\
+                export const formatTitle = (t: string) => t.trim();\n\
+                \n\
+                export default Card;\n";
+    let astro = "---\n\
+                 import Layout from \"../layouts/Base.astro\";\n\
+                 const title = \"Shop\";\n\
+                 ---\n\
+                 <Layout><h1>{title}</h1></Layout>\n";
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Components",
+               "writes": [{"path": "src/Card.tsx", "content": card},
+                          {"path": "pages/index.astro", "content": astro},
+                          {"path": "src/dup.ts", "content": "export const Item = 1;\nconst Item = 2;\n"},
+                          {"path": "README.md", "content": "# hi\n"}]}),
+    )
+    .await;
+    assert!(result(&committed).get("isError").is_none());
+
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [
+            {"path": "src/Card.tsx", "symbol": "Card"},
+            {"path": "src/Card.tsx", "symbol": "formatTitle"},
+            {"path": "pages/index.astro", "symbol": "title"},
+            {"path": "src/dup.ts", "symbol": "Item"},
+            {"path": "src/Card.tsx", "symbol": "Missing"},
+            {"path": "README.md", "symbol": "hi"},
+        ]}),
+    )
+    .await;
+    let read = result(&read);
+    assert!(read.get("isError").is_none(), "{read}");
+    let files = read["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 6);
+    assert_eq!(
+        files[0]["text"].as_str().unwrap().lines().count(),
+        3,
+        "{}",
+        files[0]["text"]
+    );
+    assert!(files[0]["text"].as_str().unwrap().starts_with("6│ "));
+    assert_eq!(files[0]["start_line"], 6);
+    assert_eq!(files[0]["end_line"], 8);
+    assert_eq!(files[0]["symbol"], "Card");
+    assert_eq!(files[1]["start_line"], 10);
+    assert_eq!(files[1]["end_line"], 10);
+    assert_eq!(files[2]["text"], "3│ const title = \"Shop\";");
+    assert_eq!(files[2]["start_line"], 3);
+    // Two top-level `Item`s: refused, not guessed.
+    assert!(files[3]["error"].as_str().unwrap().contains("2 top-level"));
+    // No such symbol: inline, not a failed call.
+    assert!(files[4]["error"].as_str().unwrap().contains("no top-level"));
+    // Markdown has no symbol table.
+    assert!(files[5]["error"]
+        .as_str()
+        .unwrap()
+        .contains("symbol extraction"));
+}
+
+/// `search_code` v2: globs, context, case/word and regex, grouped by file.
+#[tokio::test]
+async fn search_code_v2_filters_and_grouping() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Words",
+               "writes": [{"path": "src/app.ts", "content": "const greeting = \"Hello\";\nconsole.log(greeting);\n"},
+                          {"path": "src/shout.ts", "content": "HELLO world\n"},
+                          {"path": "notes.txt", "content": "hello there\n"}]}),
+    )
+    .await;
+    assert!(result(&committed).get("isError").is_none());
+
+    // Case-sensitive default: only the lowercase file hits.
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "hello"}),
+    )
+    .await;
+    let found = result(&found);
+    let files = found["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "notes.txt");
+    assert_eq!(files[0]["matches"][0]["line"], 1);
+    assert!(files[0]["matches"][0].get("before").is_none());
+    assert_eq!(found["structuredContent"]["truncated"], false);
+
+    // Case-insensitive spans all three files, grouped with context.
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "hello",
+               "case_insensitive": true, "context": 1}),
+    )
+    .await;
+    let found = result(&found);
+    let files = found["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 3, "{files:?}");
+    let app = files.iter().find(|f| f["path"] == "src/app.ts").unwrap();
+    assert_eq!(app["matches"][0]["line"], 1);
+    assert_eq!(app["matches"][0]["after"][0], "console.log(greeting);");
+
+    // Whole words: `hell` matches nothing inside `hello`.
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "hell",
+               "case_insensitive": true, "word": true}),
+    )
+    .await;
+    assert_eq!(
+        result(&found)["structuredContent"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // Globs: `*.ts` matches the basename at any depth; `src/*.ts` stays put.
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "hello",
+               "case_insensitive": true, "paths": ["*.ts"]}),
+    )
+    .await;
+    assert_eq!(
+        result(&found)["structuredContent"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "hello",
+               "case_insensitive": true, "paths": ["notes.*"]}),
+    )
+    .await;
+    let files = result(&found)["structuredContent"]["files"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "notes.txt");
+
+    // Regex still works.
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "gr..ting", "regex": true}),
+    )
+    .await;
+    assert_eq!(
+        result(&found)["structuredContent"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Bad shapes are the caller's bug.
+    for args in [
+        json!({"app": "groceries", "query": "hello", "context": 9}),
+        json!({"app": "groceries", "query": "(unclosed", "regex": true}),
+        json!({"app": "groceries", "query": "hello", "paths": ["../x"]}),
+    ] {
+        let (_, bad) = call(&state, Some(&token), "search_code", args).await;
+        assert_eq!(is_error(&bad)["error"], "invalid_argument");
+    }
+}
+
+/// Generated files stay out of results unless `include_generated` opts back in.
+#[tokio::test]
+async fn search_code_skips_generated_by_default() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Marker everywhere",
+               "writes": [{"path": "src/app.ts", "content": "const marker_xyz = 1;\n"},
+                          {"path": "dist/bundle.js", "content": "var marker_xyz=1;\n"},
+                          {"path": "node_modules/pkg/index.js", "content": "var marker_xyz=1;\n"},
+                          {"path": "package-lock.json", "content": "{\"marker_xyz\": 1}\n"}]}),
+    )
+    .await;
+    assert!(result(&committed).get("isError").is_none());
+
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "marker_xyz"}),
+    )
+    .await;
+    let files = result(&found)["structuredContent"]["files"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "src/app.ts");
+
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "marker_xyz", "include_generated": true}),
+    )
+    .await;
+    let mut paths: Vec<&str> = result(&found)["structuredContent"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec![
+            "dist/bundle.js",
+            "node_modules/pkg/index.js",
+            "package-lock.json",
+            "src/app.ts"
+        ]
+    );
+}
+
+/// `kind: "symbol"`: declaration sites are definitions, every other word
+/// match is a usage. Unparseable files contribute usages only.
+#[tokio::test]
+async fn search_code_symbol_kind() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Store",
+               "writes": [{"path": "src/store.ts", "content": "export const count = 0;\nexport function reset() {\n  console.log(count);\n}\n"},
+                          {"path": "src/app.ts", "content": "import { count } from \"./store\";\ncount;\n"},
+                          {"path": "notes.txt", "content": "count the carts\n"}]}),
+    )
+    .await;
+    assert!(result(&committed).get("isError").is_none());
+
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "count", "kind": "symbol"}),
+    )
+    .await;
+    let found = result(&found);
+    assert!(found.get("isError").is_none(), "{found}");
+    let files = found["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 3, "{files:?}");
+    let store = files.iter().find(|f| f["path"] == "src/store.ts").unwrap();
+    assert_eq!(store["definitions"].as_array().unwrap().len(), 1);
+    assert_eq!(store["definitions"][0]["line"], 1);
+    assert_eq!(store["definitions"][0]["end_line"], 1);
+    // The `count` on line 3 is a usage, not the declaration.
+    assert_eq!(store["usages"].as_array().unwrap().len(), 1);
+    assert_eq!(store["usages"][0]["line"], 3);
+    let app = files.iter().find(|f| f["path"] == "src/app.ts").unwrap();
+    assert_eq!(app["definitions"].as_array().unwrap().len(), 0);
+    assert_eq!(app["usages"].as_array().unwrap().len(), 2);
+    // Plain text contributes usages only.
+    let notes = files.iter().find(|f| f["path"] == "notes.txt").unwrap();
+    assert_eq!(notes["definitions"].as_array().unwrap().len(), 0);
+    assert_eq!(notes["usages"].as_array().unwrap().len(), 1);
+
+    // `symbol` needs one identifier, regex has no meaning there, and the
+    // kind itself is closed.
+    for args in [
+        json!({"app": "groceries", "query": "not an identifier", "kind": "symbol"}),
+        json!({"app": "groceries", "query": "count", "kind": "symbol", "regex": true}),
+        json!({"app": "groceries", "query": "count", "kind": "fuzzy"}),
+    ] {
+        let (_, bad) = call(&state, Some(&token), "search_code", args).await;
+        assert_eq!(is_error(&bad)["error"], "invalid_argument");
+    }
+}
+
+/// A stranger's slug is `not_found` for both new read paths, never `forbidden`.
+#[tokio::test]
+async fn read_search_strangers_app_is_not_found() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    for (tool, args) in [
+        (
+            "read_files",
+            json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
+        ),
+        (
+            "search_code",
+            json!({"app": "groceries", "query": "Groceries"}),
+        ),
+    ] {
+        let (_, denied) = call(&state, Some(&bob), tool, args).await;
+        assert_eq!(is_error(&denied)["error"], "not_found");
+    }
 }
