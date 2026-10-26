@@ -1548,6 +1548,32 @@ mod tests {
             port
         }
 
+        /// A port held open for the test, answering 503 to every probe: the
+        /// health gate treats it as a dead fleet. Unlike [`Self::free_port`],
+        /// the socket stays bound, so no parallel test can claim the port
+        /// mid-test and answer 200 — which the zero-timeout probe would
+        /// mistake for an already-healthy fleet, adopting it without a spawn
+        /// and breaking the attempt count.
+        async fn dead_port(&mut self) -> u16 {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            self.listeners.push(tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 503 Busy\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbusy!",
+                            )
+                            .await;
+                    });
+                }
+            }));
+            port
+        }
+
         async fn seed_user(&self, id: &str, email: &str, plan: &str) {
             sqlx::query(
                 "INSERT INTO user (id, email, plan, lastActiveAt, createdAt, updatedAt) \
@@ -1876,10 +1902,16 @@ mod tests {
     /// `wake_timeout`). The rest wait for the next tick.
     #[tokio::test]
     async fn warm_always_on_stops_after_max_failures() {
-        let (rig, log) = WarmRig::failing(2).await;
+        let (mut rig, log) = WarmRig::failing(2).await;
         rig.seed_user("a1", "a@example.com", "pro").await;
+        // Distinct activity so the most-recent-first order is total, not a
+        // three-way `created_at` tie; `three` is deterministically last. The
+        // ports stay bound (503) for the test, so no parallel test can claim
+        // one mid-test and answer 200 — which the probe would mistake for an
+        // already-healthy fleet.
+        let now = apps::now_ms();
         for (i, slug) in ["one", "two", "three"].iter().enumerate() {
-            let port = WarmRig::free_port().await as i64;
+            let port = rig.dead_port().await as i64;
             rig.seed_app(
                 &format!("app{i}"),
                 slug,
@@ -1887,7 +1919,7 @@ mod tests {
                 220101 + i as i64,
                 port,
                 true,
-                None,
+                Some(now - i as i64 * 60_000),
                 Some("sha"),
                 None,
             )
