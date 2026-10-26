@@ -359,8 +359,12 @@ fn lowest_free(used: &[i64], lo: i64, hi: i64, n: usize) -> Option<Vec<i64>> {
 /// free uid and the two lowest free ports no app row uses,
 /// and insert with `last_activity_at` = now and `desired_state` 'running'.
 ///
-/// One process-wide mutex serializes creates; a `UNIQUE` race against another
-/// process still maps to [`CreateError::Taken`].
+/// One process-wide mutex serializes creates; the count and the insert also
+/// run inside a `BEGIN IMMEDIATE` transaction, so two creates racing from
+/// different processes serialize on the database write lock instead of both
+/// passing the count: the loser re-reads after the winner commits and hits
+/// the quota. A `UNIQUE` race against another process still maps to
+/// [`CreateError::Taken`].
 pub async fn create(
     pool: &SqlitePool,
     owner_id: &str,
@@ -372,11 +376,45 @@ pub async fn create(
     let _guard = CREATE_LOCK.lock().await;
     check_slug_claimable(pool, slug).await?;
     let now = now_ms();
-    // The plan quota re-checked under the lock: an earlier check races with
-    // concurrent creates, so the count here is the one that counts.
+    let mut conn = pool.acquire().await.map_err(internal)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(internal)?;
+    let outcome = create_inner(&mut conn, owner_id, slug, name, alloc, app_limit, now).await;
+    match outcome {
+        Ok(app) => {
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .map_err(internal)?;
+            Ok(app)
+        }
+        Err(err) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(err)
+        }
+    }
+}
+
+/// The quota recheck, the uid/port allocation and the row insert, inside the
+/// caller's immediate-write transaction.
+#[allow(clippy::too_many_arguments)]
+async fn create_inner(
+    conn: &mut sqlx::SqliteConnection,
+    owner_id: &str,
+    slug: &str,
+    name: Option<&str>,
+    alloc: &Allocation,
+    app_limit: u64,
+    now: i64,
+) -> Result<App, CreateError> {
+    // The plan quota re-checked under the lock AND the write transaction: an
+    // earlier check races with concurrent creates, so the count here is the
+    // one that counts — across processes, not just tasks.
     let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE owner_id = ?1")
         .bind(owner_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(internal)?
         .unwrap_or(0);
@@ -388,7 +426,7 @@ pub async fn create(
         });
     }
     let mut uids: Vec<i64> = sqlx::query_scalar("SELECT uid FROM app")
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(internal)?;
     uids.sort_unstable();
@@ -403,7 +441,7 @@ pub async fn create(
          UNION SELECT preview_port FROM app WHERE preview_port IS NOT NULL \
          UNION SELECT preview_internal_port FROM app WHERE preview_internal_port IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(internal)?;
     ports.sort_unstable();
@@ -429,7 +467,7 @@ pub async fn create(
     .bind(port)
     .bind(internal_port)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await;
     if let Err(e) = insert {
         if is_unique_violation(&e) {
@@ -847,6 +885,43 @@ mod tests {
             ),
             "the second app is refused even though nothing else changed"
         );
+    }
+    #[tokio::test]
+    async fn concurrent_creates_share_the_plan_quota() {
+        let (_dir, pool, owner) = setup().await;
+        // Eight creates race for three slots with distinct slugs (no UNIQUE
+        // interference): the count and the insert are one atomic step, so
+        // exactly three win — in-process via the lock, across processes via
+        // the immediate-write transaction.
+        let mut tasks = Vec::new();
+        // The range fits all eight, so only the quota can refuse.
+        let wide = Allocation {
+            uid_range: (210000, 210020),
+            port_range: (18000, 18020),
+        };
+        for i in 0..8 {
+            let (pool, owner, alloc) = (pool.clone(), owner.clone(), wide.clone());
+            tasks.push(tokio::spawn(async move {
+                create(&pool, &owner, &format!("quota-racer-{i}"), None, &alloc, 3).await
+            }));
+        }
+        let mut wins = 0;
+        let mut quotas = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => wins += 1,
+                Err(CreateError::Quota { limit: 3, used: 3 }) => quotas += 1,
+                Err(other) => panic!("unexpected create outcome: {other:?}"),
+            }
+        }
+        assert_eq!(wins, 3, "exactly three racing creates take the three slots");
+        assert_eq!(quotas, 5, "the rest hit the quota, none slip past it");
+        let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE owner_id = ?1")
+            .bind(&owner)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(owned, 3);
     }
     #[tokio::test]
     async fn touch_asleep_and_last_deploy_round_trip() {

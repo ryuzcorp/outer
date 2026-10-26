@@ -233,6 +233,9 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         template,
     )
     .await?;
+    // The seed deploy carries the shared admission gate: a capped or frozen
+    // app refuses here with the quota shape, and the `?` leaves the seeded
+    // app row in place — the agent retries the deploy after the reset.
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
     let summary = format!(
         "{} is live at {}. Open it with open_app to keep working.",
@@ -544,6 +547,22 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     // its redeploy fails or is blocked.
     let claim =
         super::claim_change(&ctx.state.pool, &ctx.state.billing, &caller.account_id).await?;
+    // The rename redeploys a running app, so the redeploy's plan admission
+    // runs here too, before the move: a capped or frozen app refuses with
+    // the quota shape and the rename never happens (the claimed change is
+    // refunded). The inner `run_deploy` gate backstops the quota spent after
+    // this check.
+    if let Err(err) =
+        super::check_build_quota(&ctx.state.pool, &ctx.state.billing, &caller.account_id).await
+    {
+        let _ = super::refund_change(&ctx.state.pool, &caller.account_id).await;
+        return Err(err);
+    }
+    if let Err(err) = super::check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await
+    {
+        let _ = super::refund_change(&ctx.state.pool, &caller.account_id).await;
+        return Err(err);
+    }
     // Serialize against a racing rollback, deploy and wake, on both slugs:
     // the wake pair sorts by slug so two renames can never ABBA.
     let rollback = ctx.state.rollback_locks.lock(&app.id).await;
@@ -604,8 +623,9 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     match out.redeploy_sha {
         Some(sha) => {
             // The rename already committed (the quota counts): a redeploy
-            // infrastructure failure still answers rename success — like the
-            // console path — with the failure embedded in the deploy object.
+            // failure — infrastructure or a plan refusal from the shared
+            // admission gate — still answers rename success, like the
+            // console path, with the failure embedded in the deploy object.
             let deploy = match run_deploy(ctx.state, &out.app, &sha, true).await {
                 Ok(deploy) => deploy,
                 Err(err) => json!({"status": "failed", "sha": sha, "error": err.message}),

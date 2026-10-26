@@ -81,9 +81,11 @@ pub async fn role(
     if owner_plan(pool, owner_id).await? == "pro" {
         return Ok(Some(Role::Collaborator));
     }
-    // Free: only the oldest row keeps access.
+    // Free: only the oldest row keeps access. `added_at` is ms-resolution,
+    // so same-millisecond invites tie — `rowid` breaks the tie by insertion
+    // order, keeping the choice stable across downgrades.
     let oldest: Option<String> = sqlx::query_scalar(
-        "SELECT email FROM app_collaborator WHERE app_id = ?1 ORDER BY added_at ASC LIMIT 1",
+        "SELECT email FROM app_collaborator WHERE app_id = ?1 ORDER BY added_at ASC, rowid ASC LIMIT 1",
     )
     .bind(app_id)
     .fetch_optional(pool)
@@ -106,7 +108,7 @@ pub async fn list(pool: &sqlx::SqlitePool, app_id: &str) -> anyhow::Result<Vec<C
     }
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT email, userId, added_at FROM app_collaborator \
-         WHERE app_id = ?1 ORDER BY added_at ASC",
+         WHERE app_id = ?1 ORDER BY added_at ASC, rowid ASC",
     )
     .bind(app_id)
     .fetch_all(pool)
@@ -143,9 +145,55 @@ pub async fn add(
         .await
         .map_err(AddError::Internal)?;
     let limit = crate::limits::collaborator_limit(&plan);
+    // The count and the insert run in one immediate-write transaction: two
+    // racing invites cannot both read under the cap and both insert. The
+    // lock is per-database (SQLite takes the write lock up front), so this
+    // closes the race across processes too, not just across tasks.
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|err| AddError::Internal(err.into()))?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| AddError::Internal(err.into()))?;
+    let outcome = add_inner(&mut conn, app, &email, limit).await;
+    match outcome {
+        Ok((user_id, now)) => {
+            if let Err(err) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                return Err(AddError::Internal(err.into()));
+            }
+            finish_invite(
+                pool,
+                sender,
+                mcp_url,
+                app,
+                owner_email,
+                &email,
+                user_id,
+                now,
+            )
+            .await
+        }
+        Err(err) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(err)
+        }
+    }
+}
+
+/// The count check and the row insert, inside the caller's `BEGIN IMMEDIATE`
+/// transaction. Returns the linked `userId` and the invite timestamp for the
+/// email the caller sends after commit.
+async fn add_inner(
+    conn: &mut sqlx::SqliteConnection,
+    app: &App,
+    email: &str,
+    limit: u64,
+) -> Result<(Option<String>, i64), AddError> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_collaborator WHERE app_id = ?1")
         .bind(&app.id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|err| AddError::Internal(err.into()))?
         .unwrap_or(0);
@@ -155,8 +203,8 @@ pub async fn add(
     // An existing account links immediately; a future sign-in links through
     // [`link_user`].
     let user_id: Option<String> = sqlx::query_scalar("SELECT id FROM user WHERE email = ?1")
-        .bind(&email)
-        .fetch_optional(pool)
+        .bind(email)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|err| AddError::Internal(err.into()))?;
     let now = now_ms();
@@ -165,19 +213,36 @@ pub async fn add(
          VALUES (?1, ?2, ?3, ?4) ON CONFLICT(app_id, email) DO NOTHING",
     )
     .bind(&app.id)
-    .bind(&email)
+    .bind(email)
     .bind(&user_id)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|err| AddError::Internal(err.into()))?;
     if inserted.rows_affected() == 0 {
         return Err(AddError::Duplicate);
     }
+    Ok((user_id, now))
+}
+
+/// The post-commit half of [`add`]: the closed-beta allowlist and the
+/// spec-worded invite email. Runs after `COMMIT` so a rolled-back invite
+/// never allowlists or mails.
+#[allow(clippy::too_many_arguments)]
+async fn finish_invite(
+    pool: &sqlx::SqlitePool,
+    sender: &EmailSender,
+    mcp_url: &str,
+    app: &App,
+    owner_email: &str,
+    email: &str,
+    user_id: Option<String>,
+    now: i64,
+) -> Result<Collaborator, AddError> {
     // A Pro invite admits the email for the closed beta (spec §7.4). The
     // invite never grants codes: allowlisted emails join with none (§6.5.1).
     sqlx::query("INSERT INTO beta_allowlist (email, added_at) VALUES (?1, ?2) ON CONFLICT(email) DO NOTHING")
-        .bind(&email)
+        .bind(email)
         .bind(now)
         .execute(pool)
         .await
@@ -192,11 +257,11 @@ pub async fn add(
         "{owner_name} added you to {} on Outer. Ask your agent to connect to {mcp_url}.",
         app.slug
     );
-    if let Err(err) = sender.send_text(&email, &subject, &text).await {
+    if let Err(err) = sender.send_text(email, &subject, &text).await {
         tracing::warn!(app = %app.slug, email = %email, "collaborator invite email failed: {err}");
     }
     Ok(Collaborator {
-        email,
+        email: email.to_string(),
         joined: user_id.is_some(),
         added_at: now,
     })
@@ -244,4 +309,119 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup() -> (tempfile::TempDir, sqlx::SqlitePool, App, EmailSender) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO user (id, email, plan, lastActiveAt, createdAt, updatedAt) \
+             VALUES ('owner', 'owner@example.com', 'free', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+             last_activity_at, created_at) \
+             VALUES ('app1', 'shop', 'owner', 300001, 20001, 20002, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let app = crate::apps::get_by_slug(&pool, "shop")
+            .await
+            .unwrap()
+            .unwrap();
+        let sender = EmailSender::Capture {
+            codes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+        (dir, pool, app, sender)
+    }
+
+    #[tokio::test]
+    async fn concurrent_invites_share_one_free_slot() {
+        let (_dir, pool, app, sender) = setup().await;
+        // Eight invites race for the single Free slot: the count and the
+        // insert are one atomic step, so exactly one wins and the rest hit
+        // the cap — never two rows.
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let (pool, app, sender) = (pool.clone(), app.clone(), sender.clone());
+            tasks.push(tokio::spawn(async move {
+                add(
+                    &pool,
+                    &sender,
+                    "https://outer.now",
+                    &app,
+                    "owner@example.com",
+                    &format!("racer{i}@example.com"),
+                )
+                .await
+            }));
+        }
+        let mut wins = 0;
+        let mut limited = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => wins += 1,
+                Err(AddError::LimitReached { limit: 1 }) => limited += 1,
+                Err(other) => panic!("unexpected invite outcome: {other:?}"),
+            }
+        }
+        assert_eq!(wins, 1, "exactly one racing invite takes the Free slot");
+        assert_eq!(limited, 7, "the rest hit the cap, none slip past it");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM app_collaborator WHERE app_id = 'app1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn same_millisecond_invites_keep_a_stable_oldest() {
+        let (_dir, pool, app, _) = setup().await;
+        // Two invites stamped in the same millisecond tie on `added_at`;
+        // insertion order (`rowid`) decides, deterministically.
+        for email in ["first@example.com", "second@example.com"] {
+            sqlx::query(
+                "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+                 VALUES ('app1', ?1, NULL, 1_700_000_000_000)",
+            )
+            .bind(email)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            role(&pool, &app.id, &app.owner_id, "nobody", "first@example.com")
+                .await
+                .unwrap(),
+            Some(Role::Collaborator),
+            "the first-inserted tied invite keeps access on Free"
+        );
+        assert_eq!(
+            role(
+                &pool,
+                &app.id,
+                &app.owner_id,
+                "nobody",
+                "second@example.com"
+            )
+            .await
+            .unwrap(),
+            None,
+            "the second-inserted tied invite pauses on Free"
+        );
+        let listed = list(&pool, &app.id).await.unwrap();
+        let order: Vec<&str> = listed.iter().map(|c| c.email.as_str()).collect();
+        assert_eq!(order, ["first@example.com", "second@example.com"]);
+    }
 }

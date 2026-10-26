@@ -838,6 +838,17 @@ async fn run_deploy_inner(
     wait: bool,
     kind: crate::deploy::DeployKind,
 ) -> Result<Value, ToolError> {
+    // Plan admission lives HERE, not at the callers: every redeploy path —
+    // seed deploys, promotes, renames, rollbacks, commits and the admin
+    // re-review — funnels through this function, so a new caller cannot skip
+    // the gates. The explicit checks before the git work stay: they fail
+    // fast before anything is written, and the rollback path refunds its
+    // budget on them. This inner gate is the backstop for the quota spent
+    // between the outer check and the deploy start (commit and rollback
+    // claims already count their change/rollback; a created app or commit
+    // already exists when this refuses, and the error names the reset).
+    check_build_quota(&state.pool, &state.billing, &app.owner_id).await?;
+    check_storage_writable(&state.pool, &state.billing, app).await?;
     let deploys = state.deploys.clone();
     let pool = state.pool.clone();
     let git = state.git.clone();
@@ -1136,5 +1147,104 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         _ => Err(CallError::Rpc(-32602, format!("unknown tool {tool:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    async fn state_with_spent_quota() -> (McpState, App) {
+        let pool = crate::auth::test_support::test_pool().await;
+        let (config, _codes) = crate::auth::test_support::test_config();
+        sqlx::query(
+            "INSERT INTO user (id, email, plan, lastActiveAt, createdAt, updatedAt) \
+             VALUES ('a1', 'ana@example.com', 'free', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+             last_activity_at, created_at) \
+             VALUES ('app1', 'shop', 'a1', 300001, 20001, 20002, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The whole Free build day, already burned.
+        sqlx::query("INSERT INTO usage_day (userId, day, build_ms) VALUES ('a1', ?1, ?2)")
+            .bind(today_utc())
+            .bind(crate::limits::build_ms_limit("free") as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let auth = crate::auth::AuthState {
+            pool: pool.clone(),
+            config,
+        };
+        let state = McpState::for_tests(pool, auth);
+        let app = crate::apps::get_by_slug(&state.pool, "shop")
+            .await
+            .unwrap()
+            .unwrap();
+        (state, app)
+    }
+
+    #[tokio::test]
+    async fn deploy_entry_points_refuse_a_spent_build_quota() {
+        let (state, app) = state_with_spent_quota().await;
+        for preview in [false, true] {
+            let outcome = if preview {
+                run_preview_deploy(&state, &app, &"a".repeat(40), false).await
+            } else {
+                run_deploy(&state, &app, &"a".repeat(40), false).await
+            };
+            let err = outcome.expect_err("a spent build quota refuses the deploy");
+            assert_eq!(err.code, "quota_exceeded");
+            assert_eq!(
+                err.extra.get("quota"),
+                Some(&json!("build_minutes_per_day")),
+                "the refusal names the build-minutes quota"
+            );
+            assert!(
+                err.extra.contains_key("resets_at"),
+                "the agent is told to retry after the reset: {err:?}"
+            );
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deploy WHERE app_id = 'app1'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused deploy starts nothing");
+        // The app row survives the refusal (a refused seed deploy leaves a
+        // usable app behind; the agent retries the deploy after the reset).
+        assert!(crate::apps::get_by_slug(&state.pool, "shop")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn deploy_entry_points_refuse_a_frozen_app() {
+        let (state, app) = state_with_spent_quota().await;
+        // Fresh build budget, but frozen at the storage cap.
+        sqlx::query("DELETE FROM usage_day WHERE userId = 'a1'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE app SET storage_frozen_at = 1 WHERE id = 'app1'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let err = run_deploy(&state, &app, &"b".repeat(40), false)
+            .await
+            .expect_err("a frozen app refuses the deploy");
+        assert_eq!(err.code, "quota_exceeded");
+        assert_eq!(
+            err.extra.get("quota"),
+            Some(&json!("storage_bytes")),
+            "the refusal names the storage quota"
+        );
     }
 }

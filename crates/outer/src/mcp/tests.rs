@@ -5257,6 +5257,174 @@ async fn preview_commit_promote_discard_round_trip() {
 }
 
 #[tokio::test]
+async fn build_capped_create_leaves_the_app_and_names_the_reset() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    // Burn the whole Free build day before the seed deploy runs.
+    let owner: String = sqlx::query_scalar("SELECT id FROM user WHERE email = 'ana@example.com'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage_day (userId, day, build_ms) VALUES (?1, ?2, ?3)")
+        .bind(&owner)
+        .bind(crate::mcp::tools::today_utc())
+        .bind(crate::limits::build_ms_limit("free") as i64)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "groceries"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "build_minutes_per_day");
+    assert!(
+        err.get("resets_at").is_some(),
+        "the agent is told to retry after the reset: {err}"
+    );
+    // The seed commit's app row survives the refused deploy.
+    let kept: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert!(kept, "a refused seed deploy leaves the created app behind");
+    let deploys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM deploy WHERE app_id = (SELECT id FROM app WHERE slug = 'groceries')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(deploys, 0, "a refused deploy starts nothing");
+}
+
+#[tokio::test]
+async fn frozen_promote_refuses_before_the_fast_forward() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    make_pro(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, trialed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "trial",
+               "writes": [{"path": "t.txt", "content": "t"}],
+               "preview": true}),
+    )
+    .await;
+    assert!(result(&trialed).get("isError").is_none());
+    let live_before: Option<String> =
+        sqlx::query_scalar("SELECT last_deploy_sha FROM app WHERE slug = 'groceries'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE app SET storage_frozen_at = 1, storage_frozen_detail = 'R2 over cap' \
+         WHERE slug = 'groceries'",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (_, promoted) = call(
+        &state,
+        Some(&token),
+        "promote_preview",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let err = is_error(&promoted);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "storage_bytes");
+    // Nothing moved: live still names the seed, the preview is intact.
+    let live_after: Option<String> =
+        sqlx::query_scalar("SELECT last_deploy_sha FROM app WHERE slug = 'groceries'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(live_after, live_before);
+    let preview: Option<String> =
+        sqlx::query_scalar("SELECT preview_sha FROM app WHERE slug = 'groceries'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert!(preview.is_some(), "the refused promote keeps the preview");
+}
+
+#[tokio::test]
+async fn frozen_rename_refuses_before_the_move() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    sqlx::query(
+        "UPDATE app SET storage_frozen_at = 1, storage_frozen_detail = 'D1 over cap' \
+         WHERE slug = 'groceries'",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "rename_app",
+        json!({"app": "groceries", "slug": "corner"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "storage_bytes");
+    let kept: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert!(kept, "the refused rename leaves the slug in place");
+}
+
+#[tokio::test]
+async fn build_capped_rename_refunds_the_claimed_change() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let owner: String = sqlx::query_scalar("SELECT id FROM user WHERE email = 'ana@example.com'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage_day (userId, day, build_ms) VALUES (?1, ?2, ?3)")
+        .bind(&owner)
+        .bind(crate::mcp::tools::today_utc())
+        .bind(crate::limits::build_ms_limit("free") as i64)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "rename_app",
+        json!({"app": "groceries", "slug": "corner"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "build_minutes_per_day");
+    let changes: Option<i64> =
+        sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1 AND day = ?2")
+            .bind(&owner)
+            .bind(crate::mcp::tools::today_utc())
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert_eq!(
+        changes.unwrap_or(0),
+        0,
+        "the rename that never happened gives its change back"
+    );
+}
+
+#[tokio::test]
 async fn preview_promote_resumes_a_cancelled_run() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;

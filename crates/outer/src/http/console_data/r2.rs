@@ -778,6 +778,121 @@ async fn raw_inner(
     Ok(raw_response(head.content_type.as_deref(), filename, bytes))
 }
 
+/// Whether an upload of `size` bytes would pass the plan's R2 cap on top of
+/// `measured` already-stored bytes. Pure so the boundary stays unit-tested;
+/// `u64::MAX` measurements saturate instead of wrapping.
+pub(crate) fn r2_upload_over_cap(measured: u64, size: u64, cap: u64) -> bool {
+    measured.saturating_add(size) > cap
+}
+
+/// Refuse a Console upload up front when the app's last measured R2 bytes
+/// plus this upload's size would pass the plan cap. `None` means proceed.
+/// The measurement is the sweep's (`app.r2_measured_bytes`), falling back to
+/// a live sizing that is stored when nothing is recorded yet. Fail-open on
+/// store or database trouble (with a warning): a hiccup must not brick
+/// uploads, and the hourly sweep flag stays the hard enforcement.
+pub(crate) async fn refuse_r2_over_cap(
+    mcp: &crate::mcp::McpState,
+    app: &crate::apps::App,
+    size: u64,
+) -> Option<Response> {
+    let plan = crate::mcp::tools::plan_of(&mcp.pool, &app.owner_id)
+        .await
+        .unwrap_or_else(|_| "free".to_string());
+    let cap = crate::limits::r2_cap_bytes(&plan);
+    let stored: Option<i64> = match sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT r2_measured_bytes FROM app WHERE id = ?1",
+    )
+    .bind(&app.id)
+    .fetch_optional(&mcp.pool)
+    .await
+    {
+        Ok(row) => row.flatten(),
+        Err(err) => {
+            tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "r2 upload gate: measurement read failed");
+            return None;
+        }
+    };
+    let measured = match stored {
+        Some(m) => m.max(0) as u64,
+        None => {
+            let live = match mcp
+                .store
+                .prefix_bytes(&format!("fleets/{}/r2/", app.slug))
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "r2 upload gate: live sizing failed");
+                    return None;
+                }
+            };
+            let _ = sqlx::query(
+                "UPDATE app SET r2_measured_bytes = ?1 WHERE id = ?2 AND r2_measured_bytes IS NULL",
+            )
+            .bind(live.min(i64::MAX as u64) as i64)
+            .bind(&app.id)
+            .execute(&mcp.pool)
+            .await;
+            live
+        }
+    };
+    if !r2_upload_over_cap(measured, size, cap) {
+        return None;
+    }
+    let upgrade_url = mcp
+        .billing
+        .upgrade_url(&app.owner_id, chrono::Utc::now().timestamp());
+    Some(super::data_json(
+        StatusCode::TOO_MANY_REQUESTS,
+        serde_json::json!({
+            "error": "quota_exceeded",
+            "message": format!(
+                "{} storage is read-only: R2 holds {} MB and this upload adds {} MB over the {} MB cap",
+                app.slug,
+                measured / 1_048_576,
+                size / 1_048_576,
+                cap / 1_048_576,
+            ),
+            "user_message": format!(
+                "This upload would push {} over its R2 cap on your Outer {plan} plan — nothing is deleted. Free space here or upgrade to Pro for bigger caps.",
+                app.slug,
+            ),
+            "quota": "storage_bytes",
+            "upgrade_url": upgrade_url,
+        }),
+    ))
+}
+
+/// Add an upload's bytes to the stored R2 measurement (only when one is
+/// stored — otherwise the next gate re-sizes live). Best effort.
+pub(crate) async fn adjust_r2_measured(pool: &sqlx::SqlitePool, app_id: &str, delta: i64) {
+    if let Err(err) = sqlx::query(
+        "UPDATE app SET r2_measured_bytes = r2_measured_bytes + ?1 \
+         WHERE id = ?2 AND r2_measured_bytes IS NOT NULL",
+    )
+    .bind(delta)
+    .bind(app_id)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(app = app_id, error = %format!("{err:#}"), "r2 measurement adjust failed");
+    }
+}
+
+/// Forget the stored R2 measurement after a delete (celld reports no freed
+/// bytes): the next upload gate re-sizes live instead of refusing against a
+/// stale-high number. Best effort.
+pub(crate) async fn clear_r2_measured(pool: &sqlx::SqlitePool, app_id: &str) {
+    if let Err(err) = sqlx::query("UPDATE app SET r2_measured_bytes = NULL WHERE id = ?1")
+        .bind(app_id)
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(app = app_id, error = %format!("{err:#}"), "r2 measurement clear failed");
+    }
+}
+
 async fn api_put(
     Path(slug): Path<String>,
     headers: HeaderMap,
@@ -794,12 +909,40 @@ async fn api_put(
     if let Some(res) = super::storage_frozen_refusal(&state.mcp, &app).await {
         return res;
     }
+    // Prospective cap check, before anything is staged or uploaded: the last
+    // measured R2 bytes plus this upload's size must fit the plan cap. The
+    // hourly sweep flag is the hard enforcement (in-runtime writes stay
+    // sweep-enforced); this closes the within-the-hour burst window on the
+    // Console path without trusting a client-supplied length — the bytes are
+    // read first, then gated, then uploaded.
+    let bytes = match axum::body::to_bytes(body, R2_UPLOAD_CAP + 1).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return status_for(
+                "upload too large: 64 MiB cap",
+                "Couldn't upload right now. Try again.",
+            );
+        }
+    };
+    if bytes.len() > R2_UPLOAD_CAP {
+        return status_for(
+            "upload too large: 64 MiB cap",
+            "Couldn't upload right now. Try again.",
+        );
+    }
+    if let Some(res) = refuse_r2_over_cap(&state.mcp, &app, bytes.len() as u64).await {
+        return res;
+    }
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    match put_inner(&state, &app.slug, &query, content_type.as_deref(), body).await {
+    match put_inner(&state, &app.slug, &query, content_type.as_deref(), &bytes).await {
         Ok(size) => {
+            // Keep the stored sweep measurement current: the prospective gate
+            // above read it, so the upload's bytes join it now. Best effort —
+            // a write failure here must not fail an upload that succeeded.
+            adjust_r2_measured(&state.mcp.pool, &app.id, size as i64).await;
             crate::mcp::actions::record_console(
                 &state.mcp.pool,
                 &app.id,
@@ -836,7 +979,7 @@ async fn put_inner(
     slug: &str,
     query: &KeyQuery,
     content_type: Option<&str>,
-    body: Body,
+    bytes: &[u8],
 ) -> anyhow::Result<usize> {
     let buckets = declared_buckets(state, slug).await?;
     let bucket = find_bucket(&buckets, &query.bucket)?;
@@ -847,17 +990,11 @@ async fn put_inner(
             anyhow::bail!("invalid content type");
         }
     }
-    let bytes = axum::body::to_bytes(body, R2_UPLOAD_CAP + 1)
-        .await
-        .map_err(|_| anyhow::anyhow!("upload too large: 64 MiB cap"))?;
     let size = bytes.len();
-    if size > R2_UPLOAD_CAP {
-        anyhow::bail!("upload too large: 64 MiB cap");
-    }
     // Spool to a file: `celld r2 put` reads `--path`, and the body must not
     // sit buffered twice for a 64 MiB upload.
     let spool = tempfile::NamedTempFile::new()?;
-    tokio::fs::write(spool.path(), &bytes).await?;
+    tokio::fs::write(spool.path(), bytes).await?;
     let spool_path = spool.path().to_string_lossy().into_owned();
     let settings = super::deploy_settings(state)?;
     let storage = &settings.storage;
@@ -887,6 +1024,11 @@ async fn api_delete(
     };
     match delete_inner(&state, &app.slug, &body).await {
         Ok(count) => {
+            // The stored measurement no longer reflects reality (celld does
+            // not report freed bytes): clear it so the next upload re-sizes
+            // live instead of refusing against a stale-high number. Best
+            // effort, like the put-side adjustment.
+            clear_r2_measured(&state.mcp.pool, &app.id).await;
             crate::mcp::actions::record_console(
                 &state.mcp.pool,
                 &app.id,
@@ -1310,5 +1452,115 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["message"], "invalid prefix");
         assert_eq!(json["user_message"], "invalid prefix");
+    }
+
+    #[test]
+    fn upload_gate_fits_measured_plus_size_against_the_cap() {
+        let free = crate::limits::FREE_R2_BYTES;
+        assert!(!r2_upload_over_cap(0, 1, free));
+        assert!(!r2_upload_over_cap(free - 11, 11, free));
+        assert!(r2_upload_over_cap(free - 10, 11, free));
+        assert!(r2_upload_over_cap(free, 1, free));
+        // Saturating: a corrupted-huge measurement refuses, never wraps.
+        assert!(r2_upload_over_cap(u64::MAX, 1, free));
+    }
+
+    async fn gate_state(measured: Option<i64>) -> (crate::mcp::McpState, crate::apps::App) {
+        let pool = crate::auth::test_support::test_pool().await;
+        let (config, _codes) = crate::auth::test_support::test_config();
+        sqlx::query(
+            "INSERT INTO user (id, email, plan, lastActiveAt, createdAt, updatedAt) \
+             VALUES ('a1', 'ana@example.com', 'free', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+             last_activity_at, created_at, r2_measured_bytes) \
+             VALUES ('app1', 'shop', 'a1', 300001, 20001, 20002, 0, 0, ?1)",
+        )
+        .bind(measured)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let auth = crate::auth::AuthState {
+            pool: pool.clone(),
+            config,
+        };
+        let state = crate::mcp::McpState::for_tests(pool, auth);
+        let app = crate::apps::get_by_slug(&state.pool, "shop")
+            .await
+            .unwrap()
+            .unwrap();
+        (state, app)
+    }
+
+    async fn refusal_body(res: Response) -> (StatusCode, serde_json::Value) {
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn upload_gate_refuses_up_front_past_the_cap() {
+        let free = crate::limits::FREE_R2_BYTES;
+        let (state, app) = gate_state(Some((free - 10) as i64)).await;
+        // Fits: no refusal.
+        assert!(refuse_r2_over_cap(&state, &app, 10).await.is_none());
+        // One byte past: 429 with the quota shape the UI's Upgrade button
+        // reads.
+        let res = refuse_r2_over_cap(&state, &app, 11)
+            .await
+            .expect("an over-cap upload is refused up front");
+        let (status, json) = refusal_body(res).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json["error"], "quota_exceeded");
+        assert_eq!(json["quota"], "storage_bytes");
+        assert!(json["upgrade_url"].is_string());
+    }
+
+    #[tokio::test]
+    async fn upload_gate_sizes_live_when_nothing_is_stored() {
+        let free = crate::limits::FREE_R2_BYTES;
+        let (state, app) = gate_state(None).await;
+        state
+            .store
+            .put("fleets/shop/r2/assets/logo.png", vec![0u8; 100])
+            .await
+            .unwrap();
+        // The live 100 bytes are measured and stored by the gate itself.
+        assert!(refuse_r2_over_cap(&state, &app, 10).await.is_none());
+        let stored: Option<i64> =
+            sqlx::query_scalar("SELECT r2_measured_bytes FROM app WHERE id = 'app1'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, Some(100));
+        // And the fresh measurement gates the next upload.
+        let res = refuse_r2_over_cap(&state, &app, free)
+            .await
+            .expect("stored bytes plus a cap-sized upload refuses");
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn put_and_delete_keep_the_measurement_current() {
+        let (state, app) = gate_state(Some(100)).await;
+        adjust_r2_measured(&state.pool, &app.id, 50).await;
+        let stored: i64 = sqlx::query_scalar("SELECT r2_measured_bytes FROM app WHERE id = 'app1'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 150, "an upload's bytes join the measurement");
+        clear_r2_measured(&state.pool, &app.id).await;
+        let stored: Option<i64> =
+            sqlx::query_scalar("SELECT r2_measured_bytes FROM app WHERE id = 'app1'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None, "a delete invalidates the stale number");
     }
 }

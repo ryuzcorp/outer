@@ -3017,6 +3017,37 @@ exit 0
     }
 
     #[tokio::test]
+    async fn frozen_restore_refuses_before_touching_backups() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let (app, _health) = router_app(&pool, &state).await;
+        let ana = login(&pool, "ana@example.com").await;
+        sqlx::query(
+            "UPDATE app SET storage_frozen_at = 1, storage_frozen_detail = 'D1 over cap' \
+             WHERE slug = 'acme'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Even a well-formed confirm never reaches the restore: the app is
+        // read-only until it drops back under the cap.
+        let (status, _, body) = send(
+            &app,
+            same_origin(
+                Request::post("/api/console/apps/acme/data/d1/DB/backups/b1/restore")
+                    .header("cookie", &ana)
+                    .header("content-type", "application/json"),
+            )
+            .body(Body::from(r#"{"confirm":"b1"}"#))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "quota_exceeded");
+        assert_eq!(body["quota"], "storage_bytes");
+    }
+
+    #[tokio::test]
     async fn d1_stays_owner_only_for_collaborators() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();

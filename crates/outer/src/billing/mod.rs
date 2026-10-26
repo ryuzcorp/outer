@@ -944,8 +944,11 @@ async fn plan_downgrade(
         hostname: String,
         cf_custom_hostname_id: Option<String>,
     }
+    // Oldest-first by creation time; `id` is a random UUID, so same-
+    // millisecond apps tie on both — `rowid` breaks the tie by insertion
+    // order, keeping the kept/stopped split stable.
     let apps: Vec<ProApp> = sqlx::query_as(
-        "SELECT id, slug, visibility FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC",
+        "SELECT id, slug, visibility FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC, rowid ASC",
     )
     .bind(account_id)
     .fetch_all(&mut *conn)
@@ -984,7 +987,7 @@ async fn plan_downgrade(
         slug: String,
     }
     let apps: Vec<AppRow> = sqlx::query_as(
-        "SELECT id, slug FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC",
+        "SELECT id, slug FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC, rowid ASC",
     )
     .bind(account_id)
     .fetch_all(&mut *conn)
@@ -2339,5 +2342,64 @@ mod tests {
             "stopped",
             "re-upgrading restarts nothing"
         );
+    }
+    #[tokio::test]
+    async fn downgrade_keeps_the_two_oldest_same_millisecond_apps() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'past_due', stripeSubscriptionId = 'sub_1' \
+             WHERE id = 'a1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Five apps born in the same millisecond: `created_at` ties and the
+        // random-UUID `id` ties with it, so insertion order (`rowid`)
+        // decides which two stay live.
+        for (i, slug) in ["one", "two", "three", "four", "five"].iter().enumerate() {
+            let i = i as i64;
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+                 last_activity_at, created_at) \
+                 VALUES (?1, ?2, 'a1', ?3, ?4, ?5, 0, 1)",
+            )
+            .bind(format!("app{i}"))
+            .bind(slug)
+            .bind(300001 + i)
+            .bind(20100 + i * 2)
+            .bind(20101 + i * 2)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "unpaid"});
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_tie",
+            "customer.subscription.updated",
+            object,
+        )
+        .await;
+        let ApplyOutcome::Applied { stopped, .. } = outcome else {
+            panic!("downgrade applies");
+        };
+        assert_eq!(
+            stopped,
+            vec!["three".to_string(), "four".to_string(), "five".to_string()],
+            "the three youngest same-millisecond apps stop, in insertion order"
+        );
+        for slug in ["one", "two"] {
+            let state: String = sqlx::query_scalar("SELECT desired_state FROM app WHERE slug = ?1")
+                .bind(slug)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(state, "running", "{slug} is one of the two kept oldest");
+        }
     }
 }

@@ -225,6 +225,17 @@ pub async fn build_ms_used_today(pool: &sqlx::SqlitePool, account_id: &str) -> a
 
 /// Charge `ms` of install+build wall time to today's row. Never fails the
 /// deploy: callers warn and continue.
+///
+/// Check-then-charge by design: admission runs before the build
+/// ([`crate::mcp::tools::check_build_quota`]) and the charge lands after it
+/// finishes, so N builds admitted together all get charged and the day's
+/// total can overshoot the cap. The overshoot is bounded, not open-ended:
+/// the deploy pipeline holds a host-wide build semaphore, so at most that
+/// many builds run at once and a build in flight always finishes (its
+/// minutes are real usage, not a leak). Per-account admission serialization
+/// would close the gap further, but every deploy caller would have to share
+/// one lock map across the MCP and Console paths; the bounded overshoot
+/// stays the documented tradeoff instead.
 pub async fn add_build_ms(
     pool: &sqlx::SqlitePool,
     account_id: &str,
@@ -329,19 +340,58 @@ pub struct LimitsSweep {
 /// current calendar month), advancing the `usage_rollup_cursor` watermark so
 /// a minute is never counted twice. Runs hourly because Free minute rows
 /// prune after 24 h — a daily rollup could lose a day to downtime.
+///
+/// One `BEGIN IMMEDIATE` transaction covers the whole pass: the snapshot of
+/// the newest minute, the aggregation and the cursor advance commit or roll
+/// back together. A snapshot taken outside the transaction would either
+/// double-count (a partial failure leaves the cursor behind already-counted
+/// rows) or skip minutes (rows arriving between the aggregate and the cursor
+/// read move the watermark past minutes never summed).
 pub async fn rollup_requests(pool: &sqlx::SqlitePool, month: &str) -> anyhow::Result<u64> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let outcome = rollup_requests_inner(&mut conn, month).await;
+    match outcome {
+        Ok(owners) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(owners)
+        }
+        Err(err) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(err)
+        }
+    }
+}
+
+async fn rollup_requests_inner(
+    conn: &mut sqlx::SqliteConnection,
+    month: &str,
+) -> anyhow::Result<u64> {
     let cursor: Option<i64> =
         sqlx::query_scalar("SELECT last_minute FROM usage_rollup_cursor WHERE id = 'requests'")
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     let cursor = cursor.unwrap_or(0);
+    // The snapshot: minutes at or below this are this pass's universe, so
+    // rows arriving mid-pass stay for the next tick instead of moving the
+    // watermark past unsummed minutes.
+    let snap: Option<i64> =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(minute) FROM metric_minute")
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+    let Some(snap) = snap else { return Ok(0) };
+    if snap <= cursor {
+        return Ok(0);
+    }
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT a.owner_id, SUM(m.requests) FROM metric_minute AS m \
          JOIN app AS a ON a.id = m.app_id \
-         WHERE m.minute > ?1 GROUP BY a.owner_id",
+         WHERE m.minute > ?1 AND m.minute <= ?2 GROUP BY a.owner_id",
     )
     .bind(cursor)
-    .fetch_all(pool)
+    .bind(snap)
+    .fetch_all(&mut *conn)
     .await?;
     let mut owners = 0u64;
     for (owner_id, requests) in &rows {
@@ -353,24 +403,17 @@ pub async fn rollup_requests(pool: &sqlx::SqlitePool, month: &str) -> anyhow::Re
         .bind(owner_id)
         .bind(month)
         .bind((*requests).max(0))
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         owners += 1;
     }
-    let max_minute: Option<i64> =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(minute) FROM metric_minute")
-            .fetch_optional(pool)
-            .await?
-            .flatten();
-    if let Some(max) = max_minute {
-        sqlx::query(
-            "INSERT INTO usage_rollup_cursor (id, last_minute) VALUES ('requests', ?1) \
-             ON CONFLICT(id) DO UPDATE SET last_minute = ?1",
-        )
-        .bind(max.max(cursor))
-        .execute(pool)
-        .await?;
-    }
+    sqlx::query(
+        "INSERT INTO usage_rollup_cursor (id, last_minute) VALUES ('requests', ?1) \
+         ON CONFLICT(id) DO UPDATE SET last_minute = ?1",
+    )
+    .bind(snap.max(cursor))
+    .execute(&mut *conn)
+    .await?;
     Ok(owners)
 }
 
@@ -432,7 +475,15 @@ pub async fn check_requests_caps(
 /// the bytes under `fleets/{slug}/r2/`. App code writes through celld with
 /// scoped credentials, so Outer cannot refuse an in-runtime write at the
 /// call — the sweep flips the flag within the hour and the Console, commit
-/// and upload paths refuse while it is set.
+/// and upload paths refuse while it is set. The Console R2 upload path
+/// additionally refuses prospectively (last sweep measurement plus the
+/// upload's size against the plan cap); in-runtime writes stay
+/// sweep-enforced and can burst past the cap within the hour by design.
+///
+/// The sweep records its R2 measurement on `app.r2_measured_bytes` when no
+/// measurement is stored yet, so the upload gate has a number even before
+/// the first sweep sizes a fresh app; the Console upload and delete paths
+/// adjust the stored number afterwards.
 pub async fn check_storage(deps: &LimitsSweep, now_ms: i64) -> anyhow::Result<(usize, usize)> {
     #[derive(sqlx::FromRow)]
     struct AppRow {
@@ -470,6 +521,23 @@ pub async fn check_storage(deps: &LimitsSweep, now_ms: i64) -> anyhow::Result<(u
         };
         let d1_cap = d1_cap_bytes(&app.plan);
         let r2_cap = r2_cap_bytes(&app.plan);
+        // Record the sweep's R2 measurement when none is stored yet (fresh
+        // app, or a database created before the column existed): the Console
+        // upload gate reads this number prospectively. A stored value is
+        // left alone — the upload/delete paths keep it current, and the
+        // freeze decision above always uses the live sizing, never this.
+        // Best effort like the freeze itself: a write failure must not fail
+        // the sweep.
+        if let Err(err) = sqlx::query(
+            "UPDATE app SET r2_measured_bytes = ?1 WHERE id = ?2 AND r2_measured_bytes IS NULL",
+        )
+        .bind(r2.min(i64::MAX as u64) as i64)
+        .bind(&app.id)
+        .execute(&deps.pool)
+        .await
+        {
+            tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "storage sweep: R2 measurement store failed");
+        }
         let mut over = Vec::new();
         if d1 > d1_cap {
             over.push(format!(
@@ -680,6 +748,169 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(total, 7, "the watermark holds: no double count");
+    }
+    #[tokio::test]
+    async fn rollup_counts_minutes_arriving_mid_pass_on_the_next_tick() {
+        // A minute row inserted while the upserts run must not move the
+        // watermark past itself unsummed: the pass snapshots its universe
+        // first and the newcomer waits for the next tick.
+        let pool = pool().await;
+        seed_user(&pool, "a1", "free").await;
+        seed_app(&pool, "app1", "shop", "a1").await;
+        let minute = 1_700_000_000_000i64 / 60_000;
+        sqlx::query("INSERT INTO metric_minute (app_id, minute, requests) VALUES ('app1', ?1, 7)")
+            .bind(minute)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A row landing mid-pass, after the aggregate but before the cursor
+        // advance: the trigger fires on the pass's own `usage_month` upsert.
+        sqlx::query(
+            "CREATE TRIGGER rollup_midpass AFTER INSERT ON usage_month FOR EACH ROW \
+             BEGIN INSERT INTO metric_minute (app_id, minute, requests) \
+             VALUES ('app1', 1_700_000_000_000 / 60000 + 10, 5); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let month = "2024-01".to_string();
+        assert_eq!(rollup_requests(&pool, &month).await.unwrap(), 1);
+        let cursor: i64 =
+            sqlx::query_scalar("SELECT last_minute FROM usage_rollup_cursor WHERE id = 'requests'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cursor, minute,
+            "the watermark stops at the snapshot, not past it"
+        );
+        // The mid-pass arrival is still unsummed; the next tick counts it.
+        assert_eq!(rollup_requests(&pool, &month).await.unwrap(), 1);
+        let total: i64 = sqlx::query_scalar(
+            "SELECT requests FROM usage_month WHERE userId = 'a1' AND month = '2024-01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total, 12, "no minute is skipped by a mid-pass arrival");
+        sqlx::query("DROP TRIGGER rollup_midpass")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollup_failure_counts_nothing_and_recovers_exactly_once() {
+        // Two owners aggregate in one pass; the second upsert aborts. The
+        // whole pass must roll back (no partial count for the first owner),
+        // so the retry after the failure counts every minute exactly once.
+        let pool = pool().await;
+        seed_user(&pool, "a1", "free").await;
+        seed_user(&pool, "a2", "free").await;
+        seed_app(&pool, "app1", "shop", "a1").await;
+        // The shared helper hardcodes ports, so the second app seeds
+        // directly with its own.
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+             last_activity_at, created_at) \
+             VALUES ('app2', 'mall', 'a2', 300002, 20003, 20004, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let minute = 1_700_000_000_000i64 / 60_000;
+        for (app, requests) in [("app1", 7), ("app2", 5)] {
+            sqlx::query("INSERT INTO metric_minute (app_id, minute, requests) VALUES (?1, ?2, ?3)")
+                .bind(app)
+                .bind(minute)
+                .bind(requests)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "CREATE TRIGGER rollup_boom BEFORE INSERT ON usage_month \
+             WHEN NEW.userId = 'a2' BEGIN SELECT RAISE(ABORT, 'boom'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let month = "2024-01".to_string();
+        assert!(
+            rollup_requests(&pool, &month).await.is_err(),
+            "the aborted upsert fails the pass"
+        );
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT userId, requests FROM usage_month WHERE month = '2024-01'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            rows.is_empty(),
+            "a failed pass counts nothing, not even the first owner: {rows:?}"
+        );
+        sqlx::query("DROP TRIGGER rollup_boom")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rollup_requests(&pool, &month).await.unwrap(), 2);
+        let total: i64 =
+            sqlx::query_scalar("SELECT SUM(requests) FROM usage_month WHERE month = '2024-01'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(total, 12, "the retry counts every minute exactly once");
+        assert_eq!(rollup_requests(&pool, &month).await.unwrap(), 0);
+        let total: i64 =
+            sqlx::query_scalar("SELECT SUM(requests) FROM usage_month WHERE month = '2024-01'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(total, 12, "no double count after recovery");
+    }
+
+    #[tokio::test]
+    async fn sweep_records_its_r2_measurement_only_when_none_is_stored() {
+        let pool = pool().await;
+        seed_user(&pool, "a1", "free").await;
+        seed_app(&pool, "app1", "shop", "a1").await;
+        let store = crate::store::Store::memory();
+        store
+            .put("fleets/shop/r2/assets/logo.png", vec![0u8; 100])
+            .await
+            .unwrap();
+        let (sender, _codes) = capture_sender();
+        let deps = sweep_deps(pool.clone(), store, sender);
+        assert_eq!(
+            check_storage(&deps, 1_700_000_000_000).await.unwrap(),
+            (0, 0)
+        );
+        let measured: Option<i64> =
+            sqlx::query_scalar("SELECT r2_measured_bytes FROM app WHERE id = 'app1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(measured, Some(100), "the sweep fills a missing measurement");
+        // A stored value is left alone: the upload/delete paths own it after
+        // the first fill, and the freeze decision always uses live sizing.
+        sqlx::query("UPDATE app SET r2_measured_bytes = 40 WHERE id = 'app1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            check_storage(&deps, 1_700_000_000_001).await.unwrap(),
+            (0, 0)
+        );
+        let measured: Option<i64> =
+            sqlx::query_scalar("SELECT r2_measured_bytes FROM app WHERE id = 'app1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            measured,
+            Some(40),
+            "a stored measurement is never overwritten"
+        );
     }
 
     #[tokio::test]
