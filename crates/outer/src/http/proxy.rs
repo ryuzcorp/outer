@@ -836,22 +836,23 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         touch_once(&state, &app.id).await;
     }
 
-    // The Free badge (Contract 2): the owner's live plan, read on every
-    // request from the same `user` row every other Pro gate uses — no cache,
-    // so a plan change (upgrade webhook, downgrade) flips the very next
-    // response. A lookup failure serves without the badge rather than
-    // risking one on a Pro page.
-    let badge: Option<Vec<u8>> = match crate::apps::always_on::owner_plan(
-        &state.pool,
-        &app.owner_id,
-    )
-    .await
-    {
-        Ok(plan) if plan != "pro" => Some(badge::badge_snippet(&app.slug)),
-        Ok(_) => None,
-        Err(err) => {
-            tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "badge plan lookup failed; serving without badge");
-            None
+    // The Free badge (Contract 2): the owner's live plan, read from the same
+    // `user` row every other Pro gate uses — no cache, so a plan change
+    // (upgrade webhook, downgrade) flips the very next page. Only GETs that
+    // accept HTML can get a badge, so assets and API calls skip the lookup.
+    // A lookup failure serves without the badge rather than risking one on
+    // a Pro page.
+    let wants_page = req.method() == axum::http::Method::GET && badge::accepts_html(req.headers());
+    let badge: Option<Vec<u8>> = if !wants_page {
+        None
+    } else {
+        match crate::apps::always_on::owner_plan(&state.pool, &app.owner_id).await {
+            Ok(plan) if plan != "pro" => Some(badge::badge_snippet(&app.slug)),
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "badge plan lookup failed; serving without badge");
+                None
+            }
         }
     };
 
@@ -2814,8 +2815,8 @@ mod tests {
         );
     }
 
-    /// HEAD answers carry no badge and keep the page's own length; a 304
-    /// stays an empty 304.
+    /// HEAD answers carry no badge (and skip the plan lookup, so the client's
+    /// encoding goes upstream as-is); a 304 stays an empty 304.
     #[tokio::test]
     async fn badge_head_and_304_untouched() {
         let fix = fixture().await;
@@ -2841,9 +2842,11 @@ mod tests {
             body_text(router(state.clone()).oneshot(head).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(head_body.is_empty());
+        // The fake page echoes the encoding asked for: GET was forced to
+        // `identity`, HEAD forwards none, so its own length is 8 bytes less.
         assert_eq!(
             content_len(&headers),
-            Some(get_body.len() - shop_badge().len()),
+            Some(get_body.len() - shop_badge().len() - "identity".len()),
             "the page's own length, not the badged one"
         );
 
