@@ -78,7 +78,8 @@ impl Template {
 /// (BRANDING.md Contract 1): `name` defaults to the slug title-cased
 /// (`kalkulator-pizzy` → `Kalkulator Pizzy`), `description` defaults to
 /// `name`, and `accent` is deterministic per slug (a purplish-blue band:
-/// hue 230 + FNV-1a(slug) mod 60). Creation paths call this
+/// HSL with hue 230 + FNV-1a(slug) mod 60, saturation 62%, lightness
+/// 48%). Creation paths call this
 /// right after [`materialize`], before the first commit, so the seed commit
 /// carries the brand. It overwrites the template's own `brand.json`.
 pub fn write_brand(
