@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "entry": "cargo test --locked hostile (safe) | cargo test --locked -- --ignored hostile (privileged)",
+  "probes": [
+    { "id": "read:sibling-worktree", "phase": "build", "category": "cross-app-files", "must": "fail", "desc": "Build lists and reads another app's worktree" },
+    { "id": "read:sibling-data", "phase": "build", "category": "cross-app-files", "must": "fail", "desc": "Build reads another app's fleet/data dir" },
+    { "id": "read:host-secrets", "phase": "build", "category": "host-secrets", "must": "fail", "desc": "Build reads a root-only canary (stand-in for outer.sqlite / host keys)" },
+    { "id": "env:reserved-dropped", "phase": "build", "category": "host-secrets", "must": "fail", "desc": "App-supplied OUTER_/STRIPE_/AWS_ env names never reach the build" },
+    { "id": "env:host-environ", "phase": "build", "category": "host-secrets", "must": "fail", "desc": "No platform secret names in /proc/self/environ" },
+    { "id": "write:outside-workdir", "phase": "build", "category": "build-write-escape", "must": "fail", "desc": "Build writes outside its work dir (parent, /tmp, sibling, data root)" },
+    { "id": "exec:fork-bomb", "phase": "build", "category": "resource-exhaustion", "must": "fail", "desc": "Bounded fork burst is refused by pids.max / NPROC" },
+    { "id": "exec:memory-exhaust", "phase": "build", "category": "resource-exhaustion", "must": "fail", "desc": "Child allocating past the leaf is OOM-killed" },
+    { "id": "cgroup:leaf-limited", "phase": "build", "category": "cgroup-bounds", "must": "succeed", "desc": "Positive control: the step really runs inside a limited leaf" },
+    { "id": "fetch:smtp", "phase": "build", "category": "blocked-egress", "must": "fail", "desc": "Build cannot open SMTP ports 25/465/587" },
+    { "id": "fetch:blocked-ranges", "phase": "build", "category": "blocked-egress", "must": "fail", "desc": "Build cannot reach metadata, RFC1918, CGNAT, ULA, loopback services" },
+    { "id": "fetch:loopback-target", "phase": "build", "category": "blocked-egress", "must": "fail", "desc": "Build cannot reach a live loopback listener (fail-closed: the harness proves it serves)" },
+    { "id": "fetch:internet", "phase": "build", "category": "blocked-egress", "must": "succeed", "desc": "Positive control: ordinary internet egress still works" },
+    { "id": "fetch:neighbour-fleet", "phase": "worker", "category": "fleet-ports", "must": "fail", "desc": "Worker cannot fetch another fleet's public port" },
+    { "id": "fetch:platform-internal", "phase": "worker", "category": "fleet-ports", "must": "fail", "desc": "Worker cannot fetch outer's loopback / celld internal ports" },
+    { "id": "fetch:metadata", "phase": "worker", "category": "blocked-egress", "must": "fail", "desc": "Worker cannot reach the cloud metadata IP" },
+    { "id": "fetch:smtp-worker", "phase": "worker", "category": "blocked-egress", "must": "fail", "desc": "Worker cannot open SMTP ports" },
+    { "id": "env:worker-secrets", "phase": "worker", "category": "host-secrets", "must": "fail", "desc": "No platform secret names in the worker env" },
+    { "id": "r2:cross-prefix", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot read a sibling app's prefix" },
+    { "id": "r2:cross-prefix-put", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot write into a sibling app's prefix" },
+    { "id": "r2:bucket-root", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot list the bucket root" }
+  ]
+}

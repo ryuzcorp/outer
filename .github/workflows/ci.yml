@@ -43,6 +43,37 @@ jobs:
           env -i /tmp/oxfmt --version
           cd "$GITHUB_WORKSPACE"
           OUTER_TEST_OXFMT_BIN=/tmp/oxfmt cargo test --locked format_real_oxfmt -- --ignored
+  # The §12.7 beta gate: the non-privileged hostile layer runs on every PR
+  # touching the sandbox paths (fleet/, deploy/, store/credentials.rs, the
+  # Dockerfile). The privileged layer cannot run here (needs root, cgroupfs
+  # delegation and nft); the integrator runs it on the VPS with
+  # scripts/hostile-suite.sh.
+  hostile-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: gate
+        with:
+          # On pushes to main the base is the previous commit, so a sandbox
+          # change merged without the gate still runs it.
+          base: ${{ github.event.pull_request.base.sha || github.event.before }}
+          filters: |
+            sandbox:
+              - 'crates/outer/src/fleet/**'
+              - 'crates/outer/src/deploy/**'
+              - 'crates/outer/src/store/credentials.rs'
+              - 'docker/Dockerfile'
+              - 'e2e/hostile/**'
+              - 'crates/outer/tests/hostile.rs'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.sandbox == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.sandbox == 'true'
+      - run: cargo test --locked hostile
+        if: steps.gate.outputs.sandbox == 'true'
 
   docs:
     runs-on: ubuntu-latest
@@ -64,4 +95,4 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - run: shellcheck deploy/*.sh
+      - run: shellcheck deploy/*.sh scripts/*.sh

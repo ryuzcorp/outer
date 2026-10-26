@@ -16,6 +16,28 @@ OUTER_STORE=memory cargo run -- serve   # http://127.0.0.1:8080/health
 
 CI (`.github/workflows/ci.yml`) runs exactly the first three. A PR is ready when they pass locally.
 
+## Hostile suite (spec §12.7 beta gate)
+
+Hostile fixtures live in `e2e/hostile/` (`manifest.json` names every probe;
+`worker.js` + `build-probe.mjs` + `r2-probe.mjs` try to escape). The harness
+is `crates/outer/tests/hostile.rs`, in two layers:
+
+- **Safe** (`cargo test --locked hostile`, runs in CI on every PR touching
+  `fleet/`, `deploy/`, `store/credentials.rs` or the Dockerfile): asserts the
+  generated sandbox config for each fixture category — nft ruleset, cgroup
+  limits, `fleets/{slug}/` credential scope, reserved-env filter,
+  loopback-only fleet command, data-dir layout.
+- **Privileged** (`cargo test --locked -- --ignored hostile`, VPS only via
+  `sudo scripts/hostile-suite.sh`): runs the real fixtures through
+  `run_sandboxed` as an app uid in a real cgroup leaf with the nft table
+  installed, plus the R2 scope check with scoped creds (`--r2`). Needs root,
+  cgroup v2 with delegation, nft and bun/node; anything missing skips loudly
+  instead of passing.
+
+The `worker.js` `/probes` check needs a live celld fleet with a deployed app
+and stays a manual VPS step (see the script header). A PR that changes escape
+relevant behavior adds a fixture probe first, then the containment.
+
 ## Layout
 
 | Path | What |
@@ -27,7 +49,8 @@ CI (`.github/workflows/ci.yml`) runs exactly the first three. A PR is ready when
 | `crates/outer/src/store/` | `Store` (R2 over S3, or in-memory) and the SQLite snapshot to the bucket |
 | `crates/outer/src/git/` | Each app's repo: a bucket WAL (tip bundle + `MANIFEST.json`) and worktree-free commits |
 | `crates/outer/src/fleet/` | Sandboxed processes, cgroup v2 leaves, nft egress rules, the celld supervisor |
-| `web/` | Blume site (whole web surface): `blume.config.ts`, `package.json`, `docs/` content, built with `bun run build` inside `web/` |
+| `e2e/hostile/`, `crates/outer/tests/hostile.rs` | Hostile suite (§12.7): fixtures, manifest, two-layer harness |
+| `scripts/hostile-suite.sh` | Integrator entry for the privileged hostile layer (VPS) |
 ## Rules
 
 - **Borrowed code.** Outer lifts specific functions from Noite (`github.com/ryuzcorp/noite`, `apps/runner/src/host/`). A lifted file starts with `// Derived from noite apps/runner/src/host/<file>.rs @ <sha> (Apache-2.0).` and one line saying what changed. Lift a function, not a feature: anything Outer's spec doesn't have stays in Noite.
