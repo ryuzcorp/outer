@@ -398,6 +398,9 @@ struct UserBilling {
     email: String,
     grace_until: Option<i64>,
     subscription: Option<String>,
+    /// Downgraded after its subscription ended: `subscription` then names
+    /// that ended subscription, kept so its late events can be recognized.
+    ended: bool,
 }
 
 /// A Stripe id-or-object field: `"cus_1"` or `{"id": "cus_1"}`.
@@ -419,6 +422,7 @@ struct UserRow {
     grace_until: Option<i64>,
     #[sqlx(rename = "stripeSubscriptionId")]
     subscription: Option<String>,
+    ended: bool,
 }
 
 fn to_billing(row: UserRow) -> UserBilling {
@@ -427,6 +431,7 @@ fn to_billing(row: UserRow) -> UserBilling {
         email: row.email,
         grace_until: row.grace_until,
         subscription: row.subscription,
+        ended: row.ended,
     }
 }
 
@@ -435,7 +440,8 @@ async fn user_by_id(
     id: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user WHERE id = ?1",
+        "SELECT id, email, graceUntil, stripeSubscriptionId, \
+         (plan = 'free' AND planStatus = 'canceled') AS ended FROM user WHERE id = ?1",
     )
     .bind(id)
     .fetch_optional(conn)
@@ -448,7 +454,8 @@ async fn user_by_customer(
     customer: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user \
+        "SELECT id, email, graceUntil, stripeSubscriptionId, \
+         (plan = 'free' AND planStatus = 'canceled') AS ended FROM user \
          WHERE stripeCustomerId = ?1",
     )
     .bind(customer)
@@ -466,7 +473,8 @@ async fn user_by_email(
     email: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user WHERE email = ?1",
+        "SELECT id, email, graceUntil, stripeSubscriptionId, \
+         (plan = 'free' AND planStatus = 'canceled') AS ended FROM user WHERE email = ?1",
     )
     .bind(email.to_ascii_lowercase())
     .fetch_optional(conn)
@@ -479,7 +487,8 @@ async fn user_by_subscription(
     subscription: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId FROM user \
+        "SELECT id, email, graceUntil, stripeSubscriptionId, \
+         (plan = 'free' AND planStatus = 'canceled') AS ended FROM user \
          WHERE stripeSubscriptionId = ?1",
     )
     .bind(subscription)
@@ -524,9 +533,14 @@ async fn set_pro(
 /// `active`/`paid` for a canceled subscription must not re-promote the
 /// account). `None` on either side proceeds: a first subscription, or an
 /// object without the field, keeps today's behavior.
-fn upgrade_is_stale(current: Option<&str>, event: Option<&str>) -> bool {
-    match (current, event) {
-        (Some(current), Some(event)) => current != event,
+fn upgrade_is_stale(user: &UserBilling, event: Option<&str>) -> bool {
+    match (user.subscription.as_deref(), event) {
+        // An event for a subscription other than the account's current one.
+        (Some(current), Some(event)) if current != event => true,
+        // A late event for the subscription whose end downgraded the
+        // account: it must not bring Pro back. Resubscribing goes through
+        // `checkout.session.completed`, which names the new subscription.
+        (Some(_), Some(_)) => user.ended,
         _ => false,
     }
 }
@@ -606,13 +620,13 @@ async fn apply_subscription(
     let mut stopped = Vec::new();
     match status {
         "active" | "trialing" => {
-            if upgrade_is_stale(user.subscription.as_deref(), event_sub) {
+            if upgrade_is_stale(&user, event_sub) {
                 return Ok(Transition::kept(Some(user.id)));
             }
             set_pro(&mut *conn, &user.id, customer, event_sub).await?;
         }
         "past_due" => {
-            if upgrade_is_stale(user.subscription.as_deref(), event_sub) {
+            if upgrade_is_stale(&user, event_sub) {
                 return Ok(Transition::kept(Some(user.id)));
             }
             // First past-due event starts the 7-day grace clock; a repeat
@@ -740,7 +754,7 @@ async fn apply_invoice_paid(
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
-    if upgrade_is_stale(user.subscription.as_deref(), subscription) {
+    if upgrade_is_stale(&user, subscription) {
         return Ok(Transition::kept(Some(user.id)));
     }
     set_pro(&mut *conn, &user.id, customer, subscription).await?;
@@ -769,7 +783,7 @@ async fn apply_payment_failed(
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
-    if upgrade_is_stale(user.subscription.as_deref(), subscription) {
+    if upgrade_is_stale(&user, subscription) {
         return Ok(Transition::kept(Some(user.id)));
     }
     let grace = match user.grace_until {
@@ -858,8 +872,10 @@ async fn plan_downgrade(
         }
     }
     sqlx::query(
-        "UPDATE user SET plan = 'free', planStatus = 'canceled', graceUntil = NULL, \
-         stripeSubscriptionId = NULL WHERE id = ?1",
+        // The ended subscription id stays on the row: late events for it are
+        // recognized as stale instead of re-promoting the account.
+        "UPDATE user SET plan = 'free', planStatus = 'canceled', graceUntil = NULL \
+         WHERE id = ?1",
     )
     .bind(account_id)
     .execute(&mut *conn)
@@ -1488,7 +1504,7 @@ mod tests {
             serde_json::json!({"id": "sub_1", "customer": "cus_1"}),
         )
         .await;
-        assert_eq!(sub_of(pool, "a1").await.as_deref(), None);
+        assert_eq!(plan_of(pool, "a1").await.0, "free");
         // A genuine resubscribe mints a new subscription through checkout.
         apply(
             pool,
@@ -1534,6 +1550,47 @@ mod tests {
         assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
         assert_eq!(plan_of(&pool, "a1").await.0, "pro");
         assert_eq!(sub_of(&pool, "a1").await.as_deref(), Some("sub_2"));
+    }
+
+    #[tokio::test]
+    async fn late_upgrade_events_for_the_ended_subscription_stay_free() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'active', stripeCustomerId = 'cus_1', \
+             stripeSubscriptionId = 'sub_1' WHERE id = 'a1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_50",
+            "customer.subscription.deleted",
+            serde_json::json!({"id": "sub_1", "customer": "cus_1"}),
+        )
+        .await;
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+        // Stripe may redeliver earlier events out of order after the delete.
+        for (id, kind, object) in [
+            (
+                "evt_51",
+                "customer.subscription.updated",
+                serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "active"}),
+            ),
+            (
+                "evt_52",
+                "invoice.paid",
+                serde_json::json!({"id": "in_1", "customer": "cus_1", "subscription": "sub_1"}),
+            ),
+        ] {
+            apply(&pool, &sender, &billing, id, kind, object).await;
+            assert_eq!(plan_of(&pool, "a1").await.0, "free", "{kind} re-promoted");
+        }
     }
 
     #[tokio::test]
