@@ -1,5 +1,5 @@
 ---
-title: Style with daisyUI and phones-first layout
+title: Style with daisyUI
 description: Use daisyUI components, layout-only Tailwind, and 360px-first responsive rules.
 ---
 
@@ -30,4 +30,4 @@ Reach for daisyUI component classes before utilities:
 7. Use `btn` tap targets for primary actions and `w-full` inputs.
 8. Prefer `min-h-dvh` over `min-h-screen` so mobile browser bars never cut content.
 
-For the person-side walkthrough, see [Phones first](/design/phones-first).
+For the person-side walkthrough, see [Start from phones](/design/phones-first).

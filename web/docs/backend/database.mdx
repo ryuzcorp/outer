@@ -3,13 +3,13 @@ title: Save app data in a database
 description: Your app ships with a database turned on; schema changes ride each deploy and a failed change keeps the old version live.
 ---
 
-Your app comes with its database switched on. You ask for features that need saving, and the data persists between visits.
+Your app comes with its database switched on. You ask for features that need saving, and the data persists between visits. The next pages cover files, sign-in, schedules, background work, realtime, email, and backups.
 
 ## How your data is stored
 
 Your app gets one database (D1) and one file bucket. Asking for a second one fails the deploy, so keep everything in the single database.
 
-The starter list pattern — a page that reads the database and forms that write to it — covers most needs. Tables created in code keep working for small apps.
+The starter list pattern, a page that reads the database plus forms that write to it, covers most needs.
 
 ## How schema changes ship
 
@@ -27,6 +27,6 @@ A failed database change never takes your app down. The previous version stays l
 
 Open your app in the [Console](/get-started/console-tour). Go to Data and open the D1 browser, which shows tables, row counts, and lets you sort, search, add, edit, and delete rows.
 
-Backups run automatically — see [Backups](/backend/backups).
+Backups run automatically. See [Back up and restore your data](/backend/backups).
 
-For the technical detail, your builder reads [Database](/agents/backend/database).
+For the technical detail, your builder reads [Store data in D1](/agents/backend/database).

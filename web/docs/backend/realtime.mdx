@@ -3,7 +3,7 @@ title: Show updates as they happen
 description: Live chat, scores, and feeds stay fresh over sockets or streams; clients must reconnect after deploys and idle sleep.
 ---
 
-Ask for live updates — chat rooms, live scores, shared feeds — and your builder wires up a live connection. Two-way traffic like chat uses rooms over WebSockets. One-way streams like score tickers use server-sent events.
+Ask for live updates, like chat rooms, live scores, and shared feeds, and your builder wires up a live connection. Two-way traffic like chat uses rooms over WebSockets. One-way streams like score tickers use server-sent events.
 
 ## Why connections drop
 
@@ -13,4 +13,4 @@ For one-way streams, the server sends a keep-alive comment every few seconds. Si
 
 Cross-request fan-out belongs in [Background jobs](/backend/background-jobs).
 
-For the technical detail, your builder reads [WebSockets](/agents/backend/websockets) and [SSE](/agents/backend/sse).
+For the technical detail, your builder reads [Add realtime rooms](/agents/backend/websockets) and [Stream updates with SSE](/agents/backend/sse).

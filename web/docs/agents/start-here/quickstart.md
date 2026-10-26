@@ -1,5 +1,5 @@
 ---
-title: Quickstart for agents
+title: Quickstart
 description: Connect, create an app, change it, share it — the Outer loop for the agent builder.
 ---
 
@@ -20,7 +20,7 @@ Keep the first prompt to one screen: no login, no database yet.
 
 > Build a grocery list app for my family on Outer. One page: an input to add items, a list with checkboxes, a filter for bought vs. still needed. No login, no sharing yet — just the list.
 
-Before writing code, read the Ilha guide and the Void guide ([Void](/agents/frontend/void), [Ilha](/agents/frontend/ilha)). Then call `create_app` with a caller-picked slug. A live app serves at `https://<slug>.outer.now` in seconds. Apps are unlisted by default: reachable by link, not indexed. For a landing page, portfolio, or blog, pass `template: "website"` — see [Templates](/agents/start-here/templates).
+Before writing code, read the Ilha guide and the Void guide ([Void](/agents/frontend/void), [Ilha](/agents/frontend/ilha)). Then call `create_app` with a caller-picked slug. A live app serves at `https://<slug>.outer.now` in seconds. Apps are unlisted by default: reachable by link, not indexed. For a landing page, portfolio, or blog, pass `template: "website"`. See [Templates](/agents/start-here/templates).
 
 ## Make one small change
 

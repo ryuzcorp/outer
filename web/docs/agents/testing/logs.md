@@ -18,4 +18,4 @@ description: Use app_logs, app_errors, and deploy_log to triage failures.
 3. Open `app_logs` for the last 2000 lines of fleet stdout/stderr.
 4. Open `deploy_log` for build output when the failure sits in the pipeline.
 
-For the person-side walkthrough, see [Logs and errors](/testing/logs-errors).
+For the person-side walkthrough, see [Read logs and errors](/testing/logs-errors).

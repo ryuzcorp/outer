@@ -36,4 +36,4 @@ Trial a change before it goes live: commit with `preview: true` to deploy the sa
 7. Never name an app `*--preview`; those slugs stay reserved so live and preview URLs never collide.
 8. Discard the active preview before renaming; renames with an active preview refuse.
 
-For the person-side walkthrough, see [Preview deploys](/testing/preview-deploys).
+For the person-side walkthrough, see [Preview changes](/testing/preview-deploys).

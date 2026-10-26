@@ -37,4 +37,4 @@ look_at_app {app: "groceries", width: 1280, full_page: true}
 | `not-html` | Response holds no document to instrument. | Read `app_logs` and `app_errors`. |
 | `missing` | Recorder script did not report. | Read `app_logs` and `app_errors`. |
 
-For the person-side walkthrough, see [Agent screenshots](/testing/agent-screenshots).
+For the person-side walkthrough, see [See app screenshots](/testing/agent-screenshots).

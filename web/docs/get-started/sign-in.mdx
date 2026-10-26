@@ -6,31 +6,30 @@ description: OAuth for Claude, Codex, ChatGPT, Gemini and Perplexity; the emaile
 One Outer account is one email address. There are two ways in, both ending
 at the same account.
 
-Building it? The agent reads Agents → [Quickstart](/agents/start-here/quickstart).
+Your agent does the technical steps. The agent version lives at Agents → [Quickstart](/agents/start-here/quickstart).
 
 ## OAuth apps
 
 These clients sign you in with OAuth: Claude, Codex, ChatGPT, Gemini,
 and Perplexity. Your client opens Outer's sign-in page:
 
-1. Enter your email. During the closed beta, an email that is not allowed in gets "Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist." — unless you paste an invite code (`OUTER-XXXX-XXXX`) into the "Have an invite code?" field.
+1. Enter your email. During the closed beta, an email that is not allowed in gets "Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist." Paste an invite code (`OUTER-XXXX-XXXX`) into the "Have an invite code?" field instead.
 2. Enter the 6-digit code from your inbox.
 3. On first sign-in only, accept the Terms and Privacy Policy.
 4. Approve the client ("Allow Claude to create, change and delete apps on your Outer account?").
 
 The client retries the call with its new token. You can revoke a client any
-time with the `list_connections` / `revoke_connection` tools, or on the
-Console's Connections & keys page.
+time on the Console's Connections and keys page, or by asking your agent.
 
 ## Email code fallback
 
-For scripts, older clients and agent harnesses without OAuth:
+For scripts, older clients, and agent harnesses without OAuth, your agent signs in with an emailed code instead:
 
-1. Call `sign_in` with your email — Outer emails a 6-digit code (10-minute expiry, 5 attempts). During the closed beta, a new email that is not allowlisted also passes `invite_code`.
-2. Ask your human for the code, then call `verify_code` with your email, the code, and `accept_terms: true` on first use.
-3. Save the returned API key in your MCP config and send it as the `Authorization: Bearer` header.
+1. Your agent starts sign-in with your email. Outer emails a 6-digit code (10-minute expiry, 5 attempts). During the closed beta, a new email that is not allowlisted also needs an invite code.
+2. Read the code from your inbox and give it to your agent. On first use your agent also accepts the Terms for you.
+3. Your agent saves the returned API key in its MCP config and sends it as the `Authorization: Bearer` header.
 
-After sign-in, `sign_in` and `verify_code` disappear from the tool list.
+After sign-in, the sign-in tools disappear from your agent's tool list.
 
 ## Invite codes
 
@@ -38,14 +37,12 @@ Outer is in closed beta. New emails need an invite code (`OUTER-XXXX-XXXX`)
 to join. Joiners get 3 codes of their own to share, shown on the Console's
 Invites page. Collaborators and allowlisted emails get in without a code
 and get none. A code admits one new account and is spent when
-that account signs in — allowlisted and existing emails never burn one. Admins
+that account signs in. Allowlisted and existing emails never burn one. Admins
 generate codes in bulk from the Console's Admin page instead of getting
 automatic ones.
 
 ## API keys
 
-1. Create a key with `create_api_key` — it is shown once, so store it in your MCP config now.
-2. List keys with `list_api_keys` — it shows ids, names and prefixes, never secrets.
-3. Revoke a key with `revoke_api_key`, by prefix.
-
-Key quota: 5 keys on Free, 20 on Pro.
+1. Ask your agent to create a key. It is shown once, so store it in your MCP config now.
+2. Ask your agent to list keys. It shows ids, names, and prefixes, never secrets.
+3. Ask your agent to revoke a key by its prefix.

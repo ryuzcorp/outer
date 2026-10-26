@@ -34,12 +34,12 @@ One term per concept. Left column wins everywhere.
 | collaborator | member, teammate | Invited per app, up to 10, Pro. |
 | unlisted | private | Default visibility: anyone with the link, not indexed. Opposite of public. |
 | public | published | Pro visibility: listed and indexable. |
-| hold, suspend | ban, takedown | `hold` = serves the "being fixed" page. `suspend` = offline pending review. |
+| hold, suspend | ban, takedown | Review states an admin sets. `suspend` stops the fleet. Never promise a hold page or error code. |
 | block (deploy) | reject, fail (for the gate) | A blocked deploy keeps the old version serving. A failed deploy is a build or system error. |
 | rollback | revert, undo (as noun) | The `rollback` tool or the Console button. Never counts as a code change. |
 | invite code | referral code, coupon | `OUTER-XXXX-XXXX`, closed beta only. |
 | plan (Free / Pro) | tier, subscription (as plan name) | Capitalized plan names. |
-| quota | limit (for counted resources) | Code changes, apps, requests. `limits` only for the Deploy page title and hard technical caps. |
+| quota | limit (for counted resources) | Code changes, apps, collaborators. `limits` only for the Deploy page title and hard technical caps. |
 | preview deploy | staging, branch deploy | One per app, Pro, at `<slug>--preview.outer.now`. |
 | fleet | server, container, instance | The celld worker pool an app runs on. |
 | binding | integration, env (for config) | `d1_databases`, `kv_namespaces`, declared in `void.config.ts`. |

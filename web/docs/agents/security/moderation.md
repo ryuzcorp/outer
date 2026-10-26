@@ -42,12 +42,12 @@ Mild words pass. The classifier reads masked spellings, leetspeak, and other lan
 4. Fix flagged lines and commit again; a block counts as a code change and never becomes a rollback target.
 5. Expect brand fragments (`paypal`, `apple`, `bank`, `login`, whole or embedded) refused at claim time.
 6. Expect fail-closed `review_unavailable` when Jev is down; localhost dev without the Cloudflare pair passes with a warning.
-7. Offer no self-serve override; `request_review` only queues the case.
+7. Offer no self-serve override; there is no appeal tool. Relay `user_message` verbatim instead of inventing a workaround.
 
 ## Respect after-live enforcement
 
-1. Expect an after-live crawl: `profanity` puts the app on `hold` until a clean deploy plus crawl lifts it.
-2. Expect `sexual_minors > 0.5`, `phishing > 0.9`, or severity 3 to suspend the app (HTTP 451).
+1. Expect an after-live crawl of rendered pages after each deploy; new chunks re-enter the gate.
+2. Expect flagged apps to land in the admin moderation queue; an admin can hold or suspend the app, and suspension stops its fleet.
 3. Relay hold and suspend messages verbatim.
 
-For the person-side walkthrough, see [Moderation](/security/moderation).
+For the person-side walkthrough, see [Follow the content rules](/security/moderation).

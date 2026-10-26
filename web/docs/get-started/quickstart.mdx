@@ -4,11 +4,11 @@ description: Connect your chat app, ask for an app, see it live — the Outer lo
 ---
 
 Get a live app in about ten minutes. The example below builds a family
-grocery list — swap in your own idea, the steps are the same.
+grocery list. Swap in your own idea. The steps are the same.
 
 ## Connect your agent
 
-One line per client (full table in [Connect](/get-started/connect)):
+One line per client (full table in [Connect your agent](/get-started/connect)):
 
 - Claude Code: `claude mcp add --transport http outer https://outer.now/mcp`, then `/mcp` → `outer` to sign in
 - claude.ai, Desktop, mobile: Settings → Connectors → Add custom connector → `https://outer.now/mcp`
@@ -17,7 +17,7 @@ One line per client (full table in [Connect](/get-started/connect)):
 
 ## Ask for the app
 
-Paste a scoped first prompt — one screen, no login, no database yet:
+Paste a scoped first prompt. One screen, no login, no database yet:
 
 > Build a grocery list app for my family on Outer. One page: an input to
 > add items, a list with checkboxes, a filter for bought vs. still needed.
@@ -31,7 +31,7 @@ Paste a scoped first prompt — one screen, no login, no database yet:
 Taken slugs are rejected, and deleted names stay reserved for 30 days.
 A live Ilha + Void app serves in seconds. Unlisted by default: not indexed,
 reachable by link. Building a landing page, portfolio, or blog instead? Say so
-in the prompt — the agent passes `template: "website"` for the content-site
+in the prompt. The agent passes `template: "website"` for the content-site
 starter. See [Templates](/get-started/templates).
 
 ## Make one change
@@ -39,21 +39,20 @@ starter. See [Templates](/get-started/templates).
 > Add a "who bought it" label: tapping a bought item lets you type a name.
 
 1. Send the change in one short message.
-2. Your agent changes code with `commit {app, message, edits}` using exact-match edits.
+2. Your agent makes the change and deploys it.
 3. Read the deploy result it reports: `success` with the URL, `failed` with the log tail, or `blocked` with the lines to fix.
 
-Written code is formatted before the commit lands. `commit.formatted` lists
-the files it touched, so target that text with your next edits.
+Code is formatted before the change lands. If a deploy fails, your agent names the file and line from the log tail. Paste that back and ask for a fix.
 
 ## Share it
 
-1. Ask your agent to share the app (`share_app {app}`).
+1. Ask your agent to share the app.
 2. It returns the URL, share text, and a QR code for the family chat.
 3. Open the [Console](/get-started/console-tour) to watch the deploy, the logs, and who visits. How sharing works: [Sharing your app](/collaboration/sharing).
 
 ## Rules that bite newcomers
 
-- Read the Ilha guide before writing any code, and the Void guide before touching server code. Building it? The agent reads Agents → [Quickstart](/agents/start-here/quickstart).
-- No strong profanity in page text, seed data or the app name — the deploy is blocked and the previous version keeps serving. See [Moderation](/security/moderation).
-- After deploying server code, check `app_errors`. Undo with `rollback` (never counts as a change). Delete with `delete_app {app, confirm}` where confirm is the slug typed again; the name stays reserved for 30 days.
-- Free gives 1 app and 50 code changes a day ([Limits](/deploy/limits)). When a tool refuses something, relay its `user_message` to your human verbatim — never improvise around it.
+- Ask for the building blocks by name. Your agent reads the Ilha and Void guides before writing code, and it reads Agents → [Quickstart](/agents/start-here/quickstart) for the full loop.
+- No strong profanity in page text, seed data, or the app name. The deploy is blocked and the previous version keeps serving. See [Moderation](/security/moderation).
+- After each change, ask your agent what it checked. To undo, ask for a rollback, which never counts as a change. To delete, confirm with your slug typed again. The name stays reserved for 30 days.
+- Free gives 1 app and 50 code changes a day ([Limits](/deploy/limits)). When your agent reports a refusal, its message is written for you. Ask it to relay that message word for word.

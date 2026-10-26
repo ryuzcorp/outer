@@ -1,13 +1,13 @@
 ---
-title: Auth for agents
+title: Add user sign-in
 description: Sign-in with Better Auth plus D1 — providers, secrets, gating, migrations, and rate limits.
 ---
 
-**Verdict: works.** App auth is Better Auth backed by your app's D1 database — standard bindings only, no external service. The person-facing guide is [User sign-in](/backend/user-sign-in).
+**Verdict: works.** App auth is Better Auth backed by your app's D1 database. Standard bindings only, no external service. The person-facing guide is [Let people sign in to your app](/backend/user-sign-in).
 
 ## Declare providers
 
-In `void.config.ts`, pick providers and keep the D1 binding the template ships (`DB`). Edits need `bun run build` — bindings are read from the built config:
+In `void.config.ts`, pick providers and keep the D1 binding the template ships (`DB`). Edits need `bun run build`. Bindings are read from the built config:
 
 ```ts
 export default defineConfig({
@@ -44,7 +44,7 @@ export const GET = defineHandler((c) => {
 
 ## Set secrets before the first auth deploy
 
-Set secrets with MCP (`set_secret`) or Console → Secrets — values apply on the next deploy:
+Set secrets with MCP (`set_secret`) or Console → Secrets. Values apply on the next deploy:
 
 | Secret | Source |
 | --- | --- |
@@ -54,8 +54,8 @@ Set secrets with MCP (`set_secret`) or Console → Secrets — values apply on t
 
 ## Commit auth migrations
 
-Auth tables live alongside your tables. Run `void db generate` and commit the migration files — Outer applies them on deploy before the new code goes live ([Database](/agents/backend/database)). Never edit an applied migration; write a new one.
+Auth tables live alongside your tables. Run `void db generate` and commit the migration files. Outer applies them on deploy before the new code goes live ([Store data in D1](/agents/backend/database)). Never edit an applied migration; write a new one.
 
 ## Respect the limits
 
-Rate limits are Better Auth's defaults (roughly 3 sign-ins per 10 s per IP), tracked per Worker instance — and everyone behind one proxy IP shares that IP's count. Enough for families, not for brute force. Test sign-in on the live link, not only locally: OAuth callbacks must match the app's public host.
+Rate limits are Better Auth's defaults (roughly 3 sign-ins per 10 s per IP), tracked per Worker instance. Everyone behind one proxy IP shares that IP's count. Enough for families, not for brute force. Test sign-in on the live link, not only locally: OAuth callbacks must match the app's public host.

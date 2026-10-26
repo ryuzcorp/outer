@@ -1,13 +1,13 @@
 ---
-title: WebSockets for agents
+title: Add realtime rooms
 description: Realtime rooms with room route files — schemas, auth, reconnect, and route identity.
 ---
 
-**Verdict: works.** Define a room route, connect from the client, and Outer passes WebSocket upgrades straight through the app proxy to the fleet. The person-facing guide is [Realtime](/backend/realtime).
+**Verdict: works.** Define a room route, connect from the client, and Outer passes WebSocket upgrades straight through the app proxy to the fleet. The person-facing guide is [Show updates as they happen](/backend/realtime).
 
 ## Define a room
 
-One route file per room (`index/[id]/[...slug]` nesting allowed; `.dev`/`.prod` env suffixes). Each room instance is backed by a Durable Object — standard binding, declared for you:
+One route file per room (`index/[id]/[...slug]` nesting allowed; `.dev`/`.prod` env suffixes). Each room instance is backed by a Durable Object, a standard binding declared for you:
 
 ```ts
 // routes/chat/[room].ws.ts
@@ -36,12 +36,12 @@ import { connect } from "void/ws";
 const socket = connect("/chat/:room", { params: { room: "general" } });
 ```
 
-Events are JSON with a validated shape — no raw string/binary frames. Valibot schemas are required. Auth freezes at connect (`ctx.user`); re-check bans inside `onMessage`. Cross-origin sockets stay anonymous unless the origin is trusted.
+Events are JSON with a validated shape: no raw string/binary frames. Valibot schemas are required. Auth freezes at connect (`ctx.user`); re-check bans inside `onMessage`. Cross-origin sockets stay anonymous unless the origin is trusted.
 
 ## Reconnect with backoff — required
 
-Sockets die on deploy and on fleet sleep: every deploy moves the fleet, and an idle fleet stops after ~30 minutes. Your client must reconnect with backoff and re-fetch missed messages from D1. Hibernated Durable Object sockets survive short idles but never a move — code for the disconnect.
+Sockets die on deploy and on fleet sleep: every deploy moves the fleet, and an idle fleet stops after ~30 minutes. Your client must reconnect with backoff and re-fetch missed messages from D1. Hibernated Durable Object sockets survive short idles but never a move. Code for the disconnect.
 
 ## Keep route identity on moves
 
-Nothing to declare: the route file is the config. Rebuild and commit; the room serves at the same host as the app. One room per file keeps failure domains small. Moving a route keeps its state only when you carry its identity: run `void info` first for the `name:` to add to `defineRoom`, keep the parameter names, and use `key:` to preserve the old key when a parameter is renamed — otherwise the moved route selects a new Durable Object and looks empty.
+Nothing to declare: the route file is the config. Rebuild and commit; the room serves at the same host as the app. One room per file keeps failure domains small. Moving a route keeps its state only when you carry its identity: run `void info` first for the `name:` to add to `defineRoom`, keep the parameter names, and use `key:` to preserve the old key when a parameter is renamed. Otherwise the moved route selects a new Durable Object and looks empty.

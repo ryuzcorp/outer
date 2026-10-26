@@ -15,11 +15,11 @@ Seconds to about a minute: build, gate, then live. The tool call waits and repor
 
 **My app is slow on the first request.**
 
-The fleet sleeps after idle and wakes on the next request — that first request pays the cold start. It adopts the newest deploy when it wakes. Pro keeps warm in [keep your app warm](/deploy/keep-warm).
+The fleet sleeps after idle and wakes on the next request. That first request pays the cold start. It adopts the newest deploy when it wakes. Pro keeps warm in [Keep your app warm](/deploy/keep-warm).
 
-**The page shows a paused, building, or held screen.**
+**The page shows a building screen or an error.**
 
-Those are proxy pages, not your code: the app has no successful deploy yet, is paused over quota, or is held. Ask your agent for the deploy status.
+Those come from the proxy, not your code. A building screen means the app has no successful deploy yet. An error with a retry note means the fleet could not start. Ask your agent for the deploy status.
 
 ## Sign-in and accounts
 
@@ -37,17 +37,17 @@ During the closed beta, allowlisted emails get in directly. Everyone else pastes
 
 **How do I revoke a client or a key?**
 
-Console → Connections & keys. Manage keys in [account settings](/account/settings).
+Console → Connections and keys. Manage keys in [Account settings](/account/settings).
 
 ## Plans and limits
 
 **Free vs Pro?**
 
-1 app and 50 code changes a day versus 10 apps and 500. Full comparison: [plans](/account/plans). Billing is live — upgrade in [manage billing](/account/billing).
+1 app and 50 code changes a day versus 10 apps and 500. Full comparison: [Plans](/account/plans). Billing is live. Upgrade in [Manage billing](/account/billing).
 
 **What happens at 100% of a quota?**
 
-Change, build, app, and collaborator quotas refuse with `quota_exceeded` plus a `user_message` your agent relays word for word. Full table: [limits and quotas](/deploy/limits).
+Change, app, and collaborator quotas refuse with `quota_exceeded` plus a `user_message` your agent relays word for word. Full table: [limits and quotas](/deploy/limits).
 
 ## Deploys
 
@@ -57,7 +57,7 @@ Paste the log tail back to your agent and ask for the fix. Build errors name the
 
 **The deploy is blocked. What now?**
 
-Blocked means the pre-live review flagged page text. Fix those lines and commit again — a blocked deploy keeps the old version serving. Mild wording passes; only flagged lines need fixes.
+Blocked means the pre-live review flagged page text. Fix those lines and ask for another deploy. A blocked deploy keeps the old version serving. Mild wording passes; only flagged lines need fixes.
 
 **How do I undo?**
 
@@ -73,7 +73,7 @@ Open the live link your agent returns and reload. If you still see the old versi
 
 **Can I push with git?**
 
-No. There is no git push — your agent changes code with `commit`, and you download code with [export your code](/collaboration/export).
+No. There is no git push. Your agent changes code with `commit`, and you download code with [Export your code](/collaboration/export).
 
 **Can my app send email?**
 
@@ -85,10 +85,10 @@ Yes, one hostname per app on Pro. [Use a custom domain](/deploy/custom-domains).
 
 **Can I export my code?**
 
-Yes, on Pro as owner — the whole tree as a zip at any SHA. [Export your code](/collaboration/export).
+Yes, on Pro as owner. The whole tree as a zip at any SHA. [Export your code](/collaboration/export).
 
 ## Getting help
 
-Ask your agent first — it reads these docs. If a tool refuses something, its `user_message` is the answer: have the agent relay it word for word instead of working around it.
+Ask your agent first. It reads these docs. If a tool refuses something, its `user_message` is the answer: have the agent relay it word for word instead of working around it.
 
-Agent reference: [the deploy pipeline](/agents/deploy/pipeline).
+Agent reference: [Follow the deploy pipeline](/agents/deploy/pipeline).

@@ -18,7 +18,7 @@ Use only these top-level keys in `dist/wrangler.json` (from `ACCEPTED_CONFIG_KEY
 
 1. Expect any other key to fail the deploy naming the key (`ai`, `Vectorize`, `Cache`, `send_email` included).
 2. Set bindings in `void.config.ts` and rebuild; never hand-write `dist/wrangler.json`.
-3. Expect Free cron schedules of 1 hour or more; tighter schedules fail at validation until plan-gated bindings arrive with billing.
+3. Stay inside your plan's cron floor (hourly or slower on Free, down to a minute on Pro); the deploy pipeline does not enforce floors yet, so hold the line yourself.
 
 ## Preview Durable Object state read-only
 

@@ -46,4 +46,4 @@ export default function Counter({ start = 0 }: { start?: number }) {
 
 Every Ilha error carries a code such as `ILHA002`, a `Fix:` line, and a link. Read the fix before changing code.
 
-For the person-side walkthrough, see [Interactive pages](/frontend/interactive-pages).
+For the person-side walkthrough, see [Add interactive pages](/frontend/interactive-pages).

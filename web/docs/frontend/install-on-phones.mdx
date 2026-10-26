@@ -1,19 +1,19 @@
 ---
 title: Install your app on phones
-description: Every app is installable by default from its icon; edit the SVG and the build regenerates the rest.
+description: Every app is installable by default. Ask for a new icon or name and your builder applies it.
 ---
 
 Every app is installable by default. Visitors on a phone can add it to their home screen and open it like a native app.
 
 ## How it works
 
-The install icon comes from a single source: `public/favicon.svg`. Edit the SVG and the build regenerates matching icons and the manifest.
+The install icon comes from a single source file. Ask your builder for a new icon and the build regenerates matching icons and the manifest.
 
-What not to break:
+Two rules keep installs working:
 
-- Never commit icon PNGs or a hand-written manifest.
-- Reloads always fetch fresh data — pages never serve stale cached HTML.
+- Icons and the manifest stay generated. Your builder never adds icon image files or a hand-written manifest.
+- Reloads always fetch fresh data. Pages never serve stale cached HTML.
 
-To rename the app on home screens, ask your builder to update the manifest name and the page title.
+To rename the app on home screens, ask your builder to update the name and the page title.
 
-For the technical detail, your builder reads [App runtime](/agents/platform/celld).
+For the technical detail, your builder reads [Run inside the celld runtime](/agents/platform/celld).

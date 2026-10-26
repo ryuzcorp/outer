@@ -4,11 +4,9 @@ description: Watch your apps in the browser — deploys, logs, errors, data, sec
 ---
 
 The Console is read-mostly: it shows what your agent did to your apps and
-how they are used. Changes stay agent-driven — the Console edits data and
+how they are used. Changes stay agent-driven. The Console edits data and
 settings, never code. Open it from the site header. Pick an app, or your
 account, in the sidebar. The command palette jumps anywhere.
-
-Building it? The agent reads Agents → [Quickstart](/agents/start-here/quickstart).
 
 ## One app
 
@@ -26,14 +24,14 @@ the incident window.
 
 ### Agent actions
 
-Every tool call your agent made on this app — who ran it, what it did, and
-the outcome badge — newest first. When a deploy surprises you, this is the
+Every tool call your agent made on this app: who ran it, what it did, and
+the outcome badge, newest first. When a deploy surprises you, this is the
 audit trail.
 
 ### Deploys
 
 Every deploy with its status badge, short SHA, and age. Expand one for the
-full SHA, findings, the live URL, and — for failures — the error message.
+full SHA, findings, the live URL, and the error message for failures.
 
 1. Open the Deploys view for your app.
 2. Expand a deploy to read its findings and error message.
@@ -46,18 +44,18 @@ link jumps to the Code view's changes tab for that SHA.
 ### Code
 
 Browse the app's files at any SHA, and diff what a deploy changed (the
-changes tab, `?view=code&ct=changes`). Read-only — edits go through your
-agent's `commit`.
+changes tab, `?view=code&ct=changes`). Read-only. Edits go through your
+agent.
 
 ### Logs
 
 The fleet's stdout and stderr, newest first. Build output lives on the deploy,
-not here — for a failed deploy, expand it in Deploys or ask
-your agent for `deploy_log`.
+not here. For a failed deploy, expand it in Deploys or ask
+your agent for the log tail.
 
 ### Errors
 
-Crashes grouped by fingerprint with counts and last-seen times — the same
+Crashes grouped by fingerprint with counts and last-seen times. These are the same
 groups your agent reads via `app_errors`. Triage (`resolve`, `ignore`,
 `reopen`) happens over MCP; the Console shows the state.
 
@@ -67,12 +65,12 @@ API keys and tokens the app reads as Worker env vars (`env.MY_KEY`).
 Add, replace, or remove them here, or have your agent use
 `set_secret`/`unset_secret`. Names match `^[A-Z_][A-Z0-9_]{0,63}$`, values
 hold at most 4 KiB, 50 per app. Values are never shown again after saving.
-Secrets apply on the next deploy — setting one never touches the running
+Secrets apply on the next deploy. Setting one never touches the running
 fleet.
 
 ### Settings
 
-Slug, URL, status, your role, and last request — then, owner-only:
+Slug, URL, status, your role, and last request. Then, owner-only:
 
 - **Visibility** — Unlisted (anyone with the link) or Public. Public is Pro ([Who can see your app](/security/who-can-see)).
 - **Custom domain** — one hostname per app, Pro ([Custom domains](/deploy/custom-domains)).
@@ -91,8 +89,8 @@ Owner-only browsers over the app's live bindings:
   delete. Reads use the same scoped credentials as the app; writes go
   through celld and are recorded in the agent action log.
 - **Durable Objects** — list instances (read-only). Selecting one shows
-  what the app's own `?read=1` handler returns — implement that read-only
-  branch in your class to preview state.
+  what the app's own `?read=1` handler returns. Ask your builder to add that
+  read-only branch so you can preview state here.
 
 ## Your account
 

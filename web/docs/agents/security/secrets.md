@@ -22,4 +22,4 @@ Keep keys outside code with three tools: `set_secret {app, key, value}`, `list_s
 3. Name secret keys exactly; a same-named `vars` entry in code loses and the deploy log names the overwrite.
 4. Keep secrets out of build scripts; `bun install` and `bun run build` never see them.
 
-For the person-side walkthrough, see [Secrets](/security/secrets).
+For the person-side walkthrough, see [Save API keys as secrets](/security/secrets).

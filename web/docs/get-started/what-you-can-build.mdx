@@ -12,8 +12,8 @@ Building it? The agent reads Agents → [Quickstart](/agents/start-here/quicksta
 ## Start here
 
 <CardGroup cols={2}>
- <Card title="Family dashboard" href="/agents/frontend/ilha" icon="layout-grid">
- Links, birthdays, a dinner poll — static pages plus one form. Reads: quickstart, Ilha.
+ <Card title="Family dashboard" href="/frontend/interactive-pages" icon="layout-grid">
+ Links, birthdays, a dinner poll — static pages plus one form. Your agent reads: quickstart, Ilha.
  </Card>
 
 </CardGroup>
@@ -24,16 +24,16 @@ Building it? The agent reads Agents → [Quickstart](/agents/start-here/quicksta
 
 ## Data-backed apps
 
-D1 is on by default — loaders read it, one action per page writes it
-([D1 guide](/backend/database)). KV fits sessions, counters and flags
+D1 is on by default. Pages read from it and forms write to it
+([D1 guide](/backend/database)). KV fits sessions, counters, and flags
 ([Files and storage](/backend/files-storage)).
 
 <CardGroup cols={2}>
 <Card title="Sign-up sheet" href="/backend/database" icon="clipboard-list">
-Rows in D1, one form per slot. Reads: quickstart, Ilha, D1.
+Rows in D1, one form per slot. Your agent reads: quickstart, Ilha, D1.
 </Card>
 <Card title="Book club votes" href="/backend/database" icon="book-open">
-Nominations plus a tally, seeded from a migration. Reads: D1.
+Nominations plus a tally, seeded from a migration. Your agent reads: D1.
 </Card>
 </CardGroup>
 
@@ -43,15 +43,15 @@ Nominations plus a tally, seeded from a migration. Reads: D1.
 
 ## Scheduled and background work
 
-Cron wakes a sleeping app and runs a `scheduled` handler ([Cron](/backend/scheduled-jobs)).
+Cron wakes a sleeping app and runs your scheduled job ([Cron](/backend/scheduled-jobs)).
 Queues fan out slow work like sending messages ([Queues](/backend/background-jobs)).
 
 <CardGroup cols={2}>
 <Card title="Morning digest" href="/backend/scheduled-jobs" icon="alarm-clock">
-A cron job emails the day's items every morning. Reads: cron, email.
+A cron job emails the day's items every morning. Your agent reads: cron, email.
 </Card>
 <Card title="Welcome messages" href="/backend/background-jobs" icon="inbox">
-A form enqueues a job; the queue consumer sends it. Reads: queues.
+A form enqueues a job; the queue consumer sends it. Your agent reads: queues.
 </Card>
 </CardGroup>
 
@@ -62,33 +62,33 @@ A form enqueues a job; the queue consumer sends it. Reads: queues.
 ## Realtime
 
 Chat rooms and live updates over WebSockets, one-way streams over SSE
-([Realtime](/backend/realtime)). Both ride the same app — no extra services.
+([Realtime](/backend/realtime)). Both ride the same app. No extra services.
 
 <CardGroup cols={2}>
 <Card title="Family chat" href="/backend/realtime" icon="messages-square">
-One room per channel, names required to join. Reads: websockets, auth.
+One room per channel, names required to join. Your agent reads: websockets, auth.
 </Card>
 <Card title="Live scoreboard" href="/backend/realtime" icon="activity">
-Scores stream to every viewer without polling. Reads: SSE.
+Scores stream to every viewer without polling. Your agent reads: SSE.
 </Card>
 </CardGroup>
 
 > Build a family chat room: one room, nicknames, message history in D1.
 > Read the Outer websockets guide first. No login yet — nicknames only, and
 > keep it to non-private chatter: unlisted apps open for anyone with the
-> link. Add sign-in ([Auth](/backend/user-sign-in)) before any private messages.
+> link. Add sign-in ([User sign-in](/backend/user-sign-in)) before any private messages.
 
 ## Files and accounts
 
-Uploads land in R2 ([Storage](/backend/files-storage)); sign-in for your app's own
-users runs on Better Auth + D1 ([Auth](/backend/user-sign-in)).
+Uploads land in R2 ([Files and storage](/backend/files-storage)); sign-in for your app's own
+users runs on your app's database ([User sign-in](/backend/user-sign-in)).
 
 <CardGroup cols={2}>
 <Card title="Photo wall" href="/backend/files-storage" icon="image">
-Uploads in R2, thumbnails on the page. Reads: storage.
+Uploads in R2, thumbnails on the page. Your agent reads: storage.
 </Card>
 <Card title="Members area" href="/backend/user-sign-in" icon="key-round">
-Email + Google sign-in for readers, public pages stay open. Reads: auth, D1.
+Email + Google sign-in for readers, public pages stay open. Your agent reads: auth, D1.
 </Card>
 </CardGroup>
 
@@ -99,14 +99,14 @@ Email + Google sign-in for readers, public pages stay open. Reads: auth, D1.
 ## Content sites
 
 Prerendered pages on the `website` template ([Website](/frontend/websites)):
-mostly static, one island per interactive part, and server routes only where a page needs data (the starter ships one).
+mostly static, with small interactive parts and a database only where a page needs data.
 
 <CardGroup cols={2}>
 <Card title="Portfolio + blog" href="/frontend/websites" icon="newspaper">
-Markdown posts, newest first, one island for the newsletter form. Reads: quickstart, website.
+Markdown posts, newest first, one island for the newsletter form. Your agent reads: quickstart, website.
 </Card>
 <Card title="Event page" href="/frontend/websites" icon="calendar-days">
-Static schedule plus a D1-backed RSVP form. Reads: website, D1.
+Static schedule plus a D1-backed RSVP form. Your agent reads: website, D1.
 </Card>
 </CardGroup>
 
@@ -118,5 +118,5 @@ Static schedule plus a D1-backed RSVP form. Reads: website, D1.
 
 - **Code execution sandboxes** — not available.
 - **AI in your app** (Workers AI, Vectorize) — not available; no binding key passes deploy validation.
-- **Native email sending** — use Resend over HTTP ([Email](/backend/sending-email)).
-- Native mobile apps, branches/preview environments, git push — out of scope ([Limits](/deploy/limits)).
+- **Native email sending** — use Resend over HTTP ([Sending email](/backend/sending-email)).
+- Native mobile apps, branches, and git push — out of scope ([Limits](/deploy/limits)).

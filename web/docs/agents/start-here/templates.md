@@ -1,5 +1,5 @@
 ---
-title: Templates for agents
+title: Templates
 description: Pick the app or website starter, pass the template param, and rebuild instead of stretching.
 ---
 
@@ -13,7 +13,7 @@ Every `create_app` seeds from one of two pinned starters. The default is `app`. 
 | Grocery list, dashboard, anything with accounts or live data | `app` |
 | Starts static, might grow accounts later | `app` — a site that outgrows islands wants loaders and actions, not more of them |
 
-Both live in [ryuzcorp/outer-templates](https://github.com/ryuzcorp/outer-templates): `templates/app/` and `templates/website/`. A new app gets a copy of one folder as its first commit, so its repo starts at the project root. The person-facing picker lives at [Templates](/get-started/templates).
+Both live in [ryuzcorp/outer-templates](https://github.com/ryuzcorp/outer-templates): `templates/app/` and `templates/website/`. A new app gets a copy of one folder as its first commit, so its repo starts at the project root. The person-facing picker lives at [Pick a template](/get-started/templates).
 
 ## Know what each ships
 

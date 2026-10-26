@@ -1,17 +1,17 @@
 ---
-title: Build a fast website
-description: Content sites prerender to static HTML; interactive parts hydrate as islands and server routes opt out per route.
+title: Launch a content site
+description: Content sites prerender to static HTML, so landing pages, portfolios, and blogs load fast.
 ---
 
-If your project is mostly content — a landing page, portfolio, blog, event page — start from the website [Template](/get-started/templates). Pages prerender to static HTML, which loads fast and needs no server.
+If your project is mostly content, like a landing page, portfolio, blog, or event page, start from the website [Template](/get-started/templates). Pages prerender to static HTML, which loads fast and needs no server.
 
 ## How it fits together
 
-- Each file in the pages folder is a route. A new page is a new file.
+- Each page is its own file. A new page means a new file in the site.
 - Blog posts are Markdown files with a title, description, and date. Drafts stay out of the build.
-- Interactive parts (forms, widgets) hydrate as islands where the page says so. Until they hydrate, controls should look usable or disabled — never silently dead.
-- A route that needs the [Database](/backend/database) opts out of prerendering. Keep server routes few and small.
+- Interactive parts (forms, widgets) switch on where the page needs them. Until they switch on, controls should look usable or disabled, never silently dead.
+- A page that needs the [Database](/backend/database) skips prerendering. Keep such pages few and small.
 
-Sites that grow accounts or live collaboration outgrow this shape. Say so early: they want an app, not more islands.
+Sites that grow accounts or live collaboration outgrow this shape. Say so early: ask for an app instead of stretching the site.
 
-For the technical detail, your builder reads [Website](/agents/frontend/website).
+For the technical detail, your builder reads [Build content sites](/agents/frontend/website).

@@ -1,13 +1,13 @@
 ---
-title: KV for agents
+title: Store small state in KV
 description: Sessions, counters, and flags in KV with void/kv — declaration, API, and limits.
 ---
 
-**Verdict: works.** KV is a standard binding for small state — sessions, counters, rate flags. Anything relational belongs in [Database](/agents/backend/database).
+**Verdict: works.** KV is a standard binding for small state: sessions, counters, rate flags. Anything relational belongs in [Store data in D1](/agents/backend/database).
 
 ## Declare it
 
-In `void.config.ts`, under `cloudflare`. Edits need `bun run build` — bindings are read from the built config:
+In `void.config.ts`, under `cloudflare`. Edits need `bun run build`. Bindings are read from the built config:
 
 ```ts
 cloudflare: {
@@ -15,7 +15,7 @@ cloudflare: {
 },
 ```
 
-`kv_namespaces` is an accepted deploy key, so the namespace deploys on every account. Binding keys are validated at deploy time — see [Storage](/backend/files-storage). Celld creates the namespace on first use; a typo opens a silent empty namespace, so double-check the id.
+`kv_namespaces` is an accepted deploy key, so the namespace deploys on every account. Binding keys are validated at deploy time. See [Store uploaded files](/backend/files-storage). Celld creates the namespace on first use; a typo opens a silent empty namespace, so double-check the id.
 
 ## Use it
 
@@ -35,4 +35,4 @@ Reads reach the cell that owns the namespace, so they never return a stale value
 
 ## Respect the limits
 
-Never store the only copy of anything you cannot rebuild, and never store secrets in KV — use [Secrets](/agents/security/secrets) instead.
+Never store the only copy of anything you cannot rebuild, and never store secrets in KV. Use [Secrets](/agents/security/secrets) instead.

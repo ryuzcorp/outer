@@ -10,4 +10,4 @@ description: Avoid strong profanity in rendered text, seeds, and SQL literals.
 3. Fix flagged lines and commit again after a block.
 4. Expect a blocked deploy to keep serving the previous version.
 
-For the person-side walkthrough, see [Page text](/design/page-text).
+For the person-side walkthrough, see [Keep page text shippable](/design/page-text).

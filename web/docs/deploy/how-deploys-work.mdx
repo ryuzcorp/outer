@@ -3,7 +3,7 @@ title: How deploys work
 description: Every change runs build, content gate, then live — and a failed deploy never touches serving traffic.
 ---
 
-Every change you make goes through the same three stages: build, content gate, then live. Your agent runs them for you.
+Every change you make goes through the same three stages: build, content gate, then live. Your agent runs them for you. The next pages cover rollbacks, custom domains, keep-warm, and quotas.
 
 1. Ask your agent for a change.
 2. It builds the new version and runs the content gate.
@@ -13,6 +13,6 @@ If a deploy fails, your old version keeps serving. Nothing half-built reaches vi
 
 Your first deploy shows a building page until it succeeds. Ask your agent for the deploy status if it takes longer than a minute.
 
-When your app idles with no requests, its fleet sleeps — after about 30 minutes on Free, or 24 hours on Pro. The next request wakes it, and it wakes on the newest deploy.
+When your app idles with no requests, its fleet sleeps after about 30 minutes. The next request wakes it, and it wakes on the newest deploy. Pro can skip the sleep with [Keep your app warm](/deploy/keep-warm).
 
-Technical detail for your agent lives in [the deploy pipeline](/agents/deploy/pipeline).
+Technical detail for your agent lives in [Follow the deploy pipeline](/agents/deploy/pipeline).

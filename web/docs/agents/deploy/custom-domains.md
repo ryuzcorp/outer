@@ -25,4 +25,4 @@ Custom domains are Pro, one per app, and owner-only. The proxy routes the hostna
 2. Expect downgrading to Free or deleting the app to remove the domain.
 3. Keep the domain across renames; the binding follows the app, not the slug.
 
-For the person-side walkthrough, see [Custom domains](/deploy/custom-domains).
+For the person-side walkthrough, see [Use a custom domain](/deploy/custom-domains).

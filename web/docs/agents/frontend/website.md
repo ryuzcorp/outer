@@ -1,5 +1,5 @@
 ---
-title: Build content sites with the website template
+title: Build content sites
 description: Prerender Astro pages, hydrate Ilha islands, and add small server routes.
 ---
 
@@ -49,4 +49,4 @@ export const POST: APIRoute = async () => {
 3. Commit migration files under `db/migrations/`; never edit an applied migration.
 4. Keep the route's `CREATE TABLE IF NOT EXISTS` as a local-dev backstop matching the migration.
 
-For the person-side walkthrough, see [Websites](/frontend/websites).
+For the person-side walkthrough, see [Launch a content site](/frontend/websites).

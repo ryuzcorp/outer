@@ -21,8 +21,8 @@ description: Track counted quotas, abuse limits, fleet caps, and overage behavio
 ## Respect abuse and runtime caps
 
 1. Expect sign-in throttles: 5 OTP emails/hour/address, 20/hour/IP, 3 new accounts/day/IP.
-2. Run fleets at 512 MiB (Free) or 1 GiB (Pro), CPU 0.5/1.
-3. Expect idle sleep after 30 minutes (Free) or 24 hours; Pro can hold warmth with keep-warm.
-4. Expect Free apps at 100% requests, storage, or egress to pause until reset; stored data is kept.
+2. Run every fleet under the host's memory and CPU caps; there is no per-plan sizing.
+3. Expect idle sleep after about 30 minutes on every plan; on Pro, keep-warm holds selected fleets awake up to the host cap.
+4. Track requests, storage, and egress in usage with no enforced caps; never tell the person an app paused over quota.
 
-For the person-side walkthrough, see [Limits](/deploy/limits).
+For the person-side walkthrough, see [Limits and quotas](/deploy/limits).

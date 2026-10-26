@@ -46,4 +46,4 @@ const add = useForm("/" as string, { intent: "add", text: "" });
 5. Style with daisyUI classes (`card`, `btn`, `input`, `join`, `list`, `badge`, `alert`); reserve Tailwind for layout.
 6. Build island pages as `*.island.tsx` with `with { island: "visible" }` imports and `useIslandForm()`.
 
-For the person-side walkthrough, see [Interactive pages](/frontend/interactive-pages).
+For the person-side walkthrough, see [Add interactive pages](/frontend/interactive-pages).

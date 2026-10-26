@@ -1,11 +1,12 @@
 ---
-title: Moderation
+title: Follow the content rules
 description: What the pre-live gate checks and what happens to live apps.
 ---
 
 Outer shares one domain between the platform and every app, so one bad app can hurt everyone. Every deploy passes a gate before it can serve anything.
 
-## The pre-live gate
+## Pass the pre-live gate
+
 The gate reads what visitors can read: page text, text files, and public
 data strings. It also reads SVG text, SQL strings in migrations and seeds,
 the built HTML, and the slug plus app name.
@@ -16,14 +17,14 @@ the built HTML, and the slug plus app name.
 - Over the review caps (3000 files, 256 KiB each, 8 MiB total) the deploy is blocked as `too_large_to_review`.
 - When the classifier is unavailable, the deploy fails closed and the old version keeps serving.
 
-## After going live
+## Stay clean after going live
 
-Rendered pages are crawled after every deploy. Strong profanity on a rendered page holds the app: it serves a "being fixed" page until a clean deploy or a review. Phishing and severe content suspend it. Ask your agent to route visitor-written text through the template's `moderate()` helper before storing it. Uploaded files are not classified — that is why uploads are Pro-only.
+Outer can re-check rendered pages after each deploy. If review flags your app, an admin can hold or suspend it, and a suspended app stops serving until review clears it. Ask your agent to screen visitor-written text before storing it. Uploaded files are never classified, so keep uploads behind your own checks.
 
-## Appeals
+## Appeal a decision
 
 There is no self-serve appeal during the closed beta: a human appeal goes to the platform owner for review. Ask your agent to relay any `user_message` verbatim instead of inventing a workaround. Agent detail: [Moderation](/agents/security/moderation).
 
 :::note
-Never edit around the gate — fix the cause and commit again. Blocked? See [FAQ](/help/faq); undo with [Rollback](/deploy/rollback).
+Never work around the gate. Fix the cause and ask for another deploy. Blocked? See [FAQ](/help/faq). To undo, [roll back a deploy](/deploy/rollback).
 :::
