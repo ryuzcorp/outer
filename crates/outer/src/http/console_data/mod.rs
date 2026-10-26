@@ -111,6 +111,45 @@ pub(crate) async fn owner_app(
     }
 }
 
+/// Refuse a data-panel write while the hourly sweep holds the app read-only
+/// at its storage cap (spec §3, owner-set 2026-10-26). `None` means
+/// writable. The shape matches `data_error` plus `quota` and `upgrade_url`,
+/// so the UI can offer the same Upgrade button the MCP refusals carry.
+/// Nothing is ever deleted.
+pub(crate) async fn storage_frozen_refusal(
+    mcp: &crate::mcp::McpState,
+    app: &crate::apps::App,
+) -> Option<Response> {
+    let row: Option<(Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT storage_frozen_at, storage_frozen_detail FROM app WHERE id = ?1")
+            .bind(&app.id)
+            .fetch_optional(&mcp.pool)
+            .await
+            .ok()?;
+    let (at, detail) = row?;
+    at?;
+    let detail = detail.unwrap_or_else(|| "over its storage cap".to_string());
+    let plan = crate::mcp::tools::plan_of(&mcp.pool, &app.owner_id)
+        .await
+        .unwrap_or_else(|_| "free".to_string());
+    let upgrade_url = mcp
+        .billing
+        .upgrade_url(&app.owner_id, chrono::Utc::now().timestamp());
+    Some(data_json(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "error": "quota_exceeded",
+            "message": format!("{} storage is read-only: {detail}", app.slug),
+            "user_message": format!(
+                "{} is over its storage cap on your Outer {plan} plan ({detail}), so writes are refused until it drops back under — nothing is deleted. Free space here or upgrade to Pro for bigger caps.",
+                app.slug
+            ),
+            "quota": "storage_bytes",
+            "upgrade_url": upgrade_url,
+        }),
+    ))
+}
+
 /// Session + same-origin + owner check. Foreign or unknown slugs answer 404
 /// exactly like a missing one (spec §8.2); collaborators read 403 (see
 /// [`owner_app`]).

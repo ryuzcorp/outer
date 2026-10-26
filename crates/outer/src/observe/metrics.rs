@@ -72,10 +72,8 @@ use sqlx::SqlitePool;
 pub const FLUSH_EVERY: Duration = Duration::from_secs(10);
 /// Re-run the retention prune at most this often inside the sweep task.
 pub const PRUNE_EVERY: Duration = Duration::from_secs(3600);
-/// Free apps keep metrics this long (spec §3).
-pub const FREE_RETENTION_MS: i64 = 7 * 86_400_000;
-/// Pro apps keep metrics this long (spec §3).
-pub const PRO_RETENTION_MS: i64 = 30 * 86_400_000;
+/// Log retention by plan (spec §3, owner-set 2026-10-26): 24 h Free, 30 d
+/// Pro. The numbers live in [`crate::limits`].
 /// Normalized paths longer than this are truncated (characters).
 pub const MAX_PATH_LEN: usize = 200;
 /// Distinct normalized paths kept per app-hour; the rest fold into `(other)`.
@@ -716,8 +714,8 @@ pub struct FlushStats {
 /// Pro (spec §3). The plan lives on the account that owns the app. Returns
 /// `(metric_minute rows, path_hour rows, visitor_day rows)` deleted.
 pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64, u64)> {
-    let free_cutoff = now_ms - FREE_RETENTION_MS;
-    let pro_cutoff = now_ms - PRO_RETENTION_MS;
+    let free_cutoff = now_ms - crate::limits::FREE_LOG_RETENTION_MS;
+    let pro_cutoff = now_ms - crate::limits::PRO_LOG_RETENTION_MS;
     // Literal statements (sqlx 0.9 rejects dynamic SQL): one per
     // table × plan, all sharing the same account-plan join.
     let mut minutes = 0;

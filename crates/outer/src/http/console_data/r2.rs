@@ -789,6 +789,11 @@ async fn api_put(
         Ok(pair) => pair,
         Err(res) => return res,
     };
+    // Frozen apps refuse uploads at the storage cap; deletes stay allowed
+    // (the escape hatch back under the cap).
+    if let Some(res) = super::storage_frozen_refusal(&state.mcp, &app).await {
+        return res;
+    }
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())

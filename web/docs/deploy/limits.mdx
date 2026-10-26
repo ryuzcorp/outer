@@ -7,16 +7,29 @@ Your agent sees the same numbers through `whoami`, which shows usage and reset d
 
 | Quota | Free | Pro |
 | --- | --- | --- |
-| Apps owned | 1 | 10 |
-| Code changes per day (UTC) | 50 | 500 |
-| Collaborators per app | — | 10 |
+| Apps owned | 2 | 20 |
+| Code changes per day (UTC) | 40 | 1000 (fair use) |
+| Build minutes per day | 30 | 300 |
+| outer.now badge | Small badge, bottom-right of its pages | Removed — clean pages on Pro |
+| Visibility | Unlisted only | Public + indexable |
 | Custom domains per app | — | 1 |
+| Sleep | Sleeps after 15 min idle (cold start on wake) | Keep-warm; without keep-warm, sleeps after 30 min |
+| Collaborators per app | 1 | 10 |
 | Active preview deploys | — | 1 per app |
-| Databases and file buckets per app | 1 D1, 1 R2 | 1 D1, 1 R2 |
-| Logs and metrics kept | 7 days | 30 days |
+| Logs and errors kept | 24 hours | 30 days |
+| Backups | Daily, keep 3 | Daily, keep 30 + any-day restore |
+| Database (D1) | 100 MB | 5 GB |
+| Files (R2) | 250 MB | 25 GB |
+| Requests per month | Soft 100k | Soft 5M |
+| Code export | Yes, everyone (owner only) | Yes |
+| Inactive deletion | After 90 days without activity, with reminders | Never while subscribed |
 
 The template commit that creates your app and a rollback never count as code changes. Code changes charge to the app owner, whoever makes them.
 
 When a quota is hit, the tool returns `quota_exceeded` with an upgrade link and a `user_message`. Ask your agent to relay that message word for word. Code changes reset at midnight UTC, and `whoami` shows your current counts and reset dates.
+
+Storage caps refuse writes at the cap — nothing is ever deleted. Request caps are soft: at 100% you get an email plus an upgrade ask, and the app keeps serving. A live app is never paused over quota.
+
+Downgrade keeps your 2 oldest apps live; the rest stop but are retained for 30 days. Collaborators beyond 1 per app become read-only.
 
 Enforcement detail lives in [Stay inside quotas and caps](/agents/platform/limits).

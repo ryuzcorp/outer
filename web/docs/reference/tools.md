@@ -225,7 +225,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `add_collaborator`
 
 - **Access:** signed in
-- **Description:** Invite a collaborator to your Pro app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; at most 10 collaborators per app.
+- **Description:** Invite a collaborator to your app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; Free 1 collaborator per app, Pro 10.
 
 **Input:**
 
@@ -295,7 +295,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `export_code`
 
 - **Access:** signed in
-- **Description:** Download your app's whole code as a zip (Pro, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.
+- **Description:** Download your app's whole code as a zip (every plan, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.
 
 **Input:**
 
@@ -590,7 +590,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `list_backups`
 
 - **Access:** signed in
-- **Description:** An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30); restore one with restore_backup, download one from Console â†’ D1 â†’ Backups. Owner only.
+- **Description:** An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; newest 3 kept, Pro 30); restore one with restore_backup, download one from Console â†’ D1 â†’ Backups. Owner only.
 
 **Input:**
 

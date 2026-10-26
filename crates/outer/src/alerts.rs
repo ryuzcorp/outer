@@ -34,6 +34,12 @@ pub const KIND_DEPLOY_FAILED: &str = "deploy_failed";
 pub const KIND_ERROR_SPIKE: &str = "error_spike";
 pub const KIND_QUOTA_80: &str = "quota_80";
 pub const KIND_QUOTA_100: &str = "quota_100";
+/// Monthly soft request cap reached (spec §3): one owner email per month,
+/// the app keeps serving.
+pub const KIND_REQUESTS_100: &str = "requests_100";
+/// Storage cap hit (spec §3): the app flipped to read-only. Sent only on
+/// the transition, so the debounce is backstop, not policy.
+pub const KIND_STORAGE_FROZEN: &str = "storage_frozen";
 
 /// Unsubscribe scopes: one alert kind, or everything at once.
 pub const SCOPE_ALL: &str = "all";
@@ -462,6 +468,161 @@ pub async fn notify_quota(ctx: &Ctx<'_>, user_id: &str, used: u64, limit: u64, n
         &subject,
         &body,
         (user_id, kind),
+        now,
+        Some(&unsub),
+    )
+    .await;
+}
+
+/// Email the owner when an account's month requests pass its soft cap (spec
+/// §3, owner-set 2026-10-26: soft 100k Free, soft 5M Pro). One email per
+/// calendar month; the app keeps serving, nothing pauses. Never raises.
+#[allow(clippy::too_many_arguments)]
+pub async fn notify_requests_cap(
+    ctx: &Ctx<'_>,
+    user_id: &str,
+    used: u64,
+    limit: u64,
+    is_pro: bool,
+    upgrade_url: &str,
+    month_start_ms: i64,
+    now: i64,
+) {
+    if limit == 0 {
+        return;
+    }
+    if !match get_prefs(ctx.pool, user_id).await {
+        Ok(prefs) => prefs.quota,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "requests alert prefs lookup failed");
+            return;
+        }
+    } {
+        return;
+    }
+    // One email per calendar month: the window starts at the month's first
+    // millisecond.
+    let window = now.saturating_sub(month_start_ms).max(1);
+    let debounced = match should_send(ctx.pool, user_id, KIND_REQUESTS_100, now, window).await {
+        Ok(debounced) => debounced,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "requests alert debounce lookup failed");
+            return;
+        }
+    };
+    if !debounced {
+        return;
+    }
+    let Some(to) = (match owner_email(ctx.pool, user_id).await {
+        Ok(email) => email,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "requests alert owner lookup failed");
+            return;
+        }
+    }) else {
+        return;
+    };
+    let subject = format!("Outer requests passed {limit} this month");
+    let line = if is_pro {
+        format!(
+            "Your apps served {used} requests this month (soft cap {limit}). Everything keeps serving."
+        )
+    } else {
+        format!(
+            "Your apps served {used} requests this month (soft cap {limit}). Everything keeps serving — upgrade to Pro for a 5M soft cap: {upgrade_url}"
+        )
+    };
+    let unsub = unsubscribe_url(ctx.issuer, &sign_unsubscribe(ctx.key, user_id, "quota"));
+    let body = format!(
+        "{line}\n\n\
+         See your usage:\n{console}\n\n\
+         ---\n\
+         You get this because quota alerts are on for your account.\n\
+         Turn off quota emails:\n{unsub}\n\
+         Manage all email alerts:\n{manage}\n",
+        console = console_url(ctx.issuer, "usage"),
+        manage = console_url(ctx.issuer, "account"),
+    );
+    send_alert(
+        ctx,
+        &to,
+        &subject,
+        &body,
+        (user_id, KIND_REQUESTS_100),
+        now,
+        Some(&unsub),
+    )
+    .await;
+}
+
+/// Email the owner when an app flips to storage read-only at its D1/R2 cap
+/// (spec §3). Sent only on the transition (the sweep calls this after a
+/// successful [`crate::limits::freeze_storage`] flip); the debounce is a
+/// backstop. Never raises. Nothing is ever deleted: the owner frees space
+/// or upgrades.
+pub async fn notify_storage_frozen(
+    ctx: &Ctx<'_>,
+    user_id: &str,
+    slug: &str,
+    detail: &str,
+    upgrade_url: &str,
+    now: i64,
+) {
+    if !match get_prefs(ctx.pool, user_id).await {
+        Ok(prefs) => prefs.quota,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "storage alert prefs lookup failed");
+            return;
+        }
+    } {
+        return;
+    }
+    let debounced = match should_send(
+        ctx.pool,
+        user_id,
+        KIND_STORAGE_FROZEN,
+        now,
+        QUOTA_DEBOUNCE_MS,
+    )
+    .await
+    {
+        Ok(debounced) => debounced,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "storage alert debounce lookup failed");
+            return;
+        }
+    };
+    if !debounced {
+        return;
+    }
+    let Some(to) = (match owner_email(ctx.pool, user_id).await {
+        Ok(email) => email,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "storage alert owner lookup failed");
+            return;
+        }
+    }) else {
+        return;
+    };
+    let subject = format!("Outer storage full: {slug} is read-only");
+    let unsub = unsubscribe_url(ctx.issuer, &sign_unsubscribe(ctx.key, user_id, "quota"));
+    let body = format!(
+        "{slug} passed its storage cap ({detail}), so its data is read-only until it drops back under: writes are refused, nothing is deleted.\n\n\
+         Free space (Console → D1 / R2) or upgrade to Pro for bigger caps: {upgrade_url}\n\n\
+         See your usage:\n{console}\n\n\
+         ---\n\
+         You get this because quota alerts are on for your account.\n\
+         Turn off quota emails:\n{unsub}\n\
+         Manage all email alerts:\n{manage}\n",
+        console = console_url(ctx.issuer, "usage"),
+        manage = console_url(ctx.issuer, "account"),
+    );
+    send_alert(
+        ctx,
+        &to,
+        &subject,
+        &body,
+        (user_id, KIND_STORAGE_FROZEN),
         now,
         Some(&unsub),
     )
@@ -1253,5 +1414,94 @@ mod tests {
         .unwrap();
         assert!(!next.quota && next.deploy_failed && next.error_spike);
         assert_eq!(get_prefs(&pool, "u1").await.unwrap(), next);
+    }
+
+    #[tokio::test]
+    async fn requests_cap_emails_once_per_month_free_asks_upgrade() {
+        let pool = test_pool().await;
+        let (config, codes) = test_config();
+        seed_user(&pool, "u1", "owner@example.com").await;
+        let issuer = "http://outer.localhost:8080";
+        let ctx = ctx(&pool, &config.email, issuer);
+        let month_start = 1_700_000_000_000i64;
+        // At the cap: one Free email with the upgrade ask.
+        notify_requests_cap(
+            &ctx,
+            "u1",
+            100_000,
+            100_000,
+            false,
+            "https://upgrade",
+            month_start,
+            month_start + 1,
+        )
+        .await;
+        let first = sent_to(&codes, "owner@example.com").expect("soft cap emails once");
+        assert!(first.contains("100000"), "{first}");
+        assert!(first.contains("https://upgrade"), "{first}");
+        // Same month: debounced, no second send.
+        notify_requests_cap(
+            &ctx,
+            "u1",
+            120_000,
+            100_000,
+            false,
+            "https://upgrade",
+            month_start,
+            month_start + 2,
+        )
+        .await;
+        let sends: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM alert_send WHERE kind = 'requests_100'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sends, 1, "one email per month, the app keeps serving");
+        // Next month: the window resets, the mail goes again.
+        let next_month = month_start + 31 * 86_400_000;
+        notify_requests_cap(
+            &ctx,
+            "u1",
+            100_001,
+            100_000,
+            false,
+            "https://upgrade",
+            next_month,
+            next_month + 1,
+        )
+        .await;
+        let sends: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM alert_send WHERE kind = 'requests_100'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sends, 2);
+    }
+
+    #[tokio::test]
+    async fn requests_cap_pro_has_no_upgrade_ask() {
+        let pool = test_pool().await;
+        let (config, codes) = test_config();
+        seed_user(&pool, "u1", "owner@example.com").await;
+        let issuer = "http://outer.localhost:8080";
+        let ctx = ctx(&pool, &config.email, issuer);
+        let month_start = 1_700_000_000_000i64;
+        notify_requests_cap(
+            &ctx,
+            "u1",
+            5_000_000,
+            5_000_000,
+            true,
+            "https://upgrade",
+            month_start,
+            month_start + 1,
+        )
+        .await;
+        let mail = sent_to(&codes, "owner@example.com").expect("pro soft cap emails too");
+        assert!(
+            mail.contains("keeps serving") || mail.contains("Everything keeps serving"),
+            "{mail}"
+        );
+        assert!(!mail.contains("https://upgrade"), "{mail}");
     }
 }

@@ -65,30 +65,24 @@ pub async fn add_collaborator(
                 "collaborator": collaborator_json(&collaborator),
             }),
         )),
-        Err(AddError::NotPro) => Err(super::with_upgrade(
-            ToolError::payment_required(
-                format!("collaborators on {} need a Pro owner", app.slug),
-                "Collaborators are a Pro feature. Upgrade to Pro to invite people to your apps.",
-            ),
-            &ctx.state.billing,
-            &app.owner_id,
-        )),
-        Err(AddError::LimitReached) => Err(super::with_upgrade(
+        Err(AddError::LimitReached { limit }) => Err(super::with_upgrade(
             ToolError::quota_exceeded(
-                format!(
-                    "app quota: {} collaborators allowed, {} on {}",
-                    collaborators::MAX_COLLABORATORS,
-                    collaborators::MAX_COLLABORATORS,
-                    app.slug
-                ),
-                format!(
-                    "{} already has the maximum {} collaborators.",
-                    app.slug,
-                    collaborators::MAX_COLLABORATORS
-                ),
+                format!("app quota: {limit} collaborator(s) allowed on {}", app.slug),
+                if limit == crate::limits::FREE_COLLABORATORS {
+                    format!(
+                        "{} already has its Free collaborator. Upgrade to Pro for up to {} per app.",
+                        app.slug,
+                        crate::limits::PRO_COLLABORATORS
+                    )
+                } else {
+                    format!(
+                        "{} already has the maximum {} collaborators.",
+                        app.slug, limit
+                    )
+                },
                 "collaborators",
-                collaborators::MAX_COLLABORATORS,
-                collaborators::MAX_COLLABORATORS,
+                limit,
+                limit,
                 None,
             ),
             &ctx.state.billing,

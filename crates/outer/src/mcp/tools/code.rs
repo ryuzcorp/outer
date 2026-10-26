@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    authed, check_rev, claim_change, internal, ok, ok_deploy, ok_untrusted, refund_change,
-    run_deploy, visible_app, Ctx,
+    authed, check_build_quota, check_rev, check_storage_writable, claim_change, internal, ok,
+    ok_deploy, ok_untrusted, refund_change, run_deploy, visible_app, Ctx,
 };
 use crate::apps::App;
 use crate::git::{self, CommitError};
@@ -651,8 +651,12 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     // Claimed before the git work: a commit that never happens (bad base,
     // moved head) gives the change back; a created commit counts even when
     // its deploy fails or is blocked.
+    // A refused build spends nothing: the build-minutes check runs before
+    // the change claim, so a capped account keeps its code changes.
     // Charged to the app owner whoever calls (spec §3): a collaborator's
     // commit counts against the owner's daily changes.
+    check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
+    check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await?;
     let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     let outcome = match git::commit::commit_with_outcome(
         &ctx.state.store,
@@ -748,6 +752,8 @@ async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, T
             ));
         }
     }
+    check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
+    check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await?;
     let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     let outcome = match git::commit::commit_preview(
         &ctx.state.store,
@@ -1019,6 +1025,21 @@ pub async fn rollback_to(
     // work: a refused or redundant rollback costs nothing, and a rollback
     // whose commit never happens gives the claim back.
     super::claim_rollback(&state.pool, &app.id).await?;
+    // A refused build spends nothing: the rollback budget is refunded, so a
+    // capped account can still roll back after midnight.
+    if let Err(err) = super::check_build_quota(&state.pool, &state.billing, &app.owner_id).await {
+        if let Err(refund) = super::refund_rollback(&state.pool, &app.id).await {
+            tracing::warn!("rollback refund failed: {refund:#}");
+        }
+        return Err(err);
+    }
+    // A frozen app refuses the write like a capped build does: same refund.
+    if let Err(err) = super::check_storage_writable(&state.pool, &state.billing, app).await {
+        if let Err(refund) = super::refund_rollback(&state.pool, &app.id).await {
+            tracing::warn!("rollback refund failed: {refund:#}");
+        }
+        return Err(err);
+    }
     let author = noreply_author(account_id, email, &state.domain);
     let sha = match git::commit::rollback(
         &state.store,

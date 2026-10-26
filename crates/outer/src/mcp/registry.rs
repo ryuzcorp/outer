@@ -268,7 +268,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<collab_inputs::AddCollaboratorInput>(
             "add_collaborator",
-            "Invite a collaborator to your Pro app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; at most 10 collaborators per app.",
+            "Invite a collaborator to your app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; Free 1 collaborator per app, Pro 10.",
             Account, false,
         ),
         tool::<collab_inputs::RemoveCollaboratorInput>(
@@ -298,7 +298,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<export_inputs::ExportCodeInput>(
             "export_code",
-            "Download your app's whole code as a zip (Pro, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.",
+            "Download your app's whole code as a zip (every plan, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.",
             Account, false,
         ),
         tool::<open_app_inputs::OpenAppInput>(
@@ -408,7 +408,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<backup_inputs::ListBackupsInput>(
             "list_backups",
-            "An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.",
+            "An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; newest 3 kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.",
             Account, false,
         ),
         tool::<backup_inputs::BackupDatabaseInput>(

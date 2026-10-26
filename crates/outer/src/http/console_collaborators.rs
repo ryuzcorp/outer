@@ -188,28 +188,22 @@ async fn api_invite(
                 "collaborator": collaborator_json(&collaborator),
             }))
         }
-        Err(AddError::NotPro) => nostore_json_refusal(
-            StatusCode::PAYMENT_REQUIRED,
-            "payment_required",
-            format!("collaborators on {} need a Pro owner", app.slug),
-            "Collaborators are a Pro feature. Upgrade to Pro to invite people to your apps.",
-            mcp.billing
-                .upgrade_url(&app.owner_id, chrono::Utc::now().timestamp()),
-        ),
-        Err(AddError::LimitReached) => nostore_json_refusal(
+        Err(AddError::LimitReached { limit }) => nostore_json_refusal(
             StatusCode::TOO_MANY_REQUESTS,
             "quota_exceeded",
-            format!(
-                "app quota: {} collaborators allowed, {} on {}",
-                collaborators::MAX_COLLABORATORS,
-                collaborators::MAX_COLLABORATORS,
-                app.slug
-            ),
-            format!(
-                "{} already has the maximum {} collaborators.",
-                app.slug,
-                collaborators::MAX_COLLABORATORS
-            ),
+            format!("app quota: {limit} collaborator(s) allowed on {}", app.slug),
+            if limit == crate::limits::FREE_COLLABORATORS {
+                format!(
+                    "{} already has its Free collaborator. Upgrade to Pro for up to {} per app.",
+                    app.slug,
+                    crate::limits::PRO_COLLABORATORS
+                )
+            } else {
+                format!(
+                    "{} already has the maximum {} collaborators.",
+                    app.slug, limit
+                )
+            },
             mcp.billing
                 .upgrade_url(&app.owner_id, chrono::Utc::now().timestamp()),
         ),

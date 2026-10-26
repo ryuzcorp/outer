@@ -143,7 +143,7 @@ export const BackupsPanel = ({
     <div class="flex min-h-0 flex-col gap-3 p-4">
       <div class="flex flex-wrap items-center gap-2">
         <p class="m-0 text-sm opacity-60">
-          Daily dumps for active apps (a request or deploy in the last 24 h), kept 7 days (Pro: 30 days). Downloads are full .sql restores.
+          Daily dumps for active apps (a request or deploy in the last 24 h), newest 3 kept (Pro: 30, any day restorable). Downloads are full .sql restores.
         </p>
         {canWrite ? (
           <button

@@ -667,14 +667,21 @@ async fn api_rename(
     // the change, so a failed redeploy still answers success for the rename
     // itself (the deploy has its own rows and the previous version serves).
     let deploy_status = match out.redeploy_sha {
-        Some(sha) => match run_deploy(mcp, &out.app, &sha, true).await {
-            Ok(deploy) => deploy
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("building")
-                .to_string(),
-            Err(_) => "failed".to_string(),
-        },
+        Some(sha)
+            if crate::mcp::tools::check_build_quota(&mcp.pool, &mcp.billing, &out.app.owner_id)
+                .await
+                .is_ok() =>
+        {
+            match run_deploy(mcp, &out.app, &sha, true).await {
+                Ok(deploy) => deploy
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("building")
+                    .to_string(),
+                Err(_) => "failed".to_string(),
+            }
+        }
+        Some(_) => "quota_exceeded".to_string(),
         None => "ok".to_string(),
     };
     audit(&summary_for(&slug, &out.app.slug), &deploy_status, None).await;

@@ -60,7 +60,7 @@ const addCollaborator: ConsoleAction<AddCollaboratorInput, AddCollaboratorOutput
   name: "add_collaborator",
   title: "Invite collaborator",
   description:
-    "Invite a collaborator to a Pro app by email. The address joins the closed beta and gets an invite email. Owner only; at most 10 collaborators per app.",
+    "Invite a collaborator to an app by email. The address joins the closed beta and gets an invite email. Owner only; Free 1 collaborator per app, Pro 10.",
   inputSchema: emailSchema,
   readOnly: false,
   consequential: true,

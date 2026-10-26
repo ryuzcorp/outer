@@ -1654,6 +1654,13 @@ async fn api_write(
         Ok(app) => app,
         Err(res) => return *res,
     };
+    // Frozen apps stay writable only for deletes (the escape hatch back
+    // under the cap): inserts and updates are refused at the storage cap.
+    if !matches!(body.op, D1WriteOp::Delete) {
+        if let Some(res) = super::storage_frozen_refusal(mcp, &app).await {
+            return res;
+        }
+    }
     let ctx = D1Ctx::from_state(&state);
     let outcome = write_row(&ctx, &app, &binding, &table, &body).await;
     let op = match body.op {

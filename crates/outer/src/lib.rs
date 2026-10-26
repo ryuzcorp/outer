@@ -20,6 +20,7 @@ pub mod deploy;
 pub mod fleet;
 pub mod git;
 pub mod http;
+pub mod limits;
 pub mod look_tokens;
 pub mod mcp;
 pub mod moderation;

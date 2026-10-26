@@ -209,20 +209,11 @@ pub async fn plan_of(pool: &sqlx::SqlitePool, account_id: &str) -> Result<String
     Ok(plan.unwrap_or_else(|| "free".to_string()))
 }
 
-pub const FREE_CHANGES_PER_DAY: u64 = 50;
-pub const PRO_CHANGES_PER_DAY: u64 = 500;
+pub use crate::limits::{FREE_CHANGES_PER_DAY, PRO_CHANGES_PER_DAY};
 
-pub fn app_limit(plan: &str) -> u64 {
-    crate::apps::app_limit_for_plan(plan)
-}
+pub use crate::limits::change_limit;
 
-pub fn change_limit(plan: &str) -> u64 {
-    if plan == "pro" {
-        PRO_CHANGES_PER_DAY
-    } else {
-        FREE_CHANGES_PER_DAY
-    }
-}
+pub use crate::limits::app_limit;
 
 /// How many code changes `account_id` has used today (UTC).
 pub async fn changes_used_today(
@@ -309,6 +300,97 @@ pub async fn refund_change(pool: &sqlx::SqlitePool, account_id: &str) -> anyhow:
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Refuse a new build when the owner's daily build minutes are spent (spec
+/// §3, owner-set 2026-10-26: Free 30 min, Pro 300 min a day). The check runs
+/// before the git work, next to [`claim_change`]; a build in flight always
+/// finishes, and the pipeline charges its install+build wall time after.
+/// `billing` supplies the `upgrade_url` the refusal carries (Free only in
+/// practice: Pro names the limit and the reset).
+pub async fn check_build_quota(
+    pool: &sqlx::SqlitePool,
+    billing: &crate::billing::BillingState,
+    account_id: &str,
+) -> Result<(u64, u64), ToolError> {
+    let plan = plan_of(pool, account_id).await?;
+    let limit_min = crate::limits::build_minutes_limit(&plan);
+    let used_ms = crate::limits::build_ms_used_today(pool, account_id)
+        .await
+        .map_err(internal)?;
+    let limit_ms = crate::limits::build_ms_limit(&plan);
+    if used_ms >= limit_ms {
+        let used_min = used_ms / 60_000;
+        let resets_at = resets_at_utc();
+        let url = billing.upgrade_url(account_id, chrono::Utc::now().timestamp());
+        return Err(with_upgrade(
+            ToolError::quota_exceeded(
+                format!("{plan} plan: {limit_min} build minutes per day, {used_min} used"),
+                if plan == "pro" {
+                    format!(
+                        "You've used today's {limit_min} build minutes. They reset at midnight UTC."
+                    )
+                } else {
+                    format!(
+                        "You've used today's {limit_min} build minutes on your Outer Free plan. They reset at midnight UTC, or upgrade to Pro for {pro} a day: {url}",
+                        pro = crate::limits::PRO_BUILD_MINUTES_PER_DAY,
+                    )
+                },
+                "build_minutes_per_day",
+                limit_min,
+                used_min,
+                Some(&resets_at),
+            ),
+            billing,
+            account_id,
+        ));
+    }
+    Ok((used_ms, limit_ms))
+}
+
+/// Refuse a write when the app is frozen read-only at its storage cap
+/// (spec §3). The hourly sweep flips the flag (and emails the owner); the
+/// Console, commit and upload paths refuse while it is set. Nothing is
+/// ever deleted. `billing` supplies the `upgrade_url` the refusal carries.
+pub async fn check_storage_writable(
+    pool: &sqlx::SqlitePool,
+    billing: &crate::billing::BillingState,
+    app: &crate::apps::App,
+) -> Result<(), ToolError> {
+    let row: Option<(Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT storage_frozen_at, storage_frozen_detail FROM app WHERE id = ?1")
+            .bind(&app.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
+    let (frozen, detail) = match row {
+        Some((at, detail)) if at.is_some() => (
+            true,
+            detail.unwrap_or_else(|| "over its storage cap".to_string()),
+        ),
+        _ => (false, String::new()),
+    };
+    if !frozen {
+        return Ok(());
+    }
+    let plan = plan_of(pool, &app.owner_id).await?;
+    let url = billing.upgrade_url(&app.owner_id, chrono::Utc::now().timestamp());
+    let cap = crate::limits::d1_cap_bytes(&plan) + crate::limits::r2_cap_bytes(&plan);
+    Err(with_upgrade(
+        ToolError::quota_exceeded(
+            format!("{} storage is read-only: {detail}", app.slug),
+            format!(
+                "{} is over its storage cap on your Outer {plan} plan ({detail}), so writes are refused until it drops back under — nothing is deleted. Free space in Console → D1 / R2, or upgrade to Pro for bigger caps: {url}",
+                app.slug
+            ),
+            "storage_bytes",
+            cap,
+            cap,
+            None,
+        ),
+        billing,
+        &app.owner_id,
+    ))
 }
 
 /// Quota threshold emails (alerts #2): the claim counted even when the

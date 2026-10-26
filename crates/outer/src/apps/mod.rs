@@ -180,14 +180,12 @@ pub struct Allocation {
     pub port_range: (u16, u16),
 }
 
-/// App slots per plan (spec §3): Free owns 1 app, Pro 10. Enforced in
-/// [`create`]; the MCP layer's early check uses the same numbers.
+/// App slots per plan (spec §3, owner-set 2026-10-26: Free 2, Pro 20).
+/// Enforced in [`create`]; the MCP layer's early check uses the same number.
+/// The number lives in [`crate::limits`]; this stays as the thin redirect so
+/// existing call sites keep reading `apps::app_limit_for_plan`.
 pub fn app_limit_for_plan(plan: &str) -> u64 {
-    if plan == "pro" {
-        10
-    } else {
-        1
-    }
+    crate::limits::app_limit(plan)
 }
 
 /// Why [`create`] refused the app. Each message tells the agent what to change.

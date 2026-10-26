@@ -73,7 +73,7 @@ pub async fn about(_input: NoArgs, _ctx: &Ctx<'_>) -> Result<Value, ToolError> {
             "create_app, then commit (prefer edits). Every code tool waits for the deploy.",
             "Relay user_message to your human verbatim.",
         ],
-        "plans": "Free: 1 app, 50 code changes/day. Pro ($8/month): 10 apps, 500/day. See docs {topic: \"limits\"}.",
+        "plans": "Free: 2 apps, 40 code changes and 30 build minutes/day. Pro ($8/month): 20 apps, 1,000 changes and 300 build minutes/day. See docs {topic: \"limits\"}.",
     });
     Ok(ok(
         "Outer hosts Ilha apps at https://<slug>.outer.now. Sign in with OAuth or sign_in/verify_code, create_app, then commit. Relay any user_message verbatim.",
@@ -139,24 +139,48 @@ pub async fn verify_code(input: VerifyCodeInput, ctx: &Ctx<'_>) -> Result<Value,
 struct Usage {
     apps_owned: u64,
     code_changes_today: u64,
+    build_minutes_today: u64,
+    requests_month: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct Limits {
     apps_owned_max: u64,
     code_changes_per_day: u64,
+    build_minutes_per_day: u64,
+    requests_per_month: u64,
+    collaborators_per_app: u64,
+    d1_bytes_max: u64,
+    r2_bytes_max: u64,
 }
 
 pub async fn whoami(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let caller = authed(ctx)?;
     let plan = plan_of(&ctx.state.pool, &caller.account_id).await?;
+    let build_ms = crate::limits::build_ms_used_today(&ctx.state.pool, &caller.account_id)
+        .await
+        .map_err(internal)?;
+    let month: Option<i64> =
+        sqlx::query_scalar("SELECT requests FROM usage_month WHERE userId = ?1 AND month = ?2")
+            .bind(&caller.account_id)
+            .bind(crate::accounts::month_utc())
+            .fetch_optional(&ctx.state.pool)
+            .await
+            .map_err(internal)?;
     let usage = Usage {
         apps_owned: apps_owned(&ctx.state.pool, &caller.account_id).await?,
         code_changes_today: changes_used_today(&ctx.state.pool, &caller.account_id).await?,
+        build_minutes_today: build_ms / 60_000,
+        requests_month: month.unwrap_or(0).max(0) as u64,
     };
     let limits = Limits {
         apps_owned_max: app_limit(&plan),
         code_changes_per_day: change_limit(&plan),
+        build_minutes_per_day: crate::limits::build_minutes_limit(&plan),
+        requests_per_month: crate::limits::requests_cap(&plan),
+        collaborators_per_app: crate::limits::collaborator_limit(&plan),
+        d1_bytes_max: crate::limits::d1_cap_bytes(&plan),
+        r2_bytes_max: crate::limits::r2_cap_bytes(&plan),
     };
     Ok(ok(
         format!("{} on the {} plan.", caller.email, plan),

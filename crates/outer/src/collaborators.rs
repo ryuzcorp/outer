@@ -1,4 +1,5 @@
-//! Collaborators (Pro, spec §7.4): up to 10 extra emails per app.
+//! Collaborators (spec §7.4, plan table owner-set 2026-10-26): Free 1 per
+//! app, Pro 10.
 //!
 //! The owner (the account that created the app) invites by email. The invite
 //! allowlists the email during the closed beta and emails it the spec
@@ -6,16 +7,14 @@
 //! an account). Removal revokes access immediately but keeps nothing else:
 //! the row is gone, so the next call answers `not_found` again.
 //!
-//! A collaborator's access lives only while the owner's plan is Pro: on
-//! downgrade the rows stay (and come back on upgrade) but grant nothing
-//! (spec §7.4). Everything a collaborator does counts against the owner's
-//! plan (spec §3), so quota checks take the owner's id.
+//! Collaborator access follows the owner's plan: on downgrade the rows stay
+//! and the oldest collaborator keeps access (Free allows one); the rest
+//! grant nothing until re-upgrade (spec §3). Everything a collaborator does
+//! counts against the owner's plan (spec §3), so quota checks take the
+//! owner's id.
 
 use crate::apps::App;
 use crate::auth::{normalize_email, EmailSender};
-
-/// Collaborators per app (spec §3): Pro owners may invite this many.
-pub const MAX_COLLABORATORS: u64 = 10;
 
 /// What the caller may do with an app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +32,9 @@ pub enum AddError {
     /// The owner invited themselves.
     #[error("that address already owns the app")]
     SelfInvite,
-    /// Only Pro owners may invite (spec §7.4).
-    #[error("collaborators are a Pro feature")]
-    NotPro,
-    /// The app already has [`MAX_COLLABORATORS`] collaborators.
-    #[error("this app already has {MAX_COLLABORATORS} collaborators")]
-    LimitReached,
+    /// The owner's plan allows no more (`limit` per app: Free 1, Pro 10).
+    #[error("this app already has its {limit} collaborator(s)")]
+    LimitReached { limit: u64 },
     /// The address is already on the list (joined or pending).
     #[error("that address is already a collaborator")]
     Duplicate,
@@ -57,8 +53,9 @@ pub struct Collaborator {
 
 /// The caller's [`Role`] on the app, or `None` when the slug should read as
 /// missing (spec §8.2: a slug the caller has no role on answers `not_found`,
-/// exactly like a missing one). Collaborators only count while the owner's
-/// plan is Pro (downgrade revokes access, keeps the rows).
+/// exactly like a missing one). Access follows the owner's plan: Pro grants
+/// every row; Free grants only the oldest collaborator (the Free allowance
+/// is one per app), so a downgrade pauses the rest without deleting them.
 pub async fn role(
     pool: &sqlx::SqlitePool,
     app_id: &str,
@@ -82,10 +79,20 @@ pub async fn role(
         return Ok(None);
     };
     if owner_plan(pool, owner_id).await? == "pro" {
-        Ok(Some(Role::Collaborator))
-    } else {
-        Ok(None)
+        return Ok(Some(Role::Collaborator));
     }
+    // Free: only the oldest row keeps access.
+    let oldest: Option<String> = sqlx::query_scalar(
+        "SELECT email FROM app_collaborator WHERE app_id = ?1 ORDER BY added_at ASC LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(if oldest.as_deref() == Some(email.as_str()) {
+        Some(Role::Collaborator)
+    } else {
+        None
+    })
 }
 
 /// The app's collaborators, oldest first.
@@ -114,9 +121,9 @@ pub async fn list(pool: &sqlx::SqlitePool, app_id: &str) -> anyhow::Result<Vec<C
         .collect())
 }
 
-/// Invite `raw_email` to `app`: Pro-owner check, the cap, the insert (linking
-/// `userId` when the address already has an account), the closed-beta
-/// allowlist, and the spec-worded email. Returns the stored row.
+/// Invite `raw_email` to `app`: the owner's plan cap (Free 1, Pro 10), the
+/// insert (linking `userId` when the address already has an account), the
+/// closed-beta allowlist, and the spec-worded email. Returns the stored row.
 pub async fn add(
     pool: &sqlx::SqlitePool,
     sender: &EmailSender,
@@ -132,21 +139,18 @@ pub async fn add(
     if email == normalize_email(owner_email) {
         return Err(AddError::SelfInvite);
     }
-    if owner_plan(pool, &app.owner_id)
+    let plan = owner_plan(pool, &app.owner_id)
         .await
-        .map_err(AddError::Internal)?
-        != "pro"
-    {
-        return Err(AddError::NotPro);
-    }
+        .map_err(AddError::Internal)?;
+    let limit = crate::limits::collaborator_limit(&plan);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_collaborator WHERE app_id = ?1")
         .bind(&app.id)
         .fetch_optional(pool)
         .await
         .map_err(|err| AddError::Internal(err.into()))?
         .unwrap_or(0);
-    if count.max(0) as u64 >= MAX_COLLABORATORS {
-        return Err(AddError::LimitReached);
+    if count.max(0) as u64 >= limit {
+        return Err(AddError::LimitReached { limit });
     }
     // An existing account links immediately; a future sign-in links through
     // [`link_user`].

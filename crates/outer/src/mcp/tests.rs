@@ -698,24 +698,30 @@ async fn open_app_unknown_sha_and_changed_since_are_not_found() {
 }
 
 #[tokio::test]
-async fn free_plan_caps_apps_at_one() {
+async fn free_plan_caps_apps_at_two() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &token, "one").await;
-    let (_, second) = call(&state, Some(&token), "create_app", json!({"slug": "two"})).await;
-    let err = is_error(&second);
+    create_app(&state, &token, "two").await;
+    let (_, third) = call(&state, Some(&token), "create_app", json!({"slug": "three"})).await;
+    let err = is_error(&third);
     assert_eq!(err["error"], "quota_exceeded");
     assert_eq!(err["quota"], "apps_owned");
-    assert_eq!(err["limit"], 1);
+    assert_eq!(err["limit"], 2);
     assert!(err["user_message"]
         .as_str()
         .unwrap()
-        .contains("all 1 app slot on your Outer free plan"));
+        .contains("all 2 app slots on your Outer free plan"));
 
     let (_, who) = call(&state, Some(&token), "whoami", json!({})).await;
     let who = &result(&who)["structuredContent"];
     assert_eq!(who["plan"], "free");
-    assert_eq!(who["usage"]["apps_owned"], 1);
+    assert_eq!(who["usage"]["apps_owned"], 2);
+    assert_eq!(who["limits"]["apps_owned_max"], 2);
+    assert_eq!(who["limits"]["code_changes_per_day"], 40);
+    assert_eq!(who["limits"]["build_minutes_per_day"], 30);
+    assert_eq!(who["limits"]["requests_per_month"], 100_000);
+    assert_eq!(who["limits"]["collaborators_per_app"], 1);
     assert!(who["resets_at"].as_str().unwrap().ends_with('Z'));
 }
 
@@ -891,36 +897,159 @@ async fn free_plan_caps_changes_per_day() {
     let account_id = crate::apps::ensure_account(&state.pool, "ana@example.com")
         .await
         .unwrap();
-    sqlx::query("INSERT INTO usage_day (userId, day, code_changes) VALUES (?1, date('now'), 49)")
+    sqlx::query("INSERT INTO usage_day (userId, day, code_changes) VALUES (?1, date('now'), 39)")
         .bind(&account_id)
         .execute(&state.pool)
         .await
         .unwrap();
 
-    let (_, fiftieth) = call(
+    let (_, fortieth) = call(
         &state,
         Some(&token),
         "commit",
-        json!({"app": "groceries", "message": "fifty",
+        json!({"app": "groceries", "message": "forty",
                "writes": [{"path": "n.txt", "content": "n"}]}),
     )
     .await;
-    assert!(result(&fiftieth).get("isError").is_none());
+    assert!(result(&fortieth).get("isError").is_none());
 
     let (_, over) = call(
         &state,
         Some(&token),
         "commit",
-        json!({"app": "groceries", "message": "fifty-one",
+        json!({"app": "groceries", "message": "forty-one",
                "writes": [{"path": "m.txt", "content": "m"}]}),
     )
     .await;
     let err = is_error(&over);
     assert_eq!(err["error"], "quota_exceeded");
     assert_eq!(err["quota"], "code_changes_per_day");
-    assert_eq!(err["limit"], 50);
-    assert_eq!(err["used"], 50);
+    assert_eq!(err["limit"], 40);
+    assert_eq!(err["used"], 40);
     assert!(err["resets_at"].as_str().unwrap().ends_with('Z'));
+}
+
+#[tokio::test]
+async fn build_minutes_cap_refuses_a_new_build() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let account_id = crate::apps::ensure_account(&state.pool, "ana@example.com")
+        .await
+        .unwrap();
+    // The full 30 Free minutes are burned: a new build refuses before any
+    // git work, spending no code change.
+    sqlx::query("INSERT INTO usage_day (userId, day, build_ms) VALUES (?1, date('now'), 1800000)")
+        .bind(&account_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, over) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "too late",
+               "writes": [{"path": "late.txt", "content": "late"}]}),
+    )
+    .await;
+    let err = is_error(&over);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "build_minutes_per_day");
+    assert_eq!(err["limit"], 30);
+    assert_eq!(err["used"], 30);
+    assert!(err["resets_at"].as_str().unwrap().ends_with('Z'));
+    assert!(err["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("upgrade to Pro"));
+    let changes: i64 = sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
+        .bind(&account_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(changes, 0, "a refused build spends no code change");
+}
+
+#[tokio::test]
+async fn frozen_storage_refuses_commit_until_back_under_cap() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let app_id: String = sqlx::query_scalar("SELECT id FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE app SET storage_frozen_at = 1, storage_frozen_detail = 'D1 120 MB over the 100 MB cap' WHERE id = ?1",
+    )
+    .bind(&app_id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (_, over) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "frozen",
+               "writes": [{"path": "ice.txt", "content": "ice"}]}),
+    )
+    .await;
+    let err = is_error(&over);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "storage_bytes");
+    assert!(
+        err["message"].as_str().unwrap().contains("read-only"),
+        "{err}"
+    );
+    assert!(err["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("nothing is deleted"));
+}
+
+#[tokio::test]
+async fn downgrade_keeps_oldest_collaborator_only() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    invite(&state, &owner, "groceries", "cara@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let cara = api_key_for(&state, "cara@example.com").await;
+    for key in [&bruno, &cara] {
+        let (_, apps) = call(&state, Some(key), "list_apps", json!({})).await;
+        assert_eq!(
+            result(&apps)["structuredContent"]["apps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "both collaborators see the app while the owner is Pro"
+        );
+    }
+    // Downgrade: the oldest collaborator keeps access, the second pauses
+    // (no rows deleted).
+    set_plan(&state, "ana@example.com", "free").await;
+    let (_, apps) = call(&state, Some(&bruno), "list_apps", json!({})).await;
+    assert_eq!(
+        result(&apps)["structuredContent"]["apps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, apps) = call(&state, Some(&cara), "list_apps", json!({})).await;
+    assert!(
+        result(&apps)["structuredContent"]["apps"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the second collaborator loses access on Free"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_collaborator")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2, "downgrade pauses access, never deletes rows");
 }
 
 #[tokio::test]
@@ -1374,8 +1503,10 @@ async fn app_errors_groups_scope_and_shape() {
 async fn concurrent_creates_race_app_quota() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
-    // Both calls pass the early quota check at 0 owned apps; the in-lock
-    // recheck in `apps::create` lets exactly one through.
+    // Free allows 2: one app already owned, so both calls pass the early
+    // quota check at 1 owned app; the in-lock recheck in `apps::create`
+    // lets exactly one through.
+    create_app(&state, &token, "pre").await;
     let (a, b) = tokio::join!(
         call(&state, Some(&token), "create_app", json!({"slug": "aa"})),
         call(&state, Some(&token), "create_app", json!({"slug": "bb"})),
@@ -1396,7 +1527,7 @@ async fn concurrent_creates_race_app_quota() {
     );
     assert_eq!(loser["result"]["structuredContent"]["quota"], "apps_owned");
     let (_, who) = call(&state, Some(&token), "whoami", json!({})).await;
-    assert_eq!(result(&who)["structuredContent"]["usage"]["apps_owned"], 1);
+    assert_eq!(result(&who)["structuredContent"]["usage"]["apps_owned"], 2);
 }
 
 #[tokio::test]
@@ -1441,8 +1572,8 @@ async fn commit_quota_claim_is_atomic_and_refunded() {
     .await;
     assert_eq!(is_error(&unknown)["error"], "conflict");
     assert_eq!(used(&state, &account_id).await, 10);
-    // Racing at the boundary: exactly one claim fits under 50.
-    sqlx::query("UPDATE usage_day SET code_changes = 49 WHERE userId = ?1")
+    // Racing at the boundary: exactly one claim fits under 40.
+    sqlx::query("UPDATE usage_day SET code_changes = 39 WHERE userId = ?1")
         .bind(&account_id)
         .execute(&state.pool)
         .await
@@ -1477,7 +1608,7 @@ async fn commit_quota_claim_is_atomic_and_refunded() {
         loser["result"]["structuredContent"]["error"],
         "quota_exceeded"
     );
-    assert_eq!(used(&state, &account_id).await, 50);
+    assert_eq!(used(&state, &account_id).await, 40);
 }
 
 #[tokio::test]
@@ -2721,22 +2852,36 @@ async fn invite(state: &McpState, token: &str, slug: &str, email: &str) -> Value
 }
 
 #[tokio::test]
-async fn collaborator_invite_needs_a_pro_owner() {
+async fn collaborator_invite_free_gets_one() {
     let (state, codes) = setup().await;
     let owner = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &owner, "groceries").await;
 
-    // A Free owner is refused with payment_required, pointing at Pro.
-    let refused = invite(&state, &owner, "groceries", "bruno@example.com").await;
-    let err = is_error(&refused);
-    assert_eq!(err["error"], "payment_required");
-    assert!(err["user_message"].as_str().unwrap().contains("Pro"));
-
-    set_plan(&state, "ana@example.com", "pro").await;
+    // A Free owner may invite one collaborator.
     let added = result(&invite(&state, &owner, "groceries", "Bruno@Example.com").await)
         ["structuredContent"]
         .clone();
     assert_eq!(added["collaborator"]["email"], "bruno@example.com");
+    assert_eq!(added["collaborator"]["status"], "pending");
+
+    // The second invite is refused: Free allows 1 per app.
+    let refused = invite(&state, &owner, "groceries", "cara@example.com").await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "quota_exceeded");
+    assert_eq!(err["quota"], "collaborators");
+    assert_eq!(err["limit"], 1);
+    assert_eq!(err["used"], 1);
+    assert!(err["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("Upgrade to Pro"));
+
+    set_plan(&state, "ana@example.com", "pro").await;
+    // Pro raises the cap: the previously refused invite now lands.
+    let added = result(&invite(&state, &owner, "groceries", "cara@example.com").await)
+        ["structuredContent"]
+        .clone();
+    assert_eq!(added["collaborator"]["email"], "cara@example.com");
     assert_eq!(added["collaborator"]["status"], "pending");
 
     // The invite allowlists the email and emails the spec wording.
@@ -3107,15 +3252,20 @@ async fn collaborator_access_follows_the_owner_plan() {
     let (state, _) = setup().await;
     let owner = pro_app(&state, "ana@example.com", "groceries").await;
     invite(&state, &owner, "groceries", "bruno@example.com").await;
+    invite(&state, &owner, "groceries", "cara@example.com").await;
     let bruno = api_key_for(&state, "bruno@example.com").await;
+    let cara = api_key_for(&state, "cara@example.com").await;
     let (_, seen) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
     assert!(result(&seen).get("isError").is_none());
 
-    // Downgrade: the rows stay, but the app reads as missing.
+    // Downgrade: the rows stay, the oldest collaborator keeps access, the
+    // second reads the app as missing (Free allows 1 per app).
     set_plan(&state, "ana@example.com", "free").await;
-    let (_, hidden) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    let (_, seen) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert!(result(&seen).get("isError").is_none(), "{seen}");
+    let (_, hidden) = call(&state, Some(&cara), "get_app", json!({"app": "groceries"})).await;
     assert_eq!(is_error(&hidden)["error"], "not_found");
-    let (_, apps) = call(&state, Some(&bruno), "list_apps", json!({})).await;
+    let (_, apps) = call(&state, Some(&cara), "list_apps", json!({})).await;
     assert_eq!(
         result(&apps)["structuredContent"]["apps"]
             .as_array()
@@ -3136,12 +3286,12 @@ async fn collaborator_access_follows_the_owner_plan() {
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
     );
 
     // Re-upgrade: access is back with no re-invite.
     set_plan(&state, "ana@example.com", "pro").await;
-    let (_, back) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    let (_, back) = call(&state, Some(&cara), "get_app", json!({"app": "groceries"})).await;
     assert!(result(&back).get("isError").is_none());
 }
 /// `public` is a Pro feature, gated in the shared domain function: a Free
@@ -4659,21 +4809,12 @@ fn blob_bytes(state: &McpState, sha: &str, path: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn export_code_needs_a_pro_owner() {
+async fn export_code_is_free_owner_only() {
     let (state, _) = setup().await;
     let owner = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &owner, "groceries").await;
 
-    // A Free owner is refused with payment_required, pointing at Pro.
-    let body = export_call(&state, &owner, "groceries", None).await;
-    let err = is_error(&body);
-    assert_eq!(err["error"], "payment_required");
-    assert!(
-        err["user_message"].as_str().unwrap().contains("Pro"),
-        "{err}"
-    );
-
-    set_plan(&state, "ana@example.com", "pro").await;
+    // Export is available on Free too (owner-only stays): no Pro gate.
     let body = export_call(&state, &owner, "groceries", None).await;
     let content = result(&body)["structuredContent"].clone();
     let url = content["url"].as_str().expect("download url");

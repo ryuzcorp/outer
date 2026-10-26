@@ -4,8 +4,9 @@
 //! backup sweep dumps each active app's databases to SQL and stores the dump
 //! in R2 under `outer/backups/{slug}/` — deliberately NOT under
 //! `fleets/{slug}/`, so app code (whose scoped credentials cover only its
-//! own fleet prefix) can never read or touch the backups. Free keeps 7 days
-//! of dumps, Pro 30.
+//! own fleet prefix) can never read or touch the backups. Free keeps the
+//! newest 3 dumps per binding, Pro the newest 30 (spec §3, owner-set
+//! 2026-10-26).
 //!
 //! celld 0.6.2 has no `d1 export` command: only `d1 execute` and
 //! `d1 migrations apply` run SQL from the CLI
@@ -70,18 +71,12 @@ fn sanitize_binding(binding: &str) -> String {
     }
     out
 }
+/// Daily dumps kept per binding (spec §3, owner-set 2026-10-26): Free keeps
+/// the newest 3, Pro the newest 30 (any-day restore from the kept set). The
+/// numbers live in [`crate::limits`].
+pub use crate::limits::{FREE_BACKUPS_KEEP, PRO_BACKUPS_KEEP};
 
-/// Free keeps 7 days of dumps, Pro 30 (spec §3 plans via `user.plan`).
-pub const FREE_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-pub const PRO_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-
-pub fn retention_ms(plan: &str) -> i64 {
-    if plan == "pro" {
-        PRO_RETENTION_MS
-    } else {
-        FREE_RETENTION_MS
-    }
-}
+pub use crate::limits::backups_keep;
 
 /// A backup is due when the newest dump for the binding is at least this old.
 pub const BACKUP_EVERY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -205,22 +200,26 @@ pub async fn backup_due(
     Ok(newest.is_none_or(|row| now_ms.saturating_sub(row.created_at) >= BACKUP_EVERY_MS))
 }
 
-/// Drop every dump older than `retention_ms`, bytes and rows both. A missing
-/// key is already gone (a crashed delete converges here), never an error.
+/// Drop every dump past the newest `keep` per binding, bytes and rows both.
+/// A missing key is already gone (a crashed delete converges here), never an
+/// error.
 pub async fn prune_app(
     pool: &SqlitePool,
     store: &Store,
     app_id: &str,
-    retention_ms: i64,
-    now_ms: i64,
+    keep: i64,
 ) -> anyhow::Result<u64> {
-    let cutoff = now_ms.saturating_sub(retention_ms);
     let stale: Vec<BackupRow> = sqlx::query_as::<_, BackupRow>(
-        "SELECT id, binding, store_key, created_at, size_bytes \
-         FROM d1_backup WHERE app_id = ?1 AND created_at < ?2 ORDER BY created_at",
+        "SELECT id, binding, store_key, created_at, size_bytes FROM d1_backup \
+         WHERE app_id = ?1 AND id NOT IN \
+           (SELECT id FROM d1_backup AS b WHERE b.app_id = ?1 \
+            AND (SELECT COUNT(*) FROM d1_backup AS newer \
+                 WHERE newer.app_id = b.app_id AND newer.binding = b.binding \
+                 AND (newer.created_at, newer.id) > (b.created_at, b.id)) < ?2) \
+         ORDER BY created_at",
     )
     .bind(app_id)
-    .bind(cutoff)
+    .bind(keep.max(0))
     .fetch_all(pool)
     .await?;
     let mut pruned = 0u64;
@@ -817,7 +816,7 @@ pub async fn backup_binding(
     .await
     .map_err(unavailable)?;
     let plan = owner_plan(pool, &app.owner_id).await.map_err(unavailable)?;
-    prune_app(pool, store, &app.id, retention_ms(&plan), now_ms)
+    prune_app(pool, store, &app.id, backups_keep(&plan))
         .await
         .map_err(unavailable)?;
     Ok(row)
@@ -962,7 +961,7 @@ pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> an
                 ),
             }
         }
-        if let Err(err) = prune_app(pool, store, &app.id, retention_ms(&plan), now).await {
+        if let Err(err) = prune_app(pool, store, &app.id, backups_keep(&plan)).await {
             tracing::warn!(
                 slug = %app.slug,
                 error = %format!("{err:#}"),
@@ -1024,10 +1023,10 @@ mod tests {
     }
 
     #[test]
-    fn retention_is_7_days_free_30_pro() {
-        assert_eq!(retention_ms("free"), 7 * 24 * 60 * 60 * 1000);
-        assert_eq!(retention_ms("pro"), 30 * 24 * 60 * 60 * 1000);
-        assert_eq!(retention_ms("anything-else"), FREE_RETENTION_MS);
+    fn backup_keep_is_3_free_30_pro() {
+        assert_eq!(backups_keep("free"), 3);
+        assert_eq!(backups_keep("pro"), 30);
+        assert_eq!(backups_keep("anything-else"), FREE_BACKUPS_KEEP);
     }
 
     #[test]
@@ -1591,7 +1590,7 @@ exit 0
             .await
             .unwrap()
             .unwrap();
-        for (id, created_at) in [("old", now - FREE_RETENTION_MS - 1), ("fresh", now - 1000)] {
+        for (id, created_at) in [("b1", now - 3000), ("b2", now - 2000), ("b3", now - 1000)] {
             let key = backup_key(&app.slug, created_at, "DB");
             store.put(&key, b"dump".to_vec()).await.unwrap();
             sqlx::query(
@@ -1607,22 +1606,15 @@ exit 0
             .unwrap();
         }
 
-        assert_eq!(
-            prune_app(&pool, &store, &app.id, FREE_RETENTION_MS, now)
-                .await
-                .unwrap(),
-            1
-        );
-        assert!(backup_by_id(&pool, &app.id, "old").await.unwrap().is_none());
+        assert_eq!(prune_app(&pool, &store, &app.id, 2).await.unwrap(), 1);
+        assert!(backup_by_id(&pool, &app.id, "b1").await.unwrap().is_none());
         assert!(store
-            .get(&backup_key(&app.slug, now - FREE_RETENTION_MS - 1, "DB"))
+            .get(&backup_key(&app.slug, now - 3000, "DB"))
             .await
             .unwrap()
             .is_none());
-        assert!(backup_by_id(&pool, &app.id, "fresh")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(backup_by_id(&pool, &app.id, "b2").await.unwrap().is_some());
+        assert!(backup_by_id(&pool, &app.id, "b3").await.unwrap().is_some());
     }
 
     #[tokio::test]

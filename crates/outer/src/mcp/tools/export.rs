@@ -1,13 +1,13 @@
-//! The `export_code` tool (spec §7.5, Pro): a zip download of the whole app
-//! tree at a commit. Owner only: a collaborator's call answers `forbidden`
-//! (via [`owner_app`]), and a slug with no role answers `not_found`,
-//! exactly like a missing one.
+//! The `export_code` tool (spec §7.5): a zip download of the whole app tree
+//! at a commit. Available on every plan; owner only: a collaborator's call
+//! answers `forbidden` (via [`owner_app`]), and a slug with no role answers
+//! `not_found`, exactly like a missing one.
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{check_rev, ok, owner_app, plan_of, Ctx};
+use super::{check_rev, ok, owner_app, Ctx};
 use crate::git::export;
 use crate::mcp::error::ToolError;
 
@@ -46,38 +46,24 @@ pub(crate) fn tool_error(app: &str, err: export::ExportError) -> ToolError {
     }
 }
 
-/// The Pro gate plus the zip build, shared by the `export_code` tool and the
-/// console `POST /api/console/apps/:slug/export` endpoint (same gate, same
-/// caps, same messages). The caller checks the role first; this checks the
-/// plan and builds the zip. A plan-lookup failure propagates as `internal`:
-/// a transient DB error must never read as a Free plan refusing with
-/// `payment_required`.
+/// The zip build, shared by the `export_code` tool and the console
+/// `POST /api/console/apps/:slug/export` endpoint (same caps, same
+/// messages). Export is available on every plan (owner-only stays): the
+/// caller checks the role first; this builds the zip. A plan-lookup failure
+/// propagates as `internal`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn export_for_owner(
     pool: &sqlx::SqlitePool,
-    billing: &crate::billing::BillingState,
     store: &crate::store::Store,
     git: &crate::git::manifest::GitConfig,
     sync: &crate::git::manifest::GitSync,
     slug: &str,
     app_id: &str,
-    owner_id: &str,
     rev: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<export::ExportOutcome, ToolError> {
     if let Some(rev) = rev {
         check_rev("sha", rev)?;
-    }
-    let plan = plan_of(pool, owner_id).await?;
-    if plan != "pro" {
-        return Err(super::with_upgrade(
-            ToolError::payment_required(
-                format!("{slug} is on a Free account; code export is a Pro feature"),
-                "Code export is a Pro feature. Upgrade to Pro to download your app as a zip.",
-            ),
-            billing,
-            owner_id,
-        ));
     }
     export::export_app(
         &export::ExportDeps {
@@ -102,13 +88,11 @@ pub async fn export_code(input: ExportCodeInput, ctx: &Ctx<'_>) -> Result<Value,
     let app = owner_app(ctx, &input.app).await?;
     let outcome = export_for_owner(
         &ctx.state.pool,
-        &ctx.state.billing,
         &ctx.state.store,
         &ctx.state.git,
         &ctx.state.sync,
         &app.slug,
         &app.id,
-        &app.owner_id,
         input.sha.as_deref(),
         chrono::Utc::now(),
     )

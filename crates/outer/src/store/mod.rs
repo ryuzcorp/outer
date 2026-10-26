@@ -182,6 +182,30 @@ impl Store {
         }
     }
 
+    /// Total bytes under `prefix`, for the storage sweep's per-app sizing.
+    /// S3 sums one listing's sizes (no per-object HEAD); the memory backend
+    /// sums the stored bodies.
+    pub async fn prefix_bytes(&self, prefix: &str) -> anyhow::Result<u64> {
+        #[cfg(test)]
+        if let Some(message) = self.take_fault() {
+            return Err(anyhow::anyhow!(message));
+        }
+        match &self.inner {
+            StoreInner::S3(backend) => {
+                let mut total = 0u64;
+                for (_, size) in backend.list_sizes(prefix).await? {
+                    total = total.saturating_add(size);
+                }
+                Ok(total)
+            }
+            StoreInner::Memory(map) => Ok(lock(map)
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(_, v)| v.len() as u64)
+                .sum()),
+        }
+    }
+
     /// Delete every key under `prefix`, which must be a whole slug scope
     /// (`fleets/{slug}/`, `git/{slug}/`): an empty prefix or one without a
     /// trailing `/` is refused instead of deleting a wider scope. An empty

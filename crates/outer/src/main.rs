@@ -754,6 +754,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // shutdown), pruned per plan by the same sweep.
     let metrics = outer::observe::metrics::MetricsAgg::new();
     let metrics_sweep = outer::observe::metrics::spawn_sweep(pool.clone(), metrics.clone());
+    // Plan limits (spec §3, owner-set 2026-10-26): hourly request rollup +
+    // soft-cap email and storage freeze. A missed tick only delays mail and
+    // flags; the rollup watermark never double-counts.
+    outer::limits::spawn_limits_sweep(outer::limits::LimitsSweep {
+        pool: pool.clone(),
+        store: store.clone(),
+        sender: mcp.auth.config.email.clone(),
+        issuer: mcp.auth.config.issuer.clone(),
+        unsub_key: mcp.unsub_key.clone(),
+        billing: mcp.billing.clone(),
+    });
     let app = http::app(
         http::AppState {
             pool: pool.clone(),

@@ -380,7 +380,7 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
     name: "d1_backups",
     title: "List D1 backups",
     description:
-      "List a D1 database's stored backups: id, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; 7 days kept, Pro 30). Returns {binding, backups}.",
+      "List a D1 database's stored backups: id, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; newest 3 kept, Pro 30). Returns {binding, backups}.",
     inputSchema: {
       type: "object",
       required: ["slug", "binding"],
