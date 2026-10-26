@@ -716,12 +716,22 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         )?,
     };
     // Past-due grace (spec §14.2): day-5 reminders and the downgrade at
-    // day 7. A missed tick only delays mail and the downgrade; the next
+    // day 7, plus the downgrade-retention pass (day-23 warnings, day-30
+    // purges). A missed tick only delays mail and the downgrade; the next
     // tick catches up.
     outer::billing::spawn_grace_sweep(
         mcp.billing.clone(),
         pool.clone(),
         mcp.auth.config.email.clone(),
+        outer::billing::RetentionDeps {
+            store: store.clone(),
+            git: git.clone(),
+            sync: git_sync.clone(),
+            fleets: fleets.clone(),
+            deploys: mcp.deploys.clone(),
+            rollback_locks: mcp.rollback_locks.clone(),
+            delete_cfg: mcp.delete_cfg.clone(),
+        },
     );
     // Email alerts (wave 3, feature #2): error spikes are evaluated from
     // `error_issue` every five minutes; deploy failures and quota
