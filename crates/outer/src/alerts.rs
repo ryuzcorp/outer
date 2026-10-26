@@ -1,15 +1,19 @@
-//! Email alerts (wave 3, feature #2): the app owner (owner-only in v1)
-//! gets a plain-text email when a deploy fails, when errors spike, and
-//! when the daily code-change quota hits 80 % and 100 %.
+//! Email alerts (wave 3, feature #2, plus the inactivity reminders of spec
+//! §7.8): the app owner (owner-only in v1) gets a plain-text email when a
+//! deploy fails, when errors spike, when the daily code-change quota hits
+//! 80 % and 100 %, and at 30, 7 and 1 day before an inactive app is deleted.
 //!
-//! The three triggers run where they fit: deploy failures inline after
+//! The first three triggers run where they fit: deploy failures inline after
 //! the pipeline result in [`crate::mcp::tools::run_deploy`], quota
 //! thresholds inline after a successful `commit` claim, and spikes in a
 //! [`spawn_sweep`] loop over [`error_issue`]. Every send is debounced
 //! through `alert_send` and gated by the per-account `alert_prefs` row
-//! (absent means all three on). Unsubscribe links carry an HMAC token so
+//! (absent means all four on), except the inactivity reminders: those fire
+//! at most once each, gated by the `app.inactivity_notices` bitmask the
+//! inactivity sweep owns. Unsubscribe links carry an HMAC token so
 //! one click opts out without a login.
 
+use chrono::Datelike;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use sqlx::SqlitePool;
@@ -43,13 +47,17 @@ pub const KIND_STORAGE_FROZEN: &str = "storage_frozen";
 
 /// Unsubscribe scopes: one alert kind, or everything at once.
 pub const SCOPE_ALL: &str = "all";
+/// Unsubscribe scope for the inactivity reminders (spec §7.8): one toggle
+/// covers all three deadline mails.
+pub const SCOPE_INACTIVITY: &str = "inactivity";
 
-/// Per-account toggles. Absence of a row means all three on.
+/// Per-account toggles. Absence of a row means all four on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertPrefs {
     pub deploy_failed: bool,
     pub error_spike: bool,
     pub quota: bool,
+    pub inactivity: bool,
 }
 
 impl Default for AlertPrefs {
@@ -58,6 +66,7 @@ impl Default for AlertPrefs {
             deploy_failed: true,
             error_spike: true,
             quota: true,
+            inactivity: true,
         }
     }
 }
@@ -68,6 +77,7 @@ pub struct PrefsPatch {
     pub deploy_failed: Option<bool>,
     pub error_spike: Option<bool>,
     pub quota: Option<bool>,
+    pub inactivity: Option<bool>,
 }
 
 /// Everything one alert send needs: explicit dependencies, no globals.
@@ -83,18 +93,19 @@ pub struct Ctx<'a> {
 
 /// The toggles for `user_id`, defaulting to all-on when no row exists.
 pub async fn get_prefs(pool: &SqlitePool, user_id: &str) -> anyhow::Result<AlertPrefs> {
-    let row: Option<(i64, i64, i64)> = sqlx::query_as(
-        "SELECT deploy_failed, error_spike, quota FROM alert_prefs WHERE user_id = ?1",
+    let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT deploy_failed, error_spike, quota, inactivity FROM alert_prefs WHERE user_id = ?1",
     )
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
     Ok(match row {
         None => AlertPrefs::default(),
-        Some((deploy_failed, error_spike, quota)) => AlertPrefs {
+        Some((deploy_failed, error_spike, quota, inactivity)) => AlertPrefs {
             deploy_failed: deploy_failed != 0,
             error_spike: error_spike != 0,
             quota: quota != 0,
+            inactivity: inactivity != 0,
         },
     })
 }
@@ -112,16 +123,18 @@ pub async fn set_prefs(
         deploy_failed: patch.deploy_failed.unwrap_or(current.deploy_failed),
         error_spike: patch.error_spike.unwrap_or(current.error_spike),
         quota: patch.quota.unwrap_or(current.quota),
+        inactivity: patch.inactivity.unwrap_or(current.inactivity),
     };
     sqlx::query(
-        "INSERT INTO alert_prefs (user_id, deploy_failed, error_spike, quota, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(user_id) DO UPDATE SET deploy_failed = ?2, error_spike = ?3, quota = ?4, updated_at = ?5",
+        "INSERT INTO alert_prefs (user_id, deploy_failed, error_spike, quota, inactivity, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(user_id) DO UPDATE SET deploy_failed = ?2, error_spike = ?3, quota = ?4, inactivity = ?5, updated_at = ?6",
     )
     .bind(user_id)
     .bind(next.deploy_failed as i64)
     .bind(next.error_spike as i64)
     .bind(next.quota as i64)
+    .bind(next.inactivity as i64)
     .bind(now)
     .execute(pool)
     .await?;
@@ -215,7 +228,7 @@ pub fn verify_unsubscribe(key: &[u8], token: &str) -> Option<(String, String)> {
     };
     if !matches!(
         *scope,
-        SCOPE_ALL | KIND_DEPLOY_FAILED | KIND_ERROR_SPIKE | "quota"
+        SCOPE_ALL | KIND_DEPLOY_FAILED | KIND_ERROR_SPIKE | "quota" | SCOPE_INACTIVITY
     ) {
         return None;
     }
@@ -234,7 +247,7 @@ pub fn verify_unsubscribe(key: &[u8], token: &str) -> Option<(String, String)> {
 }
 
 /// Turn `scope` off for `user_id` (one click, no login). `all` clears all
-/// three toggles. Returns the effective row.
+/// four toggles. Returns the effective row.
 pub async fn apply_unsubscribe(
     pool: &SqlitePool,
     user_id: &str,
@@ -246,6 +259,7 @@ pub async fn apply_unsubscribe(
             deploy_failed: Some(false),
             error_spike: Some(false),
             quota: Some(false),
+            inactivity: Some(false),
         },
         KIND_DEPLOY_FAILED => PrefsPatch {
             deploy_failed: Some(false),
@@ -253,6 +267,10 @@ pub async fn apply_unsubscribe(
         },
         KIND_ERROR_SPIKE => PrefsPatch {
             error_spike: Some(false),
+            ..PrefsPatch::default()
+        },
+        SCOPE_INACTIVITY => PrefsPatch {
+            inactivity: Some(false),
             ..PrefsPatch::default()
         },
         _ => PrefsPatch {
@@ -629,6 +647,113 @@ pub async fn notify_storage_frozen(
     .await;
 }
 
+/// Visit window behind the "visits this month" line of the reminder mail:
+/// the last 30 UTC days of `visitor_day`, the cheap source the spec asks
+/// for. Zero visits omit the sentence instead of printing it.
+const REMINDER_VISIT_WINDOW_MS: i64 = 30 * 24 * 3_600_000;
+
+/// The date line of the reminder bodies: "July 24" (UTC, no year, spec
+/// wording). Millis outside the `DateTime` range fall back to "a while ago".
+fn mail_date(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|d| format!("{} {}", d.format("%B"), d.day()))
+        .unwrap_or_else(|| "a while ago".to_string())
+}
+
+/// One inactivity reminder: what [`notify_inactivity`] needs beyond the
+/// shared [`Ctx`].
+pub struct InactiveNotice<'a> {
+    /// The `app.id` row the sweep owns (visits lookup, nothing written).
+    pub app_id: &'a str,
+    pub slug: &'a str,
+    pub owner_id: &'a str,
+    pub to: &'a str,
+    /// "30 days" | "7 days" | "1 day": subject and body wording.
+    pub days_left: &'a str,
+    pub deadline_ms: i64,
+    pub touched_ms: i64,
+    pub now: i64,
+}
+
+/// Email the owner that `slug` will be deleted for inactivity in
+/// `notice.days_left` ("30 days", "7 days", "1 day"). The inactivity sweep
+/// calls this when a reminder mark is crossed; the sweep's
+/// `app.inactivity_notices` bit (not the `alert_send` ledger) records the
+/// send, so a crash between the send and the stamp only risks one duplicate.
+///
+/// Returns whether the mail went out: `false` when the account opted out of
+/// inactivity mails or the send failed (the sweep leaves the bit unset, so
+/// an opt-in or a working mailer retries on the next tick). Never raises: a
+/// dead mailer must not fail the sweep.
+pub async fn notify_inactivity(ctx: &Ctx<'_>, notice: &InactiveNotice<'_>) -> bool {
+    let prefs = match get_prefs(ctx.pool, notice.owner_id).await {
+        Ok(prefs) => prefs,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "inactivity prefs lookup failed");
+            return false;
+        }
+    };
+    if !prefs.inactivity {
+        return false;
+    }
+    let day = notice.now.div_euclid(86_400_000);
+    let since_day = (notice.now - REMINDER_VISIT_WINDOW_MS).div_euclid(86_400_000);
+    let visits: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(visitors), 0) FROM visitor_day \
+         WHERE app_id = ?1 AND day >= ?2 AND day <= ?3",
+    )
+    .bind(notice.app_id)
+    .bind(since_day)
+    .bind(day)
+    .fetch_optional(ctx.pool)
+    .await
+    .unwrap_or(None)
+    .unwrap_or(0);
+    let visits_line = if visits > 0 {
+        format!(" It had {visits} visits this month.")
+    } else {
+        String::new()
+    };
+    let unsub = unsubscribe_url(
+        ctx.issuer,
+        &sign_unsubscribe(ctx.key, notice.owner_id, SCOPE_INACTIVITY),
+    );
+    let subject = format!("{} will be deleted in {}", notice.slug, notice.days_left);
+    let body = format!(
+        "{} hasn't been touched since {touched} and will be deleted on {deadline}.{visits_line} \
+         To keep it, ask your agent to connect to Outer: any request counts.\n\n\
+         See your app:\n{console}\n\n\
+         ---\n\
+         You get this because inactivity reminders are on for your account.\n\
+         Turn off inactivity emails:\n{unsub}\n\
+         Manage all email alerts:\n{manage}\n",
+        notice.slug,
+        touched = mail_date(notice.touched_ms),
+        deadline = mail_date(notice.deadline_ms),
+        console = console_app_url(ctx.issuer, notice.slug, "overview"),
+        manage = console_url(ctx.issuer, "account"),
+    );
+    let headers = [
+        ("List-Unsubscribe", format!("<{unsub}>")),
+        (
+            "List-Unsubscribe-Post",
+            "List-Unsubscribe=One-Click".to_string(),
+        ),
+    ];
+    let header_refs: Vec<(&str, String)> = headers.iter().map(|(k, v)| (*k, v.clone())).collect();
+    match ctx
+        .sender
+        .send_text_with_headers(notice.to, &subject, &body, &header_refs)
+        .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(slug = notice.slug, to = notice.to, error = %err.to_string(), "inactivity email failed");
+            false
+        }
+    }
+}
+
 /// One app's spike verdict from [`error_issue`]: which rule fired, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpikeVerdict {
@@ -929,6 +1054,9 @@ mod tests {
             asleep_since: None,
             last_request_at: None,
             last_deploy_sha: None,
+            last_activity_at: 0,
+            expired_at: None,
+            downgraded_stopped_at: None,
             created_at: 0,
             always_on: false,
             preview_sha: None,
@@ -1378,6 +1506,7 @@ mod tests {
                 deploy_failed: false,
                 error_spike: true,
                 quota: true,
+                inactivity: true,
             }
         );
 
@@ -1392,6 +1521,7 @@ mod tests {
                 deploy_failed: false,
                 error_spike: false,
                 quota: false,
+                inactivity: false,
             }
         );
     }
@@ -1503,5 +1633,22 @@ mod tests {
             "{mail}"
         );
         assert!(!mail.contains("https://upgrade"), "{mail}");
+    }
+
+    #[tokio::test]
+    async fn inactivity_unsubscribe_disables_only_its_scope() {
+        let pool = test_pool().await;
+        seed_user(&pool, "u1", "owner@example.com").await;
+        let (user_id, scope) =
+            verify_unsubscribe(KEY, &sign_unsubscribe(KEY, "u1", SCOPE_INACTIVITY)).unwrap();
+        apply_unsubscribe(&pool, &user_id, &scope, 1_000)
+            .await
+            .unwrap();
+        let prefs = get_prefs(&pool, "u1").await.unwrap();
+        assert!(!prefs.inactivity, "{prefs:?}");
+        assert!(
+            prefs.deploy_failed && prefs.error_spike && prefs.quota,
+            "{prefs:?}"
+        );
     }
 }

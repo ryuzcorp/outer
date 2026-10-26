@@ -234,6 +234,12 @@ pub struct RuntimeConfig {
     /// host cap is what bounds total preview memory; preview commits past
     /// it refuse with a retryable error. 0 disables previews entirely.
     pub preview_max: usize,
+    /// Inactivity before a Free app stops with the `expired` page
+    /// (`OUTER_INACTIVE_DAYS`, default 90, spec §7.8).
+    pub inactive_days: u64,
+    /// Grace after expiry while qualifying activity still restores the app
+    /// (`OUTER_INACTIVE_GRACE_DAYS`, default 7, spec §7.8).
+    pub inactive_grace_days: u64,
 }
 
 const DEFAULT_DOMAIN: &str = "outer.localhost";
@@ -480,6 +486,18 @@ impl Config {
                 20,
                 &mut problems,
             ),
+            inactive_days: parse_num(
+                get("OUTER_INACTIVE_DAYS"),
+                "OUTER_INACTIVE_DAYS",
+                90,
+                &mut problems,
+            ),
+            inactive_grace_days: parse_num(
+                get("OUTER_INACTIVE_GRACE_DAYS"),
+                "OUTER_INACTIVE_GRACE_DAYS",
+                7,
+                &mut problems,
+            ),
         };
 
         let config = Config {
@@ -554,6 +572,18 @@ impl Config {
                 "OUTER_STORE=memory loses every app on restart and is refused for OUTER_DOMAIN={}; use r2",
                 self.domain
             ));
+        }
+        if self.runtime.inactive_days == 0 {
+            problems.push(
+                "OUTER_INACTIVE_DAYS=0 would delete Free apps at once; it must be at least 1"
+                    .to_string(),
+            );
+        }
+        if self.runtime.inactive_grace_days == 0 {
+            problems.push(
+                "OUTER_INACTIVE_GRACE_DAYS=0 would purge expired apps with no restore window; it must be at least 1"
+                    .to_string(),
+            );
         }
         if let StoreKind::R2(r2) = &self.store {
             if !r2.endpoint.is_empty() && !r2.endpoint.starts_with("https://") && !self.is_local() {
@@ -1302,6 +1332,39 @@ mod tests {
         assert!(
             cfg.oxfmt_bin_explicit,
             "explicit path: missing means misconfig"
+        );
+    }
+
+    #[test]
+    fn inactivity_windows_default_to_90_and_7_and_reject_zero() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert_eq!(cfg.runtime.inactive_days, 90);
+        assert_eq!(cfg.runtime.inactive_grace_days, 7);
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_INACTIVE_DAYS", "30"),
+            ("OUTER_INACTIVE_GRACE_DAYS", "3"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.runtime.inactive_days, 30);
+        assert_eq!(cfg.runtime.inactive_grace_days, 3);
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_INACTIVE_DAYS", "0"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter().any(|p| p.contains("OUTER_INACTIVE_DAYS")),
+            "{err:?}"
+        );
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_INACTIVE_GRACE_DAYS", "0"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter().any(|p| p.contains("OUTER_INACTIVE_GRACE_DAYS")),
+            "{err:?}"
         );
     }
 }

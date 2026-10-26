@@ -22,7 +22,10 @@ The discount applies as a Stripe coupon at checkout, automatically, while the pr
 | Backups | Daily, keep 3 | Daily, keep 30 + any-day restore |
 | Database / files | 100 MB / 250 MB | 5 GB / 25 GB |
 | Requests per month | Soft 100k (email + upgrade ask, keeps serving) | Soft 5M (never pause a live app) |
+| Deleted after inactivity | 90 days without owner activity, after reminders | Never while subscribed |
 
 Storage caps refuse writes at the cap and never delete. Downgrade keeps your 2 oldest apps live; the rest stop but are retained for 30 days.
+
+Free apps are deleted after 90 days without owner activity. You get reminder emails at 30, 7, and 1 day before the deadline; signing in or asking your agent to do anything restores the countdown, and so does a collaborator working on the app. Visiting the app doesn't count. `whoami`, `list_apps`, and `get_app` show the deadline as `deletes_at`, and the Console shows it on the apps list and the app overview.
 
 Full numbers live in [limits and quotas](/deploy/limits). Billing detail lives in [Manage billing](/account/billing).

@@ -157,6 +157,7 @@ struct Limits {
 pub async fn whoami(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let caller = authed(ctx)?;
     let plan = plan_of(&ctx.state.pool, &caller.account_id).await?;
+    let (_, owner_last) = crate::inactivity::owner_clock(&ctx.state.pool, &caller.account_id).await;
     let build_ms = crate::limits::build_ms_used_today(&ctx.state.pool, &caller.account_id)
         .await
         .map_err(internal)?;
@@ -182,6 +183,16 @@ pub async fn whoami(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
         d1_bytes_max: crate::limits::d1_cap_bytes(&plan),
         r2_bytes_max: crate::limits::r2_cap_bytes(&plan),
     };
+    // Soonest inactivity deadline across owned apps (spec §7.8); null on
+    // Pro (exempt) or with no owned apps.
+    let deletes_at = crate::inactivity::account_deletes_at(
+        &ctx.state.pool,
+        &caller.account_id,
+        &plan,
+        owner_last,
+        ctx.state.inactivity,
+    )
+    .await;
     Ok(ok(
         format!("{} on the {} plan.", caller.email, plan),
         json!({
@@ -191,6 +202,7 @@ pub async fn whoami(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
             "limits": limits,
             "resets_at": resets_at_utc(),
             "stopped_apps": [],
+            "deletes_at": deletes_at,
         }),
     ))
 }

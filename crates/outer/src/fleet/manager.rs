@@ -886,9 +886,9 @@ impl FleetManager {
 
     /// A tokio interval loop that sleeps idle fleets, discards expired
     /// previews, and flushes fleet logs to SQLite. Failures log and the
-    /// loop continues on the next tick. Retention prunes run at most once a
-    /// day (spec §3 log retention, §13 deploys and errors, §17 TTLs); the
-    /// timestamp lives in this task, not in global state.
+    /// loop continues on the next tick. Retention prunes and the inactivity
+    /// sweep (spec §7.8) run at most once a day; the timestamps live in this
+    /// task, not in global state.
     pub fn spawn_sleep_sweep(
         &self,
         pool: SqlitePool,
@@ -896,6 +896,7 @@ impl FleetManager {
         git: crate::git::GitConfig,
         sync: crate::git::GitSync,
         every: Duration,
+        inactive: crate::inactivity::SweepDeps,
     ) {
         let this = self.clone();
         let store = store.clone();
@@ -947,6 +948,27 @@ impl FleetManager {
                 let due = last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400));
                 if due {
                     prune_retention(&pool, &store).await;
+                    // Inactive apps (spec §7.8): reminders, expiry, restores
+                    // and purges. Idempotent, so a missed day only delays
+                    // mail and the deadline actions; the next tick catches up.
+                    match crate::inactivity::run_sweep(&pool, &inactive, crate::apps::now_ms())
+                        .await
+                    {
+                        Ok(counts) => {
+                            if counts != crate::inactivity::Counts::default() {
+                                tracing::info!(
+                                    reminded = counts.reminded,
+                                    expired = counts.expired,
+                                    restored = counts.restored,
+                                    purged = counts.purged,
+                                    "inactivity sweep",
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %format!("{err:#}"), "inactivity sweep failed")
+                        }
+                    }
                     last_prune = Some(std::time::Instant::now());
                 }
             }

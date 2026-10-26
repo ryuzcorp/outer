@@ -539,7 +539,8 @@ async fn user_by_subscription(
 
 /// Promote to Pro with the Stripe ids attached. Upgrades take effect on the
 /// next tool call because every quota gate reads the live `user` row.
-/// Re-upgrading cancels a pending downgrade purge (the stamps clear) but
+/// Re-upgrading cancels a pending downgrade purge (the stamps clear) and
+/// any inactivity expiry (the owner is exempt while subscribed), but
 /// restarts nothing: stopped apps stay stopped until the owner wakes one.
 async fn set_pro(
     conn: &mut sqlx::SqliteConnection,
@@ -560,7 +561,8 @@ async fn set_pro(
     .await?;
     sqlx::query(
         "UPDATE app SET downgraded_stopped_at = NULL, \
-         downgrade_purge_warned_at = NULL WHERE owner_id = ?1",
+         downgrade_purge_warned_at = NULL, expired_at = NULL, \
+         inactivity_notices = 0 WHERE owner_id = ?1",
     )
     .bind(account_id)
     .execute(&mut *conn)
@@ -993,13 +995,19 @@ async fn plan_downgrade(
     .fetch_all(&mut *conn)
     .await?;
     // The two kept oldest apps leave retention: previously stamped apps that
-    // are now kept (the rest were deleted) have their purge canceled. Free
-    // allows 2 apps (spec §3, owner-set 2026-10-26).
+    // are now kept (the rest were stopped) have their purge canceled. Free
+    // allows 2 apps (spec §3, owner-set 2026-10-26). Either way the
+    // inactivity clock (spec §7.8, Q3) restarts at the downgrade: the owner
+    // was exempt while Pro, so "no activity" on the row must not read as
+    // months of Free silence.
+    let now_ms = now_secs * 1000;
     for kept in apps.iter().take(2) {
         sqlx::query(
             "UPDATE app SET downgraded_stopped_at = NULL, \
-             downgrade_purge_warned_at = NULL WHERE id = ?1",
+             downgrade_purge_warned_at = NULL, last_activity_at = ?1 \
+             WHERE id = ?2",
         )
+        .bind(now_ms)
         .bind(&kept.id)
         .execute(&mut *conn)
         .await?;
@@ -1008,9 +1016,10 @@ async fn plan_downgrade(
     for app in apps.iter().skip(2) {
         sqlx::query(
             "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = ?1, \
-             downgrade_purge_warned_at = NULL WHERE id = ?2",
+             downgrade_purge_warned_at = NULL, last_activity_at = ?2 WHERE id = ?3",
         )
         .bind(now_secs)
+        .bind(now_ms)
         .bind(&app.id)
         .execute(&mut *conn)
         .await?;
@@ -2343,6 +2352,7 @@ mod tests {
             "re-upgrading restarts nothing"
         );
     }
+
     #[tokio::test]
     async fn downgrade_keeps_the_two_oldest_same_millisecond_apps() {
         let pool = pool().await;
@@ -2401,5 +2411,62 @@ mod tests {
                 .unwrap();
             assert_eq!(state, "running", "{slug} is one of the two kept oldest");
         }
+    }
+
+    #[tokio::test]
+    async fn downgrade_restarts_the_inactivity_clock() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        // Pro apps carry a zero activity stamp: no Free silence accrued.
+        seed_pro_with_apps(&pool).await;
+        let ctx = ctx(&pool, &sender, &billing);
+        downgrade_account(&ctx, "a1", None, NOW).await.unwrap();
+        // The clock starts at the downgrade date (spec §7.8, Q3), on the
+        // kept apps and the stopped extras alike.
+        let stamps: Vec<i64> =
+            sqlx::query_scalar("SELECT last_activity_at FROM app WHERE owner_id = 'a1'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stamps, vec![NOW * 1000, NOW * 1000, NOW * 1000]);
+    }
+
+    #[tokio::test]
+    async fn resubscribe_clears_inactivity_expiry() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_pro_with_apps(&pool).await;
+        sqlx::query("UPDATE user SET plan = 'free' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = 7 WHERE id = 'app2'")
+            .bind(NOW * 1000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Resubscribe: the inactivity stamps clear with the downgrade ones
+        // (the owner is exempt while subscribed).
+        let object = serde_json::json!({
+            "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
+            "customer_email": "a@example.com",
+        });
+        apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_22",
+            "checkout.session.completed",
+            object,
+        )
+        .await;
+        let row: (Option<i64>, i64) =
+            sqlx::query_as("SELECT expired_at, inactivity_notices FROM app WHERE id = 'app2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, (None, 0));
     }
 }

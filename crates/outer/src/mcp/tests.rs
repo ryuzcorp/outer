@@ -6624,3 +6624,59 @@ async fn open_app_call_is_recorded_without_args() {
     assert!(row.2.starts_with("key:"), "session keys on the credential");
     assert!(row.3 > 0, "response bytes recorded");
 }
+
+/// `whoami`, `list_apps` and `get_app` carry the inactivity deadline
+/// (spec §7.8) on Free accounts, and omit it on Pro. Each call moves the
+/// clock (any authenticated request counts), so the test reads the stamps
+/// back and pins the deadline to them.
+#[tokio::test]
+async fn tools_show_deletes_at_on_free_and_hide_it_on_pro() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    async fn deadline(state: &McpState) -> i64 {
+        let (app_last, owner_last): (i64, i64) = sqlx::query_as(
+            "SELECT a.last_activity_at, u.lastActiveAt FROM app a              JOIN user u ON u.id = a.owner_id WHERE a.slug = 'groceries'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        app_last.max(owner_last) + 90 * 86_400_000
+    }
+    let (_, who) = call(&state, Some(&token), "whoami", json!({})).await;
+    assert_eq!(
+        result(&who)["structuredContent"]["deletes_at"],
+        deadline(&state).await
+    );
+    let (_, list) = call(&state, Some(&token), "list_apps", json!({})).await;
+    let apps = result(&list)["structuredContent"]["apps"].clone();
+    assert_eq!(apps.as_array().unwrap().len(), 1);
+    assert_eq!(apps[0]["deletes_at"], deadline(&state).await);
+    assert_eq!(apps[0]["status"], "running");
+    let (_, get) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(
+        result(&get)["structuredContent"]["deletes_at"],
+        deadline(&state).await
+    );
+    // Pro is exempt: the key vanishes everywhere, `whoami` nulls it.
+    sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, who) = call(&state, Some(&token), "whoami", json!({})).await;
+    assert_eq!(
+        result(&who)["structuredContent"]["deletes_at"],
+        serde_json::Value::Null
+    );
+    let (_, list) = call(&state, Some(&token), "list_apps", json!({})).await;
+    let apps = result(&list)["structuredContent"]["apps"].clone();
+    assert!(apps[0].get("deletes_at").is_none(), "{apps}");
+    let (_, get) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
+    assert!(
+        result(&get)["structuredContent"]
+            .get("deletes_at")
+            .is_none(),
+        "{}",
+        result(&get)["structuredContent"]
+    );
+}

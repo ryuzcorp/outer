@@ -74,6 +74,7 @@ pub async fn strip_pro_extras(
 /// clock: every handle `delete_app` takes, owned, so the hourly sweep can
 /// move them into its task. Same lock discipline as the MCP `delete_app`
 /// path (deploy + rollback + wake across the whole deletion).
+#[derive(Clone)]
 pub struct RetentionDeps {
     pub store: Store,
     pub git: GitConfig,
@@ -135,7 +136,7 @@ pub async fn run_downgrade_retention(
         }
         let age = now_secs.saturating_sub(stopped_at);
         if age >= DOWNGRADE_PURGE_AFTER_SECS {
-            match delete_stopped(pool, deps, &row.id, &row.slug).await {
+            match delete_retained(pool, deps, &row.id, &row.slug).await {
                 Ok(true) => purged += 1,
                 Ok(false) => {}
                 Err(err) => tracing::warn!(
@@ -179,11 +180,12 @@ pub async fn run_downgrade_retention(
     Ok((warned, purged))
 }
 
-/// Delete one downgrade-stopped app through the shared `delete_app` path:
+/// Delete one retention-doomed app through the shared `delete_app` path:
 /// fleet stopped, bucket prefixes wiped, rows dropped (the slug is claimable
-/// again immediately), edge caches purged. Returns `false` when the row was
+/// again immediately), edge caches purged. Shared by the downgrade-retention
+/// pass and the inactivity sweep. Returns `false` when the row was
 /// already gone (a concurrent delete won).
-async fn delete_stopped(
+pub(crate) async fn delete_retained(
     pool: &SqlitePool,
     deps: &RetentionDeps,
     app_id: &str,
@@ -210,7 +212,7 @@ async fn delete_stopped(
         Err(crate::apps::delete::DeleteError::NotFound(_)) => Ok(false),
         Err(crate::apps::delete::DeleteError::ConfirmMismatch(_, _)) => {
             // `confirm` is the slug by construction: unreachable.
-            anyhow::bail!("downgrade retention confirm mismatch for {slug:?}")
+            anyhow::bail!("retention confirm mismatch for {slug:?}")
         }
         Err(crate::apps::delete::DeleteError::Internal(err)) => Err(err),
     }

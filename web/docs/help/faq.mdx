@@ -53,6 +53,10 @@ Free apps carry a small outer.now badge in the bottom-right corner of its pages.
 
 Change, app, build-minute, collaborator, and storage quotas refuse with `quota_exceeded` plus a `user_message` your agent relays word for word. Request caps are soft — an email and an upgrade ask, and the app keeps serving. Full table: [limits and quotas](/deploy/limits).
 
+**My app was deleted. Why?**
+
+Free apps are deleted after 90 days without owner activity — your sign-ins, tool calls, and Console visits, or a collaborator's tool call on the app. Visiting the app doesn't count. Reminder emails go out at 30, 7, and 1 day before the deadline, and the Console and `list_apps` show the date as `deletes_at`. After the deadline the address serves an inactivity page for 7 days; signing in during that week restores the app. After that it is purged and the name is claimable again. Nothing restores a purged app. Pro apps are never deleted for inactivity while subscribed.
+
 ## Deploys
 
 **The deploy failed. What now?**

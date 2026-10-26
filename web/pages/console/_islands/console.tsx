@@ -26,6 +26,7 @@ import {
   type MetricsSummary,
   type SecretsSummary,
   type WaitlistSummary,
+  when,
 } from "./api.ts";
 import type { AdminStats, ModerationQueue } from "./actions/admin-moderation.ts";
 import { fetchTelemetry, type TelemetrySummary } from "./views/telemetry.tsx";
@@ -127,6 +128,9 @@ function statusBadge(status: string): string {
   if (status === "failed" || status === "error" || status === "blocked") {
     return "badge-error";
   }
+  if (status === "expired") {
+    return "badge-warning";
+  }
   return "badge-ghost";
 }
 
@@ -145,7 +149,18 @@ function statusDot(status: string): string {
   if (status === "failed" || status === "error" || status === "blocked") {
     return "status-error";
   }
+  if (status === "expired") {
+    return "status-warning";
+  }
   return "status-neutral";
+}
+
+// Rail tooltip for the apps list: status, sharing, and the inactivity
+// deadline (spec §7.8) when one applies.
+function appTip(a: ConsoleApp, sep: string): string {
+  const shared = a.role === "collaborator" ? `${sep}Shared` : "";
+  const deletes = a.deletes_at != null ? `${sep}deletes ${when(a.deletes_at)}` : "";
+  return `${a.slug}${sep}${a.status}${shared}${deletes}`;
 }
 
 async function loadActionsPage(
@@ -1028,9 +1043,9 @@ export function Console() {
               type="button"
               role="listitem"
               class={`rail-tile tooltip tooltip-right${a.slug === r.app ? " is-active" : ""}`}
-              data-tip={a.role === "collaborator" ? `${a.slug} · ${a.status} · Shared` : `${a.slug} · ${a.status}`}
-              title={a.role === "collaborator" ? `${a.slug} · ${a.status} · Shared` : `${a.slug} · ${a.status}`}
-              aria-label={a.role === "collaborator" ? `${a.slug}, ${a.status}, shared with you` : `${a.slug}, ${a.status}`}
+              data-tip={appTip(a, " · ")}
+              title={appTip(a, " · ")}
+              aria-label={a.role === "collaborator" ? `${a.slug}, ${a.status}, shared with you${a.deletes_at != null ? `, deletes ${when(a.deletes_at)}` : ""}` : `${a.slug}, ${a.status}${a.deletes_at != null ? `, deletes ${when(a.deletes_at)}` : ""}`}
               aria-current={a.slug === r.app ? "page" : undefined}
               onclick={() => {
                 if (a.slug !== r.app) {
