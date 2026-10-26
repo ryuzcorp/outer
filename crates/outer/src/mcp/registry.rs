@@ -228,7 +228,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<app_inputs::CreateAppInput>(
             "create_app",
-            "Create an app and deploy it: {slug, name?, template?, wait?}. Template \"app\" is an interactive Ilha + Void app, \"website\" an Astro content site (default \"app\"). Waits for the first deploy by default.",
+            "Create an app and deploy it: {slug, name?, description?, template?, wait?}. Name (1-60 chars) and description (1-160 chars) brand the app's brand.json; both default from the slug. Template \"app\" is an interactive Ilha + Void app, \"website\" an Astro content site (default \"app\"). Waits for the first deploy by default.",
             Account, false,
         ),
         tool::<NoArgs>(

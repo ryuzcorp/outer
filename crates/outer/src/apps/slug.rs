@@ -114,10 +114,10 @@ pub enum ProfanityError {
     Unavailable,
 }
 
-/// Classify the slug (and the app `name` when given) with the same Jev
-/// client and the same block decision as the pre-live gate (spec §15.1):
-/// hyphens become spaces, and any chunk the gate would block on
-/// ([`crate::moderation::gate::judge`] — profanity, minors, phishing,
+/// Classify the slug (and the app `name` and `description` when given) with
+/// the same Jev client and the same block decision as the pre-live gate
+/// (spec §15.1): hyphens become spaces, and any chunk the gate would block
+/// on ([`crate::moderation::gate::judge`] — profanity, minors, phishing,
 /// severe) refuses the name. Hate only queues in the gate and never blocks,
 /// so it passes here too.
 ///
@@ -129,6 +129,7 @@ pub async fn check_slug_profanity(
     jev: Option<&crate::moderation::JevClient>,
     slug: &str,
     name: Option<&str>,
+    description: Option<&str>,
 ) -> Result<(), ProfanityError> {
     let Some(jev) = jev else {
         tracing::warn!(
@@ -138,8 +139,10 @@ pub async fn check_slug_profanity(
         return Ok(());
     };
     let mut texts = vec![slug.replace('-', " ")];
-    if let Some(name) = name.filter(|name| !name.is_empty()) {
-        texts.push(name.to_string());
+    for extra in [name, description] {
+        if let Some(text) = extra.filter(|text| !text.is_empty()) {
+            texts.push(text.to_string());
+        }
     }
     let scores = jev
         .classify(&texts)

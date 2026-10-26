@@ -29,7 +29,7 @@ const USAGE: &str = "usage:
   outer serve
   outer check-config
   outer templates sync [--sha SHA] [--url URL]
-  outer app create SLUG --owner EMAIL [--name NAME] [--template app|website]
+  outer app create SLUG --owner EMAIL [--name NAME] [--description TEXT] [--template app|website]
   outer app deploy SLUG
   outer app delete SLUG
   outer app list
@@ -342,7 +342,7 @@ async fn templates_sync(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
 }
 
 async fn app_create(config: Config, slug: String, rest: Vec<&str>) -> anyhow::Result<()> {
-    let flags = flags(&rest, &["--owner", "--name", "--template"])?;
+    let flags = flags(&rest, &["--owner", "--name", "--description", "--template"])?;
     let Some(owner) = flag(&flags, "--owner") else {
         anyhow::bail!("app create needs --owner EMAIL");
     };
@@ -353,8 +353,15 @@ async fn app_create(config: Config, slug: String, rest: Vec<&str>) -> anyhow::Re
         })?,
     };
     let p = platform(&config).await?;
-    let (app, outcome) =
-        ops::create_app(&p, owner, &slug, flag(&flags, "--name"), template).await?;
+    let (app, outcome) = ops::create_app(
+        &p,
+        owner,
+        &slug,
+        flag(&flags, "--name"),
+        flag(&flags, "--description"),
+        template,
+    )
+    .await?;
     p.deployer.purges().drain().await;
     print_outcome(&config, &app, &outcome, outcome.reloaded)?;
     end_outcome(&outcome)?;
