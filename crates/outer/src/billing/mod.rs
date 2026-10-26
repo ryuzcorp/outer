@@ -403,6 +403,17 @@ struct UserBilling {
     ended: bool,
 }
 
+/// The subscription an invoice belongs to. From API version `2025-03-31`
+/// (we pin `2025-08-27.basil`) Stripe moved it from the top-level
+/// `subscription` to `parent.subscription_details.subscription`; read the
+/// new place first and accept the old one.
+fn invoice_subscription(invoice: &serde_json::Value) -> Option<&str> {
+    invoice
+        .pointer("/parent/subscription_details/subscription")
+        .and_then(str_or_id)
+        .or_else(|| invoice.get("subscription").and_then(str_or_id))
+}
+
 /// A Stripe id-or-object field: `"cus_1"` or `{"id": "cus_1"}`.
 fn str_or_id(value: &serde_json::Value) -> Option<&str> {
     match value {
@@ -739,7 +750,7 @@ async fn apply_invoice_paid(
     object: &serde_json::Value,
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
-    let subscription = object.get("subscription").and_then(str_or_id);
+    let subscription = invoice_subscription(object);
     let user = match customer {
         Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
@@ -768,7 +779,7 @@ async fn apply_payment_failed(
     now_secs: i64,
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
-    let subscription = object.get("subscription").and_then(str_or_id);
+    let subscription = invoice_subscription(object);
     let user = match customer {
         Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
@@ -1586,6 +1597,17 @@ mod tests {
                 "evt_52",
                 "invoice.paid",
                 serde_json::json!({"id": "in_1", "customer": "cus_1", "subscription": "sub_1"}),
+            ),
+            (
+                "evt_53",
+                "invoice.paid",
+                // The pinned API version's real shape: no top-level
+                // `subscription`, it sits under `parent`.
+                serde_json::json!({
+                    "id": "in_2", "customer": "cus_1", "subscription": null,
+                    "parent": {"type": "subscription_details",
+                               "subscription_details": {"subscription": "sub_1"}},
+                }),
             ),
         ] {
             apply(&pool, &sender, &billing, id, kind, object).await;
