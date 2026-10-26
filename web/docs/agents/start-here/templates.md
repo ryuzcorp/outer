@@ -23,9 +23,9 @@ Both live in [ryuzcorp/outer-templates](https://github.com/ryuzcorp/outer-templa
 
 ## Know what each ships
 
-The `app` template serves server-rendered Ilha pages in `pages/` with loaders + actions on D1 and `useForm` for mutations. Read the template `AGENTS.md` first, then the [Ilha](/agents/frontend/ilha) and [Void](/agents/frontend/void) guides before writing code.
+The `app` template serves server-rendered Ilha pages in `pages/` with loaders + actions on D1 and `useForm` for mutations. Call `open_app {app}` first (it carries the `AGENTS.md` rules digest), then read the [Ilha](/agents/frontend/ilha) and [Void](/agents/frontend/void) guides before writing code.
 
-The `website` template serves mostly static, prerendered Astro pages with Ilha islands for interactive parts, at most one D1 database and one R2 bucket. Read its `AGENTS.md` first, then [Website](/agents/frontend/website).
+The `website` template serves mostly static, prerendered Astro pages with Ilha islands for interactive parts, at most one D1 database and one R2 bucket. Call `open_app {app}` first (it carries the `AGENTS.md` rules digest), then read [Website](/agents/frontend/website).
 
 ## Rebuild, never stretch
 

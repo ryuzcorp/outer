@@ -127,7 +127,7 @@ pub async fn export_app(
     let sha = match local::resolve_rev(&bare, rev).await {
         Ok(Some(sha)) => sha,
         Ok(None) => return Err(ExportError::NoRepo),
-        Err(_) if rev.is_some() => {
+        Err(e) if rev.is_some() && local::is_unknown_rev(&e) => {
             return Err(ExportError::UnknownRev(rev.unwrap_or_default().to_string()));
         }
         Err(err) => return Err(ExportError::Internal(err)),

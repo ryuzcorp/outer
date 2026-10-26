@@ -40,6 +40,7 @@ import {
 import { exportActions } from "./actions/export.ts";
 import { secretsActions } from "./actions/secrets.ts";
 import { settingsActions } from "./actions/settings.ts";
+import { TelemetryCard, type TelemetrySummary } from "./views/telemetry.tsx";
 import {
   CopyButton,
   timeAgo,
@@ -2866,6 +2867,7 @@ export function AdminView({
   waitlist,
   queue,
   stats,
+  telemetry,
   isAdmin,
   onGenerate,
   onRevoke,
@@ -2878,6 +2880,7 @@ export function AdminView({
   waitlist: Panel<WaitlistSummary>;
   queue: Panel<ModerationQueue>;
   stats: Panel<AdminStats>;
+  telemetry: Panel<TelemetrySummary>;
   isAdmin: boolean;
   onGenerate: (count: number, note: string) => Promise<void>;
   onRevoke: (code: string) => Promise<void>;
@@ -2898,6 +2901,7 @@ export function AdminView({
   return (
     <div class="flex min-w-0 flex-col gap-3">
       <ModerationStatsCard panel={stats} onRetry={onRetry} />
+      <TelemetryCard panel={telemetry} onRetry={onRetry} />
       <ModerationQueueCard
         panel={queue}
         onRetry={onRetry}

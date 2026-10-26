@@ -8,7 +8,7 @@ You build apps through MCP tools. Every code change follows one loop: build, gat
 ## Follow the loop
 
 1. Call `create_app` with the slug you want. Outer rejects a taken slug; a deleted app's slug is free to claim again immediately.
-2. Read `AGENTS.md` at the root of the new app with `read_files` (batch it with `brand.json` and the page you will change: up to 20 files, numbered lines). It holds the template's rules for code, design, and page text. Find code with `search_code`: path globs, `kind: "symbol"` for definitions, generated files skipped by default.
+2. Call `open_app {app}` to orient: the file tree with roles, routes, D1 tables, bindings, brand, the `AGENTS.md` rules digest and quota in one call. Read deeper with `read_files` (up to 20 files or line ranges per call, numbered lines, or one `symbol` by name) and find code with `search_code` (path globs, `kind: "symbol"` for definitions; generated files skipped by default).
 3. Make small edits with `commit` using exact-match `edits`, one idea per message.
 4. Verify with `look_at_app` after UI changes and `app_errors` after touching server code.
 

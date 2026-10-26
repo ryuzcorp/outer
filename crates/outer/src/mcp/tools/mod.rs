@@ -14,6 +14,7 @@ pub(crate) mod collaborators;
 pub(crate) mod domains;
 pub(crate) mod export;
 pub(crate) mod look;
+pub(crate) mod open_app;
 pub(crate) mod preview;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
@@ -65,6 +66,17 @@ pub fn internal(err: impl Into<anyhow::Error>) -> ToolError {
     let err = err.into();
     tracing::warn!("tool internal: {err:#}");
     ToolError::internal("something failed on our side; try again in a minute")
+}
+/// A `resolve_rev` failure as a tool error: a well-formed but unknown sha
+/// is the caller's bug (`not_found`, "unknown commit"); anything else is
+/// infrastructure (`internal`). `None`-revision calls resolve through the
+/// mirror head and never produce `UnknownRev`.
+pub fn rev_err(err: anyhow::Error) -> ToolError {
+    if crate::git::local::is_unknown_rev(&err) {
+        ToolError::not_found("unknown commit")
+    } else {
+        internal(err)
+    }
 }
 
 /// The §8.4 notice, prepended as its own text block to every data block a
@@ -964,6 +976,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "list_domains" => domains::list_domains(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "open_app" => open_app::open_app_impl(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "list_files" => code::list_files(parse_args(args)?, ctx)

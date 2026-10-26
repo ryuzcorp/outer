@@ -284,7 +284,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 51);
+    assert_eq!(anon.len(), 52);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -301,7 +301,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 49);
+    assert_eq!(authed.len(), 50);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
     assert!(authed.contains(&"upgrade".to_string()));
@@ -638,6 +638,7 @@ async fn strangers_app_is_not_found_never_forbidden() {
 
     for (tool, args) in [
         ("get_app", json!({"app": "groceries"})),
+        ("open_app", json!({"app": "groceries"})),
         (
             "read_files",
             json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
@@ -665,6 +666,35 @@ async fn strangers_app_is_not_found_never_forbidden() {
             .len(),
         0
     );
+}
+
+#[tokio::test]
+async fn open_app_unknown_sha_and_changed_since_are_not_found() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    // Well-formed but unknown: 40 hex chars naming nothing on main.
+    let missing = "0".repeat(40);
+    let (_, bad_sha) = call(
+        &state,
+        Some(&token),
+        "open_app",
+        json!({"app": "groceries", "sha": missing}),
+    )
+    .await;
+    let err = is_error(&bad_sha);
+    assert_eq!(err["error"], "not_found");
+    assert!(err["message"].as_str().unwrap().contains("unknown commit"));
+    let (_, bad_since) = call(
+        &state,
+        Some(&token),
+        "open_app",
+        json!({"app": "groceries", "changed_since": missing}),
+    )
+    .await;
+    let err = is_error(&bad_since);
+    assert_eq!(err["error"], "not_found");
+    assert!(err["message"].as_str().unwrap().contains("unknown commit"));
 }
 
 #[tokio::test]
@@ -5796,4 +5826,489 @@ async fn read_search_strangers_app_is_not_found() {
         let (_, denied) = call(&state, Some(&bob), tool, args).await;
         assert_eq!(is_error(&denied)["error"], "not_found");
     }
+}
+
+// --- `open_app` (Wave 4): one orientation call per app -----------------------
+
+/// One `commit` of full-file writes; returns the `structuredContent`.
+async fn commit_writes(
+    state: &McpState,
+    token: &str,
+    app: &str,
+    writes: Vec<(&str, &str)>,
+) -> Value {
+    let writes: Vec<Value> = writes
+        .into_iter()
+        .map(|(path, content)| json!({"path": path, "content": content}))
+        .collect();
+    let (_, body) = call(
+        state,
+        Some(token),
+        "commit",
+        json!({"app": app, "message": "shape the tree", "writes": writes}),
+    )
+    .await;
+    result(&body)["structuredContent"].clone()
+}
+
+/// Every tree entry flattened: `(path, lines, role, status?)`.
+fn tree_entries(body: &Value) -> Vec<(String, Option<u64>, String, Option<String>)> {
+    let sc = &body["structuredContent"];
+    sc["tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|dir| dir["files"].as_array().unwrap().iter())
+        .map(|f| {
+            (
+                f["path"].as_str().unwrap().to_string(),
+                f["lines"].as_u64(),
+                f["role"].as_str().unwrap().to_string(),
+                f.get("status").and_then(Value::as_str).map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+fn tree_paths(body: &Value) -> Vec<String> {
+    tree_entries(body)
+        .into_iter()
+        .map(|(p, _, _, _)| p)
+        .collect()
+}
+
+fn role_of(entries: &[(String, Option<u64>, String, Option<String>)], path: &str) -> String {
+    entries
+        .iter()
+        .find(|(p, _, _, _)| p == path)
+        .unwrap_or_else(|| panic!("{path} missing from the tree"))
+        .2
+        .clone()
+}
+
+const VOID_CONFIG: &str = "import { defineConfig } from \"void/config\";\nexport default defineConfig({\n  cloudflare: {\n    d1_databases: [{ binding: \"DB\", database_name: \"app-db\", migrations_dir: \"db/migrations\" }],\n  },\n});\n";
+const BRAND_JSON: &str = "{\"name\": \"Groceries\", \"shortName\": \"Groceries\", \"description\": \"Keep track.\", \"accent\": \"#555de3\"}\n";
+const AGENTS_MD: &str = "# AGENTS.md\n\nYou edit this app through Outer's MCP tools.\n\n## Files\n\n- `pages/index.tsx` is the home page.\n";
+
+#[tokio::test]
+async fn open_app_orients_ilha_shaped_repo() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    commit_writes(
+        &state,
+        &token,
+        "groceries",
+        vec![
+            ("pages/index.tsx", "<h1>Groceries</h1>\n<p>list</p>\n"),
+            ("pages/settings.tsx", "export default function Settings() {}\n"),
+            ("pages/blog/[slug].tsx", "export default function Post() {}\n"),
+            ("pages/index.server.ts", "export function load() {}\n"),
+            ("pages/layout.tsx", "export default function Layout() {}\n"),
+            ("pages/_helper.ts", "export const x = 1;\n"),
+            ("pages/x.test.tsx", "import { test } from \"bun:test\";\n"),
+            ("middleware/01.not-found.ts", "export default function notFound() {}\n"),
+            (
+                "db/migrations/0001_item.sql",
+                "-- items table\nCREATE TABLE IF NOT EXISTS item (\n  id INTEGER PRIMARY KEY AUTOINCREMENT, -- pk\n  text TEXT NOT NULL,\n  CONSTRAINT uq_text UNIQUE (text)\n);\nALTER TABLE item ADD COLUMN done INTEGER NOT NULL DEFAULT 0;\n",
+            ),
+            (
+                "db/migrations/0002_note.sql",
+                "CREATE TABLE \"note\" (\"id\" INTEGER PRIMARY KEY, body TEXT);\n",
+            ),
+            ("brand.json", BRAND_JSON),
+            ("AGENTS.md", AGENTS_MD),
+            ("void.config.ts", VOID_CONFIG),
+            ("README.md", "# Groceries\n"),
+            ("pages/app.css", ".x { color: red; }\n"),
+            ("dist/bundle.js", "console.log(1)\n"),
+            ("node_modules/dep/index.js", "module.exports = 1;\n"),
+            ("bun.lock", "{\"lockfileVersion\": 1}\n"),
+            ("void.lock.json", "{}\n"),
+            ("public/favicon.svg", "<svg></svg>\n"),
+            ("public/apple-touch-icon-180x180.png", "PNGDATA\n"),
+            ("public/manifest.webmanifest", "{}\n"),
+        ],
+    )
+    .await;
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "open_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let sc = &result(&body)["structuredContent"];
+
+    let head = sc["head"].as_str().unwrap().to_string();
+    assert_eq!(head.len(), 40, "head is the full commit sha");
+    assert_eq!(sc["truncated"], false);
+
+    // Roles follow the Ilha conventions.
+    let entries = tree_entries(&result(&body).clone());
+    for (path, role) in [
+        ("pages/index.tsx", "page"),
+        ("pages/settings.tsx", "page"),
+        ("pages/blog/[slug].tsx", "page"),
+        ("pages/index.server.ts", "server"),
+        ("pages/layout.tsx", "layout"),
+        ("pages/_helper.ts", "other"),
+        ("pages/x.test.tsx", "test"),
+        ("middleware/01.not-found.ts", "middleware"),
+        ("db/migrations/0001_item.sql", "migration"),
+        ("void.config.ts", "config"),
+        ("brand.json", "config"),
+        ("README.md", "doc"),
+        ("pages/app.css", "style"),
+    ] {
+        assert_eq!(role_of(&entries, path), role, "role of {path}");
+    }
+    // Line counts come along, including the two-line index page.
+    let index = entries
+        .iter()
+        .find(|(p, _, _, _)| p == "pages/index.tsx")
+        .unwrap();
+    assert_eq!(index.1, Some(2));
+
+    // Build output, dependencies, lockfiles and generated icons stay hidden.
+    let paths = tree_paths(&result(&body).clone());
+    for hidden in [
+        "dist/bundle.js",
+        "node_modules/dep/index.js",
+        "bun.lock",
+        "void.lock.json",
+        "public/favicon.svg",
+        "public/apple-touch-icon-180x180.png",
+        "public/manifest.webmanifest",
+    ] {
+        assert!(
+            !paths.contains(&hidden.to_string()),
+            "{hidden} must stay hidden"
+        );
+    }
+
+    // Routes cover the index, the settings page and the dynamic segment.
+    let routes: Vec<(String, String)> = sc["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["path"].as_str().unwrap().to_string(),
+                r["file"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(routes.contains(&("/settings".to_string(), "pages/settings.tsx".to_string())));
+    assert!(routes.contains(&(
+        "/blog/<slug>".to_string(),
+        "pages/blog/[slug].tsx".to_string()
+    )));
+    assert!(routes.iter().any(|(p, _)| p == "/"));
+    // Loaders, layouts and partials are never routes.
+    assert!(!routes.iter().any(|(_, f)| f == "pages/index.server.ts"));
+    assert!(!routes.iter().any(|(_, f)| f == "pages/layout.tsx"));
+    assert!(!routes.iter().any(|(_, f)| f == "pages/_helper.ts"));
+    assert!(!routes.iter().any(|(_, f)| f == "pages/x.test.tsx"));
+
+    // D1 tables parsed from the committed migrations (constraints skipped,
+    // the ALTER column appended) — the live DB untouched.
+    let tables: Vec<(String, Vec<String>)> = sc["database"]["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap().to_string(),
+                t["columns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.as_str().unwrap().to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert!(tables.contains(&(
+        "item".to_string(),
+        vec!["id".to_string(), "text".to_string(), "done".to_string()]
+    )));
+    assert!(tables.contains(&(
+        "note".to_string(),
+        vec!["id".to_string(), "body".to_string()]
+    )));
+
+    // Bindings, brand and rules digest.
+    assert_eq!(sc["bindings"]["d1_databases"][0]["binding"], "DB");
+    assert_eq!(sc["bindings"]["d1_databases"][0]["database_name"], "app-db");
+    assert_eq!(sc["brand"]["name"], "Groceries");
+    assert_eq!(sc["rules"]["path"], "AGENTS.md");
+    assert!(sc["rules"]["digest"]
+        .as_str()
+        .unwrap()
+        .contains("MCP tools"));
+
+    // Deploy, errors and quota.
+    assert_eq!(sc["deploy"]["status"], "success");
+    assert_eq!(sc["deploy"]["sha"], head);
+    assert!(sc["deploy"]["url"].as_str().unwrap().contains("groceries"));
+    assert_eq!(sc["errors_open"], 0);
+    assert_eq!(sc["quota"]["code_changes_per_day"], 50);
+    assert!(sc["quota"]["code_changes_used_today"].as_u64().unwrap() >= 1);
+
+    // `next` points at line-ranged reads, search and commit edits.
+    let next = sc["next"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(next.contains("read_files"), "next hints reads: {next}");
+    assert!(next.contains("search_code"), "next hints search: {next}");
+    assert!(next.contains("commit"), "next hints edits: {next}");
+
+    // The orientation call stays compact (≤ 4k tokens ≈ 16k chars here).
+    assert!(
+        sc.to_string().len() < 16_000,
+        "open_app answers in {} chars",
+        sc.to_string().len()
+    );
+}
+
+#[tokio::test]
+async fn open_app_orients_astro_shaped_repo() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "site").await;
+    commit_writes(
+        &state,
+        &token,
+        "site",
+        vec![
+            ("src/pages/index.astro", "---\n---\n<h1>Hi</h1>\n"),
+            ("src/pages/about.astro", "<h1>About</h1>\n"),
+            ("src/pages/blog/index.astro", "<h1>Blog</h1>\n"),
+            ("src/pages/blog/[slug].astro", "<h1>Post</h1>\n"),
+            ("src/pages/404.astro", "<h1>Missing</h1>\n"),
+            ("src/pages/api/newsletter.ts", "export function POST() {}\n"),
+            ("src/pages/rss.xml.ts", "export function GET() {}\n"),
+            ("src/pages/sitemap.xml.ts", "export function GET() {}\n"),
+            ("src/islands/NewsletterForm.tsx", "export default function Form() {}\n"),
+            ("src/layouts/Base.astro", "<html></html>\n"),
+            ("src/content/posts/hello.md", "# Hello\n"),
+            ("src/lib/site.ts", "export const x = 1;\n"),
+            ("src/lib/site.test.ts", "import { test } from \"bun:test\";\n"),
+            ("src/styles/global.css", "body {}\n"),
+            (
+                "db/migrations/0001_newsletter.sql",
+                "CREATE TABLE IF NOT EXISTS newsletter (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE);\n",
+            ),
+            ("void.config.ts", VOID_CONFIG),
+            ("astro.config.mjs", "export default {};\n"),
+            ("brand.json", BRAND_JSON),
+            ("AGENTS.md", AGENTS_MD),
+            ("public/favicon.svg", "<svg></svg>\n"),
+            ("public/og.svg", "<svg></svg>\n"),
+        ],
+    )
+    .await;
+    let (_, body) = call(&state, Some(&token), "open_app", json!({"app": "site"})).await;
+    let sc = &result(&body)["structuredContent"];
+
+    let entries = tree_entries(&result(&body).clone());
+    for (path, role) in [
+        ("src/pages/index.astro", "page"),
+        ("src/pages/api/newsletter.ts", "page"),
+        ("src/islands/NewsletterForm.tsx", "island"),
+        ("src/layouts/Base.astro", "layout"),
+        ("src/content/posts/hello.md", "content"),
+        ("src/lib/site.test.ts", "test"),
+        ("db/migrations/0001_newsletter.sql", "migration"),
+        ("astro.config.mjs", "config"),
+    ] {
+        assert_eq!(role_of(&entries, path), role, "role of {path}");
+    }
+    let paths = tree_paths(&result(&body).clone());
+    assert!(!paths.contains(&"public/favicon.svg".to_string()));
+    assert!(!paths.contains(&"public/og.svg".to_string()));
+
+    let routes: Vec<(String, String)> = sc["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["path"].as_str().unwrap().to_string(),
+                r["file"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    for (path, file) in [
+        ("/about", "src/pages/about.astro"),
+        ("/blog", "src/pages/blog/index.astro"),
+        ("/blog/<slug>", "src/pages/blog/[slug].astro"),
+        ("/api/newsletter", "src/pages/api/newsletter.ts"),
+        ("/rss.xml", "src/pages/rss.xml.ts"),
+        ("/sitemap.xml", "src/pages/sitemap.xml.ts"),
+    ] {
+        assert!(
+            routes.contains(&(path.to_string(), file.to_string())),
+            "route {path} → {file} missing in {routes:?}"
+        );
+    }
+    assert!(!routes.iter().any(|(_, f)| f == "src/pages/404.astro"));
+
+    let tables: Vec<String> = sc["database"]["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(tables.contains(&"newsletter".to_string()));
+    assert!(sc.to_string().len() < 16_000);
+}
+
+#[tokio::test]
+async fn open_app_truncates_large_trees() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "big").await;
+    // 320 single-line pages in four commits (100 writes/edits per commit).
+    for chunk in 0..4 {
+        let writes: Vec<(String, String)> = (0..80)
+            .map(|i| {
+                let n = chunk * 80 + i;
+                (
+                    format!("pages/p{n:03}.tsx"),
+                    "export default function P() {}\n".to_string(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = writes
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        commit_writes(&state, &token, "big", refs).await;
+    }
+    let (_, body) = call(&state, Some(&token), "open_app", json!({"app": "big"})).await;
+    let sc = &result(&body)["structuredContent"];
+    assert_eq!(sc["truncated"], true);
+    let total: usize = sc["tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|dir| dir["files"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(total, 300);
+    let next = sc["next"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        next.contains("list_files"),
+        "truncation hints at list_files: {next}"
+    );
+}
+
+#[tokio::test]
+async fn open_app_changed_since_lists_only_deltas() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "delta").await;
+    commit_writes(
+        &state,
+        &token,
+        "delta",
+        vec![("a.txt", "a\n"), ("b.txt", "b\n")],
+    )
+    .await;
+    let (_, first) = call(&state, Some(&token), "open_app", json!({"app": "delta"})).await;
+    let base = result(&first)["structuredContent"]["head"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // One edit, one delete, one addition.
+    let (_, edited) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "delta", "message": "second",
+               "edits": [{"path": "a.txt", "old": "a\n", "new": "a2\n"}],
+               "deletes": ["b.txt"],
+               "writes": [{"path": "c.txt", "content": "c\n"}]}),
+    )
+    .await;
+    assert!(result(&edited).get("isError").is_none());
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "open_app",
+        json!({"app": "delta", "changed_since": base}),
+    )
+    .await;
+    let entries = tree_entries(&result(&body).clone());
+    let mut statuses: Vec<(String, String)> = entries
+        .into_iter()
+        .map(|(p, _, _, s)| (p, s.unwrap_or_else(|| "none".to_string())))
+        .collect();
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        vec![
+            ("a.txt".to_string(), "modified".to_string()),
+            ("b.txt".to_string(), "deleted".to_string()),
+            ("c.txt".to_string(), "added".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn open_app_stranger_gets_not_found() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    let (_, body) = call(&state, Some(&bob), "open_app", json!({"app": "groceries"})).await;
+    assert_eq!(is_error(&body)["error"], "not_found");
+}
+
+#[tokio::test]
+async fn open_app_call_is_recorded_without_args() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "open_app",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&body).get("isError").is_none());
+    // The recorder runs spawned off the call: poll for the row.
+    let mut tries = 0;
+    let row = loop {
+        let rows: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT tool, app_slug, session, response_bytes FROM tool_call WHERE tool = 'open_app'",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        if let Some(row) = rows
+            .into_iter()
+            .find(|(_, slug, _, _)| slug.as_deref() == Some("groceries"))
+        {
+            break row;
+        }
+        tries += 1;
+        assert!(tries < 100, "telemetry row never landed");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(row.0, "open_app");
+    assert!(row.2.starts_with("key:"), "session keys on the credential");
+    assert!(row.3 > 0, "response bytes recorded");
 }

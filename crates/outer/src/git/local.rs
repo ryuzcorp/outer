@@ -125,8 +125,28 @@ fn git_dir(bare: &Path) -> String {
     format!("--git-dir={}", bare.display())
 }
 
+/// A well-formed sha that names nothing on `main`: the caller's bug, not a
+/// git failure. Carried inside the `anyhow::Error` from [`resolve_rev`] so
+/// tools can answer `not_found` while real git failures stay `internal`.
+#[derive(Debug)]
+pub struct UnknownRev(pub String);
+
+impl std::fmt::Display for UnknownRev {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown commit {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownRev {}
+
+/// Whether `err` is an [`UnknownRev`] from [`resolve_rev`].
+pub fn is_unknown_rev(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UnknownRev>().is_some()
+}
+
 /// Resolve `rev` (full or short sha) to a commit sha. `None` when the mirror
-/// has no `main` yet; an error when `rev` names nothing on `main`.
+/// has no `main` yet; an [`UnknownRev`] error when `rev` names nothing on
+/// `main`. Other git failures (timeout, corrupt mirror) propagate as-is.
 pub async fn resolve_rev(bare: &Path, rev: Option<&str>) -> anyhow::Result<Option<String>> {
     let gd = git_dir(bare);
     match rev {
@@ -136,13 +156,30 @@ pub async fn resolve_rev(bare: &Path, rev: Option<&str>) -> anyhow::Result<Optio
         },
         Some(rev) => {
             validate_sha(rev)?;
-            let out = run_git(
+            match run_git(
                 &[&gd, "rev-parse", "--verify", &format!("{rev}^{{commit}}")],
                 &[],
                 GIT_TIMEOUT,
             )
-            .await?;
-            Ok(Some(out.trim().to_string()))
+            .await
+            {
+                Ok(out) => Ok(Some(out.trim().to_string())),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    // `rev-parse --verify` fails on unknown revs with
+                    // "Needed a single revision" / "unknown revision"; a
+                    // timeout or a broken mirror says something else, and
+                    // stays a plain git failure.
+                    if msg.contains("Needed a single revision")
+                        || msg.contains("unknown revision")
+                        || msg.contains("bad revision")
+                    {
+                        Err(UnknownRev(rev.to_string()).into())
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
         }
     }
 }
@@ -505,6 +542,76 @@ pub async fn blob_sha(
         .await
         .map_err(|_| anyhow::anyhow!("{path} not found"))?;
     Ok((sha, out.trim().to_string()))
+}
+
+/// Line counts for every text file at `rev`, in one `git grep` pass:
+/// `--count` with an empty pattern counts every line, `-I` skips binary
+/// blobs. Returns the resolved sha and `path -> lines`. Files `grep`
+/// skips (binary, empty) are absent: callers treat a missing entry as
+/// unknown, not zero.
+pub async fn line_counts(
+    bare: &Path,
+    rev: Option<&str>,
+) -> anyhow::Result<(String, std::collections::HashMap<String, u64>)> {
+    let Some(sha) = resolve_rev(bare, rev).await? else {
+        anyhow::bail!("app has no commits yet");
+    };
+    let gd = git_dir(bare);
+    let run = run_capped(
+        &[&gd, "grep", "--count", "-I", "-e", "", &sha, "--", "."],
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .await?;
+    // Exit 1 is "no matches" (an empty tree): not a failure.
+    if run.failed() && run.status.code() != Some(1) {
+        anyhow::bail!("git grep --count failed\n{}", run.stderr);
+    }
+    let mut counts = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&run.stdout).lines() {
+        // `<sha>:<path>:<count>`.
+        let rest = line.strip_prefix(&sha).and_then(|r| r.strip_prefix(':'));
+        let Some(rest) = rest else { continue };
+        let Some(colon) = rest.rfind(':') else {
+            continue;
+        };
+        let (path, count) = rest.split_at(colon);
+        if let Ok(n) = count[1..].parse::<u64>() {
+            counts.insert(path.to_string(), n);
+        }
+    }
+    Ok((sha, counts))
+}
+
+/// Name-status pairs (`path`, status char) between two commits, in
+/// `git diff` order. Renames land on the new path with status `R`;
+/// callers map the codes they care about.
+pub async fn changed_paths(
+    bare: &Path,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<Vec<(String, char)>> {
+    for rev in [from, to] {
+        validate_sha(rev)?;
+    }
+    let gd = git_dir(bare);
+    let out = run_git(
+        &[&gd, "diff", "--no-ext-diff", "--name-status", from, to],
+        &[],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let mut out_paths = Vec::new();
+    for line in out.lines() {
+        let mut parts = line.split('\t');
+        let Some(code) = parts.next() else { continue };
+        let status = code.chars().next().unwrap_or('M');
+        // Renames carry `old new`: the change lands on the new path.
+        let path = parts.next_back().unwrap_or("").to_string();
+        if !path.is_empty() {
+            out_paths.push((path, status));
+        }
+    }
+    Ok(out_paths)
 }
 
 /// Largest single git stdout kept in memory: `grep`, `ls-tree` and `show`
@@ -1135,6 +1242,22 @@ mod tests {
         assert!(validate_sha("xyz!!").is_err());
         assert!(validate_sha("-5").is_err());
         assert!(validate_sha("a3f2c91d5e7b4a6c8f0e2d4b6a8c0e2f4a6b8d0e1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolve_rev_marks_unknown_but_not_other_failures() {
+        let (dir, cfg, store, sync) = seed().await;
+        let bare = bare(&dir, &cfg, &store, &sync).await;
+        // The head resolves through `None`.
+        assert!(resolve_rev(&bare, None).await.unwrap().is_some());
+        // A well-formed but unknown sha is `UnknownRev`.
+        let missing = "0".repeat(40);
+        let err = resolve_rev(&bare, Some(&missing)).await.unwrap_err();
+        assert!(is_unknown_rev(&err), "{err:#}");
+        assert!(err.to_string().contains("unknown commit"));
+        // Bad shape never reaches git, so it is not `UnknownRev` either.
+        let err = resolve_rev(&bare, Some("xyz!!")).await.unwrap_err();
+        assert!(!is_unknown_rev(&err));
     }
 
     async fn seed_two() -> (

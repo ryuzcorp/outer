@@ -11,6 +11,7 @@ pub mod actions;
 pub mod docs;
 pub mod error;
 pub mod registry;
+pub mod telemetry;
 pub mod tools;
 pub mod tools_page;
 
@@ -43,7 +44,7 @@ pub const LATEST_PROTOCOL: &str = "2025-11-25";
 
 /// Exactly the §8.1 text (Codex reads only this much). The length test pins
 /// it at or under 512 chars.
-pub const INSTRUCTIONS: &str = "Outer hosts Ilha apps. Call `docs {topic: \"ilha\"}` before writing code. `create_app` → `commit` (prefer `edits`); every code tool waits for the deploy. Relay `user_message` verbatim.";
+pub const INSTRUCTIONS: &str = "Start with `open_app` to orient on the app. Read only what you need with `read_files` (batch up to 20 files, line ranges or one symbol), find code with `search_code`, change code with `commit` edits. Relay `user_message` verbatim. Guides: `docs {topic}` and /llms.txt.";
 
 /// Largest `POST /mcp` body: one `commit` at the caps fits (spec §8.1).
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -738,7 +739,7 @@ async fn handle_call(
     let ctx = tools::Ctx {
         state,
         principal: caller,
-        client_ip,
+        client_ip: client_ip.clone(),
     };
     // The agent action log (spec §13.1): time the call, then record one row
     // for app-targeting tools. Recording runs after the result is computed
@@ -757,6 +758,20 @@ async fn handle_call(
         )
         .await;
     }
+    // Tool telemetry (migration 0015): every call, spawned so the insert
+    // never slows the response. Only scalar facts reach the row — never
+    // arguments or outputs.
+    telemetry::spawn_record(
+        state.pool.clone(),
+        telemetry::RecordReq::from_outcome(
+            name,
+            ctx.principal.clone(),
+            client_ip.clone(),
+            args.as_ref(),
+            &outcome,
+            duration_ms,
+        ),
+    );
     match outcome {
         Ok(result) => rpc_result(id, result),
         Err(tools::CallError::Rpc(code, message)) => rpc_error(Some(id), code, message),

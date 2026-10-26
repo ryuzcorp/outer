@@ -304,6 +304,19 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `sha` | string | no | A commit sha (full or short). Defaults to `main`. |
 
+## `open_app`
+
+- **Access:** signed in
+- **Description:** Orient on an app in one call: head sha, role-tagged tree, routes, D1 tables, bindings, brand, AGENTS.md digest, last deploy, open errors and quota. Start here, then read_files (batched ranges), search_code, commit edits.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `changed_since` | string | no | Only files changed since this sha (a commit sha on main): the tree lists just those, each with `status` added/modified/deleted. |
+| `sha` | string | no | A commit sha (default: the tip of main). |
+
 ## `list_files`
 
 - **Access:** signed in
