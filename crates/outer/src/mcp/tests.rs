@@ -150,9 +150,28 @@ async fn api_key_for(state: &McpState, email: &str) -> String {
 
 async fn create_app(state: &McpState, token: &str, slug: &str) -> Value {
     let (_, body) = call(state, Some(token), "create_app", json!({"slug": slug})).await;
-    let structured = &result(&body)["structuredContent"];
+    let mut structured = result(&body)["structuredContent"].clone();
+    // Under a loaded parallel suite the spawned fake deploy can outlast the
+    // short test `tool_wait`, so the call answers `building`: follow the
+    // deploy to its terminal row instead of asserting on the first answer.
+    // (Tests that want the in-progress shape call the tool directly.)
+    if structured["deploy"]["status"] == "building" {
+        for _ in 0..100 {
+            let (_, status) = call(
+                state,
+                Some(token),
+                "deploy_status",
+                json!({"app": slug, "wait": true}),
+            )
+            .await;
+            structured["deploy"] = result(&status)["structuredContent"].clone();
+            if structured["deploy"]["status"] != "building" {
+                break;
+            }
+        }
+    }
     assert_eq!(structured["deploy"]["status"], "success");
-    structured.clone()
+    structured
 }
 
 #[tokio::test]
@@ -1628,8 +1647,16 @@ async fn rollback_in_flight_rejects_and_coalesces() {
     .await;
     assert!(result(&second).get("isError").is_none());
     state.deploys.set_fake(FakeOutcome::slow());
-    // One rollback proceeds (past the cap it reports building); the second
-    // fails fast instead of queueing another build.
+    // Overlap the two rollbacks by construction, not by scheduler luck: the
+    // second waits until the first holds the app's rollback lock, so it must
+    // take the fail-fast refusal. (A bare `join!` can serialize under a
+    // loaded suite — the first returns `building` and drops the lock before
+    // the second tries it — and neither call is rate-limited.)
+    let app_id = crate::apps::get_by_slug(&state.pool, "groceries")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     let (a, b) = tokio::join!(
         call(
             &state,
@@ -1637,31 +1664,44 @@ async fn rollback_in_flight_rejects_and_coalesces() {
             "rollback",
             json!({"app": "groceries", "sha": sha1})
         ),
-        call(
-            &state,
-            Some(&token),
-            "rollback",
-            json!({"app": "groceries", "sha": sha1})
-        ),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while state.rollback_locks.try_lock(&app_id).is_some() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("first rollback never took the lock");
+            call(
+                &state,
+                Some(&token),
+                "rollback",
+                json!({"app": "groceries", "sha": sha1}),
+            )
+            .await
+        }
     );
-    let bodies = [&a.1, &b.1];
-    let limited: Vec<_> = bodies
-        .iter()
-        .filter(|b| b["result"]["structuredContent"]["error"] == "rate_limited")
-        .collect();
-    assert_eq!(limited.len(), 1, "exactly one rollback is rate-limited");
+    // The first proceeds (past the cap it reports building); the second
+    // fails fast instead of queueing another build.
+    assert!(
+        result(&a.1).get("isError").is_none(),
+        "first rollback should proceed, got {}",
+        a.1
+    );
     assert_eq!(
-        limited[0]["result"]["structuredContent"]["retry_after_s"], 30,
+        is_error(&b.1)["error"],
+        "rate_limited",
+        "second rollback is refused while the first runs"
+    );
+    assert_eq!(
+        is_error(&b.1)["retry_after_s"],
+        30,
         "the in-flight refusal names its backoff"
     );
     // A deploy row stuck non-terminal coalesces: no new commit, no budget
     // spent, just the running deploy reported. (The slow fake only writes
     // its row at completion, so the stuck row is inserted directly.)
-    let app_id = crate::apps::get_by_slug(&state.pool, "groceries")
-        .await
-        .unwrap()
-        .unwrap()
-        .id;
+    // (`app_id` was resolved above, before the racing rollbacks.)
     sqlx::query(
         "INSERT INTO deploy (id, app_id, sha, status, created_at) VALUES (?1, ?2, ?3, 'building', ?4)",
     )
@@ -1701,11 +1741,6 @@ async fn rollback_in_flight_rejects_and_coalesces() {
         n_before,
         "coalescing must not create a commit"
     );
-    let app_id = crate::apps::get_by_slug(&state.pool, "groceries")
-        .await
-        .unwrap()
-        .unwrap()
-        .id;
     let rollbacks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rollback_day WHERE app_id = ?1")
         .bind(&app_id)
         .fetch_one(&state.pool)
