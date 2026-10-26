@@ -649,71 +649,16 @@ mod tests {
         (app, pool)
     }
 
-    /// A tiny stand-in for the vendored Ilha template (mirrors
-    /// `crate::mcp::tests::vendor_template`, which is private to that
-    /// module): three files, one commit, bundled into the memory store.
+    /// A tiny stand-in for the vendored templates: two files per folder.
     async fn vendor_template(store: &crate::store::Store) {
-        let src = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(src.path().join("pages")).unwrap();
-        std::fs::write(src.path().join("package.json"), "{}\n").unwrap();
-        std::fs::write(src.path().join("pages/index.tsx"), "<h1>Test</h1>\n").unwrap();
-        git(&src, &["init", "-b", "main"]);
-        git(&src, &["add", "-A"]);
-        git(
-            &src,
-            &[
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-m",
-                "seed",
-            ],
-        );
-        let sha = git_out(&src, &["rev-parse", "HEAD"]);
-        let bundle = src.path().join("template.bundle");
-        git(
-            &src,
-            &["bundle", "create", bundle.to_str().unwrap(), "main"],
-        );
-        crate::templates::put_test_template(
+        crate::templates::vendor_test_templates(
             store,
-            crate::templates::Template::App,
-            sha.trim(),
-            &bundle,
+            &[
+                ("package.json", "{}\n"),
+                ("pages/index.tsx", "<h1>Test</h1>\n"),
+            ],
         )
-        .await
-        .unwrap();
-    }
-
-    fn git(dir: &tempfile::TempDir, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn git_out(dir: &tempfile::TempDir, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap()
+        .await;
     }
 
     async fn account(pool: &SqlitePool, email: &str) -> String {

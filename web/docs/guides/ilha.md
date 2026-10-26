@@ -65,6 +65,6 @@ export default function Counter({ start = 0 }: { start?: number }) {
 ## Sources
 
 - Template `AGENTS.md` (the counter, commands, error codes):
-  <https://github.com/ryuzcorp/outer-template/blob/32d413655a4f050485c14d04e9476325619f2b32/AGENTS.md>
+  <https://github.com/ryuzcorp/outer-templates/blob/e4953cb237072d5ac11373a98c17fa9bfc76d771/templates/app/AGENTS.md>
 - Ilha docs for agents and the Void integration:
   <https://ilha.build/llms.txt>, <https://ilha.build/guide/void>

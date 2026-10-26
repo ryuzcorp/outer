@@ -34,73 +34,21 @@ async fn setup() -> (McpState, Codes) {
     (state, codes)
 }
 
-/// A tiny stand-in for the vendored Ilha template: three files, one commit,
-/// bundled straight into the memory store. No network.
+/// A tiny stand-in for the vendored templates: three files in each
+/// template folder, one commit, bundled straight into the memory store.
 async fn vendor_template(store: &Store) {
-    let src = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(src.path().join("pages")).unwrap();
-    std::fs::create_dir_all(src.path().join("lib")).unwrap();
-    std::fs::write(src.path().join("package.json"), "{}\n").unwrap();
-    std::fs::write(src.path().join("pages/index.tsx"), "<h1>Groceries</h1>\n").unwrap();
-    std::fs::write(
-        src.path().join("lib/moderate.ts"),
-        "export function moderate(s: string) { return s; }\n",
-    )
-    .unwrap();
-    git(&src, &["init", "-b", "main"]);
-    git(&src, &["add", "-A"]);
-    git(
-        &src,
+    crate::templates::vendor_test_templates(
+        store,
         &[
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "user.name=t",
-            "commit",
-            "-m",
-            "seed",
+            ("package.json", "{}\n"),
+            ("pages/index.tsx", "<h1>Groceries</h1>\n"),
+            (
+                "lib/moderate.ts",
+                "export function moderate(s: string) { return s; }\n",
+            ),
         ],
-    );
-    let sha = git_out(&src, &["rev-parse", "HEAD"]);
-    let bundle = src.path().join("template.bundle");
-    git(
-        &src,
-        &["bundle", "create", bundle.to_str().unwrap(), "main"],
-    );
-    for template in crate::templates::Template::ALL {
-        crate::templates::put_test_template(store, template, sha.trim(), &bundle)
-            .await
-            .unwrap();
-    }
-}
-
-fn git(dir: &tempfile::TempDir, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn git_out(dir: &tempfile::TempDir, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap()
+    )
+    .await;
 }
 
 fn app_state(state: &McpState) -> crate::http::AppState {

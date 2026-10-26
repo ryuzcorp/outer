@@ -1,10 +1,11 @@
 //! The vendored starter templates (spec §16): the interactive `app` (Ilha +
 //! Void) and the content-site `website` (Astro + Ilha islands).
 //!
-//! `outer templates sync` pins each template repo at a sha into the store as
-//! a git bundle plus a per-template `current.json` pointer; app creation
-//! [`materialize`]s one bundle into a fresh directory. No network is needed
-//! past the sync.
+//! Both live in one repo, `ryuzcorp/outer-templates`, as `templates/app/` and
+//! `templates/website/`. `outer templates sync` pins that repo at one sha into
+//! the store as a git bundle plus a `current.json` pointer; app creation
+//! [`materialize`]s one template's folder into a fresh directory. No network
+//! is needed past the sync.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -15,29 +16,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
 
-/// Where the app template lives upstream.
-pub const ILHA_VOID_URL: &str = "https://github.com/ryuzcorp/outer-template";
-/// The pinned commit `outer templates sync` vendors for the app template.
-pub const ILHA_VOID_SHA: &str = "32d413655a4f050485c14d04e9476325619f2b32";
-/// Where the website template lives upstream.
-pub const WEBSITE_URL: &str = "https://github.com/ryuzcorp/outer-template-website";
-/// The pinned commit `outer templates sync` vendors for the website
-/// template. Placeholder until the integrator pushes
-/// `outer-template-website` and pins its first commit here — one line to
-/// change, then `outer templates sync --template website` vendors it.
-pub const WEBSITE_SHA: &str = "dc1754950a89485226452b6350913bdc2bfc5893";
+/// Where the templates live upstream: one folder per template under
+/// `templates/`.
+pub const TEMPLATES_URL: &str = "https://github.com/ryuzcorp/outer-templates";
+/// The pinned commit `outer templates sync` vendors. Repinning is a
+/// one-line change, then `outer templates sync`.
+pub const TEMPLATES_SHA: &str = "6272da8a7f13c195eba67ed395087428d467514a";
+
+/// The store pointer to the vendored bundle.
+const CURRENT_KEY: &str = "outer/templates/current.json";
 
 /// Which starter template an app is created from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Template {
-    /// Interactive Ilha + Void app (`outer-template`).
+    /// Interactive Ilha + Void app (`templates/app`).
     App,
-    /// Astro + Ilha-islands content site (`outer-template-website`).
+    /// Astro + Ilha-islands content site (`templates/website`).
     Website,
 }
 
 impl Template {
-    /// Every template `outer templates sync` vendors.
+    /// Every template the vendored repo must carry.
     pub const ALL: [Template; 2] = [Template::App, Template::Website];
 
     /// The `create_app`/`--template` id.
@@ -57,20 +56,11 @@ impl Template {
         }
     }
 
-    /// Where this template lives upstream.
-    pub fn url(self) -> &'static str {
+    /// This template's folder in the templates repo.
+    pub fn dir(self) -> &'static str {
         match self {
-            Template::App => ILHA_VOID_URL,
-            Template::Website => WEBSITE_URL,
-        }
-    }
-
-    /// The pinned commit `outer templates sync` vendors for this template.
-    /// Each arm reads one const, so repinning is a one-line change.
-    pub fn sha(self) -> &'static str {
-        match self {
-            Template::App => ILHA_VOID_SHA,
-            Template::Website => WEBSITE_SHA,
+            Template::App => "templates/app",
+            Template::Website => "templates/website",
         }
     }
 
@@ -82,22 +72,14 @@ impl Template {
             Template::Website => format!("Start from the Astro website template ({short})"),
         }
     }
-
-    /// Pointer to this template's vendored bundle in the store.
-    fn current_key(self) -> &'static str {
-        match self {
-            Template::App => "outer/templates/app/current.json",
-            Template::Website => "outer/templates/website/current.json",
-        }
-    }
-
-    /// Key of this template's vendored bundle in the store.
-    fn bundle_key(self, sha: &str) -> String {
-        format!("outer/templates/{}/{sha}.bundle", self.id())
-    }
 }
 
-/// Per-step git timeout: a full clone of the small template repo takes seconds.
+/// Key of the vendored bundle for `sha` in the store.
+fn bundle_key(sha: &str) -> String {
+    format!("outer/templates/{sha}.bundle")
+}
+
+/// Per-step git timeout: a full clone of the small templates repo takes seconds.
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What [`sync`] vendors and [`materialize`] reads back. On the wire the
@@ -141,16 +123,11 @@ async fn run_git(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Clone `url`, check out exactly `sha` (failing when it is missing), bundle
-/// that commit, and upload the bundle plus `template`'s `current.json`
-/// pointer. Re-running for the same sha overwrites the same keys:
-/// idempotent.
-pub async fn sync(
-    store: &Store,
-    template: Template,
-    url: &str,
-    sha: &str,
-) -> anyhow::Result<TemplateRef> {
+/// Clone `url`, check out exactly `sha` (failing when it is missing or lacks
+/// any template folder), bundle that commit, and upload the bundle plus the
+/// `current.json` pointer. Re-running for the same sha overwrites the same
+/// keys: idempotent.
+pub async fn sync(store: &Store, url: &str, sha: &str) -> anyhow::Result<TemplateRef> {
     // Full lowercase commit sha only: an abbreviated sha or branch name would
     // pass `cat-file` and be stored, but `materialize` checks out and compares
     // `rev-parse HEAD` (always full length), so every later create would fail.
@@ -173,6 +150,26 @@ pub async fn sync(
     )
     .await
     .map_err(|_| anyhow::anyhow!("template sha {sha} not found in {url}"))?;
+    // Every template `create_app` offers must exist at this commit, or a
+    // create would fail long after the sync said it was fine.
+    for template in Template::ALL {
+        let tree = format!("{sha}:{}", template.dir());
+        // `-t` and not `-e`: a file or symlink at the path exists too, but
+        // only a tree can be copied as the app's project root.
+        let kind = run_git(
+            &["-C", src_str.as_str(), "cat-file", "-t", tree.as_str()],
+            None,
+            &[],
+        )
+        .await
+        .unwrap_or_default();
+        anyhow::ensure!(
+            kind.trim() == "tree",
+            "{url} at {sha} has no {}/ folder for the {} template",
+            template.dir(),
+            template.id()
+        );
+    }
     run_git(
         &[
             "-c",
@@ -187,7 +184,7 @@ pub async fn sync(
         &[],
     )
     .await?;
-    let bundle_path = tmp.path().join("template.bundle");
+    let bundle_path = tmp.path().join("templates.bundle");
     let bundle_str = bundle_path.to_string_lossy().into_owned();
     run_git(
         &[
@@ -203,7 +200,7 @@ pub async fn sync(
         &[],
     )
     .await?;
-    let key = template.bundle_key(sha);
+    let key = bundle_key(sha);
     store.put_file(&key, &bundle_path).await?;
     let reference = TemplateRef {
         sha: sha.to_string(),
@@ -211,20 +208,14 @@ pub async fn sync(
         source: url.to_string(),
     };
     store
-        .put(template.current_key(), serde_json::to_vec(&reference)?)
+        .put(CURRENT_KEY, serde_json::to_vec(&reference)?)
         .await?;
     Ok(reference)
 }
 
-/// Vendor every pinned template at its const sha: the `--template`-less
-/// `outer templates sync` path.
-pub async fn sync_pinned(store: &Store) -> anyhow::Result<Vec<(Template, TemplateRef)>> {
-    let mut out = Vec::with_capacity(Template::ALL.len());
-    for template in Template::ALL {
-        let reference = sync(store, template, template.url(), template.sha()).await?;
-        out.push((template, reference));
-    }
-    Ok(out)
+/// Vendor the pinned templates repo: the flag-less `outer templates sync`.
+pub async fn sync_pinned(store: &Store) -> anyhow::Result<TemplateRef> {
+    sync(store, TEMPLATES_URL, TEMPLATES_SHA).await
 }
 
 /// Copy a directory tree to `dest`, skipping a top-level `.git`.
@@ -270,33 +261,31 @@ fn copy_tree_contents(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read `template`'s `current.json` pointer, download its bundle, clone it,
-/// and copy the tree (without `.git`) into `dest_dir`, creating it when
+/// Read the `current.json` pointer, download the bundle, clone it, and copy
+/// `template`'s folder (without `.git`) into `dest_dir`, creating it when
 /// missing.
 pub async fn materialize(
     store: &Store,
     template: Template,
     dest_dir: &Path,
 ) -> anyhow::Result<TemplateRef> {
-    let current = template.current_key();
-    let bytes = store.get(current).await?.ok_or_else(|| {
+    let bytes = store.get(CURRENT_KEY).await?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no vendored {} template in the store; run `outer templates sync` \
-             to vendor {} first",
+            "no vendored templates in the store (wanted the {} template); run \
+             `outer templates sync` to vendor {TEMPLATES_URL} first",
             template.id(),
-            template.url(),
         )
     })?;
-    let template: TemplateRef = serde_json::from_slice(&bytes)?;
+    let reference: TemplateRef = serde_json::from_slice(&bytes)?;
     let tmp = tempfile::tempdir().context("template scratch dir")?;
-    let bundle_path = tmp.path().join("template.bundle");
+    let bundle_path = tmp.path().join("templates.bundle");
     if !store
-        .get_to_file(&template.bundle_key, &bundle_path)
+        .get_to_file(&reference.bundle_key, &bundle_path)
         .await?
     {
         anyhow::bail!(
             "template bundle {} is missing from the store; run `outer templates sync` again",
-            template.bundle_key
+            reference.bundle_key
         );
     }
     let bundle_str = bundle_path.to_string_lossy().into_owned();
@@ -314,7 +303,7 @@ pub async fn materialize(
     )
     .await?;
     run_git(
-        &["-C", src_str.as_str(), "checkout", template.sha.as_str()],
+        &["-C", src_str.as_str(), "checkout", reference.sha.as_str()],
         None,
         &[],
     )
@@ -324,40 +313,75 @@ pub async fn materialize(
         .trim()
         .to_string();
     anyhow::ensure!(
-        head == template.sha,
+        head == reference.sha,
         "vendored bundle checked out {head}, want {}",
-        template.sha
+        reference.sha
     );
-    copy_tree(&src, dest_dir)?;
-    Ok(template)
+    let folder = src.join(template.dir());
+    anyhow::ensure!(
+        folder.is_dir(),
+        "vendored templates at {} have no {}/ folder; repin and run `outer templates sync`",
+        reference.sha,
+        template.dir()
+    );
+    copy_tree(&folder, dest_dir)?;
+    Ok(reference)
 }
 
-/// Point the store at an already-built bundle file (tests): uploads
-/// `bundle` under the template key for `sha` and stores the `current.json`
-/// pointer, so [`materialize`] works without a network `sync`.
+/// Vendor a tiny templates repo into `store` for tests: `files` are written
+/// into every template folder, committed once, bundled, and pointed at by
+/// `current.json`, so [`materialize`] works without a network `sync`.
 #[cfg(test)]
-pub(crate) async fn put_test_template(
-    store: &Store,
-    template: Template,
-    sha: &str,
-    bundle: &Path,
-) -> anyhow::Result<TemplateRef> {
-    let key = template.bundle_key(sha);
-    store.put_file(&key, bundle).await?;
+pub(crate) async fn vendor_test_templates(store: &Store, files: &[(&str, &str)]) -> TemplateRef {
+    let src = tempfile::tempdir().unwrap();
+    for template in Template::ALL {
+        for (rel, body) in files {
+            let path = src.path().join(template.dir()).join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+    }
+    let author = [
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@example.com"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@example.com"),
+    ];
+    run_git(&["init", "-b", "main"], Some(src.path()), &[])
+        .await
+        .unwrap();
+    run_git(&["add", "-A"], Some(src.path()), &[])
+        .await
+        .unwrap();
+    run_git(&["commit", "-m", "seed"], Some(src.path()), &author)
+        .await
+        .unwrap();
+    let sha = run_git(&["rev-parse", "HEAD"], Some(src.path()), &[])
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+    let bundle = src.path().join("templates.bundle");
+    let bundle_str = bundle.to_string_lossy().into_owned();
+    run_git(
+        &["bundle", "create", bundle_str.as_str(), "main"],
+        Some(src.path()),
+        &[],
+    )
+    .await
+    .unwrap();
+    let key = bundle_key(&sha);
+    store.put_file(&key, &bundle).await.unwrap();
     let reference = TemplateRef {
-        sha: sha.to_string(),
+        sha,
         bundle_key: key,
         source: "test".to_string(),
     };
     store
-        .put(template.current_key(), serde_json::to_vec(&reference)?)
-        .await?;
-    Ok(reference)
-}
-/// `dest_dir` joined with `rel`, for tests.
-#[cfg(test)]
-fn dest_path(dest_dir: &Path, rel: &str) -> std::path::PathBuf {
-    dest_dir.join(rel)
+        .put(CURRENT_KEY, serde_json::to_vec(&reference).unwrap())
+        .await
+        .unwrap();
+    reference
 }
 
 #[cfg(test)]
@@ -371,102 +395,119 @@ mod tests {
         ("GIT_COMMITTER_EMAIL", "t@example.com"),
     ];
 
-    /// A local repo with two commits acting as the template "source".
-    async fn make_source_repo() -> (tempfile::TempDir, String, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_string_lossy().into_owned();
-        run_git(&["init"], Some(dir.path()), &[]).await.unwrap();
-        std::fs::write(dir.path().join("README.md"), "# ilha-void\n").unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src").join("app.ts"), "export {};\n").unwrap();
-        run_git(&["add", "-A"], Some(dir.path()), &[])
+    async fn commit_all(dir: &Path, message: &str) -> String {
+        run_git(&["add", "-A"], Some(dir), &[]).await.unwrap();
+        run_git(&["commit", "-m", message], Some(dir), &AUTHOR)
             .await
             .unwrap();
-        run_git(&["commit", "-m", "seed"], Some(dir.path()), &AUTHOR)
-            .await
-            .unwrap();
-        std::fs::write(dir.path().join("src").join("extra.ts"), "export {};\n").unwrap();
-        run_git(&["add", "-A"], Some(dir.path()), &[])
-            .await
-            .unwrap();
-        run_git(&["commit", "-m", "more"], Some(dir.path()), &AUTHOR)
-            .await
-            .unwrap();
-        let sha = run_git(&["rev-parse", "HEAD"], Some(dir.path()), &[])
+        run_git(&["rev-parse", "HEAD"], Some(dir), &[])
             .await
             .unwrap()
             .trim()
-            .to_string();
-        let url = format!("file://{root}");
+            .to_string()
+    }
+
+    /// A local templates repo: an `app` and a `website` folder plus a
+    /// root README that must never reach an app. Returns its url and sha.
+    async fn make_source_repo() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(&["init"], Some(dir.path()), &[]).await.unwrap();
+        std::fs::write(dir.path().join("README.md"), "# templates\n").unwrap();
+        let app = dir.path().join("templates/app/src");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dir.path().join("templates/app/README.md"), "# app\n").unwrap();
+        std::fs::write(app.join("app.ts"), "export {};\n").unwrap();
+        let site = dir.path().join("templates/website/src/pages");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(
+            dir.path().join("templates/website/README.md"),
+            "# website\n",
+        )
+        .unwrap();
+        std::fs::write(site.join("index.astro"), "<h1>site</h1>\n").unwrap();
+        let sha = commit_all(dir.path(), "seed").await;
+        let url = format!("file://{}", dir.path().to_string_lossy());
         (dir, url, sha)
     }
 
     #[tokio::test]
-    async fn sync_then_materialize_round_trips() {
+    async fn each_template_materializes_only_its_own_folder() {
         let (_repo, url, sha) = make_source_repo().await;
         let store = Store::memory();
-        let first = sync(&store, Template::App, &url, &sha).await.unwrap();
-        assert_eq!(first.sha, sha);
-        assert_eq!(
-            first.bundle_key,
-            format!("outer/templates/app/{sha}.bundle")
-        );
-        assert_eq!(first.source, url);
-        assert!(store.get(&first.bundle_key).await.unwrap().is_some());
-        let pointer: serde_json::Value = serde_json::from_slice(
-            &store
-                .get(Template::App.current_key())
-                .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(pointer["sha"], serde_json::Value::String(sha.clone()));
+        let synced = sync(&store, &url, &sha).await.unwrap();
+        assert_eq!(synced.sha, sha);
+        assert_eq!(synced.bundle_key, format!("outer/templates/{sha}.bundle"));
         // Idempotent: a second sync vendors the same pointer.
-        let second = sync(&store, Template::App, &url, &sha).await.unwrap();
-        assert_eq!(first, second);
-        let dest = tempfile::tempdir().unwrap();
-        let out = dest.path().join("app");
-        let back = materialize(&store, Template::App, &out).await.unwrap();
-        assert_eq!(back, first);
+        assert_eq!(sync(&store, &url, &sha).await.unwrap(), synced);
+
+        let app = tempfile::tempdir().unwrap();
+        let back = materialize(&store, Template::App, app.path())
+            .await
+            .unwrap();
+        assert_eq!(back, synced);
         assert_eq!(
-            std::fs::read_to_string(dest_path(&out, "README.md")).unwrap(),
-            "# ilha-void\n"
+            std::fs::read_to_string(app.path().join("README.md")).unwrap(),
+            "# app\n"
         );
+        assert!(app.path().join("src/app.ts").exists());
+        assert!(
+            !app.path().join("templates").exists(),
+            "no repo layout leaks into the app"
+        );
+        assert!(
+            !app.path().join("src/pages").exists(),
+            "no website files in an app"
+        );
+        assert!(!app.path().join(".git").exists());
+
+        let site = tempfile::tempdir().unwrap();
+        materialize(&store, Template::Website, site.path())
+            .await
+            .unwrap();
         assert_eq!(
-            std::fs::read_to_string(dest_path(&out, "src/extra.ts")).unwrap(),
-            "export {};\n"
+            std::fs::read_to_string(site.path().join("README.md")).unwrap(),
+            "# website\n"
         );
-        assert!(!out.join(".git").exists(), "materialized tree has no .git");
+        assert!(site.path().join("src/pages/index.astro").exists());
+        assert!(
+            !site.path().join("src/app.ts").exists(),
+            "no app files in a website"
+        );
     }
 
     #[tokio::test]
-    async fn both_templates_sync_and_materialize_independently() {
-        let (_repo, url, sha) = make_source_repo().await;
+    async fn sync_refuses_a_commit_missing_a_template_folder() {
+        let (repo, url, _) = make_source_repo().await;
+        std::fs::remove_dir_all(repo.path().join("templates/website")).unwrap();
+        let sha = commit_all(repo.path(), "drop website").await;
         let store = Store::memory();
-        for template in Template::ALL {
-            sync(&store, template, &url, &sha).await.unwrap();
-        }
-        assert_ne!(
-            Template::App.current_key(),
-            Template::Website.current_key(),
-            "each template owns its pointer"
+        let err = sync(&store, &url, &sha).await.unwrap_err();
+        assert!(
+            err.to_string().contains("templates/website"),
+            "the error names the missing folder: {err:#}"
         );
-        for template in Template::ALL {
-            let dest = tempfile::tempdir().unwrap();
-            let back = materialize(&store, template, dest.path()).await.unwrap();
-            assert_eq!(back.sha, sha);
-            assert_eq!(
-                std::fs::read_to_string(dest_path(dest.path(), "README.md")).unwrap(),
-                "# ilha-void\n"
-            );
-        }
-        // Syncing one template again leaves the other's pointer alone.
-        sync(&store, Template::Website, &url, &sha).await.unwrap();
-        let back = materialize(&store, Template::App, tempfile::tempdir().unwrap().path())
-            .await
-            .unwrap();
-        assert_eq!(back.sha, sha);
+        assert!(
+            store.get(CURRENT_KEY).await.unwrap().is_none(),
+            "nothing vendored"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_a_file_where_a_template_folder_belongs() {
+        let (repo, url, _) = make_source_repo().await;
+        std::fs::remove_dir_all(repo.path().join("templates/website")).unwrap();
+        std::fs::write(repo.path().join("templates/website"), "not a folder\n").unwrap();
+        let sha = commit_all(repo.path(), "website is a file").await;
+        let store = Store::memory();
+        let err = sync(&store, &url, &sha).await.unwrap_err();
+        assert!(
+            err.to_string().contains("templates/website"),
+            "the error names the folder: {err:#}"
+        );
+        assert!(
+            store.get(CURRENT_KEY).await.unwrap().is_none(),
+            "nothing vendored"
+        );
     }
 
     #[tokio::test]
@@ -481,9 +522,7 @@ mod tests {
     async fn sync_refuses_a_missing_sha() {
         let (_repo, url, _sha) = make_source_repo().await;
         let store = Store::memory();
-        let err = sync(&store, Template::Website, &url, &"0".repeat(40))
-            .await
-            .unwrap_err();
+        let err = sync(&store, &url, &"0".repeat(40)).await.unwrap_err();
         assert!(
             err.to_string().contains("not found"),
             "unexpected error: {err:#}"
@@ -500,12 +539,9 @@ mod tests {
         let message = format!("{err:#}");
         assert!(
             message.contains("outer templates sync"),
-            "operator-facing error must name the fix, got: {message}"
+            "names the fix: {message}"
         );
-        assert!(
-            message.contains("website"),
-            "the error names the missing template, got: {message}"
-        );
+        assert!(message.contains("website"), "names the template: {message}");
     }
 
     #[tokio::test]
@@ -519,7 +555,7 @@ mod tests {
             "main".to_string(),
             "HEAD".to_string(),
         ] {
-            let err = sync(&store, Template::App, &url, &bad).await.unwrap_err();
+            let err = sync(&store, &url, &bad).await.unwrap_err();
             assert!(
                 err.to_string()
                     .contains("full 40-character lowercase commit sha"),
@@ -527,11 +563,7 @@ mod tests {
             );
         }
         assert!(
-            store
-                .get(Template::App.current_key())
-                .await
-                .unwrap()
-                .is_none(),
+            store.get(CURRENT_KEY).await.unwrap().is_none(),
             "a refused sync stores no pointer"
         );
     }

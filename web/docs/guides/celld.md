@@ -88,8 +88,8 @@ in `void.config.ts`.
 ## Sources
 
 - The template's build config (celld config derivation):
-  <https://github.com/ryuzcorp/outer-template/blob/32d413655a4f050485c14d04e9476325619f2b32/vite.config.ts>
+  <https://github.com/ryuzcorp/outer-templates/blob/e4953cb237072d5ac11373a98c17fa9bfc76d771/templates/app/vite.config.ts>
 - The PWA registration:
-  <https://github.com/ryuzcorp/outer-template/blob/32d413655a4f050485c14d04e9476325619f2b32/pages/_pwa.ts>
+  <https://github.com/ryuzcorp/outer-templates/blob/e4953cb237072d5ac11373a98c17fa9bfc76d771/templates/app/pages/_pwa.ts>
 - celld's runtime docs: <https://celld.dev/docs/>
 - Outer's deploy pipeline: `crates/outer/src/deploy/pipeline.rs`

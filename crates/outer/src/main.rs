@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 const USAGE: &str = "usage:
   outer serve
   outer check-config
-  outer templates sync [--template app|website [--sha SHA] [--url URL]]
+  outer templates sync [--sha SHA] [--url URL]
   outer app create SLUG --owner EMAIL [--name NAME] [--template app|website]
   outer app deploy SLUG
   outer app delete SLUG
@@ -332,28 +332,12 @@ fn flag<'a>(flags: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
 }
 
 async fn templates_sync(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
-    let flags = flags(&rest, &["--template", "--sha", "--url"])?;
+    let flags = flags(&rest, &["--sha", "--url"])?;
     let store = build_store(&config)?;
-    if let Some(id) = flag(&flags, "--template") {
-        let Some(template) = templates::Template::from_id(id) else {
-            anyhow::bail!("unknown template {id:?}: want \"app\" or \"website\"");
-        };
-        let url = flag(&flags, "--url").unwrap_or(template.url());
-        let sha = flag(&flags, "--sha").unwrap_or(template.sha());
-        let synced = templates::sync(&store, template, url, sha).await?;
-        println!("{}", serde_json::to_string_pretty(&synced)?);
-        return Ok(());
-    }
-    if flag(&flags, "--url").is_some() || flag(&flags, "--sha").is_some() {
-        anyhow::bail!(
-            "--url/--sha need --template: sync one template, or sync both pinned with no flags"
-        );
-    }
-    let mut out = Vec::with_capacity(templates::Template::ALL.len());
-    for (template, synced) in templates::sync_pinned(&store).await? {
-        out.push(serde_json::json!({"template": template.id(), "ref": synced}));
-    }
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    let url = flag(&flags, "--url").unwrap_or(templates::TEMPLATES_URL);
+    let sha = flag(&flags, "--sha").unwrap_or(templates::TEMPLATES_SHA);
+    let synced = templates::sync(&store, url, sha).await?;
+    println!("{}", serde_json::to_string_pretty(&synced)?);
     Ok(())
 }
 

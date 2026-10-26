@@ -8,6 +8,10 @@ Every `create_app` seeds from one of two pinned starters. The default is
 the other. Both build with `bun run build` and deploy to celld with the
 same pipeline.
 
+Both live in one repo, [ryuzcorp/outer-templates](https://github.com/ryuzcorp/outer-templates):
+`templates/app/` and `templates/website/`. A new app gets a copy of one
+folder as its first commit, so its repo starts at the project root.
+
 ## The app template
 
 Interactive Ilha + Void apps: accounts, live state, dashboards, anything
