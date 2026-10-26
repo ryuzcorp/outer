@@ -6362,7 +6362,10 @@ async fn open_app_orients_ilha_shaped_repo() {
     assert_eq!(sc["deploy"]["sha"], head);
     assert!(sc["deploy"]["url"].as_str().unwrap().contains("groceries"));
     assert_eq!(sc["errors_open"], 0);
-    assert_eq!(sc["quota"]["code_changes_per_day"], 50);
+    assert_eq!(
+        sc["quota"]["code_changes_per_day"],
+        crate::limits::change_limit("free")
+    );
     assert!(sc["quota"]["code_changes_used_today"].as_u64().unwrap() >= 1);
 
     // `next` points at line-ranged reads, search and commit edits.
