@@ -142,6 +142,12 @@ impl StripeClient {
         })
     }
 
+    /// A sandbox key (`sk_test_…`): Checkout takes Stripe's test cards
+    /// and nothing is charged.
+    pub fn is_test_mode(&self) -> bool {
+        self.secret_key.starts_with("sk_test_")
+    }
+
     /// Tests point the client at a local double instead of Stripe.
     #[cfg(test)]
     pub fn with_base(mut self, base: String) -> Self {

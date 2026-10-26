@@ -105,6 +105,12 @@ impl BillingState {
         matches!(self, Self::Enabled { .. })
     }
 
+    /// Stripe is running on sandbox keys: the Console tells people to pay
+    /// with a test card.
+    pub fn test_mode(&self) -> bool {
+        matches!(self, Self::Enabled { client, .. } if client.is_test_mode())
+    }
+
     fn platform_base(&self) -> &str {
         match self {
             Self::Disabled { platform_base } => platform_base,
@@ -635,6 +641,16 @@ async fn apply_subscription(
                 return Ok(Transition::kept(Some(user.id)));
             }
             set_pro(&mut *conn, &user.id, customer, event_sub).await?;
+            // A portal cancel leaves the subscription `active` until the
+            // period ends, flagged `cancel_at_period_end`: Pro stays, and the
+            // plan card says it ends. Undoing the cancel clears the flag and
+            // `set_pro` above restores `active`.
+            if cancel_at_period_end {
+                sqlx::query("UPDATE user SET planStatus = 'canceled' WHERE id = ?1")
+                    .bind(&user.id)
+                    .execute(&mut *conn)
+                    .await?;
+            }
         }
         "past_due" => {
             if upgrade_is_stale(&user, event_sub) {
@@ -1713,6 +1729,43 @@ mod tests {
             plan_of(&pool, "a1").await,
             ("pro".to_string(), Some("canceled".to_string()), None)
         );
+    }
+
+    /// The shape Stripe really sends for a portal cancel: still `active`,
+    /// flagged `cancel_at_period_end`. Pro stays and is marked as ending;
+    /// undoing the cancel in the portal brings back plain `active`.
+    #[tokio::test]
+    async fn portal_cancel_marks_ending_and_undo_restores_active() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET plan = 'pro', planStatus = 'active', stripeCustomerId = 'cus_1', \
+             stripeSubscriptionId = 'sub_1' WHERE id = 'a1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, flag, expected) in [("evt_6", true, "canceled"), ("evt_7", false, "active")] {
+            let object = serde_json::json!({
+                "id": "sub_1", "customer": "cus_1", "status": "active", "cancel_at_period_end": flag,
+            });
+            apply(
+                &pool,
+                &sender,
+                &billing,
+                id,
+                "customer.subscription.updated",
+                object,
+            )
+            .await;
+            assert_eq!(
+                plan_of(&pool, "a1").await,
+                ("pro".to_string(), Some(expected.to_string()), None),
+                "cancel_at_period_end = {flag}"
+            );
+        }
     }
 
     #[tokio::test]
