@@ -67,6 +67,17 @@ pub fn internal(err: impl Into<anyhow::Error>) -> ToolError {
     tracing::warn!("tool internal: {err:#}");
     ToolError::internal("something failed on our side; try again in a minute")
 }
+/// A `resolve_rev` failure as a tool error: a well-formed but unknown sha
+/// is the caller's bug (`not_found`, "unknown commit"); anything else is
+/// infrastructure (`internal`). `None`-revision calls resolve through the
+/// mirror head and never produce `UnknownRev`.
+pub fn rev_err(err: anyhow::Error) -> ToolError {
+    if crate::git::local::is_unknown_rev(&err) {
+        ToolError::not_found("unknown commit")
+    } else {
+        internal(err)
+    }
+}
 
 /// The §8.4 notice, prepended as its own text block to every data block a
 /// tool returns that an app or its visitors could have written.

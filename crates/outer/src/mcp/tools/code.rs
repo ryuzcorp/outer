@@ -186,7 +186,7 @@ pub async fn list_files(input: ListFilesInput, ctx: &Ctx<'_>) -> Result<Value, T
         5000,
     )
     .await
-    .map_err(internal)?;
+    .map_err(super::rev_err)?;
     let files: Vec<Value> = files
         .iter()
         .map(|f| json!({"path": f.path, "size": f.size}))
@@ -225,7 +225,7 @@ pub async fn read_files(input: ReadFilesInput, ctx: &Ctx<'_>) -> Result<Value, T
     let bare = mirror(ctx, &app.slug).await?;
     let head = crate::git::local::resolve_rev(&bare, input.sha.as_deref())
         .await
-        .map_err(internal)?
+        .map_err(super::rev_err)?
         .ok_or_else(|| ToolError::not_found("app has no commits yet"))?;
     let mut used = 0usize;
     let mut budget_spent = false;

@@ -33,6 +33,10 @@ const MAX_TREE_FILES: usize = 300;
 /// First-N-lines cap for the AGENTS.md digest, in lines and chars.
 const MAX_RULE_LINES: usize = 40;
 const MAX_RULE_CHARS: usize = 2000;
+/// Largest serialized `brand.json` the snapshot carries: bigger files are
+/// replaced by a truncation marker, so one hostile blob cannot bloat the
+/// orientation call.
+const MAX_BRAND_CHARS: usize = 2000;
 /// Most migration files parsed per call.
 const MAX_MIGRATION_FILES: usize = 50;
 
@@ -322,8 +326,11 @@ fn parse_migrations(sql: &str, tables: &mut Vec<(String, Vec<String>)>) {
                 None => tables.push((name, cols)),
             }
         } else if let Some(rest) = strip_kw(&t_upper, trimmed, "ALTER TABLE") {
-            let name = ident(rest);
-            let after = rest[name.len()..].trim_start();
+            // The remainder is measured from the consumed text (`ident` strips
+            // quotes), so `name.len()` would slice mid-token on quoted or
+            // multi-byte names.
+            let (name, used) = split_ident(rest);
+            let after = rest[used..].trim_start();
             let a_upper = after.to_uppercase();
             if let Some(after_add) = strip_kw(&a_upper, after, "ADD COLUMN") {
                 let col = ident(after_add.trim_start());
@@ -364,16 +371,88 @@ fn strip_kw_opt<'a>(s: &'a str, kw: &str) -> &'a str {
     strip_kw(&upper, s, kw).unwrap_or(s)
 }
 
+/// The next identifier plus the bytes it consumed: quoted (`"note"`,
+/// `` `note` ``, `[note]`) and schema-qualified (`public.note`) names come
+/// back unquoted, and every index is a char boundary, so multi-byte names
+/// never panic.
+fn split_ident(s: &str) -> (String, usize) {
+    let trimmed = s.trim_start();
+    let leading = s.len() - trimmed.len();
+    let Some(first) = trimmed.chars().next() else {
+        return (String::new(), s.len());
+    };
+    // Quoted name: consume through the matching close quote.
+    if first == '"' || first == '\'' || first == '`' {
+        if let Some(rel) = trimmed[1..].find(first) {
+            let name = trimmed[1..1 + rel].to_string();
+            return (name, leading + 1 + rel + 1);
+        }
+        return (String::new(), s.len());
+    }
+    if first == '[' {
+        if let Some(rel) = trimmed[1..].find(']') {
+            let name = trimmed[1..1 + rel].to_string();
+            return (name, leading + 1 + rel + 1);
+        }
+        return (String::new(), s.len());
+    }
+    // Bare name: dotted segments may each be quoted (`public."note"`).
+    let mut name = String::new();
+    let mut pos = 0;
+    loop {
+        let rest = &trimmed[pos..];
+        let (seg, used) = split_ident_segment(rest);
+        if seg.is_empty() {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(&seg);
+        pos += used;
+        if trimmed[pos..].starts_with('.') {
+            // A trailing dot with nothing after it is not part of the name.
+            if pos + 1 >= trimmed.len() {
+                break;
+            }
+            pos += 1;
+            // Dots must join segments: `note . x` ends the name at `note`.
+            if trimmed[pos..].starts_with(char::is_whitespace) {
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    (name, leading + pos)
+}
+
+/// One unquoted-or-bare segment and the bytes it consumed.
+fn split_ident_segment(s: &str) -> (String, usize) {
+    let Some(first) = s.chars().next() else {
+        return (String::new(), 0);
+    };
+    if first == '"' || first == '\'' || first == '`' {
+        if let Some(rel) = s[1..].find(first) {
+            return (s[1..1 + rel].to_string(), 1 + rel + 1);
+        }
+        return (String::new(), 0);
+    }
+    if first == '[' {
+        if let Some(rel) = s[1..].find(']') {
+            return (s[1..1 + rel].to_string(), 1 + rel + 1);
+        }
+        return (String::new(), 0);
+    }
+    let end = s
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(s.len());
+    (s[..end].to_string(), end)
+}
+
 /// The next identifier: strip quoting, stop at whitespace or punctuation.
 fn ident(s: &str) -> String {
-    let s = s
-        .trim_start()
-        .trim_start_matches('"')
-        .trim_start_matches('`');
-    let end = s
-        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-        .unwrap_or(s.len());
-    s[..end].trim_matches('"').trim_matches('`').to_string()
+    split_ident(s).0
 }
 
 /// Split on commas that are not inside parens or quotes.
@@ -426,8 +505,10 @@ fn parse_bindings(config: &str) -> Value {
         let mut search_from = 0;
         while let Some(found) = config[search_from..].find(kind) {
             let abs = search_from + found;
-            // The kind must be a key (`d1_databases:`), not prose.
-            let after = config[abs + kind.len()..].trim_start();
+            // The kind must be a key (`d1_databases:`), not prose. JSON
+            // configs quote it (`"d1_databases":`), so tolerate one closing
+            // quote before the colon.
+            let after = strip_close_quote(&config[abs + kind.len()..]);
             if !after.starts_with(':') {
                 search_from = abs + kind.len();
                 continue;
@@ -501,7 +582,9 @@ fn capture_str(entry: &str, key: &str) -> Option<String> {
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        let after = entry[abs + key.len()..].trim_start();
+        // JSON configs quote the key (`"binding": "DB"`), so tolerate one
+        // closing quote before the colon.
+        let after = strip_close_quote(&entry[abs + key.len()..]);
         if before_ok && after.starts_with(':') {
             let val = after[1..].trim_start();
             let quote = val.chars().next()?;
@@ -514,6 +597,38 @@ fn capture_str(entry: &str, key: &str) -> Option<String> {
         search_from = abs + key.len();
     }
     None
+}
+
+/// Drop leading whitespace plus one optional closing quote (`"`, `'`),
+/// so `"key":` matches as well as `key:`.
+fn strip_close_quote(s: &str) -> &str {
+    let t = s.trim_start();
+    t.strip_prefix(['"', '\'']).unwrap_or(t)
+}
+
+/// The snapshot's `brand` value from the committed `brand.json`: absent
+/// becomes `Null`; invalid JSON becomes a bounded error object; files whose
+/// serialized form runs past [`MAX_BRAND_CHARS`] become a bounded truncation
+/// marker. The whole file is never returned.
+fn brand_value(text: Option<String>) -> Value {
+    let Some(text) = text else {
+        return Value::Null;
+    };
+    let Ok(value): Result<Value, _> = serde_json::from_str(&text) else {
+        return json!({"error": "brand.json is not valid JSON"});
+    };
+    let serialized = serde_json::to_string(&value).unwrap_or_default();
+    if serialized.len() <= MAX_BRAND_CHARS {
+        return value;
+    }
+    let mut end = MAX_BRAND_CHARS;
+    while !serialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    json!({
+        "error": "brand.json exceeds 2000 characters",
+        "preview": &serialized[..end],
+    })
 }
 
 /// Read a small committed text file (`brand.json`, `AGENTS.md`, configs):
@@ -555,7 +670,7 @@ pub async fn open_app_impl(input: OpenAppInput, ctx: &Ctx<'_>) -> Result<Value, 
     let (head, mut files, list_truncated) =
         local::list_files(&bare, input.sha.as_deref(), None, 5000)
             .await
-            .map_err(internal)?;
+            .map_err(super::rev_err)?;
     files.retain(|f| !hidden(&f.path));
     let (_, counts) = local::line_counts(&bare, Some(&head))
         .await
@@ -564,10 +679,14 @@ pub async fn open_app_impl(input: OpenAppInput, ctx: &Ctx<'_>) -> Result<Value, 
     // `changed_since`: keep only files changed since that sha, with status.
     let mut statuses: Option<std::collections::HashMap<String, String>> = None;
     if let Some(since) = input.changed_since.as_deref() {
-        let from = local::resolve_rev(&bare, Some(since))
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| ToolError::not_found("unknown commit"))?;
+        // `resolve_rev` returns `Some` for explicit revs (or `UnknownRev`);
+        // only a missing `main` yields `None`, which cannot happen here —
+        // `head` above already resolved.
+        let from = match local::resolve_rev(&bare, Some(since)).await {
+            Ok(Some(sha)) => sha,
+            Ok(None) => return Err(ToolError::not_found("unknown commit")),
+            Err(e) => return Err(super::rev_err(e)),
+        };
         let changed = local::changed_paths(&bare, &from, &head)
             .await
             .map_err(internal)?;
@@ -680,10 +799,7 @@ pub async fn open_app_impl(input: OpenAppInput, ctx: &Ctx<'_>) -> Result<Value, 
         }
     }
 
-    let brand = match read_small(&bare, &head, "brand.json").await? {
-        Some(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
-        None => Value::Null,
-    };
+    let brand = brand_value(read_small(&bare, &head, "brand.json").await?);
 
     let rules = match read_small(&bare, &head, "AGENTS.md").await? {
         Some(text) => {
@@ -780,4 +896,79 @@ pub async fn open_app_impl(input: OpenAppInput, ctx: &Ctx<'_>) -> Result<Value, 
             "next": next,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tables_of(sql: &str) -> Vec<(String, Vec<String>)> {
+        let mut tables = Vec::new();
+        parse_migrations(sql, &mut tables);
+        tables
+    }
+
+    #[test]
+    fn alter_table_quoted_names_add_columns() {
+        for (sql, table, col) in [
+            (r#"ALTER TABLE "note" ADD COLUMN x TEXT"#, "note", "x"),
+            ("ALTER TABLE `note` ADD COLUMN y TEXT", "note", "y"),
+            ("ALTER TABLE [note] ADD COLUMN z TEXT", "note", "z"),
+        ] {
+            let tables = tables_of(sql);
+            assert_eq!(tables.len(), 1, "sql: {sql}");
+            assert_eq!(tables[0].0, table);
+            assert_eq!(tables[0].1, vec![col.to_string()]);
+        }
+    }
+
+    #[test]
+    fn alter_table_multibyte_name_does_not_panic() {
+        let tables = tables_of(r#"ALTER TABLE "café" ADD COLUMN x TEXT"#);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].0, "café");
+        assert_eq!(tables[0].1, vec!["x".to_string()]);
+        // Quoted CREATE TABLE plus quoted ALTER on the same table merge.
+        let tables = tables_of(
+            "CREATE TABLE \"café\" (id TEXT);\nALTER TABLE \"café\" ADD COLUMN \"naïve\" TEXT",
+        );
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].0, "café");
+        assert_eq!(tables[0].1, vec!["id".to_string(), "naïve".to_string()]);
+    }
+
+    #[test]
+    fn json_config_bindings_parse() {
+        let config = "{\"d1_databases\": [{\"binding\": \"DB\", \"database_name\": \"app-db\"}]}";
+        let bindings = parse_bindings(config);
+        let dbs = bindings["d1_databases"].as_array().unwrap();
+        assert_eq!(dbs.len(), 1);
+        assert_eq!(dbs[0]["binding"], "DB");
+        assert_eq!(dbs[0]["database_name"], "app-db");
+        // The unquoted TS form still parses.
+        let ts = "d1_databases: [{binding: 'DB2', database_name: 'x'}]";
+        let bindings = parse_bindings(ts);
+        assert_eq!(bindings["d1_databases"][0]["binding"], "DB2");
+    }
+
+    #[test]
+    fn brand_value_bounds_large_and_invalid() {
+        assert_eq!(brand_value(None), Value::Null);
+        assert_eq!(
+            brand_value(Some("not json{".to_string())),
+            json!({"error": "brand.json is not valid JSON"})
+        );
+        let big = serde_json::json!({"name": "x".repeat(5000)});
+        let branded = brand_value(Some(serde_json::to_string(&big).unwrap()));
+        assert_eq!(branded["error"], "brand.json exceeds 2000 characters");
+        let preview = branded["preview"].as_str().unwrap();
+        assert!(preview.len() <= MAX_BRAND_CHARS);
+        assert!(serde_json::to_string(&branded).unwrap().len() <= MAX_BRAND_CHARS + 128);
+        // A small valid file passes through untouched.
+        let small = serde_json::json!({"name": "Acme"});
+        assert_eq!(
+            brand_value(Some(serde_json::to_string(&small).unwrap())),
+            small
+        );
+    }
 }

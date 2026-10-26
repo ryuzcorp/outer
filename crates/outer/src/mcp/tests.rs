@@ -669,6 +669,35 @@ async fn strangers_app_is_not_found_never_forbidden() {
 }
 
 #[tokio::test]
+async fn open_app_unknown_sha_and_changed_since_are_not_found() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    // Well-formed but unknown: 40 hex chars naming nothing on main.
+    let missing = "0".repeat(40);
+    let (_, bad_sha) = call(
+        &state,
+        Some(&token),
+        "open_app",
+        json!({"app": "groceries", "sha": missing}),
+    )
+    .await;
+    let err = is_error(&bad_sha);
+    assert_eq!(err["error"], "not_found");
+    assert!(err["message"].as_str().unwrap().contains("unknown commit"));
+    let (_, bad_since) = call(
+        &state,
+        Some(&token),
+        "open_app",
+        json!({"app": "groceries", "changed_since": missing}),
+    )
+    .await;
+    let err = is_error(&bad_since);
+    assert_eq!(err["error"], "not_found");
+    assert!(err["message"].as_str().unwrap().contains("unknown commit"));
+}
+
+#[tokio::test]
 async fn free_plan_caps_apps_at_one() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;

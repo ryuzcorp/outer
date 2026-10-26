@@ -33,6 +33,23 @@ pub struct RecordReq {
     pub response_bytes: i64,
 }
 
+/// Stored string fields are capped so a hostile client name or a pasted
+/// slug cannot bloat the row.
+pub const MAX_STR_LEN: usize = 64;
+
+/// Cut `s` to at most [`MAX_STR_LEN`] chars, on a char boundary.
+fn cap(s: &str) -> &str {
+    if s.len() <= MAX_STR_LEN {
+        return s;
+    }
+    // `MAX_STR_LEN` is ASCII-small, but the tail may be multi-byte.
+    let mut end = MAX_STR_LEN;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 impl RecordReq {
     /// Build from the dispatch outcome. `args` is read for the `app` slug
     /// only — never stored.
@@ -47,15 +64,17 @@ impl RecordReq {
         let app_slug = args
             .and_then(|a| a.get("app"))
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .map(|s| cap(s).to_string());
         let (ok, error_code, response_bytes) = match outcome {
             Ok(result) => (true, None, result.to_string().len() as i64),
             Err(CallError::Rpc(code, message)) => {
                 (false, Some(format!("rpc_{code}")), message.len() as i64)
             }
-            Err(CallError::Tool(err)) => {
-                (false, Some(err.code.to_string()), err.message.len() as i64)
-            }
+            Err(CallError::Tool(err)) => (
+                false,
+                Some(cap(err.code).to_string()),
+                err.message.len() as i64,
+            ),
         };
         Self {
             tool: tool.to_string(),
@@ -68,7 +87,6 @@ impl RecordReq {
             response_bytes,
         }
     }
-
     fn account_id(&self) -> Option<&str> {
         self.principal.as_ref().map(|p| p.account_id.as_str())
     }
@@ -114,6 +132,8 @@ pub async fn record(pool: &SqlitePool, req: &RecordReq) -> anyhow::Result<()> {
         .flatten(),
         None => None,
     };
+    // The slug is stored only when it names a real app (the same lookup
+    // that sets `app_id`); unknown or huge slugs record NULL.
     let app_id: Option<String> = match req.app_slug.as_deref() {
         Some(slug) => {
             sqlx::query_scalar("SELECT id FROM app WHERE slug = ?1")
@@ -122,6 +142,10 @@ pub async fn record(pool: &SqlitePool, req: &RecordReq) -> anyhow::Result<()> {
                 .await?
         }
         None => None,
+    };
+    let app_slug: Option<&str> = match (&req.app_slug, &app_id) {
+        (Some(slug), Some(_)) => Some(cap(slug)),
+        _ => None,
     };
     sqlx::query(
         "INSERT INTO tool_call (id, tool, account_id, app_id, app_slug, client, session, \
@@ -132,12 +156,12 @@ pub async fn record(pool: &SqlitePool, req: &RecordReq) -> anyhow::Result<()> {
     .bind(&req.tool)
     .bind(req.account_id())
     .bind(app_id)
-    .bind(req.app_slug.as_deref())
-    .bind(client)
+    .bind(app_slug)
+    .bind(client.as_deref().map(cap))
     .bind(req.session())
     .bind(req.duration_ms)
     .bind(i64::from(req.ok))
-    .bind(req.error_code.as_deref())
+    .bind(req.error_code.as_deref().map(cap))
     .bind(req.response_bytes)
     .bind(crate::apps::now_ms())
     .execute(pool)
@@ -300,6 +324,34 @@ mod tests {
         ok: i64,
         error_code: Option<String>,
         response_bytes: i64,
+    }
+    #[tokio::test]
+    async fn unknown_or_huge_app_slug_records_no_slug() {
+        let pool = pool().await;
+        // Unknown slug: no app row, so both id and slug stay NULL.
+        let mut bad = req("open_app");
+        bad.app_slug = Some("no-such-app".to_string());
+        record(&pool, &bad).await.unwrap();
+        // Huge slug: capped in `from_outcome`, and still unknown here.
+        let mut huge = req("open_app");
+        huge.app_slug = Some("x".repeat(5000));
+        huge.error_code = Some("y".repeat(5000));
+        record(&pool, &huge).await.unwrap();
+        let rows: Vec<ToolCallRow> = sqlx::query_as(
+            "SELECT tool, account_id, app_slug, client, session, duration_ms, ok, error_code, response_bytes \
+             FROM tool_call",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.app_slug.is_none()));
+        assert_eq!(rows[1].error_code.as_deref().unwrap().len(), MAX_STR_LEN);
+        // `from_outcome` caps the slug before it ever reaches the row.
+        let args = serde_json::json!({"app": "z".repeat(500)});
+        let out: Result<serde_json::Value, CallError> = Ok(serde_json::json!({}));
+        let capped = RecordReq::from_outcome("open_app", None, None, Some(&args), &out, 1);
+        assert_eq!(capped.app_slug.as_deref().unwrap().len(), MAX_STR_LEN);
     }
 
     #[tokio::test]
