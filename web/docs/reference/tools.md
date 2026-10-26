@@ -201,7 +201,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `delete_app`
 
 - **Access:** signed in
-- **Description:** Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. Pass confirm equal to the slug. The name stays reserved for 30 days.
+- **Description:** Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. Pass confirm equal to the slug. The freed name is claimable again immediately.
 
 **Input:**
 
@@ -213,14 +213,14 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `rename_app`
 
 - **Access:** signed in
-- **Description:** Rename an app: {app, slug}. Moves its slug, hostname, code, data and files to the new name (D1 and Durable Object data survive); the old name stays reserved for 30 days and redirects to the new one. Counts one code change; a running app redeploys.
+- **Description:** Rename an app: {app, slug}. Moves its slug, hostname, code, data and files to the new name (D1 and Durable Object data survive); the old name redirects to the new one until someone claims it. Counts one code change; a running app redeploys.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app's current slug. |
-| `slug` | string | yes | The new slug: lowercase letters, digits and dashes, 1-48 chars. The old name stays reserved for 30 days and redirects to the new one. Brand and account-page names and flagged names are refused like at creation. |
+| `slug` | string | yes | The new slug: lowercase letters, digits and dashes, 1-48 chars. The old name redirects to the new one until someone claims it. Brand and account-page names and flagged names are refused like at creation. |
 
 ## `add_collaborator`
 

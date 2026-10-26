@@ -1078,12 +1078,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ana_apps, 0);
-        let quarantine: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM slug_quarantine WHERE slug = 'anaapp'")
+        // The freed slug carries no redirect: the account's deleted app was
+        // never renamed, so nothing points at or from it.
+        let redirects: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM slug_redirect WHERE slug = 'anaapp'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(quarantine, 1);
+        assert_eq!(redirects, 0);
         let ana_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE id = ?1")
             .bind(&ana)
             .fetch_one(&pool)

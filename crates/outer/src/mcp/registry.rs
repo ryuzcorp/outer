@@ -258,12 +258,12 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<app_inputs::DeleteAppInput>(
             "delete_app",
-            "Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. Pass confirm equal to the slug. The name stays reserved for 30 days.",
+            "Delete an app forever: stops the fleet, wipes its code, data and files, and purges its cached pages. Pass confirm equal to the slug. The freed name is claimable again immediately.",
             Account, false,
         ),
         tool::<app_inputs::RenameAppInput>(
             "rename_app",
-            "Rename an app: {app, slug}. Moves its slug, hostname, code, data and files to the new name (D1 and Durable Object data survive); the old name stays reserved for 30 days and redirects to the new one. Counts one code change; a running app redeploys.",
+            "Rename an app: {app, slug}. Moves its slug, hostname, code, data and files to the new name (D1 and Durable Object data survive); the old name redirects to the new one until someone claims it. Counts one code change; a running app redeploys.",
             Account, false,
         ),
         tool::<collab_inputs::AddCollaboratorInput>(

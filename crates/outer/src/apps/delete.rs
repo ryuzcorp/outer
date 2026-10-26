@@ -1,7 +1,7 @@
 //! Delete an app (spec §7.6): stop the fleet, drop its custom domains at
 //! Cloudflare (spec §7.7), wipe its bucket prefixes and local state, drop
-//! its rows (quarantining the slug for 30 days), and purge its edge cache
-//! (app host plus every custom hostname).
+//! its rows (the slug is claimable again immediately), and purge its edge
+//! cache (app host plus every custom hostname).
 //!
 //! One function serves the MCP `delete_app` tool, `delete_account` (which
 //! deletes owned apps through this same path) and the operator CLI, so all
@@ -60,8 +60,6 @@ pub struct DeleteLocks<'g> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteOutput {
     pub slug: String,
-    /// Unix milliseconds: the slug is claimable again after this.
-    pub quarantined_until: i64,
 }
 
 /// Why deletion refused, or what broke mid-way. `NotFound` and
@@ -83,8 +81,8 @@ fn internal(err: impl Into<anyhow::Error>) -> DeleteError {
 
 /// Every app-scoped table keyed by `app_id`, including the ones whose
 /// foreign key already cascades: explicit deletes are idempotent, and they
-/// keep working if a cascade is ever dropped. `slug_quarantine` is keyed by
-/// slug and written by [`crate::apps::delete_row`], not here.
+/// keep working if a cascade is ever dropped. The `slug_redirect` rows
+/// touching the slug go in [`crate::apps::delete_row`], not here.
 const CHILD_TABLES: &[&str] = &[
     "deploy",
     "app_secret",
@@ -226,20 +224,14 @@ pub async fn delete_app(
         .await
         .map_err(internal)?;
     }
-    crate::apps::delete_row(pool, &app.id)
+    if !crate::apps::delete_row(pool, &app.id)
         .await
-        .map_err(internal)?;
-    let quarantined_until: Option<i64> =
-        sqlx::query_scalar("SELECT until FROM slug_quarantine WHERE slug = ?1")
-            .bind(slug)
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    let Some(quarantined_until) = quarantined_until else {
+        .map_err(internal)?
+    {
         // The row vanished between lookup and delete: a concurrent delete
         // won. Report it as gone, not as deleted.
         return Err(DeleteError::NotFound(slug.to_string()));
-    };
+    }
 
     // 5. Edge cache: a cached page must not outlive the deletion. Best
     // effort — the row is already gone, so a failure warns instead of
@@ -252,6 +244,5 @@ pub async fn delete_app(
 
     Ok(DeleteOutput {
         slug: slug.to_string(),
-        quarantined_until,
     })
 }

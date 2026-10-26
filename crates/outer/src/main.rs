@@ -405,7 +405,6 @@ async fn app_delete(config: Config, slug: String) -> anyhow::Result<()> {
         serde_json::json!({
             "deleted": true,
             "slug": out.slug,
-            "quarantined_until": out.quarantined_until,
         })
     );
     Ok(())

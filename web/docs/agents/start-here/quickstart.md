@@ -30,7 +30,7 @@ Change code with `commit {app, message, edits}` using exact-match edits. Written
 
 ## Share it
 
-Call `share_app {app}` for the URL, share text, and QR code. Check [Look](/agents/testing/look) output and [Logs](/agents/testing/logs) after server changes. Undo with `rollback` (never counts as a code change). Delete with `delete_app {app, confirm}` where confirm repeats the slug; the name stays reserved 30 days.
+Call `share_app {app}` for the URL, share text, and QR code. Check [Look](/agents/testing/look) output and [Logs](/agents/testing/logs) after server changes. Undo with `rollback` (never counts as a code change). Delete with `delete_app {app, confirm}` where confirm repeats the slug; the name is free to claim again immediately.
 
 ## Rules that bite newcomers
 

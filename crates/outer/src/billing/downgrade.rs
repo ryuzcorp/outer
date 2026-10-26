@@ -180,8 +180,8 @@ pub async fn run_downgrade_retention(
 }
 
 /// Delete one downgrade-stopped app through the shared `delete_app` path:
-/// fleet stopped, bucket prefixes wiped, rows dropped with the slug
-/// quarantined, edge caches purged. Returns `false` when the row was
+/// fleet stopped, bucket prefixes wiped, rows dropped (the slug is claimable
+/// again immediately), edge caches purged. Returns `false` when the row was
 /// already gone (a concurrent delete won).
 async fn delete_stopped(
     pool: &SqlitePool,

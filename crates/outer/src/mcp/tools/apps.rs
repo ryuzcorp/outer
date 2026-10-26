@@ -82,8 +82,8 @@ pub struct RenameAppInput {
     /// The app's current slug.
     pub app: String,
     /// The new slug: lowercase letters, digits and dashes, 1-48 chars. The
-    /// old name stays reserved for 30 days and redirects to the new one.
-    /// Brand and account-page names and flagged names are refused like at
+    /// old name redirects to the new one until someone claims it. Brand
+    /// and account-page names and flagged names are refused like at
     /// creation.
     pub slug: String,
 }
@@ -147,8 +147,8 @@ async fn seed_app(
         // under this now-unclaimed slug. The row insert above is the claim
         // and nothing local is written yet, so wipe before `init_repo`. A
         // wipe failure lands in the row-removing cleanup below (nobody ever
-        // saw the slug: no quarantine). The stale in-memory manifest seq
-        // goes too, or `ensure_synced` could read it as already-applied.
+        // saw the slug). The stale in-memory manifest seq goes too, or
+        // `ensure_synced` could read it as already-applied.
         crate::apps::local::remove_local_state(
             &ctx.state.delete_cfg.data_dir,
             &ctx.state.git,
@@ -448,10 +448,11 @@ pub async fn share_app(input: ShareAppInput, ctx: &Ctx<'_>) -> Result<Value, Too
 }
 
 /// Delete an app forever (spec §7.6, owner only): stops the fleet, wipes
-/// its bucket prefixes and local state, drops its rows (quarantining the
-/// slug for 30 days), and purges its edge cache. `confirm` must equal the
-/// slug exactly; anything else is refused with what to confirm. A slug the
-/// caller has no role on answers `not_found`, exactly like a missing one.
+/// its bucket prefixes and local state, drops its rows (the slug is
+/// claimable again immediately), and purges its edge cache. `confirm`
+/// must equal the slug exactly; anything else is refused with what to
+/// confirm. A slug the caller has no role on answers `not_found`, exactly
+/// like a missing one.
 pub async fn delete_app(input: DeleteAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     // `not_found` first: a foreign slug never reaches the confirm check.
     let app = owner_app(ctx, &input.app).await?;
@@ -498,24 +499,23 @@ pub async fn delete_app(input: DeleteAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         crate::apps::delete::DeleteError::Internal(err) => internal(err),
     })?;
     let host = format!("{}.{}", out.slug, ctx.state.delete_cfg.apps_domain);
-    let user_message = format!("{host} is deleted. The name stays reserved for 30 days.");
+    let user_message = format!("{host} is deleted. The name is free to claim again.");
     Ok(ok(
         user_message.clone(),
         json!({
             "deleted": true,
             "slug": out.slug,
-            "quarantined_until": out.quarantined_until,
             "user_message": user_message,
         }),
     ))
 }
 
 /// Rename an app (owner only): move its slug, hostname, code, data and
-/// files to `slug`, and quarantine the old slug for 30 days (it answers 308
-/// to the new hostname while the quarantine holds). D1 and Durable Object
-/// data survive: the fleet's bucket prefix moves with the app. Counts one
-/// code change; a running app redeploys under the new name. A slug the
-/// caller has no role on answers `not_found`, exactly like a missing one.
+/// files to `slug`; the old name redirects to the new hostname until
+/// someone claims it. D1 and Durable Object data survive: the fleet's
+/// bucket prefix moves with the app. Counts one code change; a running app
+/// redeploys under the new name. A slug the caller has no role on answers
+/// `not_found`, exactly like a missing one.
 pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     // `not_found` first: a foreign slug never reaches validation or quota.
     let app = owner_app(ctx, &input.app).await?;
@@ -587,13 +587,13 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     let quota =
         json!({"limit": claim.limit, "used": claim.used, "resets_at": super::resets_at_utc()});
     let summary = format!(
-        "{} is now {} at {}. The name {} stays reserved for 30 days.",
-        out.old_slug, out.app.slug, url, out.old_slug
+        "{} is now {} at {}. The old name redirects here until claimed.",
+        out.old_slug, out.app.slug, url
     );
     let structured = json!({
         "slug": out.app.slug,
         "url": url,
-        "quarantined_until": out.quarantined_until,
+        "old_slug": out.old_slug,
         "quota": quota,
     });
     match out.redeploy_sha {
