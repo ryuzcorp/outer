@@ -16,6 +16,15 @@ export const VIEWS = [
   { id: "d1", label: "D1" },
 ] as const;
 
+export const ACCOUNT_TABS = [
+  { id: "account", label: "Account" },
+  { id: "usage", label: "Usage & plan" },
+  { id: "connections", label: "Connections & keys" },
+  { id: "invites", label: "Invite codes" },
+] as const;
+
+export type AccountTabId = (typeof ACCOUNT_TABS)[number]["id"];
+
 export const ACCOUNT_VIEWS = [
   { id: "connections", label: "Connections & keys" },
   { id: "usage", label: "Usage & plan" },
@@ -45,6 +54,11 @@ export const RANGES = [
 export interface Route {
   app: string | null;
   view: ViewId;
+  // The Account hub's tab. Old top-level account URLs (`?t=usage`) map
+  // onto it in readRoute so docs and email links keep landing on the
+  // right tab. Other views ignore it; it survives view switches the way
+  // `sha` does so going back to Account keeps its place.
+  acctab: AccountTabId;
   range: number;
   // The Code view's pinned version; null means the live sha. Other views
   // ignore it, and it survives view switches so Code keeps its place.
@@ -81,6 +95,31 @@ export function toViewId(raw: string | null): ViewId {
   return "overview";
 }
 
+export function toAcctab(raw: string | null): AccountTabId {
+  if (ACCOUNT_TABS.some((t) => t.id === raw)) {
+    return raw as AccountTabId;
+  }
+  return "account";
+}
+
+/** Old top-level account views live on as hub tabs now. */
+const LEGACY_ACCOUNT_TABS: Record<string, AccountTabId> = {
+  account: "account",
+  usage: "usage",
+  connections: "connections",
+  invites: "invites",
+};
+
+/**
+ * Map a legacy `?t=` account view onto the hub (`t=account` + `acctab`).
+ * Returns null for views that navigate unchanged.
+ */
+export function toAccountRoute(view: ViewId): { view: "account"; acctab: AccountTabId } | null {
+  const tab = LEGACY_ACCOUNT_TABS[view];
+  return tab === undefined ? null : { view: "account", acctab: tab };
+}
+
+
 export function toRange(raw: string | null): number {
   const hours = Number(raw);
   return RANGES.some((r) => r.hours === hours) ? hours : 24;
@@ -88,13 +127,19 @@ export function toRange(raw: string | null): number {
 
 export function readRoute(): Route {
   if (typeof window === "undefined") {
-    return { app: null, view: "overview", range: 24, sha: null, codeTab: null, ...D1_DEFAULTS };
+    return { app: null, view: "overview", acctab: "account", range: 24, sha: null, codeTab: null, ...D1_DEFAULTS };
   }
   const q = new URLSearchParams(window.location.search);
   const ct = q.get("ct");
+  const view = toViewId(q.get("t"));
+  // Old `?t=usage|connections|invites` links (docs, emails, the upgrade
+  // flow) land on the matching hub tab. An explicit `?acctab=` wins:
+  // the hub's own canonical URLs carry it.
+  const mapped = view === "account" ? null : toAccountRoute(view);
   return {
     app: q.get("app"),
-    view: toViewId(q.get("t")),
+    view: mapped?.view ?? view,
+    acctab: mapped?.acctab ?? toAcctab(q.get("acctab")),
     range: toRange(q.get("r")),
     sha: q.get("sha"),
     codeTab: ct === "changes" ? "changes" : ct === "files" ? "files" : null,
@@ -115,6 +160,9 @@ export function routeUrl(route: Route): string {
     q.set("app", route.app);
   }
   q.set("t", route.view);
+  if (route.view === "account" && route.acctab !== "account") {
+    q.set("acctab", route.acctab);
+  }
   q.set("r", String(route.range));
   if (route.sha) {
     q.set("sha", route.sha);

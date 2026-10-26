@@ -9,7 +9,7 @@ import { consoleActions } from "./actions/console.ts";
 import type { ActionContext, ConsoleBridge } from "./actions/settings.ts";
 import type { ConsoleApp } from "./api.ts";
 import type { Route } from "./common.tsx";
-import { actionView, buildGroups, emptyQueryEntries, isRunnable, matchScore, searchEntries, type ItemGroup } from "./palette.tsx";
+import { actionTarget, actionView, buildGroups, emptyQueryEntries, isRunnable, matchScore, searchEntries, type ItemGroup } from "./palette.tsx";
 import {
   applyDefaults,
   createConfirmHandler,
@@ -383,6 +383,7 @@ describe("console bridge", () => {
   const route: Route = {
     app: "groceries",
     view: "overview",
+    acctab: "account",
     range: 24,
     sha: null,
     codeTab: null,
@@ -423,6 +424,7 @@ describe("console bridge", () => {
     const state = await consoleActions.consoleState.run({} as never, ctx);
     expect(state.email).toBe("ana@example.com");
     expect(state.slug).toBe("groceries");
+    expect(state.acctab).toBe("account");
     expect(state.apps).toEqual([
       { slug: "groceries", role: "owner", status: "running" },
     ]);
@@ -433,10 +435,23 @@ describe("console bridge", () => {
       'Unknown app "nope"',
     );
     const viewed = await consoleActions.openView.run({ view: "deploys" }, ctx);
-    expect(viewed).toEqual({ slug: "groceries", view: "deploys" });
+    expect(viewed).toEqual({ slug: "groceries", view: "deploys", acctab: "account" });
     await expect(consoleActions.openView.run({ view: "nope" }, ctx)).rejects.toThrow(
       "Unknown view",
     );
+  });
+
+  test("open_view maps legacy account views onto the hub tabs", async () => {
+    const navigated: Partial<Route>[] = [];
+    const ctx = bridgeCtx(navigated);
+    const viewed = await consoleActions.openView.run({ view: "usage" }, ctx);
+    expect(viewed).toEqual({ slug: "groceries", view: "account", acctab: "usage" });
+    expect(navigated.at(-1)).toEqual({ view: "account", acctab: "usage" });
+    const opened = await consoleActions.openApp.run({ slug: "groceries", view: "invites" }, ctx);
+    expect(opened).toEqual({ slug: "groceries", view: "account" });
+    expect(navigated.at(-1)).toEqual({ app: "groceries", view: "account", acctab: "invites" });
+    const kept = await consoleActions.openView.run({ view: "admin" }, ctx);
+    expect(kept).toEqual({ slug: "groceries", view: "admin", acctab: "account" });
   });
 
   test("open_view rejects values outside the schema", async () => {
@@ -457,7 +472,7 @@ describe("console bridge", () => {
       { view: "code", codeTab: null, sha: null },
       ctx,
     );
-    expect(viewed).toEqual({ slug: "groceries", view: "code" });
+    expect(viewed).toEqual({ slug: "groceries", view: "code", acctab: "account" });
   });
 });
 
@@ -475,6 +490,25 @@ describe("palette", () => {
     expect(actionView(findAction("set_secret")!)).toBe("secrets");
     expect(actionView(findAction("rename_app")!)).toBe("settings");
     expect(actionView(findAction("d1_rows")!)).toBe("d1");
+  });
+  test("account actions point at the hub tabs", () => {
+    expect(actionTarget(findAction("create_api_key")!)).toEqual({
+      view: "account",
+      acctab: "connections",
+    });
+    expect(actionTarget(findAction("revoke_connection")!)).toEqual({
+      view: "account",
+      acctab: "connections",
+    });
+    expect(actionTarget(findAction("delete_account")!)).toEqual({
+      view: "account",
+      acctab: "account",
+    });
+    expect(actionTarget(findAction("create_checkout")!)).toEqual({
+      view: "account",
+      acctab: "usage",
+    });
+    expect(actionView(findAction("create_api_key")!)).toBe("account");
   });
   test("admin actions list for admins only and navigate to admin", () => {
     expect(actionView(findAction("admin_review")!)).toBe("admin");
@@ -499,6 +533,39 @@ describe("palette", () => {
       expect(actionKeys(false)).not.toContain(`action:${name}`);
     }
     expect(actionKeys(false)).toContain("action:rollback");
+  });
+  test("the palette lists one Account entry per hub tab", () => {
+    const base = {
+      apps: [],
+      slug: null,
+      view: "overview",
+      onNavigate: () => {},
+      execCtx: { getSlug: () => null },
+      onMutated: () => {},
+      onClose: () => {},
+    } as const;
+    const account = buildGroups({ ...base, isAdmin: false }).find(
+      (g) => g.title === "Account",
+    )!;
+    const tabs = account.items.filter((i) => i.kind === "view");
+    expect(
+      tabs.map((i) => (i.kind === "view" ? [i.view, i.acctab] : null)),
+    ).toEqual([
+      ["account", "account"],
+      ["account", "usage"],
+      ["account", "connections"],
+      ["account", "invites"],
+    ]);
+    // Admin keeps its own entry, visible to admins only.
+    expect(tabs.some((i) => i.key === "view:admin")).toBe(false);
+    const adminTabs = buildGroups({ ...base, isAdmin: true })
+      .find((g) => g.title === "Account")!
+      .items.filter((i) => i.kind === "view");
+    expect(adminTabs.some((i) => i.key === "view:admin")).toBe(true);
+    const keys = buildGroups({ ...base, isAdmin: true }).flatMap((g) =>
+      g.items.map((i) => i.key),
+    );
+    expect(new Set(keys).size).toBe(keys.length);
   });
 
   test("domains: refresh is runnable, add navigates to settings", () => {
