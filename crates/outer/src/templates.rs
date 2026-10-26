@@ -154,19 +154,21 @@ pub async fn sync(store: &Store, url: &str, sha: &str) -> anyhow::Result<Templat
     // create would fail long after the sync said it was fine.
     for template in Template::ALL {
         let tree = format!("{sha}:{}", template.dir());
-        run_git(
-            &["-C", src_str.as_str(), "cat-file", "-e", tree.as_str()],
+        // `-t` and not `-e`: a file or symlink at the path exists too, but
+        // only a tree can be copied as the app's project root.
+        let kind = run_git(
+            &["-C", src_str.as_str(), "cat-file", "-t", tree.as_str()],
             None,
             &[],
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "{url} at {sha} has no {}/ folder for the {} template",
-                template.dir(),
-                template.id()
-            )
-        })?;
+        .unwrap_or_default();
+        anyhow::ensure!(
+            kind.trim() == "tree",
+            "{url} at {sha} has no {}/ folder for the {} template",
+            template.dir(),
+            template.id()
+        );
     }
     run_git(
         &[
@@ -483,6 +485,24 @@ mod tests {
         assert!(
             err.to_string().contains("templates/website"),
             "the error names the missing folder: {err:#}"
+        );
+        assert!(
+            store.get(CURRENT_KEY).await.unwrap().is_none(),
+            "nothing vendored"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_a_file_where_a_template_folder_belongs() {
+        let (repo, url, _) = make_source_repo().await;
+        std::fs::remove_dir_all(repo.path().join("templates/website")).unwrap();
+        std::fs::write(repo.path().join("templates/website"), "not a folder\n").unwrap();
+        let sha = commit_all(repo.path(), "website is a file").await;
+        let store = Store::memory();
+        let err = sync(&store, &url, &sha).await.unwrap_err();
+        assert!(
+            err.to_string().contains("templates/website"),
+            "the error names the folder: {err:#}"
         );
         assert!(
             store.get(CURRENT_KEY).await.unwrap().is_none(),
