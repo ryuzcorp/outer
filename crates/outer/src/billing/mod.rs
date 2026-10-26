@@ -188,6 +188,18 @@ impl BillingState {
             Self::Enabled { webhook_secret, .. } => Some(webhook_secret),
         }
     }
+    /// The live subscription object for a webhook event, `None` when
+    /// billing is disabled. The route fetches this before `apply_event`
+    /// opens its transaction, so no network happens inside the DB lock.
+    pub async fn retrieve_subscription(
+        &self,
+        id: &str,
+    ) -> Option<anyhow::Result<serde_json::Value>> {
+        match self {
+            Self::Disabled { .. } => None,
+            Self::Enabled { client, .. } => Some(client.retrieve_subscription(id).await),
+        }
+    }
 
     /// Verify a `GET /billing/checkout?t=` token back to its account.
     pub fn verify_checkout_token(&self, token: &str, now_secs: i64) -> Option<String> {
