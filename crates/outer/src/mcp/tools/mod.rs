@@ -11,6 +11,7 @@ pub(crate) mod backups;
 pub(crate) mod billing;
 pub(crate) mod code;
 pub(crate) mod collaborators;
+pub(crate) mod data;
 pub(crate) mod domains;
 pub(crate) mod export;
 pub(crate) mod look;
@@ -1123,6 +1124,12 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "reopen_error" => runtime::reopen_error(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "app_metrics" => data::app_metrics(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "db_query" => data::db_query(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "look_at_app" => look::look_at_app(parse_args(args)?, ctx)

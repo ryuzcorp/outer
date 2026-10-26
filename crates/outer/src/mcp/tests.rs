@@ -3,6 +3,7 @@
 //! deploys, captured email codes — no celld, no network.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -13,6 +14,7 @@ use serde_json::{json, Value};
 use super::registry::registry;
 use super::{mcp_handler, FakeOutcome, McpState, INSTRUCTIONS, LATEST_PROTOCOL};
 use crate::auth::test_support as auth_ts;
+use crate::fleet::manager::{FleetManager, ManagerSettings};
 use crate::store::Store;
 
 type Codes = Arc<Mutex<HashMap<String, String>>>;
@@ -303,7 +305,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 52);
+    assert_eq!(anon.len(), 54);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -320,7 +322,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 50);
+    assert_eq!(authed.len(), 52);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
     assert!(authed.contains(&"upgrade".to_string()));
@@ -411,6 +413,8 @@ async fn registry_schemas_are_valid_json_schema() {
             "deploy_log",
             "app_logs",
             "app_errors",
+            "app_metrics",
+            "db_query",
             "look_at_app"
         ]
     );
@@ -6714,4 +6718,575 @@ async fn tools_show_deletes_at_on_free_and_hide_it_on_pro() {
         "{}",
         result(&get)["structuredContent"]
     );
+}
+
+// --- app_metrics / db_query (M3 data tools) --------------------------------
+//
+// app_metrics reads the same metric_minute/path_hour/visitor_day rows as the
+// Console metrics tab; db_query runs through the same celld path as the
+// Console D1 panel. The fake celld below answers `d1 execute` with canned
+// JSON per `--command` marker, and a stub health server makes `ensure_awake`
+// count the fleet awake so no real fleet ever spawns.
+
+/// A fake `celld` for db_query tests: answers `d1 execute` with canned JSON
+/// rows, recording argv under the state dir derived from
+/// `--bucket s3://<dir>/fleets/<slug>`.
+fn install_fake_query_celld(state: &std::path::Path) -> PathBuf {
+    let script = state.join("fake-celld");
+    let tmp = script.with_extension("tmp");
+    std::fs::write(
+        &tmp,
+        r#"#!/bin/sh
+command_of() {
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--command" ]; then printf '%s' "$a"; return 0; fi
+    prev="$a"
+  done
+}
+bucket_of() {
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--bucket" ]; then printf '%s' "$a"; return 0; fi
+    prev="$a"
+  done
+}
+sql=$(command_of "$@")
+bucket=$(bucket_of "$@")
+statedir=$(printf '%s' "$bucket" | sed -e 's|^s3://||' -e 's|/fleets/.*||')
+mkdir -p "$statedir"
+printf '%s\n' "$*" >> "$statedir/calls.log"
+case "$sql" in
+  *FAILME*) echo "no such table: missing" >&2; exit 1;;
+  *BIGONE*)
+    printf '{"big":"'
+    head -c 300000 /dev/zero | tr '\0' 'x'
+    printf '"}\n'
+    ;;
+  *MANYROWS*)
+    i=1
+    while [ $i -le 250 ]; do printf '{"id":%d,"name":"n%d"}\n' "$i" "$i"; i=$((i+1)); done
+    ;;
+  *HUGEROWS*)
+    pad=$(head -c 2000 /dev/zero | tr '\0' 'y')
+    i=1
+    while [ $i -le 200 ]; do printf '{"id":%d,"pad":"%s"}\n' "$i" "$pad"; i=$((i+1)); done
+    ;;
+  *) printf '%s\n' '{"id":1,"name":"ada"}';;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::rename(&tmp, &script).unwrap();
+    script
+}
+
+/// The live manifest celld published for the app: D1 bindings only, in the
+/// layout `deployed_manifest` reads.
+async fn seed_query_manifest(store: &Store, slug: &str, bindings: &[(&str, &str)]) {
+    let prefix = "deploy/outer-app/abcd1234";
+    store
+        .put(
+            &format!("fleets/{slug}/deploy/current.json"),
+            format!(
+                "{{\"script_name\":\"outer-app\",\"version\":\"abcd1234\",\"prefix\":\"{prefix}\"}}"
+            )
+            .into_bytes(),
+        )
+        .await
+        .unwrap();
+    let dbs: Vec<Value> = bindings
+        .iter()
+        .map(|(binding, name)| json!({"type": "d1", "name": binding, "database_name": name}))
+        .collect();
+    let manifest = json!({
+        "schema_version": 2,
+        "script_name": "outer-app",
+        "main_module": "index.js",
+        "raw_metadata": {
+            "bindings": dbs,
+            "compatibility_date": "2026-09-01",
+            "main_module": "index.js",
+        },
+    });
+    store
+        .put(
+            &format!("fleets/{slug}/{prefix}/manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+/// A stub fleet health gate: answers 200 on every connection so
+/// `ensure_awake`'s pre-spawn probe counts the fleet awake and no `celld`
+/// spawn ever runs. Loopback-only; the task dies with the test.
+async fn stub_query_health() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    (port, handle)
+}
+
+/// db_query test app: real app row plus seeded manifest, the fleet pointed
+/// at the fake celld and the stub health server. Guards keep the temp dirs
+/// and the stub alive; `McpState` only holds path copies.
+struct QueryApp {
+    state: McpState,
+    token: String,
+    statedir: tempfile::TempDir,
+    _stub: tokio::task::JoinHandle<()>,
+}
+
+async fn query_setup(slug: &str, bindings: &[(&str, &str)]) -> QueryApp {
+    let (mut state, _) = setup().await;
+    set_plan(&state, "ana@example.com", "pro").await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, slug).await;
+    seed_query_manifest(&state.store, slug, bindings).await;
+    // Point the app at the stub so the D1 wake probe succeeds locally.
+    let (port, stub) = stub_query_health().await;
+    sqlx::query("UPDATE app SET port = ?1 WHERE slug = ?2")
+        .bind(port as i64)
+        .bind(slug)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let statedir = tempfile::tempdir().unwrap();
+    let script = install_fake_query_celld(statedir.path());
+    let mut storage = state.fleets.storage().clone();
+    storage.bucket = statedir.path().to_string_lossy().into_owned();
+    let data_dir = tempfile::tempdir().unwrap();
+    let data_path = data_dir.path().to_path_buf();
+    std::mem::forget(data_dir);
+    state.fleets = FleetManager::new(ManagerSettings {
+        data_dir: data_path,
+        celld_bin: script.to_string_lossy().into_owned(),
+        storage,
+        cgroups: None,
+        memory_max_bytes: 512 * 1024 * 1024,
+        cpu_max: "50000 100000".to_string(),
+        sleep_after: std::time::Duration::from_secs(1800),
+        credential_refresh_after: std::time::Duration::from_secs(6 * 86400),
+        wake_timeout: std::time::Duration::from_secs(1),
+        wake_concurrency: 4,
+        always_on_max: 10,
+        preview_max: 20,
+    });
+    QueryApp {
+        state,
+        token,
+        statedir,
+        _stub: stub,
+    }
+}
+
+fn query_calls(q: &QueryApp) -> String {
+    std::fs::read_to_string(q.statedir.path().join("calls.log")).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn app_metrics_shape_matches_the_console_source() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    let bob = api_key_for(&state, "bob@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    create_app(&state, &ana, "quiet").await;
+    let id = app_id(&state, "groceries").await;
+    let now = crate::apps::now_ms();
+    // One minute row with all 10 requests in the 50 ms histogram bucket.
+    let mut hist = vec![0u64; 14];
+    hist[5] = 10;
+    sqlx::query(
+        "INSERT INTO metric_minute (app_id, minute, requests, s4xx, s5xx, latency_hist, bytes_out, visitors) \
+         VALUES (?1, ?2, 10, 2, 1, ?3, 0, 0)",
+    )
+    .bind(&id)
+    .bind(now / 60_000 * 60_000)
+    .bind(serde_json::to_string(&hist).unwrap())
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO visitor_day (app_id, day, visitors) VALUES (?1, ?2, 7)")
+        .bind(&id)
+        .bind(now.div_euclid(86_400_000))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let hour = now / 3_600_000 * 3_600_000;
+    for (path, requests, errors) in [("/home", 6, 1), ("/about", 4, 0)] {
+        sqlx::query(
+            "INSERT INTO path_hour (app_id, hour, path, requests, s5xx) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&id)
+        .bind(hour)
+        .bind(path)
+        .bind(requests)
+        .bind(errors)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    // A stranger's slug answers not_found, exactly like a missing one.
+    let (_, stranger) = call(
+        &state,
+        Some(&bob),
+        "app_metrics",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&stranger)["error"], "not_found");
+
+    // Only the Console's windows pass; anything else is the caller's bug.
+    for hours in [1, 48, 721] {
+        let (_, bad) = call(
+            &state,
+            Some(&ana),
+            "app_metrics",
+            json!({"app": "groceries", "hours": hours}),
+        )
+        .await;
+        let err = is_error(&bad);
+        assert_eq!(err["error"], "invalid_argument");
+        assert!(err["message"].as_str().unwrap().contains("24, 168 or 720"));
+    }
+
+    let (_, out) = call(
+        &state,
+        Some(&ana),
+        "app_metrics",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let body = result(&out);
+    let sc = &body["structuredContent"];
+    assert_eq!(sc["app"], "groceries");
+    assert_eq!(sc["hours"], 24);
+    assert_eq!(sc["requests"], 10);
+    assert_eq!(sc["visitors"], 7);
+    assert_eq!(sc["errors"], 1);
+    assert_eq!(sc["s4xx"], 2);
+    assert_eq!(sc["s5xx"], 1);
+    assert!((sc["error_rate"].as_f64().unwrap() - 0.1).abs() < 1e-9);
+    assert_eq!(sc["p50_ms"], 50);
+    assert_eq!(sc["p95_ms"], 50);
+    assert_eq!(sc["top_paths"][0]["path"], "/home");
+    assert_eq!(sc["top_paths"][0]["requests"], 6);
+    assert_eq!(sc["top_paths"][0]["errors"], 1);
+    assert_eq!(sc["top_paths"].as_array().unwrap().len(), 2);
+    // Paths name app routes, which visitor input can shape: they ride
+    // behind the §8.4 notice as their own text block.
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    let data = content[1]["text"].as_str().unwrap();
+    assert!(data.starts_with("The following was produced by your app"));
+    assert!(data.contains("/home"));
+
+    // A wider window passes through; an app with no traffic answers zeros.
+    let (_, wide) = call(
+        &state,
+        Some(&ana),
+        "app_metrics",
+        json!({"app": "groceries", "hours": 168}),
+    )
+    .await;
+    assert_eq!(result(&wide)["structuredContent"]["hours"], 168);
+    let (_, empty) = call(&state, Some(&ana), "app_metrics", json!({"app": "quiet"})).await;
+    let sc = &result(&empty)["structuredContent"];
+    assert_eq!(sc["requests"], 0);
+    assert_eq!(sc["visitors"], 0);
+    assert_eq!(sc["errors"], 0);
+    assert_eq!(sc["error_rate"], 0.0);
+    assert_eq!(sc["top_paths"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn app_metrics_collaborator_may_read() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let (_, out) = call(
+        &state,
+        Some(&bruno),
+        "app_metrics",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&out).get("isError").is_none(), "{out}");
+    assert_eq!(result(&out)["structuredContent"]["app"], "groceries");
+}
+
+#[tokio::test]
+async fn db_query_reads_rows_through_the_console_path() {
+    let q = query_setup("groceries", &[("DB", "app-db")]).await;
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "sql": "SELECT * FROM users"}),
+    )
+    .await;
+    let body = result(&out);
+    let sc = &body["structuredContent"];
+    assert_eq!(sc["app"], "groceries");
+    assert_eq!(sc["binding"], "DB");
+    assert_eq!(sc["row_count"], 1);
+    assert_eq!(sc["truncated"], false);
+    assert_eq!(sc["rows"][0]["name"], "ada");
+    assert_eq!(sc["columns"].as_array().unwrap().len(), 2);
+    // One `celld d1 execute` with the scoped bucket, JSON output, and the
+    // app's database identity.
+    let calls = query_calls(&q);
+    assert!(calls.contains("d1 execute app-db"), "{calls}");
+    assert!(calls.contains("--command SELECT * FROM users"), "{calls}");
+    assert!(calls.contains("--json"), "{calls}");
+    // Rows may hold visitor data: they ride behind the §8.4 notice.
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    let data = content[1]["text"].as_str().unwrap();
+    assert!(data.starts_with("The following was produced by your app"));
+    assert!(data.contains("ada"));
+}
+
+#[tokio::test]
+async fn db_query_caps_rows_values_and_bytes() {
+    let q = query_setup("groceries", &[("DB", "app-db")]).await;
+    // 250 rows in, 200 out.
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "sql": "SELECT * FROM MANYROWS"}),
+    )
+    .await;
+    let sc = &result(&out)["structuredContent"];
+    assert_eq!(sc["row_count"], 200);
+    assert_eq!(sc["truncated"], true);
+    assert_eq!(sc["rows"][199]["id"], 200);
+    assert!(result(&out)["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("(truncated)"));
+
+    // One 300 KiB value is cut to the per-cell cap.
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "sql": "SELECT big FROM BIGONE"}),
+    )
+    .await;
+    let sc = &result(&out)["structuredContent"];
+    assert_eq!(sc["row_count"], 1);
+    assert_eq!(sc["truncated"], true);
+    assert_eq!(sc["rows"][0]["big"].as_str().unwrap().chars().count(), 5001);
+
+    // 200 wide rows shed trailing rows past the byte cap.
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "sql": "SELECT * FROM HUGEROWS"}),
+    )
+    .await;
+    let sc = &result(&out)["structuredContent"];
+    let n = sc["row_count"].as_u64().unwrap();
+    assert!(n < 200 && n > 50, "{n}");
+    assert_eq!(sc["truncated"], true);
+    let bytes = serde_json::to_string(&sc["rows"]).unwrap().len();
+    assert!(bytes <= 250_000, "{bytes}");
+}
+
+#[tokio::test]
+async fn db_query_refuses_writes_before_touching_celld() {
+    let q = query_setup("groceries", &[("DB", "app-db")]).await;
+    for sql in [
+        "DELETE FROM users",
+        "INSERT INTO users VALUES (1)",
+        "UPDATE users SET name = 'x'",
+        "ATTACH DATABASE 'x' AS y",
+        "PRAGMA writable_schema = ON",
+        "SELECT 1; DROP TABLE users",
+        "WITH x AS (SELECT 1) UPDATE t SET a = 2",
+        "SELECT load_extension('evil')",
+    ] {
+        let (_, out) = call(
+            &q.state,
+            Some(&q.token),
+            "db_query",
+            json!({"app": "groceries", "sql": sql}),
+        )
+        .await;
+        let err = is_error(&out);
+        assert_eq!(err["error"], "invalid_argument", "{sql}");
+        // The refusal names where writes live: migrations and restore.
+        let message = err["message"].as_str().unwrap();
+        assert!(message.contains("migrations"), "{sql}: {message}");
+        assert!(message.contains("restore_backup"), "{sql}: {message}");
+    }
+    // No refused shape ever reached celld.
+    assert!(!q.statedir.path().join("calls.log").exists());
+    // An engine refusal (missing table) is still the caller's bug.
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "sql": "SELECT * FROM FAILME"}),
+    )
+    .await;
+    let err = is_error(&out);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"].as_str().unwrap().contains("no such table"));
+}
+
+#[tokio::test]
+async fn db_query_binds_params_server_side() {
+    let q = query_setup("groceries", &[("DB", "app-db")]).await;
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries",
+               "sql": "SELECT * FROM users WHERE id = ? AND name <> ?",
+               "params": [1, "o'brien"]}),
+    )
+    .await;
+    assert!(result(&out).get("isError").is_none(), "{out}");
+    // Numbers stay bare, strings are quoted server-side: no smuggling.
+    let calls = query_calls(&q);
+    assert!(
+        calls.contains("WHERE id = 1 AND name <> 'o''brien'"),
+        "{calls}"
+    );
+    // A hole count mismatch is the caller's bug.
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "sql": "SELECT ? AND ?", "params": [1]}),
+    )
+    .await;
+    let err = is_error(&out);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"].as_str().unwrap().contains("placeholder"));
+}
+
+#[tokio::test]
+async fn db_query_access_follows_visibility() {
+    let q = query_setup("groceries", &[("DB", "app-db")]).await;
+    let bob = api_key_for(&q.state, "bob@example.com").await;
+    // A stranger's slug answers not_found, exactly like a missing one —
+    // even for a well-formed read.
+    let (_, out) = call(
+        &q.state,
+        Some(&bob),
+        "db_query",
+        json!({"app": "groceries", "sql": "SELECT 1"}),
+    )
+    .await;
+    assert_eq!(is_error(&out)["error"], "not_found");
+}
+
+#[tokio::test]
+async fn db_query_collaborator_may_read() {
+    let q = query_setup("groceries", &[("DB", "app-db")]).await;
+    invite(&q.state, &q.token, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&q.state, "bruno@example.com").await;
+    // A collaborator passes the access check: a write-shaped query is
+    // refused as invalid_argument, never not_found — and a real read runs.
+    let (_, refused) = call(
+        &q.state,
+        Some(&bruno),
+        "db_query",
+        json!({"app": "groceries", "sql": "DELETE FROM users"}),
+    )
+    .await;
+    assert_eq!(is_error(&refused)["error"], "invalid_argument");
+    let (_, out) = call(
+        &q.state,
+        Some(&bruno),
+        "db_query",
+        json!({"app": "groceries", "sql": "PRAGMA table_info(users)"}),
+    )
+    .await;
+    assert!(result(&out).get("isError").is_none(), "{out}");
+    assert_eq!(result(&out)["structuredContent"]["binding"], "DB");
+}
+
+#[tokio::test]
+async fn db_query_resolves_the_default_binding() {
+    let q = query_setup("groceries", &[("DB", "app-db")]).await;
+    // An explicit binding works, including PRAGMA table_info.
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "binding": "DB", "sql": "PRAGMA table_info(users)"}),
+    )
+    .await;
+    assert!(result(&out).get("isError").is_none(), "{out}");
+    // An unknown binding names the problem before any celld call.
+    let (_, out) = call(
+        &q.state,
+        Some(&q.token),
+        "db_query",
+        json!({"app": "groceries", "binding": "NOPE", "sql": "SELECT 1"}),
+    )
+    .await;
+    let err = is_error(&out);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown database"));
+
+    // Several bindings need an explicit choice.
+    let q2 = query_setup("stock", &[("DB", "app-db"), ("PLAIN", "plain-db")]).await;
+    let (_, out) = call(
+        &q2.state,
+        Some(&q2.token),
+        "db_query",
+        json!({"app": "stock", "sql": "SELECT 1"}),
+    )
+    .await;
+    let err = is_error(&out);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(err["message"].as_str().unwrap().contains("binding"));
+
+    // An app with no deployed D1 binding fails before any celld call.
+    create_app(&q2.state, &q2.token, "plain").await;
+    let (_, out) = call(
+        &q2.state,
+        Some(&q2.token),
+        "db_query",
+        json!({"app": "plain", "sql": "SELECT 1"}),
+    )
+    .await;
+    assert_eq!(is_error(&out)["error"], "invalid_argument");
+    assert!(!q2.statedir.path().join("calls.log").exists());
 }
