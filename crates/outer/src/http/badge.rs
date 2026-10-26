@@ -37,27 +37,29 @@ pub fn badge_snippet(slug: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Whether the request accepts an HTML document: a missing `Accept` means
-/// the client takes anything, otherwise `text/html` (or a wildcard covering
-/// it). Anything else (API and asset fetches) keeps its encoding so the
-/// proxy never pays to decode bodies it must not touch.
+/// Whether the request is a page navigation: its `Accept` names
+/// `text/html` with a non-zero quality, as every browser navigation does.
+/// Wildcards and a missing header don't count: scripts, `fetch` calls and
+/// other asset loads send `*/*`, and they keep their encoding, their
+/// conditional requests and skip the plan lookup.
 pub fn accepts_html(headers: &HeaderMap) -> bool {
-    let Some(value) = headers.get(axum::http::header::ACCEPT) else {
-        return true;
-    };
-    let Ok(accept) = value.to_str() else {
-        return true;
+    let Some(Ok(accept)) = headers
+        .get(axum::http::header::ACCEPT)
+        .map(|value| value.to_str())
+    else {
+        return false;
     };
     accept.split(',').any(|part| {
-        matches!(
-            part.split(';')
-                .next()
-                .unwrap_or("")
+        let mut params = part.split(';');
+        let media = params.next().unwrap_or("").trim();
+        let refused = params.any(|param| {
+            param
                 .trim()
-                .to_ascii_lowercase()
-                .as_str(),
-            "text/html" | "text/*" | "*/*"
-        )
+                .strip_prefix("q=")
+                .and_then(|q| q.trim().parse::<f32>().ok())
+                .is_some_and(|q| q <= 0.0)
+        });
+        media.eq_ignore_ascii_case("text/html") && !refused
     })
 }
 
@@ -105,13 +107,21 @@ mod tests {
 
     #[test]
     fn accepts_html_matrix() {
-        assert!(accepts_html(&headers(&[])), "missing accepts anything");
         assert!(accepts_html(&headers(&[(
             "accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         )])));
-        assert!(accepts_html(&headers(&[("accept", "*/*")])));
-        assert!(accepts_html(&headers(&[("accept", "text/*")])));
+        assert!(accepts_html(&headers(&[("accept", "TEXT/HTML;q=0.5")])));
+        assert!(!accepts_html(&headers(&[])), "no Accept: not a navigation");
+        assert!(
+            !accepts_html(&headers(&[("accept", "*/*")])),
+            "scripts, fetch"
+        );
+        assert!(!accepts_html(&headers(&[(
+            "accept",
+            "text/html;q=0, */*;q=1"
+        )])));
+        assert!(!accepts_html(&headers(&[("accept", "text/html; q=0.0")])));
         assert!(!accepts_html(&headers(&[("accept", "application/json")])));
         assert!(!accepts_html(&headers(&[(
             "accept",

@@ -518,6 +518,15 @@ async fn badge_response(
         .and_then(|value| value.to_str().ok())
         .and_then(|text| text.parse::<usize>().ok());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    // The badge depends on the owner's plan, not the page: no validators, and
+    // every reuse revalidates, so an upgrade never keeps showing a cached
+    // badged page (the request side drops conditionals for the same reason).
+    parts.headers.remove(axum::http::header::ETAG);
+    parts.headers.remove(axum::http::header::LAST_MODIFIED);
+    parts.headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-cache"),
+    );
     let mut out = copy_response_headers(
         Response::builder().status(parts.status),
         &mut parts.headers,
@@ -940,6 +949,15 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         if (look_armed || badge_identity) && name == axum::http::header::ACCEPT_ENCODING {
             continue;
         }
+        // A Free navigation's body is plan-dependent: a 304 would let the
+        // client reuse a page decorated for an earlier plan (a Pro page
+        // cached before a downgrade), so always fetch the full page.
+        if badge_identity
+            && (*name == axum::http::header::IF_NONE_MATCH
+                || *name == axum::http::header::IF_MODIFIED_SINCE)
+        {
+            continue;
+        }
         if (is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()))
             && !(upgrade
                 && (*name == axum::http::header::UPGRADE
@@ -1199,6 +1217,26 @@ mod tests {
                     Response::builder()
                         .status(StatusCode::NOT_MODIFIED)
                         .body(Body::empty())
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/etag-html",
+                // A cacheable page: 304 when the client's validator matches.
+                axum::routing::get(|req: Request| async move {
+                    if req.headers().get("if-none-match").is_some_and(|v| v == "\"v1\"") {
+                        return Response::builder()
+                            .status(StatusCode::NOT_MODIFIED)
+                            .header("etag", "\"v1\"")
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .header("content-type", "text/html")
+                        .header("etag", "\"v1\"")
+                        .header("last-modified", "Mon, 26 Oct 2026 10:00:00 GMT")
+                        .header("cache-control", "public, max-age=600")
+                        .body(Body::from("<html><body>cached</body></html>"))
                         .unwrap()
                 }),
             )
@@ -2253,10 +2291,12 @@ mod tests {
         .with_look_tokens(tokens)
     }
 
+    /// The screenshot browser's navigation, optionally carrying a token.
     fn look_html_request(token: Option<&str>) -> Request {
         let mut req = Request::builder()
             .uri("/look-html")
-            .header("host", "shop.outer.test");
+            .header("host", "shop.outer.test")
+            .header("accept", "text/html,*/*;q=0.8");
         if let Some(token) = token {
             req = req.header(LOOK_HEADER, token);
         }
@@ -2523,6 +2563,7 @@ mod tests {
         let req = Request::builder()
             .uri("/look-big")
             .header("host", "shop.outer.test")
+            .header("accept", "text/html,*/*;q=0.8")
             .header(LOOK_HEADER, token)
             .body(Body::empty())
             .unwrap();
@@ -2642,12 +2683,43 @@ mod tests {
         String::from_utf8(badge::badge_snippet("shop")).unwrap()
     }
 
+    /// A browser navigation to `path` on the shop app.
     fn shop_html(path: &str) -> Request {
         Request::builder()
             .uri(path)
             .header("host", "shop.outer.test")
+            .header(
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
             .body(Body::empty())
             .unwrap()
+    }
+
+    /// The badge follows the plan, not the page: a Free navigation never
+    /// revalidates into a 304 (which would reuse a page cached under another
+    /// plan), and the badged page carries no validators and must revalidate.
+    #[tokio::test]
+    async fn badge_pages_never_reuse_a_cached_body() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = badge_state(fix.pool.clone(), fix._dir.path());
+
+        let mut req = shop_html("/etag-html");
+        req.headers_mut().insert(
+            "if-none-match",
+            axum::http::HeaderValue::from_static("\"v1\""),
+        );
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "conditional dropped: full page");
+        assert!(body.ends_with(&shop_badge()), "{body}");
+        assert!(headers.get("etag").is_none());
+        assert!(headers.get("last-modified").is_none());
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("private, no-cache")
+        );
     }
 
     /// A Free owner's HTML page gets exactly one badge at the end, with a
@@ -2891,7 +2963,12 @@ mod tests {
             .into_data()
             .expect("data, not trailers");
         let first_elapsed = started.elapsed();
-        assert_eq!(&first[..], b"<html><body>slow-");
+        // The socket may split upstream's first item; any non-empty prefix
+        // of it arriving now proves the stream wasn't held back.
+        assert!(
+            !first.is_empty() && b"<html><body>slow-".starts_with(&first),
+            "{first:?}"
+        );
         let mut tail = Vec::new();
         while let Some(next) = body.frame().await {
             if let Ok(data) = next.expect("upstream open").into_data() {
@@ -2899,7 +2976,7 @@ mod tests {
             }
         }
         let gap = started.elapsed() - first_elapsed;
-        let mut page = b"<html><body>slow-".to_vec();
+        let mut page = first.to_vec();
         page.extend_from_slice(&tail);
         assert_eq!(
             String::from_utf8(page).unwrap(),
