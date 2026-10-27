@@ -44,7 +44,13 @@ set -eu
 log() { printf 'hostile-probe-vps: %s\n' "$*"; }
 die() { printf 'hostile-probe-vps: %s\n' "$*" >&2; exit 1; }
 skip() { printf 'hostile-probe-vps: SKIP: %s\n' "$*"; exit 0; }
+# Single-quote a value for a generated script or env assignment.
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+# `bash -s PROBE_UID SIBLING_UID` (documented above); env vars also work.
+PROBE_UID="${1:-${PROBE_UID:-}}"
+SIBLING_UID="${2:-${SIBLING_UID:-}}"
+FIXTURES="${3:-${FIXTURES:-/tmp/hostile-fixtures}}"
 case "$PROBE_UID" in ''|*[!0-9]*) die "PROBE_UID must be a non-negative integer" ;; esac
 case "$SIBLING_UID" in ''|*[!0-9]*) die "SIBLING_UID must be a non-negative integer" ;; esac
 [ "$PROBE_UID" != "$SIBLING_UID" ] || die "uids must be distinct"
@@ -193,7 +199,6 @@ log "leaf $LEAF carries memory.max=536870912 pids.max=512"
 # fixture pointers. Reserved platform names an app must never set are
 # planted, then dropped by the same prefix list as is_reserved_env_name —
 # what the env:reserved-dropped probe exercises.
-sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 ASSIGN=""
 putenv() { ASSIGN="$ASSIGN $1=$(sq "$2")"; }
 putenv PATH "/usr/local/bin:/usr/bin:/bin"
@@ -231,7 +236,7 @@ done
 # single-quoted by sq(), so this split is safe.
 {
     printf '#!/bin/sh\nset -eu\n'
-    printf 'echo $$ > %s/cgroup.procs\n' "$(sq "$LEAF/cgroup.procs")"
+    printf 'echo $$ > %s\n' "$(sq "$LEAF/cgroup.procs")"
     printf 'cd %s\n' "$(sq "$WORK")"
     # shellcheck disable=SC2086
     printf 'exec setpriv --reuid %s --regid %s --clear-groups env -i %s %s %s\n' \
@@ -240,8 +245,8 @@ done
 chmod 0755 "$BASE/runner.sh"
 
 log "running build-probe.mjs as uid $PROBE_UID in $LEAF"
-if ! timeout 300 sh "$BASE/runner.sh" > "$BASE/stdout.log" 2> "$BASE/stderr.log"; then
-    status="$?"
+status=0; timeout 300 sh "$BASE/runner.sh" > "$BASE/stdout.log" 2> "$BASE/stderr.log" || status="$?"
+if [ "$status" != 0 ]; then
     tail -30 "$BASE/stderr.log" >&2
     die "probe run failed (exit $status); logs above"
 fi

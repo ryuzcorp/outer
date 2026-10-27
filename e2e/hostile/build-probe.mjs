@@ -117,39 +117,30 @@ deny("write:outside-workdir", () => {
   throw new Error(`${attempts.length} writes refused`);
 });
 
-// Fork bomb: a burst of short-lived children. The leaf's pids.max (or
-// RLIMIT_NPROC without a leaf) must refuse part of the burst; if every
-// spawn succeeds the host has no process bound.
+// Fork bomb: a shell child starts more background processes than the
+// leaf's pids.max (512 for builds) allows and counts the forks the kernel
+// refused. The burst runs in a child so the probe itself, a runtime that
+// needs threads, survives the limit to report it. Bounded: the leaf caps
+// it, the children sleep briefly, and the whole group is killed after.
 await denyAsync("exec:fork-bomb", async () => {
-  const N = 300;
-  const kids = [];
-  let refused = 0;
-  for (let i = 0; i < N; i++) {
-    try {
-      const kid = spawn(process.execPath, ["-e", "setTimeout(()=>{},300);"], {
-        stdio: "ignore",
-      });
-      // A failed fork throws here; a late failure arrives as 'error'.
-      kid.on("error", () => {
-        refused++;
-      });
-      kids.push(kid);
-    } catch {
-      refused++;
-    }
+  const N = 1200;
+  const script =
+    `ok=0; bad=0; i=0; while [ $i -lt ${N} ]; do ` +
+    `if (sleep 5 &) 2>/dev/null; then ok=$((ok+1)); else bad=$((bad+1)); fi; ` +
+    `i=$((i+1)); done; echo "$ok $bad"; exit 0`;
+  const res = spawnSync("sh", ["-c", script], { encoding: "utf8", timeout: 30000 });
+  // The capped children still hold the leaf's pids until their 5 s sleep
+  // ends; wait them out so the probes after this one get processes again.
+  await new Promise((resolve) => setTimeout(resolve, 6000));
+  const out = (res.stdout || "").trim();
+  const [ok, bad] = out.split(/\s+/).map(Number);
+  const forkErrors = /fork|Resource temporarily unavailable|Cannot fork/i.test(res.stderr || "");
+  if (bad > 0 || forkErrors || res.signal || !Number.isFinite(ok) || ok < N) {
+    throw new Error(
+      `burst capped: ${Number.isFinite(ok) ? ok : "?"}/${N} started, ${Number.isFinite(bad) ? bad : "?"} refused${forkErrors ? ", fork refused" : ""}${res.signal ? `, ${res.signal}` : ""}`,
+    );
   }
-  // Let the burst settle so late 'error' events surface, then reap: none
-  // may outlive the probe.
-  await new Promise((resolve) => setTimeout(resolve, 1500));
-  for (const kid of kids) {
-    try {
-      kid.kill("SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }
-  if (refused > 0) throw new Error(`${refused}/${N} spawns refused`);
-  return `${N}/${N} spawns succeeded`;
+  return `${N}/${N} processes started`;
 });
 
 // Memory exhaustion: a child touching 64 MiB pages up to 1.5 GiB. Past a
