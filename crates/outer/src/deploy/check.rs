@@ -52,11 +52,7 @@ impl Deployer {
         if draft_sha.len() != 40 || !draft_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
             anyhow::bail!("refusing to check {draft_sha:?}: not a full commit sha");
         }
-        let work = self.check_dir(&app.slug);
-        if work.exists() {
-            tokio::fs::remove_dir_all(&work).await?;
-        }
-        tokio::fs::create_dir_all(&work).await?;
+        let work = fresh_check_dir(&self.settings().data_dir, &app.slug).await?;
         let mut log = String::new();
         let mut steps = Vec::new();
         materialize_draft(git, &app.slug, draft_sha, &work, &mut log).await?;
@@ -87,12 +83,6 @@ impl Deployer {
         push_check(&mut steps, &mut log, "tests", started, skipped, ok, &out);
 
         Ok(CheckOutput { steps, log })
-    }
-
-    /// This check's scratch dir. Separate from the deploy worktree so a
-    /// check racing a deploy corrupts neither.
-    fn check_dir(&self, slug: &str) -> PathBuf {
-        self.settings().data_dir.join("checks").join(slug)
     }
 
     /// `bun install` when the draft has a `package.json`.
@@ -256,6 +246,26 @@ impl Deployer {
     }
 }
 
+/// Fresh `checks/<slug>` scratch dir: wipes a previous run, then recreates
+/// it. `checks/` itself is `0711` — the app uid must traverse it to reach
+/// its own dir, and the process umask (`077` in production) would otherwise
+/// leave it owner-only. The per-app dir is handed to the app uid by the
+/// caller ([`super::pipeline::hand_worktree_to_app`]).
+async fn fresh_check_dir(data_dir: &Path, slug: &str) -> anyhow::Result<PathBuf> {
+    let checks = data_dir.join("checks");
+    let work = checks.join(slug);
+    if work.exists() {
+        tokio::fs::remove_dir_all(&work).await?;
+    }
+    tokio::fs::create_dir_all(&work).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&checks, std::fs::Permissions::from_mode(0o711))?;
+    }
+    Ok(work)
+}
+
 /// Materialize the draft tree into an empty dir: `read-tree --reset -u`
 /// moves the sidecar index and worktree to exactly the draft, `clean`
 /// deletes files the tree no longer has. Same shape as the deploy's
@@ -379,4 +389,29 @@ fn push_check(
         ok,
     });
     log.push_str(&format!("=== {name} ===\n{out}\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `checks/` must stay traversable by the app uid even under the
+    /// production umask: without the explicit `0711` the sandbox step runs
+    /// as the app and cannot open its own scratch dir (EACCES on
+    /// `checks/<slug>/package.json`).
+    #[tokio::test]
+    async fn fresh_check_dir_parent_is_traversable_under_private_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: test-only; the previous mask is restored below.
+        let prev = unsafe { libc::umask(0o077) };
+        let dir = tempfile::tempdir().unwrap();
+        let work = fresh_check_dir(dir.path(), "grocery").await.unwrap();
+        unsafe { libc::umask(prev) };
+        assert_eq!(work, dir.path().join("checks").join("grocery"));
+        let mode = std::fs::metadata(dir.path().join("checks"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o711, "checks/ must be traversable (o+x)");
+    }
 }
