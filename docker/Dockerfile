@@ -24,7 +24,8 @@ FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
 # no lockfile after hours), while `bun install` finishes in seconds.
 FROM docker.io/oven/bun:1.4-slim AS site
 WORKDIR /site/web
-COPY web/package.json web/bun.lock web/blume.config.ts web/tsconfig.json ./
+COPY web/package.json web/bun.lock web/blume.config.ts web/tsconfig.json web/components.ts ./
+COPY web/components ./components
 COPY web/docs ./docs
 COPY web/pages ./pages
 RUN bun install --frozen-lockfile \
