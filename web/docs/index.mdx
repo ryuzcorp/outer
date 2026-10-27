@@ -1,14 +1,35 @@
 ---
 title: Outer
 description: A personal software forge for AI agents — your agent builds the app, Outer serves it at <slug>.outer.now.
+mode: wide
+sidebar:
+  hidden: true
 ---
 
-Outer is a personal software forge for AI agents. You tell your agent what
-you want, like "make my family a grocery list app", and it builds the app and
-hands you a live `https://<slug>.outer.now` link you can share.
+Your agent's own app cloud. Tell your agent what you want, like "make my
+family a grocery list app", and it builds the app and hands you a live
+`https://<slug>.outer.now` link to share.
 
-These docs have two tabs. This Guide speaks to you, the person.
-The For agents tab speaks to your agent while it builds.
+<CardGroup cols={2}>
+<Card title="Connect your agent" href="/get-started/connect" icon="plug">
+One line per client: Claude, Codex, ChatGPT, Gemini, Perplexity, anything else.
+</Card>
+<Card title="Open Console" href="/console" icon="layout-dashboard">
+Watch your apps: deploys, logs, errors, data, secrets, settings.
+</Card>
+</CardGroup>
+
+```text MCP endpoint
+https://outer.now/mcp
+```
+
+This Guide speaks to you, the person. The For agents section speaks to your
+agent while it builds.
+
+## How it works
+
+Connect your agent, ask for an app, refine it by chatting, and share the live
+link. The full loop takes about ten minutes: [Quickstart](/get-started/quickstart).
 
 ## Core concepts
 
@@ -23,28 +44,6 @@ Three terms, used everywhere in these docs:
   reports back: `success` with the URL, `failed` with the log tail, or
   `blocked` with the exact lines to fix.
 
-## The core loop
-
-<Steps>
-<Step title="Connect your agent">
-Point it at `https://outer.now/mcp`: one line per client in [Connect your agent](/get-started/connect).
-Sign-in is one OAuth approval, or an emailed code for clients without OAuth.
-</Step>
-<Step title="Ask for an app">
-"Make a grocery list app for my family." Your agent calls `create_app` and
-a live Ilha + Void app serves in seconds.
-</Step>
-<Step title="Refine it">
-"Add a filter for who bought what." Every change ships through the same
-loop: build, review, deploy. The previous version keeps serving until the
-new one is healthy.
-</Step>
-<Step title="Share the link">
-Your agent returns the URL plus a QR code for the family chat
-(`share_app`). Open the [Console](/get-started/console-tour) to see what it built.
-</Step>
-</Steps>
-
 ## What you can build
 
 Anything the Ilha + Void template can express, backed by D1, KV, Durable
@@ -52,10 +51,10 @@ Objects, R2, queues, cron and realtime: family tools, sign-up sheets,
 dashboards, games, chat rooms, scheduled digests. Concrete starters with
 copy-paste prompts: [What you can build](/get-started/what-you-can-build).
 
-:::note
+::::note
 Outer is in closed beta. New accounts need an invite code (`OUTER-XXXX-XXXX`). If your email is not allowed in yet and you have no code, sign-in tells you
 that you are on the waitlist. [Sign in](/get-started/sign-in) has the details.
-:::
+::::
 
 ## Start here
 

@@ -1,0 +1,557 @@
+---
+import { EN_UI } from "blume/core/i18n-ui.ts";
+import type { UIStrings } from "blume/core/i18n-ui.ts";
+import type { NavNode } from "blume/core/types.ts";
+import { methodColor } from "blume/components/colors.ts";
+import Icon from "blume/components/Icon.astro";
+import { withBase, withMountedBase } from "blume/components/islands/base-path.ts";
+import Self from "./NavTree.astro";
+import NavTreeCache from "blume/components/layout/NavTreeCache.astro";
+import NavTreeScript from "blume/components/layout/NavTreeScript.astro";
+import { groupStartsOpen, isGroupRowCurrent } from "blume/components/layout/nav-utils.ts";
+
+interface PagePanel {
+  id: string;
+  parentId: string;
+  /** Nesting level in the panel stack (a root-level page group is 1). */
+  depth: number;
+  label: string;
+  route?: string;
+  icon?: string;
+  children: NavNode[];
+  active: boolean;
+  node: NavNode;
+}
+
+interface Props {
+  items: NavNode[];
+  currentRoute: string;
+  depth?: number;
+  /** Id prefix used to address `page`-mode panels (`${prefix}.${index}`). */
+  idPrefix?: string;
+  /** True only for the top-level call; renders the `<blume-nav>` panel stack. */
+  root?: boolean;
+  /** Localized labels ("Back", the deprecated badge); English when omitted. */
+  strings?: UIStrings["nav"];
+  /**
+   * Stable ids for the full sidebar's groups (`navGroupIds`), so panel and
+   * fragment ids match across the scoped views the layout renders. Absent,
+   * ids fall back to positions within this render. A group missing from the
+   * map exists only in this render — a container the tab scoping rebuilt
+   * without a nested tab section — so no fragment can serve it: it renders
+   * in full instead of being deferred.
+   */
+  ids?: Map<NavNode, string>;
+  /**
+   * URL prefix of the deferred-section fragments (`/blume-nav/<version>/
+   * <locale>`). When set, a collapsed group's children and an inactive
+   * drill-in panel's contents are left out of the page and fetched from
+   * `<fragmentBase>/<id>` on first open (see NavTreeScript); absent, every
+   * section renders in full.
+   */
+  fragmentBase?: string;
+}
+
+const {
+  items,
+  currentRoute,
+  depth = 0,
+  idPrefix = "n",
+  root = depth === 0,
+  strings,
+  ids,
+  fragmentBase,
+} = Astro.props;
+
+/** A group's id: its stable full-tree id, else its position in this render. */
+const idOf = (node: NavNode, positional: string): string =>
+  ids?.get(node) ?? positional;
+
+/**
+ * The fragment a group's section loads from, when sections are deferred and
+ * the group is one the fragments know (in `ids`, or `ids` is absent).
+ */
+const fragmentFor = (node: NavNode, id: string): string | undefined =>
+  fragmentBase && (ids?.has(node) ?? true) ? `${fragmentBase}/${id}` : undefined;
+
+// Merge over the English defaults so a label missing from a translation (or
+// from a not-yet-regenerated snapshot) still renders instead of coming out
+// blank — the PageActions pattern.
+const n = { ...EN_UI.nav, ...strings };
+
+/** The DOM id of a drill-in panel, which its drill button controls. */
+const navPanelId = (id: string): string => `blume-nav-panel-${id}`;
+
+/**
+ * A page row's href. A row backed by a page links a route Blume generates, so
+ * the deployment base always goes on — even over a route that starts with the
+ * base's own name. A config `href` link (no backing page) is authored, and
+ * keeps a base written by hand. Group rows link their index page the same way
+ * a backed page row does.
+ */
+const pageHref = (item: Extract<NavNode, { kind: "page" }>): string =>
+  item.pageId ? withMountedBase(item.route) : withBase(item.route);
+
+const badgeBase =
+  "shrink-0 rounded-full px-1.5 py-0.5 font-medium text-[0.65rem] leading-none";
+// HTTP-method, AsyncAPI-action, and GraphQL operation-kind badges (from a
+// reference's sidebar) share MethodBadge's table; every other badge falls
+// through to the same neutral style.
+const badgeClassFor = (badge: string): string =>
+  `${badgeBase} ${methodColor(badge)}`;
+const deprecatedClass =
+  "shrink-0 rounded-full bg-amber-500/10 px-1.5 py-0.5 font-medium text-[0.65rem] text-amber-700 leading-none dark:text-amber-300";
+
+const hasActivePage = (item: NavNode): boolean =>
+  item.kind === "page"
+    ? item.route === currentRoute
+    : item.route === currentRoute || item.children.some(hasActivePage);
+
+// Collect every `page`-mode group in the tree as a panel that is hoisted to the
+// top of the `<blume-nav>` stack. Panel ids match the `${prefix}.${index}`
+// scheme the row renderer uses for `data-nav-to`, so a drill-in trigger and its
+// panel always agree. `flat`/`group` ancestors keep their children in the same
+// visual panel (parentId unchanged); a `page` group opens a new panel.
+const collectPanels = (
+  nodes: NavNode[],
+  prefix: string,
+  parentId: string,
+  level = 1
+): PagePanel[] => {
+  const out: PagePanel[] = [];
+  nodes.forEach((node, index) => {
+    if (node.kind !== "group") {
+      return;
+    }
+    const id = idOf(node, `${prefix}.${index}`);
+    if ((node.display ?? "flat") === "page") {
+      out.push({
+        active: hasActivePage(node),
+        children: node.children,
+        depth: level,
+        icon: node.icon,
+        id,
+        label: node.label,
+        node,
+        parentId,
+        route: node.route,
+      });
+      out.push(...collectPanels(node.children, id, id, level + 1));
+    } else {
+      out.push(...collectPanels(node.children, id, parentId, level));
+    }
+  });
+  return out;
+};
+
+const panels = root ? collectPanels(items, idPrefix, "root") : [];
+// Open the deepest panel that contains the current page, so a real page load
+// lands on the right sub-panel (and degrades gracefully without JS).
+const activePanels = panels.filter((panel) => panel.active);
+const initialId =
+  activePanels.length > 0
+    ? activePanels.reduce((a, b) => (b.depth > a.depth ? b : a)).id
+    : "root";
+---
+
+{root && (panels.length > 0 || fragmentBase) && <NavTreeScript />}
+{
+  root && panels.length > 0 ? (
+    <blume-nav class="block" data-initial={initialId}>
+      <div data-nav-depth="0" data-nav-panel="root" hidden={initialId !== "root"}>
+        <Self
+          currentRoute={currentRoute}
+          depth={0}
+          fragmentBase={fragmentBase}
+          idPrefix={idPrefix}
+          ids={ids}
+          items={items}
+          root={false}
+          strings={n}
+        />
+      </div>
+      {panels.map((panel) => {
+        const src = panel.active ? undefined : fragmentFor(panel.node, panel.id);
+        return (
+          <div
+            data-nav-depth={panel.depth}
+            data-nav-panel={panel.id}
+            data-nav-src={src}
+            hidden={panel.id !== initialId}
+            id={navPanelId(panel.id)}
+          >
+            {/* The title is the only sidebar link to the section's own page, so
+                a routed panel keeps it as a link; without a route the whole row
+                becomes the back button. Either way every part of the row is
+                interactive. */}
+            {panel.route ? (
+              <div class="mb-3 flex items-center gap-0.5">
+                <button
+                  aria-label={n.back}
+                  class="-ms-1 flex shrink-0 items-center justify-center self-stretch rounded-[0.65rem] px-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  data-nav-back={panel.parentId}
+                  type="button"
+                >
+                  <Icon class="rtl:-scale-x-100" name="arrow-left" size={16} />
+                </button>
+                <a
+                  aria-current={
+                    isGroupRowCurrent(panel.node, currentRoute)
+                      ? "page"
+                      : undefined
+                  }
+                  class="flex-1 truncate rounded-[0.65rem] px-1 py-1 font-semibold text-foreground text-sm transition-colors hover:bg-muted"
+                  href={withMountedBase(panel.route)}
+                >
+                  {panel.label}
+                </a>
+              </div>
+            ) : (
+              <button
+                aria-label={`${n.back}: ${panel.label}`}
+                class="-ms-1 mb-3 flex w-full items-center gap-1.5 rounded-[0.65rem] p-1 text-start font-semibold text-foreground text-sm transition-colors hover:bg-muted"
+                data-nav-back={panel.parentId}
+                type="button"
+              >
+                <Icon
+                  class="shrink-0 text-muted-foreground rtl:-scale-x-100"
+                  name="arrow-left"
+                  size={16}
+                />
+                <span class="flex-1 truncate">{panel.label}</span>
+              </button>
+            )}
+            {/* An inactive panel's contents are deferred (fetched into this
+                element on drill-in) when it has a fragment; otherwise the
+                build-time cache renders them once. */}
+            {panel.active ? (
+              <Self
+                currentRoute={currentRoute}
+                depth={1}
+                fragmentBase={fragmentBase}
+                idPrefix={panel.id}
+                ids={ids}
+                items={panel.children}
+                root={false}
+                strings={n}
+              />
+            ) : src ? null : (
+              <NavTreeCache node={panel.node} variant={`${panel.id}|${n.back}|${n.deprecated}`}>
+                <Self
+                  currentRoute={currentRoute}
+                  depth={1}
+                  fragmentBase={fragmentBase}
+                  idPrefix={panel.id}
+                  ids={ids}
+                  items={panel.children}
+                  root={false}
+                  strings={n}
+                />
+              </NavTreeCache>
+            )}
+          </div>
+        );
+      })}
+    </blume-nav>
+  ) : (
+    <ul class="m-0 list-none space-y-px p-0">
+      {items.map((item, index) => {
+        if (item.kind === "page") {
+          const current = item.route === currentRoute ? "page" : undefined;
+          // A bare row (no icon, badge, or deprecation) is the common case and
+          // the bulk of every page's HTML on a large site, so it renders as a
+          // single truncating link with no inner row markup.
+          if (!(item.icon || item.badge || item.deprecated)) {
+            return (
+              <li>
+                <a
+                  aria-current={current}
+                  class="blume-nav-link truncate"
+                  href={pageHref(item)}
+                >
+                  {item.label}
+                </a>
+              </li>
+            );
+          }
+          return (
+            <li>
+              <a
+                aria-current={current}
+                class="blume-nav-link"
+                href={pageHref(item)}
+              >
+                <span class="flex items-center gap-2">
+                  {item.icon && (
+                    <Icon
+                      class="shrink-0 text-muted-foreground"
+                      name={item.icon}
+                      size={14}
+                    />
+                  )}
+                  <span class="flex-1 truncate">{item.label}</span>
+                  {item.badge && <span class={badgeClassFor(item.badge)}>{item.badge}</span>}
+                  {item.deprecated && (
+                    <span class={deprecatedClass}>{n.deprecated}</span>
+                  )}
+                </span>
+              </a>
+            </li>
+          );
+        }
+
+        const display = item.display ?? "flat";
+        const id = idOf(item, `${idPrefix}.${index}`);
+        // Flat groups are section headers and want breathing room; collapsible
+        // `group`/`page` rows are single rows and should stack tightly.
+        const spacing =
+          index === 0 ? "mt-0" : display === "flat" ? "mt-6" : "mt-0.5";
+
+        // `page`: a single row that drills into this group's panel. Its drill
+        // button controls that panel; NavTreeScript keeps `aria-expanded` in
+        // step with the panel shown (static markup, since cached subtrees and
+        // fragments can't carry per-page state). A group with an index page
+        // splits the row, like the `group` summary: the label links that page
+        // (which renders with the panel open), so the row opens the section
+        // even when the index hides its own row, and the chevron stays a
+        // button that slides the panel in without leaving the page. Without
+        // one, the whole row is the drill button, so it never links a missing
+        // page. `aria-current` marks the row whose panel holds the current
+        // page (`page` on the section's own page), so the parent panel still
+        // shows where the reader is after the back arrow. Only rows on the
+        // active path carry it, and those always render live, never from a
+        // cache.
+        if (display === "page") {
+          const current = hasActivePage(item)
+            ? isGroupRowCurrent(item, currentRoute)
+              ? "page"
+              : "true"
+            : undefined;
+          return item.route ? (
+            <li class={`flex items-center gap-0.5 ${spacing}`}>
+              <a
+                aria-current={current}
+                class="blume-nav-drill-link"
+                href={withMountedBase(item.route)}
+              >
+                {item.icon && (
+                  <Icon
+                    class="shrink-0 text-muted-foreground"
+                    name={item.icon}
+                    size={14}
+                  />
+                )}
+                <span class="flex-1 truncate">{item.label}</span>
+                {item.badge && <span class={badgeClassFor(item.badge)}>{item.badge}</span>}
+              </a>
+              <button
+                aria-controls={navPanelId(id)}
+                aria-expanded="false"
+                aria-label={item.label}
+                class="blume-nav-drill-toggle"
+                data-nav-to={id}
+                type="button"
+              >
+                <Icon class="rtl:-scale-x-100" name="chevron-right" size={14} />
+              </button>
+            </li>
+          ) : (
+            <li class={spacing}>
+              <button
+                aria-controls={navPanelId(id)}
+                aria-current={current}
+                aria-expanded="false"
+                class="blume-nav-drill"
+                data-nav-to={id}
+                type="button"
+              >
+                {item.icon && (
+                  <Icon
+                    class="shrink-0 text-muted-foreground"
+                    name={item.icon}
+                    size={14}
+                  />
+                )}
+                <span class="flex-1 truncate">{item.label}</span>
+                {item.badge && <span class={badgeClassFor(item.badge)}>{item.badge}</span>}
+                <Icon
+                  class="shrink-0 text-muted-foreground rtl:-scale-x-100"
+                  name="chevron-right"
+                  size={14}
+                />
+              </button>
+            </li>
+          );
+        }
+
+        // `group`: a collapsible `<details>` disclosure.
+        if (display === "group") {
+          const active = hasActivePage(item);
+          // Default every group closed; open only those on the active path (so
+          // the current page's ancestors stay expanded), forced open via meta,
+          // or alone at the top of the sidebar.
+          const open = groupStartsOpen(
+            item,
+            active,
+            depth === 0 && items.length === 1
+          );
+          return (
+            <li class={spacing}>
+              <details open={open}>
+                <summary class="blume-nav-summary">
+                  {item.route ? (
+                    <a
+                      aria-current={
+                        isGroupRowCurrent(item, currentRoute)
+                          ? "page"
+                          : undefined
+                      }
+                      class="blume-nav-summary-link"
+                      href={withMountedBase(item.route)}
+                    >
+                      {item.icon && (
+                        <Icon
+                          class="shrink-0 text-muted-foreground"
+                          name={item.icon}
+                          size={14}
+                        />
+                      )}
+                      <span class="flex-1 truncate">{item.label}</span>
+                      {item.badge && (
+                        <span class={badgeClassFor(item.badge)}>{item.badge}</span>
+                      )}
+                    </a>
+                  ) : (
+                    <>
+                      {item.icon && (
+                        <Icon
+                          class="shrink-0 text-muted-foreground"
+                          name={item.icon}
+                          size={14}
+                        />
+                      )}
+                      <span class="flex-1 truncate">{item.label}</span>
+                      {item.badge && (
+                        <span class={badgeClassFor(item.badge)}>{item.badge}</span>
+                      )}
+                    </>
+                  )}
+                  {/* Scope the rotation to this group's own `details` — the
+                      `group-open` variant matches any open ancestor `.group`,
+                      so nested chevrons rotated while their own group stayed
+                      closed. */}
+                  <span class="shrink-0 text-muted-foreground transition-transform [details[open]>summary_&]:rotate-90">
+                    <Icon name="chevron-right" size={13} />
+                  </span>
+                </summary>
+                <div
+                  class="space-y-0.5 border-border border-s ps-3"
+                  data-nav-src={open ? undefined : fragmentFor(item, id)}
+                >
+                  {/* A closed group's children are deferred (fetched into this
+                      element on first open) when it has a fragment. */}
+                  {!open && fragmentFor(item, id) ? null : active ? (
+                    <Self
+                      currentRoute={currentRoute}
+                      depth={depth + 1}
+                      fragmentBase={fragmentBase}
+                      idPrefix={id}
+                      ids={ids}
+                      items={item.children}
+                      root={false}
+                      strings={n}
+                    />
+                  ) : (
+                    <NavTreeCache node={item} variant={`${id}|${n.back}|${n.deprecated}`}>
+                      <Self
+                        currentRoute={currentRoute}
+                        depth={depth + 1}
+                        fragmentBase={fragmentBase}
+                        idPrefix={id}
+                        ids={ids}
+                        items={item.children}
+                        root={false}
+                        strings={n}
+                      />
+                    </NavTreeCache>
+                  )}
+                </div>
+              </details>
+            </li>
+          );
+        }
+
+        // `flat` (default): a non-collapsible header with its items beneath.
+        return (
+          <li class={spacing}>
+            <p class="blume-nav-heading">
+              {item.route ? (
+                <a
+                  aria-current={
+                    isGroupRowCurrent(item, currentRoute) ? "page" : undefined
+                  }
+                  class="blume-nav-heading-link"
+                  href={withMountedBase(item.route)}
+                >
+                  {item.icon && (
+                    <Icon
+                      class="shrink-0 text-muted-foreground"
+                      name={item.icon}
+                      size={14}
+                    />
+                  )}
+                  <span class="truncate">{item.label}</span>
+                  {item.badge && (
+                    <span class={`ms-auto ${badgeClassFor(item.badge)}`}>{item.badge}</span>
+                  )}
+                </a>
+              ) : (
+                <>
+                  {item.icon && (
+                    <Icon
+                      class="shrink-0 text-muted-foreground"
+                      name={item.icon}
+                      size={14}
+                    />
+                  )}
+                  <span class="truncate">{item.label}</span>
+                  {item.badge && (
+                    <span class={`ms-auto ${badgeClassFor(item.badge)}`}>{item.badge}</span>
+                  )}
+                </>
+              )}
+            </p>
+            <div class="space-y-0.5">
+              {hasActivePage(item) ? (
+                <Self
+                  currentRoute={currentRoute}
+                  depth={depth + 1}
+                  fragmentBase={fragmentBase}
+                  idPrefix={id}
+                  ids={ids}
+                  items={item.children}
+                  root={false}
+                  strings={n}
+                />
+              ) : (
+                <NavTreeCache node={item} variant={`${id}|${n.back}|${n.deprecated}`}>
+                  <Self
+                    currentRoute={currentRoute}
+                    depth={depth + 1}
+                    fragmentBase={fragmentBase}
+                    idPrefix={id}
+                    ids={ids}
+                    items={item.children}
+                    root={false}
+                    strings={n}
+                  />
+                </NavTreeCache>
+              )}
+            </div>
+          </li>
+        );
+      })}
+    </ul>
+  )
+}
+
