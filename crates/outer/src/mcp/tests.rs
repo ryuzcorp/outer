@@ -305,9 +305,10 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 60);
+    assert_eq!(anon.len(), 61);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
+    assert!(anon.contains(&"add_example".to_string()));
 
     let token = api_key_for(&state, "ana@example.com").await;
     let (_, _, authed) = post(
@@ -322,7 +323,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 58);
+    assert_eq!(authed.len(), 59);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
     assert!(authed.contains(&"upgrade".to_string()));
@@ -7947,4 +7948,380 @@ async fn draft_stale_expect_blob_conflicts_at_stage() {
         result(&staged)["structuredContent"]["draft"]["staged"]["edits"],
         1
     );
+}
+
+/// apply-examples behaviour tests: `add_example`, `create_app {examples}`
+/// and the slimmer `examples` shape, against a vendored templates repo that
+/// carries markers plus `passkeys`/`photos` (app) and `newsletter` (website).
+const APPLY_NAV: &str = "import { House, Settings } from \"lucide\"; // outer:nav-icons\nimport type { LucideIcon } from \"lucide\";\n\nexport const NAV: readonly NavItem[] = [\n  { href: \"/\", label: \"Home\", icon: House },\n  // outer:nav-items\n  { href: \"/settings\", label: \"Settings\", icon: Settings },\n];\n";
+const APPLY_VOID: &str = "export default {\n  cloudflare: {\n    // outer:bindings\n  },\n};\n";
+const APPLY_PACKAGE: &str = "{\n  \"name\": \"seed\",\n  \"private\": true\n}\n";
+
+async fn setup_apply() -> (McpState, Codes) {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+        .await
+        .unwrap();
+    std::mem::forget(dir);
+    let (auth_cfg, codes) = auth_ts::test_config();
+    let auth_state = crate::auth::AuthState {
+        pool: pool.clone(),
+        config: auth_cfg,
+    };
+    let state = McpState::for_tests(pool, auth_state);
+    crate::templates::vendor_test_templates_with(
+        &state.store,
+        &[
+            ("package.json", APPLY_PACKAGE),
+            ("pages/_nav.ts", APPLY_NAV),
+            ("void.config.ts", APPLY_VOID),
+            (
+                "pages/index.tsx",
+                "export default function Home() {\n  return <h1>Hi</h1>;\n}\n",
+            ),
+        ],
+        &[
+            ("package.json", APPLY_PACKAGE),
+            ("void.config.ts", APPLY_VOID),
+            ("src/pages/index.astro", "---\n---\n<h1>Hi</h1>\n"),
+        ],
+        &[
+            (
+                "passkeys",
+                r#"{"title": "Passkeys", "summary": "Sign in with passkeys.", "template": "app", "requires": [], "nav": [{"href": "/sign-in", "label": "Sign in", "icon": "KeyRound"}, {"href": "/members", "label": "Members", "icon": "Users"}], "bindings": {}, "dependencies": {}}"#,
+                &[
+                    ("README.md", "# Passkeys\n\nSign in.\n"),
+                    (
+                        "pages/sign-in.tsx",
+                        "export default function SignIn() {\n  return <h1>Sign in</h1>;\n}\n",
+                    ),
+                    (
+                        "pages/_session.ts",
+                        "export async function getViewer() {\n  return null;\n}\n",
+                    ),
+                ],
+            ),
+            (
+                "photos",
+                r#"{"title": "Photos", "summary": "A photo feed.", "template": "app", "requires": ["passkeys"], "nav": [{"href": "/photos", "label": "Photos", "icon": "Camera"}], "bindings": {"r2_buckets": [{"binding": "PHOTOS", "bucket_name": "photos"}]}, "dependencies": {"some-pkg": "^1.0.0"}}"#,
+                &[
+                    ("README.md", "# Photos\n\nPost photos.\n"),
+                    (
+                        "pages/photos.tsx",
+                        "export default function Photos() {\n  return <h1>Photos</h1>;\n}\n",
+                    ),
+                    (
+                        "db/migrations/0001_photos.sql",
+                        "CREATE TABLE photos (\n  id TEXT PRIMARY KEY\n);\n",
+                    ),
+                ],
+            ),
+            (
+                "newsletter",
+                r#"{"title": "Newsletter", "summary": "Email signup.", "template": "website", "requires": [], "nav": [], "bindings": {"d1_databases": [{"binding": "DB", "database_name": "newsletter"}]}, "dependencies": {}}"#,
+                &[
+                    ("README.md", "# Newsletter\n\nSubscribe.\n"),
+                    ("src/pages/subscribe.astro", "---\n---\n<h1>Subscribe</h1>\n"),
+                    (
+                        "db/migrations/0001_sub.sql",
+                        "CREATE TABLE subs (\n  id TEXT PRIMARY KEY\n);\n",
+                    ),
+                ],
+            ),
+        ],
+    )
+    .await;
+    (state, codes)
+}
+
+/// The head tree's file texts, keyed by path.
+async fn head_texts(state: &McpState, token: &str, app: &str, paths: &[&str]) -> Value {
+    let files: Vec<Value> = paths.iter().map(|path| json!({"path": path})).collect();
+    let (_, read) = call(
+        state,
+        Some(token),
+        "read_files",
+        json!({"app": app, "files": files}),
+    )
+    .await;
+    result(&read)["structuredContent"]["files"].clone()
+}
+
+#[tokio::test]
+async fn add_example_applies_requires_nav_bindings_and_deploys() {
+    let (state, _) = setup_apply().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "familygram").await;
+    let (_, added) = call(
+        &state,
+        Some(&token),
+        "add_example",
+        json!({"app": "familygram", "name": "photos"}),
+    )
+    .await;
+    let structured = &result(&added)["structuredContent"];
+    // `requires` pulls `passkeys` in, requires first.
+    assert_eq!(structured["added"], json!(["passkeys", "photos"]));
+    assert_eq!(
+        structured["nav"],
+        json!(["/sign-in", "/members", "/photos"])
+    );
+    assert_eq!(structured["deploy"]["status"], "success");
+    for path in [
+        "pages/sign-in.tsx",
+        "pages/_session.ts",
+        "pages/photos.tsx",
+        "db/migrations/0001_photos.sql",
+    ] {
+        assert!(
+            structured["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file == path),
+            "missing {path}: {}",
+            structured["files"]
+        );
+    }
+    let texts = head_texts(
+        &state,
+        &token,
+        "familygram",
+        &[
+            "pages/_nav.ts",
+            "void.config.ts",
+            "package.json",
+            "pages/photos.tsx",
+            "db/migrations/0001_photos.sql",
+        ],
+    )
+    .await;
+    // `read_files` numbers lines (`{n}\u{2502} {text}`): strip the numbers.
+    let by_path = |path: &str| {
+        let numbered = texts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == path)
+            .unwrap_or_else(|| panic!("no {path}"))
+            .get("text")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        let out: Vec<&str> = numbered
+            .lines()
+            .map(|line| {
+                line.split_once('│')
+                    .map(|(_, rest)| rest.strip_prefix(' ').unwrap_or(rest))
+                    .unwrap_or(line)
+            })
+            .collect();
+        let mut text = out.join("\n");
+        text.push('\n');
+        text
+    };
+    let nav = by_path("pages/_nav.ts");
+    assert!(
+        nav.contains("import { Camera, House, KeyRound, Settings, Users }"),
+        "{nav}"
+    );
+    for href in ["/sign-in", "/members", "/photos"] {
+        assert!(nav.contains(&format!("href: \"{href}\"")), "{nav}");
+    }
+    let config = by_path("void.config.ts");
+    assert!(
+        config.contains("r2_buckets: [{ binding: \"PHOTOS\", bucket_name: \"photos\" }],"),
+        "{config}"
+    );
+    let package: Value = serde_json::from_str(&by_path("package.json")).unwrap();
+    assert_eq!(package["dependencies"]["some-pkg"], "^1.0.0");
+    assert_eq!(
+        by_path("pages/photos.tsx"),
+        "export default function Photos() {\n  return <h1>Photos</h1>;\n}\n"
+    );
+    assert_eq!(
+        by_path("db/migrations/0001_photos.sql"),
+        "CREATE TABLE photos (\n  id TEXT PRIMARY KEY\n);\n"
+    );
+    // Seed plus the one apply commit.
+    assert_eq!(history_len(&state, &token, "familygram").await, 2);
+}
+
+#[tokio::test]
+async fn add_example_reapply_is_a_noop_refusal() {
+    let (state, _) = setup_apply().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "familygram").await;
+    let (_, first) = call(
+        &state,
+        Some(&token),
+        "add_example",
+        json!({"app": "familygram", "name": "passkeys"}),
+    )
+    .await;
+    assert_eq!(
+        result(&first)["structuredContent"]["added"],
+        json!(["passkeys"])
+    );
+    let (_, again) = call(
+        &state,
+        Some(&token),
+        "add_example",
+        json!({"app": "familygram", "name": "passkeys"}),
+    )
+    .await;
+    let err = is_error(&again);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(
+        err["message"].as_str().unwrap().contains("already applied"),
+        "{}",
+        err["message"]
+    );
+    assert_eq!(history_len(&state, &token, "familygram").await, 2);
+}
+
+#[tokio::test]
+async fn add_example_conflicting_file_refuses_without_a_commit() {
+    let (state, _) = setup_apply().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "familygram").await;
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "familygram", "message": "own photos page",
+               "writes": [{"path": "pages/photos.tsx", "content": "mine\n"}]}),
+    )
+    .await;
+    assert_eq!(
+        result(&committed)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "add_example",
+        json!({"app": "familygram", "name": "photos"}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("pages/photos.tsx"),
+        "{}",
+        err["message"]
+    );
+    assert_eq!(history_len(&state, &token, "familygram").await, 2);
+}
+
+#[tokio::test]
+async fn add_example_wrong_template_is_refused() {
+    let (state, _) = setup_apply().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (_, created) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "site", "template": "website"}),
+    )
+    .await;
+    assert_eq!(
+        result(&created)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "add_example",
+        json!({"app": "site", "name": "passkeys"}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(
+        err["message"].as_str().unwrap().contains("website"),
+        "{}",
+        err["message"]
+    );
+    assert_eq!(history_len(&state, &token, "site").await, 1);
+}
+
+#[tokio::test]
+async fn create_app_with_examples_makes_exactly_one_commit() {
+    let (state, _) = setup_apply().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (_, created) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "familygram", "examples": ["photos"]}),
+    )
+    .await;
+    let body = result(&created);
+    let text = body["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("with passkeys, photos"), "{text}");
+    assert!(text.contains("/photos"), "{text}");
+    let structured = &body["structuredContent"];
+    assert_eq!(structured["added"], json!(["passkeys", "photos"]));
+    assert_eq!(structured["deploy"]["status"], "success");
+    // One commit holds the seed and the examples together.
+    assert_eq!(history_len(&state, &token, "familygram").await, 1);
+    let texts = head_texts(&state, &token, "familygram", &["pages/photos.tsx"]).await;
+    let photos = texts[0]["text"].as_str().unwrap();
+    assert!(
+        photos.contains("export default function Photos()"),
+        "{photos}"
+    );
+    assert!(photos.contains("return <h1>Photos</h1>;"), "{photos}");
+}
+
+#[tokio::test]
+async fn create_app_unknown_example_refuses_before_creation() {
+    let (state, _) = setup_apply().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "create_app",
+        json!({"slug": "familygram", "examples": ["nope"]}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "invalid_argument");
+    assert!(
+        err["message"].as_str().unwrap().contains("nope"),
+        "{}",
+        err["message"]
+    );
+    let (_, missing) = call(
+        &state,
+        Some(&token),
+        "get_app",
+        json!({"app": "familygram"}),
+    )
+    .await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+}
+
+#[tokio::test]
+async fn examples_without_files_is_small_and_text_only() {
+    let (state, _) = setup_apply().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (_, body) = call(&state, Some(&token), "examples", json!({"name": "photos"})).await;
+    let text = result(&body)["content"][0]["text"].as_str().unwrap();
+    assert!(text.len() < 6 * 1024, "stays small: {}", text.len());
+    assert!(
+        !text.contains("return <h1>Photos</h1>"),
+        "no contents: {text}"
+    );
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["requires"], json!(["passkeys"]));
+    assert_eq!(structured["nav"][0]["href"], "/photos");
+    assert_eq!(structured["bindings"]["r2_buckets"][0]["binding"], "PHOTOS");
+    for entry in structured["files"].as_array().unwrap() {
+        assert!(entry.get("text").is_none(), "no contents in structured");
+    }
 }

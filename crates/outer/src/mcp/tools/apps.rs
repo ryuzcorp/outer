@@ -37,6 +37,10 @@ pub struct CreateAppInput {
     /// portfolios, blogs and event pages; "app" for anything with accounts,
     /// live state or dashboards.
     pub template: Option<String>,
+    /// Ready features to seed in the first commit: applied onto the empty
+    /// template before it, so the app is born with working pages. Unknown
+    /// names are refused before anything is created.
+    pub examples: Option<Vec<String>>,
     /// Wait for the first deploy (default true). False returns immediately;
     /// poll deploy_status.
     pub wait: Option<bool>,
@@ -91,16 +95,30 @@ pub struct RenameAppInput {
 /// Seed `slug` from the vendored template and create its repo. Mirrors
 /// `ops::create_app` without the deploy: the MCP layer runs deploys through
 /// its own [`super::Deploys`] so tests can substitute a fake.
+/// Everything `seed_app` needs beyond the shared state.
+struct SeedRequest<'a> {
+    owner_id: &'a str,
+    owner_email: &'a str,
+    slug: &'a str,
+    name: Option<&'a str>,
+    description: Option<&'a str>,
+    template: crate::templates::Template,
+    examples: &'a [crate::examples::Example],
+}
+
 async fn seed_app(
     ctx: &Ctx<'_>,
-    owner_id: &str,
-    owner_email: &str,
-    slug: &str,
-    name: Option<&str>,
-    description: Option<&str>,
-    template: crate::templates::Template,
-) -> Result<(App, String), ToolError> {
-    // Cheap brand-shape checks before template bytes move or any row exists,
+    seed: SeedRequest<'_>,
+) -> Result<(App, String, Vec<String>, Vec<String>), ToolError> {
+    let SeedRequest {
+        owner_id,
+        owner_email,
+        slug,
+        name,
+        description,
+        template,
+        examples,
+    } = seed;
     // so a refused name or description costs nothing.
     let display_name = crate::brand::resolve_brand(slug, name, description)
         .map(|brand| brand.name)
@@ -114,6 +132,32 @@ async fn seed_app(
     // `brand.json` with the new app's values.
     crate::templates::write_brand(&tree, slug, name, description)
         .map_err(|err| ToolError::invalid_argument(err.to_string()))?;
+    // Optional examples apply into the seed tree before the first commit,
+    // so the app is born with working features: one commit, one deploy.
+    let mut added = Vec::new();
+    let mut nav = Vec::new();
+    if !examples.is_empty() {
+        let inputs: Vec<crate::examples::apply::ExampleInput> = examples
+            .iter()
+            .map(|example| example.apply_input())
+            .collect();
+        let requested: Vec<&str> = examples
+            .iter()
+            .map(|example| example.name.as_str())
+            .collect();
+        let seed = read_tree(&tree).map_err(internal)?;
+        let applied = crate::examples::apply::plan_apply(&seed, template.id(), &inputs, &requested)
+            .map_err(|refusal| ToolError::invalid_argument(refusal.to_string()))?;
+        for (path, text) in &applied.writes {
+            let dest = tree.join(path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(internal)?;
+            }
+            std::fs::write(&dest, text).map_err(internal)?;
+        }
+        added = applied.added;
+        nav = applied.nav;
+    }
     let plan = super::plan_of(&ctx.state.pool, owner_id).await?;
     let mut app = apps::create(
         &ctx.state.pool,
@@ -197,7 +241,7 @@ async fn seed_app(
         .await
         .map_err(internal)?
         .ok_or_else(|| ToolError::internal(format!("seeded {slug} has no commits")))?;
-    Ok((app, sha))
+    Ok((app, sha, added, nav))
 }
 
 pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
@@ -211,6 +255,15 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
             ))
         })?,
     };
+    // Requested examples load before anything is created: an unknown name
+    // refuses before any row exists.
+    let wanted: Vec<String> = input.examples.clone().unwrap_or_default();
+    let examples = if wanted.is_empty() {
+        Vec::new()
+    } else {
+        super::examples::load_closure(&ctx.state.store, &ctx.state.delete_cfg.data_dir, &wanted)
+            .await?
+    };
     check_app_quota(&ctx.state.pool, &ctx.state.billing, &caller.account_id).await?;
     // The name and description checks run before any row exists and before
     // the quota claim, so refused text costs nothing and Jev never sees a
@@ -223,14 +276,17 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     )
     .await
     .map_err(ToolError::from_profanity)?;
-    let (app, sha) = seed_app(
+    let (app, sha, added, nav) = seed_app(
         ctx,
-        &caller.account_id,
-        &caller.email,
-        &input.slug,
-        input.name.as_deref(),
-        input.description.as_deref(),
-        template,
+        SeedRequest {
+            owner_id: &caller.account_id,
+            owner_email: &caller.email,
+            slug: &input.slug,
+            name: input.name.as_deref(),
+            description: input.description.as_deref(),
+            template,
+            examples: &examples,
+        },
     )
     .await?;
     // The uid set changed: reinstall so the new uid's per-uid rules exist
@@ -240,9 +296,9 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     // app refuses here with the quota shape, and the `?` leaves the seeded
     // app row in place — the agent retries the deploy after the reset.
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
-    // Name the ready patterns for this template from the live examples
-    // list; a missing or empty list falls back to a plain pointer. Never
-    // fails the creation: examples are a hint, not the app.
+    // Name this template's ready features from the live examples list; a
+    // missing or empty list falls back to a plain pointer. Never fails the
+    // creation: examples are a hint, not the app.
     let hint = match crate::examples::list(
         &ctx.state.store,
         &ctx.state.delete_cfg.data_dir,
@@ -256,30 +312,82 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
                 .map(|example| example.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("For ready patterns ({names}) call examples {{name}} for the README and files to copy.")
+            format!("For ready features ({names}) call add_example {{app, name}}.")
         }
-        _ => "For ready patterns call examples.".to_string(),
+        _ => "For ready features call add_example {app, name}.".to_string(),
     };
     let url = ctx.state.app_url(&app.slug);
     let lead = seed_deploy_lead(&app.slug, &url, &deploy);
-    let summary = match template {
-        crate::templates::Template::App => format!(
-            "{lead} It's an empty app shell: build what your user asked for. Pages go in pages/ (list them in pages/_nav.ts). {hint}",
-        ),
-        crate::templates::Template::Website => format!(
-            "{lead} It's an empty website shell: build what your user asked for. Content lives in Astro pages (islands for interactive parts). {hint}",
-        ),
+    let summary = if added.is_empty() {
+        let shell = match template {
+            crate::templates::Template::App => format!(
+                "{lead} It's an empty app shell: build what your user asked for. Pages go in pages/ (list them in pages/_nav.ts). {hint}",
+            ),
+            crate::templates::Template::Website => format!(
+                "{lead} It's an empty website shell: build what your user asked for. Content lives in Astro pages (islands for interactive parts). {hint}",
+            ),
+        };
+        format!(
+            "{shell} Nothing the user asked for exists yet: add_example or commit before telling them it's built."
+        )
+    } else {
+        let live = if nav.is_empty() {
+            "working files".to_string()
+        } else {
+            nav.join(", ")
+        };
+        match deploy["status"].as_str().unwrap_or("unknown") {
+            "success" => format!(
+                "{} is live at {} with {}: {} are live. Customise the copy with commit; check with look_at_app. {}",
+                app.slug,
+                url,
+                added.join(", "),
+                live,
+                hint,
+            ),
+            _ => format!("{lead} with {}. {hint}", added.join(", ")),
+        }
     };
     let structured = json!({
         "app": {"slug": app.slug, "url": ctx.state.app_url(&app.slug), "visibility": app.visibility.as_str()},
         "deploy": deploy,
-        "next": "open_app {app} to orient, then read_files (batched ranges), search_code, examples for ready patterns, commit edits",
+        "added": added,
+        "next": "open_app {app} to orient, then read_files (batched ranges), search_code, add_example for ready features, commit edits",
     });
     Ok(super::ok_deploy(
         summary,
         &structured["deploy"].clone(),
         structured,
     ))
+}
+
+/// The seed tree as path → full text, app-relative with `/` separators.
+fn read_tree(dir: &std::path::Path) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    fn visit(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, base, out)?;
+            } else if path.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .map_err(|err| anyhow::anyhow!("{err:#}"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(rel, std::fs::read_to_string(&path)?);
+            }
+        }
+        Ok(())
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(dir, dir, &mut out)?;
+    Ok(out)
 }
 
 /// The first sentence of `create_app`'s result, true to the seed deploy:

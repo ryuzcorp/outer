@@ -133,13 +133,14 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated �
 ## `create_app`
 
 - **Access:** signed in
-- **Description:** Create an app and deploy it: {slug, name?, description?, template?, wait?}. Name (1-60 chars) and description (1-160 chars) brand the app's brand.json; both default from the slug. Template "app" is an interactive Ilha + Void app, "website" an Astro content site (default "app"). Waits for the first deploy by default.
+- **Description:** Create an app and deploy it: {slug, name?, description?, template?, examples?, wait?}. Examples like ["passkeys"] seed working features in the first commit. Name (1-60 chars) and description (1-160 chars) brand the app; both default from the slug. Template "app" is an interactive Ilha + Void app, "website" an Astro content site (default "app"). Waits for the first deploy by default.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `description` | string | no | One-line pitch, 1–160 chars, no control chars (defaults to the name). Written to the repo's `brand.json`. Checked by the same content check as the slug, with the same refusal. |
+| `examples` | array of string | no | Ready features to seed in the first commit: applied onto the empty template before it, so the app is born with working pages. Unknown names are refused before anything is created. |
 | `name` | string | no | Display name, 1–60 chars, no control chars (defaults to the slug title-cased: `kalkulator-pizzy` → `Kalkulator Pizzy`). Written to the repo's `brand.json` with the accent; the app row keeps the same name. Checked by the same content check as the slug. |
 | `slug` | string | yes | URL name: lowercase letters, digits and dashes, 1-48 chars. Brand and account-page names (paypal, apple, bank, login, …) and flagged names are refused; without a Jev client (localhost dev) the content check is skipped. |
 | `template` | string | no | Which starter to seed from: "app" (interactive Ilha + Void app) or "website" (Astro + Ilha-islands content site). Defaults to "app"; any other value is refused. Pick "website" for landing pages, portfolios, blogs and event pages; "app" for anything with accounts, live state or dashboards. |
@@ -724,12 +725,26 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated �
 ## `examples`
 
 - **Access:** anyone (no token needed)
-- **Description:** Copy-paste patterns for apps and sites: `examples` lists them, `examples {name}` returns the README and files to copy.
+- **Description:** Ready features for apps and sites: `examples` lists them, `examples {name}` shows the README and file list (contents with `files: true`). Apply one with `add_example`.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
+| `files` | boolean | no | Include every file's contents in the text block (default false: README plus the file list with line counts). |
 | `name` | string | no | An example name (`examples` lists them). Omit to list. |
 | `template` | string | no | Only examples for one template: "app" or "website". Omit for both. |
+
+## `add_example`
+
+- **Access:** signed in
+- **Description:** Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and deps in one change and deploys. Customise with commit after.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `name` | string | yes | The example name (`examples` lists them). Its `requires` apply first. |
+| `wait` | boolean | no | Wait for the deploy (default true). False returns immediately; poll deploy_status. |
 

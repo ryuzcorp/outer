@@ -5,11 +5,11 @@
 use serde_json::Value;
 
 use crate::mcp::tools::{
-    account, apps as app_inputs, backups as backup_inputs, code as code_inputs,
-    collaborators as collab_inputs, data as data_inputs, domains as domain_inputs,
-    drafts as draft_inputs, examples as examples_inputs, export as export_inputs,
-    look as look_inputs, open_app as open_app_inputs, preview as preview_inputs,
-    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
+    account, add_example as add_example_inputs, apps as app_inputs, backups as backup_inputs,
+    code as code_inputs, collaborators as collab_inputs, data as data_inputs,
+    domains as domain_inputs, drafts as draft_inputs, examples as examples_inputs,
+    export as export_inputs, look as look_inputs, open_app as open_app_inputs,
+    preview as preview_inputs, runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -97,7 +97,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
         | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" | "stage"
-        | "check" | "ship" => Hints::WRITE,
+        | "check" | "ship" | "add_example" => Hints::WRITE,
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -233,7 +233,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<app_inputs::CreateAppInput>(
             "create_app",
-            "Create an app and deploy it: {slug, name?, description?, template?, wait?}. Name (1-60 chars) and description (1-160 chars) brand the app's brand.json; both default from the slug. Template \"app\" is an interactive Ilha + Void app, \"website\" an Astro content site (default \"app\"). Waits for the first deploy by default.",
+            "Create an app and deploy it: {slug, name?, description?, template?, examples?, wait?}. Examples like [\"passkeys\"] seed working features in the first commit. Name (1-60 chars) and description (1-160 chars) brand the app; both default from the slug. Template \"app\" is an interactive Ilha + Void app, \"website\" an Astro content site (default \"app\"). Waits for the first deploy by default.",
             Account, false,
         ),
         tool::<NoArgs>(
@@ -463,8 +463,13 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<examples_inputs::ExamplesInput>(
             "examples",
-            "Copy-paste patterns for apps and sites: `examples` lists them, `examples {name}` returns the README and files to copy.",
+            "Ready features for apps and sites: `examples` lists them, `examples {name}` shows the README and file list (contents with `files: true`). Apply one with `add_example`.",
             Public, false,
+        ),
+        tool::<add_example_inputs::AddExampleInput>(
+            "add_example",
+            "Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and deps in one change and deploys. Customise with commit after.",
+            Account, false,
         ),
     ]
 }
@@ -492,7 +497,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 60);
+        assert_eq!(tools.len(), 61);
     }
 }
 

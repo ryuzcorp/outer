@@ -29,9 +29,9 @@ The `app` shell serves server-rendered Ilha pages in `pages/` with loaders + act
 
 The `website` shell serves mostly static, prerendered Astro pages with Ilha islands for interactive parts, at most one D1 database and one R2 bucket. Call `open_app {app}` first (it carries the `AGENTS.md` rules digest), then read [Website](/agents/frontend/website).
 
-## Copy patterns from the examples
+## Apply features from the examples
 
-Real features live in [Examples](/agents/start-here/examples): `examples` lists them, `examples {name}` returns the README and files to copy onto the fresh shell. Copy each file to the same path, add the page to `pages/_nav.ts`, add any dependency or binding, and rename the migration when the app already has migrations.
+Real features live in [Examples](/agents/start-here/examples): `examples` lists them, `add_example {app, name}` commits one onto the app (nav, dependencies, bindings and migrations included), or pass `examples: [...]` to `create_app` to seed them in the first commit. Customise the copy with `commit` afterwards.
 
 ## Rebuild, never stretch
 

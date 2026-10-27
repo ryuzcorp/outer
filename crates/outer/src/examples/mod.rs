@@ -1,4 +1,5 @@
-//! Copy-paste patterns served over the public `examples` MCP tool.
+//! Copy-paste patterns served over the public `examples` MCP tool, and
+//! applied by `add_example` / `create_app {examples}`.
 //!
 //! The patterns live in `examples/` in the `outer-templates` repo, vendored
 //! into the store as a git bundle at the pinned sha (see [`crate::templates`]).
@@ -6,6 +7,7 @@
 //! Outer's data dir, once per sha, and serve from there. A pinned sha with no
 //! `examples/` yields an empty list. A bad example is skipped with a warn and
 //! never fails the whole list.
+pub mod apply;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -41,7 +43,16 @@ pub struct ExampleFile {
     pub text: String,
 }
 
-/// One full example: the README plus every file's text.
+/// One full example: the README plus every file's text, plus the apply
+/// metadata `add_example` plans from (`requires`, `nav`, `bindings`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavEntry {
+    pub href: String,
+    pub label: String,
+    pub icon: String,
+}
+
+/// One full example: the README, every file's text, and the apply metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Example {
     pub name: String,
@@ -49,6 +60,9 @@ pub struct Example {
     pub summary: String,
     pub template: String,
     pub dependencies: BTreeMap<String, String>,
+    pub requires: Vec<String>,
+    pub nav: Vec<NavEntry>,
+    pub bindings: BTreeMap<String, Vec<BTreeMap<String, String>>>,
     pub readme: String,
     pub files: Vec<ExampleFile>,
 }
@@ -68,13 +82,27 @@ pub fn is_valid_name(name: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
-/// The `example.json` contract: name, title, summary, template, plus optional
-/// dependencies. Unknown fields are ignored.
+/// The `example.json` contract: title, summary, template, plus optional
+/// `requires`, `nav`, `bindings` and `dependencies`. Unknown fields are
+/// ignored.
+#[derive(Debug, Deserialize)]
+struct NavJson {
+    href: String,
+    label: String,
+    icon: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ExampleJson {
     title: String,
     summary: String,
     template: String,
+    #[serde(default)]
+    requires: Vec<String>,
+    #[serde(default)]
+    nav: Vec<NavJson>,
+    #[serde(default)]
+    bindings: BTreeMap<String, Vec<BTreeMap<String, String>>>,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
 }
@@ -142,6 +170,31 @@ impl Example {
                     path: file.path.clone(),
                     lines: file.text.lines().count(),
                 })
+                .collect(),
+        }
+    }
+
+    /// The apply engine's view of this example.
+    pub fn apply_input(&self) -> apply::ExampleInput {
+        apply::ExampleInput {
+            name: self.name.clone(),
+            template: self.template.clone(),
+            requires: self.requires.clone(),
+            nav: self
+                .nav
+                .iter()
+                .map(|item| apply::NavItem {
+                    href: item.href.clone(),
+                    label: item.label.clone(),
+                    icon: item.icon.clone(),
+                })
+                .collect(),
+            bindings: self.bindings.clone(),
+            dependencies: self.dependencies.clone(),
+            files: self
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.text.clone()))
                 .collect(),
         }
     }
@@ -350,6 +403,35 @@ fn load_example(dir: &Path, name: &str) -> Option<Example> {
     if crate::templates::Template::from_id(&meta.template).is_none() {
         return reject(&format!("bad template {:?}", meta.template));
     }
+    for dep in &meta.requires {
+        if !is_valid_name(dep) {
+            return reject(&format!("bad requires entry {dep:?}"));
+        }
+    }
+    let mut nav = Vec::with_capacity(meta.nav.len());
+    for item in meta.nav {
+        if item.href.is_empty() || !item.href.starts_with('/') {
+            return reject(&format!("bad nav href {:?}", item.href));
+        }
+        if item.label.is_empty() {
+            return reject(&format!("bad nav label for {:?}", item.href));
+        }
+        if !apply::is_valid_icon(&item.icon) {
+            return reject(&format!("bad nav icon {:?}", item.icon));
+        }
+        nav.push(NavEntry {
+            href: item.href,
+            label: item.label,
+            icon: item.icon,
+        });
+    }
+    for key in meta.bindings.keys() {
+        if key != "d1_databases" && key != "r2_buckets" {
+            return reject(&format!(
+                "bad bindings key {key:?}: want d1_databases or r2_buckets"
+            ));
+        }
+    }
     let readme = match std::fs::read_to_string(dir.join("README.md")) {
         Ok(readme) => readme,
         Err(_) => return reject("missing README.md"),
@@ -382,6 +464,9 @@ fn load_example(dir: &Path, name: &str) -> Option<Example> {
         summary: meta.summary,
         template: meta.template,
         dependencies: meta.dependencies,
+        requires: meta.requires,
+        nav,
+        bindings: meta.bindings,
         readme,
         files: out,
     })
@@ -621,6 +706,7 @@ mod tests {
             ExamplesInput {
                 name: Some("nope".to_string()),
                 template: None,
+                files: None,
             },
             &ctx,
         )
@@ -654,6 +740,7 @@ mod tests {
                 ExamplesInput {
                     name: Some(bad.clone()),
                     template: None,
+                    files: None,
                 },
                 &ctx,
             )
@@ -666,6 +753,7 @@ mod tests {
             ExamplesInput {
                 name: Some("list-form".to_string()),
                 template: None,
+                files: None,
             },
             &ctx,
         )
@@ -736,6 +824,7 @@ mod tests {
             ExamplesInput {
                 name: Some("big".to_string()),
                 template: None,
+                files: Some(true),
             },
             &ctx,
         )
@@ -751,6 +840,50 @@ mod tests {
             "{text}"
         );
         assert!(text.starts_with("# Big\n"), "{text}");
+        // Contents travel in the text block only, never duplicated.
+        assert!(
+            !text.contains("\"text\""),
+            "no JSON envelope in the text block"
+        );
+        for entry in structured["files"].as_array().unwrap() {
+            assert!(entry.get("text").is_none(), "no contents in structured");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_files_lists_without_contents() {
+        let state = two_example_state().await;
+        let ctx = Ctx {
+            state: &state,
+            principal: None,
+            client_ip: None,
+        };
+        let value = examples_tool(
+            ExamplesInput {
+                name: Some("list-form".to_string()),
+                template: None,
+                files: None,
+            },
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = value["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() < 6 * 1024, "stays small: {}", text.len());
+        assert!(text.contains("pages/list.tsx"), "{text}");
+        assert!(
+            !text.contains("export default function List"),
+            "no file contents: {text}"
+        );
+        assert!(text.contains("add_example"), "{text}");
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["name"], "list-form");
+        assert_eq!(structured["requires"].as_array().unwrap().len(), 0);
+        assert_eq!(structured["files"].as_array().unwrap().len(), 2);
+        assert!(structured.get("readme").is_some());
+        for entry in structured["files"].as_array().unwrap() {
+            assert!(entry.get("text").is_none(), "no contents in structured");
+        }
     }
 
     #[tokio::test]

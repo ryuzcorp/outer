@@ -360,10 +360,40 @@ pub async fn materialize(
 /// `current.json`, so [`materialize`] works without a network `sync`.
 #[cfg(test)]
 pub(crate) async fn vendor_test_templates(store: &Store, files: &[(&str, &str)]) -> TemplateRef {
+    vendor_test_templates_with(store, files, files, &[]).await
+}
+
+/// Like [`vendor_test_templates`], with separate seed trees per template and
+/// an `examples/` dir: each entry is `(name, example.json body, app files)`.
+/// A `README.md` is included in the files when given; examples without one
+/// are skipped by the reader like invalid ones.
+#[cfg(test)]
+type TestExample<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+#[cfg(test)]
+pub(crate) async fn vendor_test_templates_with(
+    store: &Store,
+    app_files: &[(&str, &str)],
+    site_files: &[(&str, &str)],
+    examples: &[TestExample<'_>],
+) -> TemplateRef {
     let src = tempfile::tempdir().unwrap();
-    for template in Template::ALL {
-        for (rel, body) in files {
-            let path = src.path().join(template.dir()).join(rel);
+    for (rel, body) in app_files {
+        let path = src.path().join(Template::App.dir()).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    for (rel, body) in site_files {
+        let path = src.path().join(Template::Website.dir()).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    for (name, meta, files) in examples {
+        let dir = src.path().join("examples").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("example.json"), meta).unwrap();
+        for (rel, body) in *files {
+            let path = dir.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
         }

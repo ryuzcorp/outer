@@ -215,6 +215,11 @@ async fn mirror(ctx: &Ctx<'_>, slug: &str) -> Result<std::path::PathBuf, ToolErr
         .map_err(internal)
 }
 
+/// The synced bare mirror for `slug`, shared with `add_example`.
+pub(crate) async fn mirror_for(ctx: &Ctx<'_>, slug: &str) -> Result<std::path::PathBuf, ToolError> {
+    mirror(ctx, slug).await
+}
+
 pub async fn list_files(input: ListFilesInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let (app, _) = visible_app(ctx, &input.app).await?;
     // Validate before git runs: bad shape is `invalid_argument` with a

@@ -44,7 +44,7 @@ pub const LATEST_PROTOCOL: &str = "2025-11-25";
 
 /// Exactly the §8.1 text (Codex reads only this much). The length test pins
 /// it at or under 512 chars.
-pub const INSTRUCTIONS: &str = "New apps are empty branded shells: build the request, nothing to delete. Start `open_app`, read (`read_files` batches, `search_code`), copy patterns from `examples`, iterate `stage`→`check`→`ship` (`commit` ships at once). Relay `user_message` verbatim. Guides: `docs {topic}`, /llms.txt.";
+pub const INSTRUCTIONS: &str = "Start with `create_app {examples}` or `add_example`, then customise with `commit`. New apps are empty shells until you build. Begin `open_app`, read (`read_files` batches, `search_code`), iterate `stage`→`check`→`ship`. Relay `user_message` verbatim. Guides: `docs {topic}`, /llms.txt.";
 
 /// Largest `POST /mcp` body: one `commit` at the caps fits (spec §8.1).
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;

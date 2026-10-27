@@ -70,8 +70,8 @@ pub async fn about(_input: NoArgs, _ctx: &Ctx<'_>) -> Result<Value, ToolError> {
         "connect": "Claude, Codex and ChatGPT sign in through OAuth automatically. Without OAuth: sign_in {email}, read the emailed code, verify_code {email, code, accept_terms: true}, then send Authorization: Bearer <api_key>.",
         "rules": [
             "Call docs {topic: \"ilha\"} before writing code.",
-            "create_app, then commit (prefer edits). Every code tool waits for the deploy.",
-            "New apps are empty shells: build the request, copying proven patterns from `examples`.",
+            "create_app {examples}, then add_example, then commit (prefer edits). Every code tool waits for the deploy.",
+            "New apps are empty shells until you build: start from create_app {examples} or add_example, then customise.",
             "Relay user_message to your human verbatim.",
         ],
         "plans": "Free: 2 apps, 40 code changes and 30 build minutes/day. Pro ($8/month): 20 apps, 1,000 changes and 300 build minutes/day. See docs {topic: \"limits\"}.",
