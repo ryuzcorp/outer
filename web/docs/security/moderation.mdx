@@ -19,7 +19,16 @@ the built HTML, and the slug plus app name.
 
 ## Stay clean after going live
 
-Outer can re-check rendered pages after each deploy. If review flags your app, an admin can hold or suspend it, and a suspended app stops serving until review clears it. Ask your agent to screen visitor-written text before storing it. Uploaded files are never classified, so keep uploads behind your own checks.
+Outer re-crawls rendered pages after each successful deploy: `/` plus up to 10 same-origin links, fetched internally. Public apps are re-crawled daily while awake, unlisted ones weekly.
+
+- A login or payment form posting somewhere unexpected, a brand name next to a password field, or a link to a known-bad host suspends the app: it stops serving (a 451 page) until review clears it.
+- Strong profanity on a rendered page (often visitor-written content in your database) holds the app: visitors see a "being reviewed" page instead. Fix the text and deploy again — a clean crawl after the next deploy lifts the hold automatically — or ask for review.
+- Anything milder lands in the review queue without changing what visitors see.
+- If the content check itself is down, your app keeps serving; the crawl retries later.
+
+## Report abuse
+
+Every app host serves `/.outer/report`: a short form (rate-limited) that queues the report for a human reviewer and triggers a re-crawl. You can also write to abuse@outer.now.
 
 ## Appeal a decision
 

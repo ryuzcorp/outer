@@ -18,11 +18,15 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::apps;
+use crate::auth::limits;
 use crate::browser::MAX_LOOK_HTML_BYTES;
+use crate::config::CrawlConfig;
 use crate::fleet::manager::FleetManager;
 use crate::http::badge;
 use crate::http::client_ip::{cf_connecting_ip, client_ip};
 use crate::look_tokens::{LookTokens, LOOK_HEADER};
+use crate::moderation::crawl::{self, EffectDeps};
+use crate::moderation::JevClient;
 use crate::observe::metrics::{MetricsAgg, RequestRecord};
 
 /// other than the platform host.
@@ -48,6 +52,12 @@ pub struct ProxyState {
     /// token for the request's own host arms the recorder injection below.
     /// Shared with the MCP state, never global.
     pub look_tokens: LookTokens,
+    /// After-live moderation hooks (spec §15.2): the Jev client, crawl
+    /// config and effect deps the `/.outer/report` path crawls with.
+    /// `None` on localhost dev without the Cloudflare pair and in tests
+    /// that only assert the queued row: the report still records, and the
+    /// crawl sweep picks the app up within minutes.
+    pub crawl_hooks: Option<CrawlHooks>,
 }
 impl ProxyState {
     /// Build the per-state upstream client and the per-state touch-throttle
@@ -73,7 +83,15 @@ impl ProxyState {
             last_touch_ms: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             look_tokens: LookTokens::new(),
+            crawl_hooks: None,
         }
+    }
+
+    /// Wire the after-live moderation hooks (the integration owner calls this
+    /// once, like [`ProxyState::with_look_tokens`]).
+    pub fn with_crawl_hooks(mut self, hooks: CrawlHooks) -> Self {
+        self.crawl_hooks = Some(hooks);
+        self
     }
 
     /// Share one console-capture token table with the MCP state (the
@@ -82,6 +100,16 @@ impl ProxyState {
         self.look_tokens = look_tokens;
         self
     }
+}
+
+/// What the `/.outer/report` path needs to crawl the reported app right
+/// away: the Jev client (or `None` to record heuristic-only), the crawl
+/// config and the effect deps. Clone shares the pools and handles.
+#[derive(Clone)]
+pub struct CrawlHooks {
+    pub jev: Option<JevClient>,
+    pub cfg: CrawlConfig,
+    pub effects: EffectDeps,
 }
 
 type UpstreamClient =
@@ -710,6 +738,228 @@ fn domain_setup_page(host: &str, status: &str) -> Response {
         .unwrap()
 }
 
+/// The `/.outer/` suffix of an app-host path, if any: proxy-owned pages
+/// (spec §4.2) that never reach the fleet — apps cannot serve this prefix.
+fn outer_suffix(path: &str) -> Option<&str> {
+    path.strip_prefix("/.outer/")
+        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+}
+
+/// One proxy-owned page (spec §4.2, §15.2): the abuse report form, the
+/// moderation state pages. Never forwarded, never metered: the caller
+/// returns before the metering closure exists, like the expired page.
+async fn outer_page(state: &ProxyState, app: &apps::App, suffix: &str, req: Request) -> Response {
+    match (req.method().as_str(), suffix) {
+        ("GET", "report") => report_form_page(),
+        ("POST", "report") => report_submit(state, app, req).await,
+        ("GET", "held") => held_page(),
+        ("GET", "suspended") => suspended_page(),
+        ("GET", "paused") => paused_page(app.paused_reason.as_deref()),
+        ("GET", "expired") => expired_outer_page(),
+        _ => text(StatusCode::NOT_FOUND, "no such page"),
+    }
+}
+
+/// Render one proxy-owned HTML page: `no-store` so the edge cannot outlive
+/// an admin restore, `noindex` so the state pages never get indexed.
+fn outer_html(status: StatusCode, title: &str, heading: &str, body: &str) -> Response {
+    let page = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title}</title></head>\
+         <body><main><h1>{heading}</h1>{body}</main></body></html>"
+    );
+    Response::builder()
+        .status(status)
+        .header("cache-control", "no-store")
+        .header("x-robots-tag", "noindex, nofollow")
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(page))
+        .unwrap()
+}
+
+fn html_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// `/.outer/report`: the abuse report form (spec §15.2), rate-limited on
+/// submit. Reports queue in `moderation_check` with stage `report` for the
+/// admin queue, and trigger a re-crawl of the app.
+fn report_form_page() -> Response {
+    outer_html(
+        StatusCode::OK,
+        "Report this app",
+        "Report this app",
+        "<p>If this app is phishing, abusive or otherwise harmful, tell us. \
+         A human reviews every report.</p>\
+         <form method=\"post\" action=\"/.outer/report\">\
+         <p><label>What is wrong?<br><select name=\"reason\">\
+         <option value=\"phishing\">Phishing or fake login</option>\
+         <option value=\"profanity\">Hate or severe profanity</option>\
+         <option value=\"spam\">Spam or scam</option>\
+         <option value=\"abuse\">Abuse or harassment</option>\
+         <option value=\"other\">Something else</option>\
+         </select></label></p>\
+         <p><label>What did you see?<br>\
+         <textarea name=\"details\" rows=\"6\" cols=\"48\" required></textarea></label></p>\
+         <p><button type=\"submit\">Send report</button></p></form>\
+         <p>Prefer email? Write to abuse@outer.now.</p>",
+    )
+}
+
+/// `POST /.outer/report`: validate, rate-limit per client IP, record the
+/// `report` row (the admin queue reads it immediately), and kick off a
+/// re-crawl when the hooks are wired. The sweep is the backstop: it crawls
+/// every app with an unreviewed report newer than its last crawl.
+async fn report_submit(state: &ProxyState, app: &apps::App, req: Request) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    let client = client_ip(req.headers(), state.origin_locked, peer);
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return text(StatusCode::PAYLOAD_TOO_LARGE, "report too large");
+        }
+    };
+    let fields = crawl::parse_form(&bytes);
+    let (reason, details) = match crawl::normalize_report(
+        fields.get("reason").map(String::as_str).unwrap_or(""),
+        fields.get("details").map(String::as_str).unwrap_or(""),
+    ) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            return outer_html(
+                StatusCode::BAD_REQUEST,
+                "Report not sent",
+                "Report not sent",
+                &format!(
+                    "<p>{}</p><p><a href=\"/.outer/report\">Back to the form</a></p>",
+                    html_escape(msg)
+                ),
+            );
+        }
+    };
+    let per_hour = state
+        .crawl_hooks
+        .as_ref()
+        .map(|hooks| hooks.cfg.reports_per_hour)
+        .unwrap_or_else(|| CrawlConfig::default().reports_per_hour);
+    let now = apps::now_ms();
+    let subject = format!("report-ip:{}", client.as_deref().unwrap_or("unknown"));
+    match limits::check_and_record(&state.pool, &subject, "report", per_hour, 3_600_000, now).await
+    {
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "report rate-limit lookup failed");
+            return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+        Ok(Some(retry_after)) => {
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", retry_after.to_string())
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from("too many reports; try again later"))
+                .unwrap();
+        }
+        Ok(None) => {}
+    }
+    if let Err(err) = crawl::record_report(
+        &state.pool,
+        &app.id,
+        app.last_deploy_sha.as_deref(),
+        &reason,
+        &details,
+        now,
+    )
+    .await
+    {
+        tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "report record failed");
+        return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+    }
+    // Crawl the reported app right away when the hooks are wired (failures
+    // fail open; the sweep retries). Without hooks the row still queues for
+    // the admin and the sweep.
+    if let Some(hooks) = state.crawl_hooks.clone() {
+        if app.moderation_state == apps::ModerationState::Ok {
+            let pool = state.pool.clone();
+            let owned = app.clone();
+            tokio::spawn(async move {
+                let Ok(fetch) = crawl::LoopbackFetch::new(owned.port, hooks.cfg.page_timeout)
+                else {
+                    return;
+                };
+                match crawl::crawl_app(&pool, &owned, &fetch, hooks.jev.as_ref(), &hooks.cfg, now)
+                    .await
+                {
+                    Ok((_result, effects)) => {
+                        crawl::apply_effects(&hooks.effects, &owned, &effects).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(slug = %owned.slug, error = %format!("{err:#}"), "report-triggered crawl failed");
+                    }
+                }
+            });
+        }
+    }
+    outer_html(
+        StatusCode::OK,
+        "Report received",
+        "Thanks — report received",
+        "<p>A human reviews every report. If the app is harmful, it will be \
+         held or suspended soon.</p>",
+    )
+}
+
+/// The held interstitial (spec §15.2): 503 while the app is being reviewed.
+fn held_page() -> Response {
+    outer_html(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "App under review",
+        "This app is being reviewed",
+        "<p>Outer flagged content on one of this app's pages and held it for \
+         review. The owner has been emailed. Check back soon.</p>",
+    )
+}
+
+/// The suspended interstitial (spec §15.2): 451, fleet stopped.
+fn suspended_page() -> Response {
+    outer_html(
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        "App suspended",
+        "This app is suspended",
+        "<p>Outer suspended this app after flagging phishing or harmful \
+         content. The owner has been emailed.</p>",
+    )
+}
+
+/// The paused interstitial (spec §4.2): 503 with the pause reason.
+fn paused_page(reason: Option<&str>) -> Response {
+    let detail = match reason {
+        Some(reason) => format!("<p>{}</p>", html_escape(reason)),
+        None => "<p>The owner paused this app.</p>".to_string(),
+    };
+    outer_html(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "App paused",
+        "This app is paused",
+        &detail,
+    )
+}
+
+fn expired_outer_page() -> Response {
+    outer_html(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "App removed",
+        "This app was removed for inactivity",
+        "<p>The owner can restore it by signing in.</p>",
+    )
+}
+
 /// Route `<slug>.<apps_domain>` — and Pro custom hostnames from `app_domain`
 /// (spec §7.7) — to the app's fleet on loopback. Only `active` custom
 /// domains forward; a `pending`/`failed` one gets a setup page explaining
@@ -785,6 +1035,26 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             .header("content-type", "text/plain; charset=utf-8")
             .body(Body::from("This app was removed for inactivity"))
             .unwrap();
+    }
+    // Proxy-owned pages (spec §4.2, §15.2): the abuse report form and the
+    // moderation state pages. They never reach the fleet — apps cannot serve
+    // the `/.outer/` prefix — and they answer before the liveness gates so a
+    // report lands even while the app is still building.
+    let outer = outer_suffix(req.uri().path()).map(str::to_string);
+    if let Some(suffix) = outer {
+        return outer_page(&state, &app, &suffix, req).await;
+    }
+    // After-live moderation (spec §15.2): a held or suspended app never wakes
+    // its fleet and never serves the build. The pages are `no-store` so the
+    // edge cannot outlive an admin restore, which flips the row back to `ok`
+    // and the very next request forwards again.
+    match app.moderation_state {
+        apps::ModerationState::Suspended => return suspended_page(),
+        apps::ModerationState::Held => return held_page(),
+        apps::ModerationState::Ok => {}
+    }
+    if let Some(reason) = app.paused_reason.as_deref() {
+        return paused_page(Some(reason));
     }
     // No successful deploy yet: never forward. A first deploy uploads before
     // its migrations apply, so a fleet can be awake on unmigrated code while
@@ -3070,5 +3340,182 @@ mod tests {
         assert!(body.contains("id=\"__outer_look\""), "{body}");
         assert!(body.ends_with(&shop_badge()), "badge closes the page");
         assert_eq!(content_len(&headers), Some(body.len()));
+    }
+
+    async fn outer_get(
+        state: &ProxyState,
+        host: &str,
+        uri: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let req = Request::builder()
+            .uri(uri)
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap();
+        body_text(router(state.clone()).oneshot(req).await.unwrap()).await
+    }
+
+    async fn outer_post(
+        state: &ProxyState,
+        host: &str,
+        uri: &str,
+        form: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", host)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(form.to_string()))
+            .unwrap();
+        body_text(router(state.clone()).oneshot(req).await.unwrap()).await
+    }
+
+    /// A held app serves the 503 review page without waking its fleet, a
+    /// suspended app the 451 page, and an admin restore (`ok`) clears both:
+    /// the very next request forwards again.
+    #[tokio::test]
+    async fn held_and_suspended_pages_are_served_and_restore_clears_them() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        sqlx::query("UPDATE app SET moderation_state = 'held' WHERE id = 'app-shop'")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
+        let (status, headers, body) = outer_get(&state, "shop.outer.test", "/nominated").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("being reviewed"), "{body}");
+        assert_eq!(
+            headers.get("x-robots-tag").and_then(|v| v.to_str().ok()),
+            Some("noindex, nofollow")
+        );
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            0,
+            "a held app never wakes its fleet"
+        );
+        sqlx::query("UPDATE app SET moderation_state = 'suspended' WHERE id = 'app-shop'")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
+        let (status, _, body) = outer_get(&state, "shop.outer.test", "/nominated").await;
+        assert_eq!(status, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert!(body.contains("suspended"), "{body}");
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), 0);
+        // The admin restore flips the row back to `ok`; the proxy forwards
+        // the very next request with no restart.
+        sqlx::query("UPDATE app SET moderation_state = 'ok' WHERE id = 'app-shop'")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
+        let (status, _, _) = outer_get(&state, "shop.outer.test", "/some/page").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paused_page_names_the_reason() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        sqlx::query("UPDATE app SET paused_reason = 'over quota' WHERE id = 'app-shop'")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
+        let (status, _, body) = outer_get(&state, "shop.outer.test", "/nominated").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("over quota"), "{body}");
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// `/.outer/report` serves its form, records `report` rows the admin
+    /// queue reads, and rate-limits per client IP. The prefix never reaches
+    /// the fleet.
+    #[tokio::test]
+    async fn report_creates_queue_row_and_rate_limits() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        let (status, _, body) = outer_get(&state, "shop.outer.test", "/.outer/report").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Report this app"), "{body}");
+        let (status, _, body) = outer_post(
+            &state,
+            "shop.outer.test",
+            "/.outer/report",
+            "reason=phishing&details=fake+login+page",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("report received"), "{body}");
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT stage, verdict FROM moderation_check WHERE app_id = 'app-shop'")
+                .fetch_all(&fix.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, [("report".to_string(), "flag".to_string())]);
+        // Unknown reasons are refused with the form to fix.
+        let (status, _, _) = outer_post(
+            &state,
+            "shop.outer.test",
+            "/.outer/report",
+            "reason=hate&details=x",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Five reports an hour per client: the sixth is refused with a
+        // `retry-after`, and records nothing.
+        for _ in 0..4 {
+            let (status, _, _) = outer_post(
+                &state,
+                "shop.outer.test",
+                "/.outer/report",
+                "reason=spam&details=junk",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, headers, _) = outer_post(
+            &state,
+            "shop.outer.test",
+            "/.outer/report",
+            "reason=spam&details=junk",
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key("retry-after"));
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM moderation_check WHERE app_id = 'app-shop'")
+                .fetch_one(&fix.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 5, "the refused report records nothing");
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            0,
+            "reports never reach the fleet"
+        );
     }
 }

@@ -65,6 +65,37 @@ pub fn brand_hit(slug: &str) -> Option<&'static str> {
     })
 }
 
+/// The brand-list entry named whole in rendered page text, if any (after-live
+/// phishing signal, spec §15.2: a brand name together with a password or card
+/// field). Entries match case-insensitively on word boundaries, so a recipe
+/// page about pineapples never trips `apple` while `Sign in with PayPal`
+/// does. Short entries (under 4 chars) never match: they collide with
+/// ordinary words.
+pub fn brand_in_text(haystack: &str) -> Option<&'static str> {
+    let lower = haystack.to_lowercase();
+    let bytes = lower.as_bytes();
+    BRANDS.iter().copied().find(|entry| {
+        if entry.len() < 4 {
+            return false;
+        }
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(entry) {
+            let start = from + pos;
+            let end = start + entry.len();
+            let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+            let right_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+            from = start + 1;
+            if from >= lower.len() {
+                break;
+            }
+        }
+        false
+    })
+}
+
 /// Noite's slug rule plus the spec §7.1 reserved list and brand filter.
 pub fn validate_slug(slug: &str) -> Result<(), SlugError> {
     if slug.is_empty() {

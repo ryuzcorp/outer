@@ -393,6 +393,9 @@ pub struct McpState {
     /// `None` is localhost dev without the Cloudflare pair: the check logs
     /// a warning and passes, exactly like the pre-live gate.
     pub jev: Option<crate::moderation::JevClient>,
+    /// After-live crawl cadence and budgets (spec §15.2): the post-deploy
+    /// hook and the periodic sweep share this config.
+    pub crawl: crate::config::CrawlConfig,
     /// Awaited calls return the in-progress status after this long (§10.3).
     pub tool_wait: Duration,
     /// Inactivity windows (spec §7.8) from `OUTER_INACTIVE_DAYS` /
@@ -519,6 +522,7 @@ impl McpState {
             app_scheme: "http".to_string(),
             app_port_suffix: String::new(),
             jev: None,
+            crawl: crate::config::CrawlConfig::default(),
             tool_wait: Duration::from_millis(200),
             inactivity: crate::inactivity::Windows::default(),
             browser: None,

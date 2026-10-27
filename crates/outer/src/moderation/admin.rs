@@ -162,7 +162,7 @@ pub async fn queue(pool: &SqlitePool) -> anyhow::Result<Vec<QueueItem>> {
         "SELECT c.id, c.app_id, c.sha, c.findings, c.scores, a.slug, u.email, c.created_at \
          FROM moderation_check c \
          JOIN app a ON a.id = c.app_id JOIN user u ON u.id = a.owner_id \
-         WHERE c.reviewed_by IS NULL AND c.stage != 'gate' AND c.verdict != 'pass' ORDER BY c.created_at DESC",
+         WHERE c.reviewed_by IS NULL AND c.stage != 'gate' AND c.verdict NOT IN ('pass', 'error') ORDER BY c.created_at DESC",
     )
     .fetch_all(pool)
     .await?;

@@ -15,7 +15,9 @@ pub mod domains;
 pub(crate) mod local;
 pub mod rename;
 mod slug;
-pub use slug::{brand_hit, check_slug_profanity, validate_slug, ProfanityError, SlugError};
+pub use slug::{
+    brand_hit, brand_in_text, check_slug_profanity, validate_slug, ProfanityError, SlugError,
+};
 
 /// Bucket prefixes a slug owns. Shared by the claim check, the rename guard
 /// and the maintenance drain: a slug is its fleet state, its repo WAL, and
@@ -142,6 +144,46 @@ impl Visibility {
             Visibility::Public => "public",
         }
     }
+
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw {
+            "public" => Ok(Visibility::Public),
+            "unlisted" => Ok(Visibility::Unlisted),
+            other => anyhow::bail!("unknown visibility {other:?}"),
+        }
+    }
+}
+
+/// What the after-live moderation crawls decided about the app (spec §15.2).
+/// The proxy serves the held/suspended/paused pages while the state is not
+/// `Ok`; the wake sweep skips non-`Ok` apps, and `admin_restore_app` (or an
+/// `allow` review) flips the row back to `Ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModerationState {
+    Ok,
+    Held,
+    Suspended,
+}
+
+impl ModerationState {
+    /// The `app.moderation_state` column value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModerationState::Ok => "ok",
+            ModerationState::Held => "held",
+            ModerationState::Suspended => "suspended",
+        }
+    }
+
+    /// Parse the `app.moderation_state` column value.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw {
+            "ok" => Ok(ModerationState::Ok),
+            "held" => Ok(ModerationState::Held),
+            "suspended" => Ok(ModerationState::Suspended),
+            other => anyhow::bail!("unknown moderation_state {other:?}"),
+        }
+    }
 }
 
 /// One row of the `app` table.
@@ -155,6 +197,14 @@ pub struct App {
     pub port: u16,
     pub internal_port: u16,
     pub visibility: Visibility,
+    /// After-live moderation state (spec §15.2): `Ok` serves, `Held` serves
+    /// the 503 being-reviewed page, `Suspended` serves the 451 page and the
+    /// fleet stays stopped. Flipped by the crawl engine, cleared by an
+    /// admin restore/allow.
+    pub moderation_state: ModerationState,
+    /// Quota pause message (spec §4.2 `/.outer/*` pages): when set the proxy
+    /// serves the paused page instead of the app.
+    pub paused_reason: Option<String>,
     pub asleep_since: Option<i64>,
     pub last_request_at: Option<i64>,
     pub last_deploy_sha: Option<String>,
@@ -234,6 +284,7 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visibility, \
+    moderation_state, paused_reason, \
     asleep_since, last_request_at, last_deploy_sha, last_activity_at, expired_at, \
     downgraded_stopped_at, created_at, always_on, preview_sha, preview_updated_at, \
     preview_port, preview_internal_port";
@@ -248,6 +299,8 @@ struct AppRow {
     port: Option<i64>,
     internal_port: Option<i64>,
     visibility: String,
+    moderation_state: String,
+    paused_reason: Option<String>,
     asleep_since: Option<i64>,
     last_request_at: Option<i64>,
     last_deploy_sha: Option<String>,
@@ -266,11 +319,8 @@ impl AppRow {
     fn into_app(self) -> anyhow::Result<App> {
         let port = self.port.context("app row has no port")?;
         let internal_port = self.internal_port.context("app row has no internal_port")?;
-        let visibility = match self.visibility.as_str() {
-            "public" => Visibility::Public,
-            "unlisted" => Visibility::Unlisted,
-            other => anyhow::bail!("unknown visibility {other:?}"),
-        };
+        let visibility = Visibility::parse(&self.visibility)?;
+        let moderation_state = ModerationState::parse(&self.moderation_state)?;
         Ok(App {
             id: self.id,
             slug: self.slug,
@@ -280,6 +330,8 @@ impl AppRow {
             port: u16::try_from(port).context("port out of range")?,
             internal_port: u16::try_from(internal_port).context("internal_port out of range")?,
             visibility,
+            moderation_state,
+            paused_reason: self.paused_reason,
             asleep_since: self.asleep_since,
             last_request_at: self.last_request_at,
             last_deploy_sha: self.last_deploy_sha,
@@ -503,6 +555,8 @@ async fn create_inner(
         port: port as u16,
         internal_port: internal_port as u16,
         visibility: Visibility::Unlisted,
+        moderation_state: ModerationState::Ok,
+        paused_reason: None,
         asleep_since: None,
         last_request_at: None,
         last_deploy_sha: None,

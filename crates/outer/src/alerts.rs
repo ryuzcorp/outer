@@ -1051,6 +1051,8 @@ mod tests {
             port: 18101,
             internal_port: 18102,
             visibility: crate::apps::Visibility::Unlisted,
+            moderation_state: crate::apps::ModerationState::Ok,
+            paused_reason: None,
             asleep_since: None,
             last_request_at: None,
             last_deploy_sha: None,
