@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-[ -n "$KEY_FILE" ] && [ -n "$APP" ] || { echo "usage: $0 --base URL --key-file KEY_FILE --app SLUG [--only CHECKS] [--page PATH]" >&2; exit 2; }
+if [ -z "$KEY_FILE" ] || [ -z "$APP" ]; then echo "usage: $0 --base URL --key-file KEY_FILE --app SLUG [--only CHECKS] [--page PATH]" >&2; exit 2; fi
 
 command -v curl >/dev/null || { echo "need curl" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "need python3" >&2; exit 2; }
@@ -214,7 +214,7 @@ import json, os
 print(json.dumps({"app": os.environ["M1_APP"]}))
 EOF
 code=$(mcp_call "get_app")
-[ "$code" = "200" ] && [ "$(jok "$RESP")" = "1" ] || { fail "setup" "get_app HTTP $code"; exit 1; }
+if [ "$code" != "200" ] || [ "$(jok "$RESP")" != "1" ]; then fail "setup" "get_app HTTP $code"; exit 1; fi
 APP_URL=$(jget "$RESP" 'v["result"]["structuredContent"]["url"]')
 ORIG_VIS=$(jget "$RESP" 'v["result"]["structuredContent"]["visibility"]')
 BASE_SHA=$(jget "$RESP" 'v["result"]["structuredContent"].get("last_deploy", {}).get("sha", "")')
@@ -234,7 +234,7 @@ import json, os
 print(json.dumps({"app": os.environ["M1_APP"]}))
 EOF
     code=$(mcp_call "list_files")
-    [ "$code" = "200" ] && [ "$(jok "$RESP")" = "1" ] || { echo ""; return 1; }
+    if [ "$code" != "200" ] || [ "$(jok "$RESP")" != "1" ]; then echo ""; return 1; fi
     jget "$RESP" '(([(f["path"]) for f in v["result"]["structuredContent"]["files"] if f["path"] == "pages/index.tsx"] + [f["path"] for f in v["result"]["structuredContent"]["files"] if f["path"].endswith(".tsx")] + [f["path"] for f in v["result"]["structuredContent"]["files"] if f["path"].endswith((".ts", ".jsx", ".js", ".mjs"))]) or ["None"])[0]'
 }
 read_page() { # $1 path -> prints file text to stdout
