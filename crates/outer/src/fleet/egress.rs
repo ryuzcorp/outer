@@ -140,17 +140,35 @@ pub async fn resolve_storage_addrs(host: &str, port: u16) -> Vec<IpAddr> {
     }
 }
 
-/// `(free uids, pro uids)` from the live rows: every app's uid, classed by
-/// its owner's `user.plan` (missing account rows count as free, the same
-/// default the MCP layer uses). Sorted and deduplicated.
-pub async fn classify_uids(pool: &SqlitePool) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
-    let rows: Vec<(i64, Option<String>)> =
-        sqlx::query_as("SELECT a.uid AS uid, u.plan AS plan FROM app AS a LEFT JOIN user AS u ON u.id = a.owner_id")
-            .fetch_all(pool)
-            .await?;
+/// What the ruleset needs from the live rows: every app's uid classed by its
+/// owner's `user.plan` (missing account rows count as free, the same
+/// default the MCP layer uses), sorted and deduplicated, plus each uid's own
+/// loopback ports (live and preview, public and internal).
+pub struct UidClasses {
+    pub free: Vec<u32>,
+    pub pro: Vec<u32>,
+    pub own_ports: Vec<(u32, Vec<u16>)>,
+}
+
+pub async fn classify_uids(pool: &SqlitePool) -> anyhow::Result<UidClasses> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT a.uid, u.plan, a.port, a.internal_port, a.preview_port, a.preview_internal_port \
+             FROM app AS a LEFT JOIN user AS u ON u.id = a.owner_id",
+    )
+    .fetch_all(pool)
+    .await?;
     let mut free = Vec::new();
     let mut pro = Vec::new();
-    for (uid, plan) in rows {
+    let mut own_ports = Vec::new();
+    for (uid, plan, port, internal, preview, preview_internal) in rows {
         let Ok(uid) = u32::try_from(uid) else {
             continue;
         };
@@ -159,12 +177,26 @@ pub async fn classify_uids(pool: &SqlitePool) -> anyhow::Result<(Vec<u32>, Vec<u
         } else {
             free.push(uid);
         }
+        let mut ports: Vec<u16> = [port, internal, preview, preview_internal]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| u16::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        own_ports.push((uid, ports));
     }
     free.sort_unstable();
     free.dedup();
     pro.sort_unstable();
     pro.dedup();
-    Ok((free, pro))
+    own_ports.sort_unstable();
+    Ok(UidClasses {
+        free,
+        pro,
+        own_ports,
+    })
 }
 
 #[derive(Clone)]
@@ -305,7 +337,11 @@ impl EgressFirewall {
         if self.inner.mode == EgressMode::Off {
             return Ok(());
         }
-        let (free_uids, pro_uids) = classify_uids(pool).await?;
+        let UidClasses {
+            free: free_uids,
+            pro: pro_uids,
+            own_ports,
+        } = classify_uids(pool).await?;
         let storage_addrs = match &self.inner.fixed_addrs {
             Some(addrs) => addrs.clone(),
             None => resolve_storage_addrs(&self.inner.storage_host, self.inner.storage_port).await,
@@ -316,6 +352,7 @@ impl EgressFirewall {
             storage_port: self.inner.storage_port,
             free_uids: free_uids.clone(),
             pro_uids: pro_uids.clone(),
+            own_ports,
         });
         match &self.inner.apply {
             Apply::Live => nft::apply(&rules).await?,
@@ -392,7 +429,8 @@ mod tests {
             .unwrap();
         sqlx::query(
             "CREATE TABLE app (id TEXT PRIMARY KEY, slug TEXT, owner_id TEXT, uid INTEGER, \
-             port INTEGER, internal_port INTEGER, last_activity_at INTEGER, created_at INTEGER)",
+             port INTEGER, internal_port INTEGER, preview_port INTEGER, \
+             preview_internal_port INTEGER, last_activity_at INTEGER, created_at INTEGER)",
         )
         .execute(pool)
         .await
@@ -474,9 +512,28 @@ mod tests {
     async fn classify_groups_uids_by_owner_plan() {
         let pool = test_pool();
         seed(&pool).await;
-        let (free, pro) = classify_uids(&pool).await.unwrap();
-        assert_eq!(free, vec![200001, 200004]);
-        assert_eq!(pro, vec![200002, 200003]);
+        let classes = classify_uids(&pool).await.unwrap();
+        assert_eq!(classes.free, vec![200001, 200004]);
+        assert_eq!(classes.pro, vec![200002, 200003]);
+    }
+
+    /// Each uid gets exactly its own live and preview ports; unset (NULL)
+    /// and unassigned (0) ports are left out.
+    #[tokio::test]
+    async fn classify_collects_each_apps_own_ports() {
+        let pool = test_pool();
+        seed(&pool).await;
+        sqlx::query(
+            "UPDATE app SET port = 21001, internal_port = 20001, preview_port = 22001, \
+             preview_internal_port = NULL WHERE id = 'app1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let classes = classify_uids(&pool).await.unwrap();
+        let own: std::collections::HashMap<u32, Vec<u16>> = classes.own_ports.into_iter().collect();
+        assert_eq!(own[&200001], vec![20001, 21001, 22001]);
+        assert!(own[&200002].is_empty());
     }
 
     #[tokio::test]
