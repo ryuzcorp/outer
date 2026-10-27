@@ -3256,7 +3256,11 @@ mod tests {
     }
 
     fn write(path: &str, content: &str) -> FileWrite {
-        FileWrite { path: path.to_string(), body: WriteBody::Text(content.to_string()), expect_blob: None }
+        FileWrite {
+            path: path.to_string(),
+            body: WriteBody::Text(content.to_string()),
+            expect_blob: None,
+        }
     }
 
     async fn seed_mirror(
@@ -3270,16 +3274,38 @@ mod tests {
             .await
             .unwrap();
 
-        let seed = CommitRequest { message: "seed".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![
-            write("index.ts", "v1"),
-            write("old.ts", "remove me"),
-            write("sub/keep.ts", "keep"),
-        ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() };
+        let seed = CommitRequest {
+            message: "seed".to_string(),
+            base: None,
+            changes: crate::git::commit::CommitChanges {
+                writes: vec![
+                    write("index.ts", "v1"),
+                    write("old.ts", "remove me"),
+                    write("sub/keep.ts", "keep"),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                ..Default::default()
+            },
+            author: author(),
+        };
         let sha_a = commit::commit(&store, &cfg, &sync, slug, seed)
             .await
             .unwrap();
 
-        let second = CommitRequest { message: "second".to_string(), base: Some(sha_a.clone()), changes: crate::git::commit::CommitChanges { writes: vec![write("index.ts", "v2"), write("new.ts", "new")], edits: vec![], deletes: vec!["old.ts".to_string()], moves: vec![], ..Default::default() }, author: author() };
+        let second = CommitRequest {
+            message: "second".to_string(),
+            base: Some(sha_a.clone()),
+            changes: crate::git::commit::CommitChanges {
+                writes: vec![write("index.ts", "v2"), write("new.ts", "new")],
+                edits: vec![],
+                deletes: vec!["old.ts".to_string()],
+                moves: vec![],
+                ..Default::default()
+            },
+            author: author(),
+        };
         let sha_b = commit::commit(&store, &cfg, &sync, slug, second)
             .await
             .unwrap();
@@ -3652,20 +3678,31 @@ mod tests {
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "profane".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![
-                write(
-                    "package.json",
-                    r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
-                ),
-                write(
-                    "pages/index.tsx",
-                    "export default () => <h1>this list is fuck awesome</h1>;",
-                ),
-                write(
-                    "dist/wrangler.json",
-                    r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
-                ),
-            ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "profane".to_string(),
+                base: None,
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "package.json",
+                            r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
+                        ),
+                        write(
+                            "pages/index.tsx",
+                            "export default () => <h1>this list is fuck awesome</h1>;",
+                        ),
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                        ),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -3718,20 +3755,31 @@ mod tests {
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "profane".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![
-                write(
-                    "package.json",
-                    r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
-                ),
-                write(
-                    "pages/index.tsx",
-                    "export default () => <h1>this list is fuck awesome</h1>;",
-                ),
-                write(
-                    "dist/wrangler.json",
-                    r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
-                ),
-            ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "profane".to_string(),
+                base: None,
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "package.json",
+                            r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
+                        ),
+                        write(
+                            "pages/index.tsx",
+                            "export default () => <h1>this list is fuck awesome</h1>;",
+                        ),
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                        ),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -3831,20 +3879,31 @@ mod tests {
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "clean".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![
-                write(
-                    "package.json",
-                    r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
-                ),
-                write(
-                    "pages/index.tsx",
-                    "export default () => <h1>Welcome to my grocery list</h1>;",
-                ),
-                write(
-                    "dist/wrangler.json",
-                    r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
-                ),
-            ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "clean".to_string(),
+                base: None,
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "package.json",
+                            r#"{"name":"t","scripts":{"build":"echo hi"}}"#,
+                        ),
+                        write(
+                            "pages/index.tsx",
+                            "export default () => <h1>Welcome to my grocery list</h1>;",
+                        ),
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                        ),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -4640,10 +4699,21 @@ exit 0
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "second migration".to_string(), base: Some(sha_a.clone()), changes: crate::git::commit::CommitChanges { writes: vec![write(
-                "db/migrations/0002_add_owner.sql",
-                "ALTER TABLE item ADD COLUMN owner TEXT;",
-            )], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "second migration".to_string(),
+                base: Some(sha_a.clone()),
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![write(
+                        "db/migrations/0002_add_owner.sql",
+                        "ALTER TABLE item ADD COLUMN owner TEXT;",
+                    )],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -4716,10 +4786,21 @@ exit 0
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "bad migration".to_string(), base: Some(sha_a.clone()), changes: crate::git::commit::CommitChanges { writes: vec![
-                write("db/migrations/0002_bad.sql", "CREATE TABLE oops (;"),
-                write("dist/.fake-fail", "0002_bad.sql"),
-            ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "bad migration".to_string(),
+                base: Some(sha_a.clone()),
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![
+                        write("db/migrations/0002_bad.sql", "CREATE TABLE oops (;"),
+                        write("dist/.fake-fail", "0002_bad.sql"),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -4825,13 +4906,24 @@ exit 0
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "no d1".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![
-                write(
-                    "dist/wrangler.json",
-                    r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
-                ),
-                write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
-            ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "no d1".to_string(),
+                base: None,
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01"}"#,
+                        ),
+                        write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -5017,13 +5109,24 @@ exit 0
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "fix migration".to_string(), base: Some(sha_a.clone()), changes: crate::git::commit::CommitChanges { writes: vec![], edits: vec![crate::git::commit::Edit {
-                path: "db/migrations/0002_bad.sql".to_string(),
-                old: "CREATE TABLE oops (;".to_string(),
-                new: "CREATE TABLE oops (id INTEGER);".to_string(),
-                replace_all: false,
-                expect_blob: None,
-            }], deletes: vec!["dist/.fake-fail".to_string()], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "fix migration".to_string(),
+                base: Some(sha_a.clone()),
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![],
+                    edits: vec![crate::git::commit::Edit {
+                        path: "db/migrations/0002_bad.sql".to_string(),
+                        old: "CREATE TABLE oops (;".to_string(),
+                        new: "CREATE TABLE oops (id INTEGER);".to_string(),
+                        replace_all: false,
+                        expect_blob: None,
+                    }],
+                    deletes: vec!["dist/.fake-fail".to_string()],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -5094,13 +5197,24 @@ exit 0
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "edit applied migration".to_string(), base: Some(sha_a.clone()), changes: crate::git::commit::CommitChanges { writes: vec![], edits: vec![crate::git::commit::Edit {
-                path: "db/migrations/0001_init.sql".to_string(),
-                old: "CREATE TABLE item (id INTEGER);".to_string(),
-                new: "CREATE TABLE item (id TEXT);".to_string(),
-                replace_all: false,
-                expect_blob: None,
-            }], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "edit applied migration".to_string(),
+                base: Some(sha_a.clone()),
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![],
+                    edits: vec![crate::git::commit::Edit {
+                        path: "db/migrations/0001_init.sql".to_string(),
+                        old: "CREATE TABLE item (id INTEGER);".to_string(),
+                        new: "CREATE TABLE item (id TEXT);".to_string(),
+                        replace_all: false,
+                        expect_blob: None,
+                    }],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -5266,14 +5380,25 @@ exit 0
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "first id".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![
-                wrangler("db-id-1"),
-                write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
-                write(
-                    "db/migrations/0001_init.sql",
-                    "CREATE TABLE item (id INTEGER);",
-                ),
-            ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "first id".to_string(),
+                base: None,
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![
+                        wrangler("db-id-1"),
+                        write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
+                        write(
+                            "db/migrations/0001_init.sql",
+                            "CREATE TABLE item (id INTEGER);",
+                        ),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();
@@ -5296,7 +5421,18 @@ exit 0
             &cfg,
             &sync,
             "grocery",
-            CommitRequest { message: "second id".to_string(), base: Some(sha_a.clone()), changes: crate::git::commit::CommitChanges { writes: vec![wrangler("db-id-2")], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "second id".to_string(),
+                base: Some(sha_a.clone()),
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![wrangler("db-id-2")],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();

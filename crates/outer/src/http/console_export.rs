@@ -237,11 +237,22 @@ mod tests {
             &mcp.git,
             &mcp.sync,
             "groceries",
-            CommitRequest { message: "groceries".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![FileWrite {
-                path: "pages/index.tsx".to_string(),
-                body: WriteBody::Text("<h1>Groceries</h1>\n".to_string()),
-                expect_blob: None,
-            }], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() },
+            CommitRequest {
+                message: "groceries".to_string(),
+                base: None,
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![FileWrite {
+                        path: "pages/index.tsx".to_string(),
+                        body: WriteBody::Text("<h1>Groceries</h1>\n".to_string()),
+                        expect_blob: None,
+                    }],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
         )
         .await
         .unwrap();

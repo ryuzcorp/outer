@@ -172,14 +172,18 @@ pub enum CommitError {
         expected: String,
         current: String,
     },
-    #[error("line range {start_line}-{end_line} in {path} is out of range (the file has {total} lines)")]
+    #[error(
+        "line range {start_line}-{end_line} in {path} is out of range (the file has {total} lines)"
+    )]
     OutOfRange {
         path: String,
         start_line: u64,
         end_line: u64,
         total: u64,
     },
-    #[error("insert after line {after_line} in {path} is out of range (the file has {total} lines)")]
+    #[error(
+        "insert after line {after_line} in {path} is out of range (the file has {total} lines)"
+    )]
     InsertOutOfRange {
         path: String,
         after_line: u64,
@@ -734,9 +738,10 @@ fn validate_line_overlap(line_edits: &[LineEdit], inserts: &[Insert]) -> Result<
         }
     }
     for i in inserts {
-        if line_edits.iter().any(|e| {
-            e.path == i.path && e.start_line <= i.after_line && i.after_line < e.end_line
-        }) {
+        if line_edits
+            .iter()
+            .any(|e| e.path == i.path && e.start_line <= i.after_line && i.after_line < e.end_line)
+        {
             return Err(CommitError::OverlappingLines {
                 path: i.path.clone(),
             });
@@ -1187,7 +1192,7 @@ async fn apply_line_ops(
         let lines: Vec<&str> = base_text.lines().collect();
         let n = lines.len() as u64;
         let base_trailing = base_text.ends_with('\n');
-        let mut reps: Vec<&LineEdit> = replaces.iter().copied().collect();
+        let mut reps: Vec<&LineEdit> = replaces.to_vec();
         reps.sort_by_key(|e| e.start_line);
         for e in &reps {
             if e.end_line > n {
@@ -1236,8 +1241,8 @@ async fn apply_line_ops(
         } else if n == 0 {
             insertions
                 .iter()
-                .filter(|i| i.after_line == 0)
-                .last()
+                .rev()
+                .find(|i| i.after_line == 0)
                 .is_some_and(|last| last.text.ends_with('\n'))
         } else {
             base_trailing
@@ -1340,8 +1345,17 @@ async fn apply_patch(
     let mut new_deletes = Vec::new();
     let mut new_moves = Vec::new();
     for (f, kind) in parsed.iter().zip(kinds) {
-        apply_patch_file(git_dir, parent, f, &kind, &mut new_files, &mut new_deletes, &mut new_moves, total)
-            .await?;
+        apply_patch_file(
+            git_dir,
+            parent,
+            f,
+            &kind,
+            &mut new_files,
+            &mut new_deletes,
+            &mut new_moves,
+            total,
+        )
+        .await?;
     }
     files.extend(new_files);
     deletes.extend(new_deletes);
@@ -1569,9 +1583,8 @@ fn apply_hunks(
             }
         }
     }
-    let marked_final = last_emit.is_some_and(|(hi, li)| {
-        matches!(hunks[hi].lines.get(li + 1), Some(HunkLine::NoNewline))
-    });
+    let marked_final = last_emit
+        .is_some_and(|(hi, li)| matches!(hunks[hi].lines.get(li + 1), Some(HunkLine::NoNewline)));
     let mut new_lines: Vec<String> = Vec::new();
     let mut cursor = 0usize;
     let mut touches_eof = false;
@@ -1586,9 +1599,7 @@ fn apply_hunks(
             Some(s) => {
                 if s == 0 {
                     if h.old_count != 0 {
-                        return Err(reject(
-                            "old start 0 with a nonempty old range".to_string(),
-                        ));
+                        return Err(reject("old start 0 with a nonempty old range".to_string()));
                     }
                     if cursor != 0 {
                         return Err(reject("hunk overlaps an earlier hunk".to_string()));
@@ -1635,20 +1646,14 @@ fn apply_hunks(
             match line {
                 HunkLine::Context(t) => {
                     if old_lines.get(cursor) != Some(t) {
-                        return Err(reject(format!(
-                            "context mismatch at line {}",
-                            cursor + 1
-                        )));
+                        return Err(reject(format!("context mismatch at line {}", cursor + 1)));
                     }
                     new_lines.push(t.clone());
                     cursor += 1;
                 }
                 HunkLine::Remove(t) => {
                     if old_lines.get(cursor) != Some(t) {
-                        return Err(reject(format!(
-                            "removal mismatch at line {}",
-                            cursor + 1
-                        )));
+                        return Err(reject(format!("removal mismatch at line {}", cursor + 1)));
                     }
                     cursor += 1;
                 }
@@ -1658,9 +1663,7 @@ fn apply_hunks(
         }
     }
     new_lines.extend(old_lines[cursor..].iter().cloned());
-    let trailing = if new_lines.is_empty() {
-        false
-    } else if marked_final {
+    let trailing = if new_lines.is_empty() || marked_final {
         false
     } else if touches_eof {
         true
@@ -1763,7 +1766,9 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<PatchFile>, CommitError> {
             continue;
         }
         if line.starts_with("--- ")
-            && lines.get(i + 1).is_some_and(|next| next.starts_with("+++ "))
+            && lines
+                .get(i + 1)
+                .is_some_and(|next| next.starts_with("+++ "))
         {
             let old_raw = clean_patch_path(&line[4..]);
             let new_raw = clean_patch_path(&lines[i + 1][4..]);
@@ -1849,7 +1854,9 @@ fn parse_numbered_hunk(
             break;
         }
         if l.starts_with("--- ")
-            && lines.get(j + 1).is_some_and(|next| next.starts_with("+++ "))
+            && lines
+                .get(j + 1)
+                .is_some_and(|next| next.starts_with("+++ "))
         {
             break;
         }
@@ -1891,7 +1898,7 @@ fn parse_hunk_ranges(s: &str, label: &str) -> Result<(u64, u64, u64, u64), Commi
         .next()
         .ok_or_else(|| bad(format!("bad hunk header in {label}: {s:?}")))?;
     if parts.next().is_some() {
-        return Err(bad(format!("bad hunk header in {label}: {s:?}")))?;
+        return Err(bad(format!("bad hunk header in {label}: {s:?}")));
     }
     let (old_start, old_count) = parse_hunk_range(old, '-', label)?;
     let (new_start, new_count) = parse_hunk_range(new, '+', label)?;
@@ -2031,7 +2038,7 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<PatchFile>, CommitError> {
         if line.starts_with("*** ") {
             return Err(bad(format!("bad patch: unexpected line {line:?}")));
         }
-        if line.starts_with("@@") {
+        if let Some(inner) = line.strip_prefix("@@") {
             if cur_path.is_none() {
                 return Err(bad(format!("bad patch: hunk outside a file: {line:?}")));
             }
@@ -2041,11 +2048,9 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<PatchFile>, CommitError> {
                 ));
             }
             flush_hunk(&mut cur_hunk, &mut cur_hunks);
-            let inner = &line[2..];
             let end = inner.find("@@");
-            let numbered = end.is_some_and(|e| {
-                parse_hunk_ranges(inner[..e].trim(), "__codex__").is_ok()
-            });
+            let numbered =
+                end.is_some_and(|e| parse_hunk_ranges(inner[..e].trim(), "__codex__").is_ok());
             if numbered {
                 let end = end.unwrap_or(0);
                 let (old_start, old_count, _, new_count) =
@@ -2627,7 +2632,9 @@ mod tests {
     async fn rehydrate_into_a_fresh_mirror_reproduces_head_and_files() {
         let (_dir, cfg, store, sync) = setup("rehyd").await;
         let mut r = req("seed");
-        r.changes.writes.push(write("app/index.ts", "export const x = 1;"));
+        r.changes
+            .writes
+            .push(write("app/index.ts", "export const x = 1;"));
         let head = commit(&store, &cfg, &sync, "rehyd", r).await.unwrap();
 
         let fresh_dir = tempfile::tempdir().unwrap();
@@ -2687,13 +2694,21 @@ mod tests {
     async fn edits_match_exactly_once_by_default() {
         let (_dir, cfg, store, sync) = setup("edits").await;
         let mut seed = req("seed");
-        seed.changes.writes.push(write("page.tsx", "<h1>x</h1>\n<p>y</p>\n<h1>x</h1>\n"));
+        seed.changes
+            .writes
+            .push(write("page.tsx", "<h1>x</h1>\n<p>y</p>\n<h1>x</h1>\n"));
         let head = commit(&store, &cfg, &sync, "edits", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "edits");
 
         // Zero matches: error names the path and the count.
         let mut zero = req("zero");
-        zero.changes.edits.push(Edit { path: "page.tsx".to_string(), old: "missing".to_string(), new: "n".to_string(), replace_all: false, expect_blob: None });
+        zero.changes.edits.push(Edit {
+            path: "page.tsx".to_string(),
+            old: "missing".to_string(),
+            new: "n".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "edits", zero).await {
             Err(CommitError::EditMatch { path, count }) => {
                 assert_eq!(path, "page.tsx");
@@ -2704,7 +2719,13 @@ mod tests {
 
         // Two matches without replace_all: error counts both.
         let mut two = req("two");
-        two.changes.edits.push(Edit { path: "page.tsx".to_string(), old: "<h1>x</h1>".to_string(), new: "<h1>z</h1>".to_string(), replace_all: false, expect_blob: None });
+        two.changes.edits.push(Edit {
+            path: "page.tsx".to_string(),
+            old: "<h1>x</h1>".to_string(),
+            new: "<h1>z</h1>".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "edits", two).await {
             Err(CommitError::EditMatch { path, count }) => {
                 assert_eq!(path, "page.tsx");
@@ -2715,7 +2736,13 @@ mod tests {
 
         // replace_all rewrites both.
         let mut all = req("all");
-        all.changes.edits.push(Edit { path: "page.tsx".to_string(), old: "<h1>x</h1>".to_string(), new: "<h1>z</h1>".to_string(), replace_all: true, expect_blob: None });
+        all.changes.edits.push(Edit {
+            path: "page.tsx".to_string(),
+            old: "<h1>x</h1>".to_string(),
+            new: "<h1>z</h1>".to_string(),
+            replace_all: true,
+            expect_blob: None,
+        });
         let h_all = commit(&store, &cfg, &sync, "edits", all).await.unwrap();
         assert_eq!(
             show(&bare, &h_all, "page.tsx").await,
@@ -2725,7 +2752,13 @@ mod tests {
         // Exactly one match without replace_all.
         let mut one = req("one");
         one.base = Some(h_all);
-        one.changes.edits.push(Edit { path: "page.tsx".to_string(), old: "<p>y</p>".to_string(), new: "<p>w</p>".to_string(), replace_all: false, expect_blob: None });
+        one.changes.edits.push(Edit {
+            path: "page.tsx".to_string(),
+            old: "<p>y</p>".to_string(),
+            new: "<p>w</p>".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         let h_one = commit(&store, &cfg, &sync, "edits", one).await.unwrap();
         assert_eq!(
             show(&bare, &h_one, "page.tsx").await,
@@ -2757,17 +2790,29 @@ mod tests {
         {
             let (_dir, cfg, store, sync) = setup("cap-text").await;
             let mut ok = req("ok");
-            ok.changes.writes.push(FileWrite { path: "t.txt".to_string(), body: WriteBody::Text("a".repeat(MAX_TEXT_BYTES)), expect_blob: None });
+            ok.changes.writes.push(FileWrite {
+                path: "t.txt".to_string(),
+                body: WriteBody::Text("a".repeat(MAX_TEXT_BYTES)),
+                expect_blob: None,
+            });
             commit(&store, &cfg, &sync, "cap-text", ok).await.unwrap();
             let mut over = req("over");
-            over.changes.writes.push(FileWrite { path: "t.txt".to_string(), body: WriteBody::Text("a".repeat(MAX_TEXT_BYTES + 1)), expect_blob: None });
+            over.changes.writes.push(FileWrite {
+                path: "t.txt".to_string(),
+                body: WriteBody::Text("a".repeat(MAX_TEXT_BYTES + 1)),
+                expect_blob: None,
+            });
             assert!(matches!(
                 commit(&store, &cfg, &sync, "cap-text", over).await,
                 Err(CommitError::TextTooLarge { .. })
             ));
             // NUL bytes are refused even under the size cap.
             let mut nul = req("nul");
-            nul.changes.writes.push(FileWrite { path: "t.txt".to_string(), body: WriteBody::Text("a\0b".to_string()), expect_blob: None });
+            nul.changes.writes.push(FileWrite {
+                path: "t.txt".to_string(),
+                body: WriteBody::Text("a\0b".to_string()),
+                expect_blob: None,
+            });
             assert!(matches!(
                 commit(&store, &cfg, &sync, "cap-text", nul).await,
                 Err(CommitError::HasNul { .. })
@@ -2779,10 +2824,18 @@ mod tests {
             let (_dir, cfg, store, sync) = setup("cap-b64").await;
             let enc = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![b'a'; n]);
             let mut ok = req("ok");
-            ok.changes.writes.push(FileWrite { path: "b.bin".to_string(), body: WriteBody::Base64(enc(MAX_UPLOAD_BYTES)), expect_blob: None });
+            ok.changes.writes.push(FileWrite {
+                path: "b.bin".to_string(),
+                body: WriteBody::Base64(enc(MAX_UPLOAD_BYTES)),
+                expect_blob: None,
+            });
             commit(&store, &cfg, &sync, "cap-b64", ok).await.unwrap();
             let mut over = req("over");
-            over.changes.writes.push(FileWrite { path: "b.bin".to_string(), body: WriteBody::Base64(enc(MAX_UPLOAD_BYTES + 1)), expect_blob: None });
+            over.changes.writes.push(FileWrite {
+                path: "b.bin".to_string(),
+                body: WriteBody::Base64(enc(MAX_UPLOAD_BYTES + 1)),
+                expect_blob: None,
+            });
             assert!(matches!(
                 commit(&store, &cfg, &sync, "cap-b64", over).await,
                 Err(CommitError::FileTooLarge { .. })
@@ -2794,14 +2847,38 @@ mod tests {
             let (_dir, cfg, store, sync) = setup("cap-total").await;
             let enc = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![b'a'; n]);
             let mut ok = req("ok");
-            ok.changes.writes.push(FileWrite { path: "a.bin".to_string(), body: WriteBody::Base64(enc(10 * 1024 * 1024)), expect_blob: None });
-            ok.changes.writes.push(FileWrite { path: "b.bin".to_string(), body: WriteBody::Base64(enc(10 * 1024 * 1024)), expect_blob: None });
-            ok.changes.writes.push(FileWrite { path: "c.bin".to_string(), body: WriteBody::Base64(enc(5 * 1024 * 1024)), expect_blob: None });
+            ok.changes.writes.push(FileWrite {
+                path: "a.bin".to_string(),
+                body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+                expect_blob: None,
+            });
+            ok.changes.writes.push(FileWrite {
+                path: "b.bin".to_string(),
+                body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+                expect_blob: None,
+            });
+            ok.changes.writes.push(FileWrite {
+                path: "c.bin".to_string(),
+                body: WriteBody::Base64(enc(5 * 1024 * 1024)),
+                expect_blob: None,
+            });
             commit(&store, &cfg, &sync, "cap-total", ok).await.unwrap();
             let mut over = req("over");
-            over.changes.writes.push(FileWrite { path: "a.bin".to_string(), body: WriteBody::Base64(enc(10 * 1024 * 1024)), expect_blob: None });
-            over.changes.writes.push(FileWrite { path: "b.bin".to_string(), body: WriteBody::Base64(enc(10 * 1024 * 1024)), expect_blob: None });
-            over.changes.writes.push(FileWrite { path: "c.bin".to_string(), body: WriteBody::Base64(enc(5 * 1024 * 1024 + 1)), expect_blob: None });
+            over.changes.writes.push(FileWrite {
+                path: "a.bin".to_string(),
+                body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+                expect_blob: None,
+            });
+            over.changes.writes.push(FileWrite {
+                path: "b.bin".to_string(),
+                body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+                expect_blob: None,
+            });
+            over.changes.writes.push(FileWrite {
+                path: "c.bin".to_string(),
+                body: WriteBody::Base64(enc(5 * 1024 * 1024 + 1)),
+                expect_blob: None,
+            });
             assert!(matches!(
                 commit(&store, &cfg, &sync, "cap-total", over).await,
                 Err(CommitError::TotalTooLarge { .. })
@@ -2845,10 +2922,14 @@ mod tests {
         {
             let (_dir, cfg, store, sync) = setup("cap-path").await;
             let mut ok = req("ok");
-            ok.changes.writes.push(write(&format!("{}.txt", "p".repeat(508)), "x"));
+            ok.changes
+                .writes
+                .push(write(&format!("{}.txt", "p".repeat(508)), "x"));
             commit(&store, &cfg, &sync, "cap-path", ok).await.unwrap();
             let mut over = req("over");
-            over.changes.writes.push(write(&format!("{}.txt", "p".repeat(509)), "x"));
+            over.changes
+                .writes
+                .push(write(&format!("{}.txt", "p".repeat(509)), "x"));
             assert!(matches!(
                 commit(&store, &cfg, &sync, "cap-path", over).await,
                 Err(CommitError::BadPath { .. })
@@ -2986,12 +3067,24 @@ mod tests {
             .await
             .unwrap();
         let mut ok = req("ok");
-        ok.changes.edits.push(Edit { path: "f.txt".to_string(), old: "aaa".to_string(), new: "a".repeat(MAX_TEXT_BYTES), replace_all: false, expect_blob: None });
+        ok.changes.edits.push(Edit {
+            path: "f.txt".to_string(),
+            old: "aaa".to_string(),
+            new: "a".repeat(MAX_TEXT_BYTES),
+            replace_all: false,
+            expect_blob: None,
+        });
         commit(&store, &cfg, &sync, "edit-caps", ok).await.unwrap();
 
         // ...and one byte over fails, against the new base.
         let mut over = req("over");
-        over.changes.edits.push(Edit { path: "f.txt".to_string(), old: "a".repeat(MAX_TEXT_BYTES), new: "a".repeat(MAX_TEXT_BYTES + 1), replace_all: false, expect_blob: None });
+        over.changes.edits.push(Edit {
+            path: "f.txt".to_string(),
+            old: "a".repeat(MAX_TEXT_BYTES),
+            new: "a".repeat(MAX_TEXT_BYTES + 1),
+            replace_all: false,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "edit-caps", over).await {
             Err(CommitError::TextTooLarge { path }) => assert_eq!(path, "f.txt"),
             other => panic!("an over-cap edit result must fail, got {other:?}"),
@@ -3003,7 +3096,13 @@ mod tests {
         seed.changes.writes.push(write("f.txt", "aaa"));
         commit(&store, &cfg, &sync, "edit-nul", seed).await.unwrap();
         let mut nul = req("nul");
-        nul.changes.edits.push(Edit { path: "f.txt".to_string(), old: "aaa".to_string(), new: "a\0b".to_string(), replace_all: false, expect_blob: None });
+        nul.changes.edits.push(Edit {
+            path: "f.txt".to_string(),
+            old: "aaa".to_string(),
+            new: "a\0b".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "edit-nul", nul).await {
             Err(CommitError::HasNul { path }) => assert_eq!(path, "f.txt"),
             other => panic!("a NUL edit result must fail, got {other:?}"),
@@ -3015,16 +3114,26 @@ mod tests {
         use base64::Engine as _;
         let (_dir, cfg, store, sync) = setup("edit-big-base").await;
         let mut seed = req("seed");
-        seed.changes.writes.push(FileWrite { path: "big.txt".to_string(), body: WriteBody::Base64(base64::engine::general_purpose::STANDARD.encode(vec![
-            b'a';
-            MAX_TEXT_BYTES
-                + 1
-        ])), expect_blob: None });
+        seed.changes.writes.push(FileWrite {
+            path: "big.txt".to_string(),
+            body: WriteBody::Base64(base64::engine::general_purpose::STANDARD.encode(vec![
+                b'a';
+                MAX_TEXT_BYTES
+                    + 1
+            ])),
+            expect_blob: None,
+        });
         commit(&store, &cfg, &sync, "edit-big-base", seed)
             .await
             .unwrap();
         let mut big = req("big");
-        big.changes.edits.push(Edit { path: "big.txt".to_string(), old: "a".to_string(), new: "b".to_string(), replace_all: true, expect_blob: None });
+        big.changes.edits.push(Edit {
+            path: "big.txt".to_string(),
+            old: "a".to_string(),
+            new: "b".to_string(),
+            replace_all: true,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "edit-big-base", big).await {
             Err(CommitError::TextTooLarge { path }) => assert_eq!(path, "big.txt"),
             other => panic!("editing an over-cap base must fail, got {other:?}"),
@@ -3040,10 +3149,28 @@ mod tests {
             .unwrap();
         let enc = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![b'a'; n]);
         let mut big = req("big");
-        big.changes.writes.push(FileWrite { path: "a.bin".to_string(), body: WriteBody::Base64(enc(10 * 1024 * 1024)), expect_blob: None });
-        big.changes.writes.push(FileWrite { path: "b.bin".to_string(), body: WriteBody::Base64(enc(10 * 1024 * 1024)), expect_blob: None });
-        big.changes.writes.push(FileWrite { path: "c.bin".to_string(), body: WriteBody::Base64(enc(5 * 1024 * 1024)), expect_blob: None });
-        big.changes.edits.push(Edit { path: "e.txt".to_string(), old: "aaa".to_string(), new: "bbb".to_string(), replace_all: false, expect_blob: None });
+        big.changes.writes.push(FileWrite {
+            path: "a.bin".to_string(),
+            body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+            expect_blob: None,
+        });
+        big.changes.writes.push(FileWrite {
+            path: "b.bin".to_string(),
+            body: WriteBody::Base64(enc(10 * 1024 * 1024)),
+            expect_blob: None,
+        });
+        big.changes.writes.push(FileWrite {
+            path: "c.bin".to_string(),
+            body: WriteBody::Base64(enc(5 * 1024 * 1024)),
+            expect_blob: None,
+        });
+        big.changes.edits.push(Edit {
+            path: "e.txt".to_string(),
+            old: "aaa".to_string(),
+            new: "bbb".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "edit-total", big).await {
             Err(CommitError::TotalTooLarge { .. }) => {}
             other => panic!("an edit overflowing the commit total must fail, got {other:?}"),
@@ -3111,7 +3238,13 @@ mod tests {
         // A write and an edit on one path.
         let mut both = req("both");
         both.changes.writes.push(write("g.txt", "x"));
-        both.changes.edits.push(Edit { path: "g.txt".to_string(), old: "x".to_string(), new: "y".to_string(), replace_all: false, expect_blob: None });
+        both.changes.edits.push(Edit {
+            path: "g.txt".to_string(),
+            old: "x".to_string(),
+            new: "y".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "overlap", both).await {
             Err(CommitError::BothWrittenAndEdited { path }) => assert_eq!(path, "g.txt"),
             other => panic!("a write and an edit on one path must fail, got {other:?}"),
@@ -3119,8 +3252,20 @@ mod tests {
 
         // The same path edited twice.
         let mut dedup = req("dedup");
-        dedup.changes.edits.push(Edit { path: "h.txt".to_string(), old: "x".to_string(), new: "y".to_string(), replace_all: false, expect_blob: None });
-        dedup.changes.edits.push(Edit { path: "h.txt".to_string(), old: "y".to_string(), new: "z".to_string(), replace_all: false, expect_blob: None });
+        dedup.changes.edits.push(Edit {
+            path: "h.txt".to_string(),
+            old: "x".to_string(),
+            new: "y".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
+        dedup.changes.edits.push(Edit {
+            path: "h.txt".to_string(),
+            old: "y".to_string(),
+            new: "z".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         match commit(&store, &cfg, &sync, "overlap", dedup).await {
             Err(CommitError::DuplicateEdit { path }) => assert_eq!(path, "h.txt"),
             other => panic!("duplicate edits must fail, got {other:?}"),
@@ -3140,7 +3285,13 @@ mod tests {
 
         // A move whose target is edited in the same commit.
         let mut mv_edit = req("mv-edit");
-        mv_edit.changes.edits.push(Edit { path: "e.txt".to_string(), old: "x".to_string(), new: "y".to_string(), replace_all: false, expect_blob: None });
+        mv_edit.changes.edits.push(Edit {
+            path: "e.txt".to_string(),
+            old: "x".to_string(),
+            new: "y".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         mv_edit.changes.moves.push(Move {
             from: "a.txt".to_string(),
             to: "e.txt".to_string(),
@@ -3246,7 +3397,11 @@ mod tests {
         r.changes.writes.push(write("app/a.ts", "const x = 1;\n"));
         r.changes.writes.push(write("app/clean.ts", "ABC\n"));
         r.changes.writes.push(write("app/note.txt", "hello\n"));
-        r.changes.writes.push(FileWrite { path: "app/upload.ts".to_string(), body: WriteBody::Base64("Y29uc3QgeSA9IDI7Cg==".to_string()), expect_blob: None });
+        r.changes.writes.push(FileWrite {
+            path: "app/upload.ts".to_string(),
+            body: WriteBody::Base64("Y29uc3QgeSA9IDI7Cg==".to_string()),
+            expect_blob: None,
+        });
         let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-only", r)
             .await
             .unwrap();
@@ -3286,7 +3441,13 @@ mod tests {
         let logged_after_seed = logged_paths(&files_log).len();
         assert_eq!(logged_after_seed, 3);
         let mut change = req("change");
-        change.changes.edits.push(Edit { path: "edit.ts".to_string(), old: "WORLD".to_string(), new: "world".to_string(), replace_all: false, expect_blob: None });
+        change.changes.edits.push(Edit {
+            path: "edit.ts".to_string(),
+            old: "WORLD".to_string(),
+            new: "world".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        });
         change.changes.moves.push(Move {
             from: "move.ts".to_string(),
             to: "moved.ts".to_string(),
@@ -3321,7 +3482,9 @@ mod tests {
         let (_dir, cfg, store, sync) = setup_with_bin("fmt-fail", Some(bin)).await;
         let mut r = req("format");
         r.changes.writes.push(write("good.ts", "const x = 1;\n"));
-        r.changes.writes.push(write("bad.ts", "const = SYNTAX-BROKEN ;;;\n"));
+        r.changes
+            .writes
+            .push(write("bad.ts", "const = SYNTAX-BROKEN ;;;\n"));
         let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-fail", r)
             .await
             .unwrap();
@@ -3378,7 +3541,11 @@ mod tests {
         let mut r = req("format");
         let big = "const x = 1;\n".repeat(8192);
         assert!(big.len() > 64 * 1024, "must fill the pipe buffer");
-        r.changes.writes.push(FileWrite { path: "big.ts".to_string(), body: WriteBody::Text(big.clone()), expect_blob: None });
+        r.changes.writes.push(FileWrite {
+            path: "big.ts".to_string(),
+            body: WriteBody::Text(big.clone()),
+            expect_blob: None,
+        });
         let start = std::time::Instant::now();
         let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-hung", r)
             .await
@@ -3501,10 +3668,22 @@ mod tests {
             ".oxfmtrc.json",
             "{\"ignorePatterns\": [\"gen/**\"]}\n",
         ));
-        first.changes.writes.push(write(".prettierignore", "skip/\n"));
-        first.changes.writes.push(write("gen/a.ts", "const x = 1;\n"));
-        first.changes.writes.push(write("skip/b.ts", "const x = 1;\n"));
-        first.changes.writes.push(write("src/a.ts", "const x = 1;\n"));
+        first
+            .changes
+            .writes
+            .push(write(".prettierignore", "skip/\n"));
+        first
+            .changes
+            .writes
+            .push(write("gen/a.ts", "const x = 1;\n"));
+        first
+            .changes
+            .writes
+            .push(write("skip/b.ts", "const x = 1;\n"));
+        first
+            .changes
+            .writes
+            .push(write("src/a.ts", "const x = 1;\n"));
         let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-ignore", first)
             .await
             .unwrap();
@@ -3536,8 +3715,14 @@ mod tests {
         // A later commit reads the config from head: the ignore still holds
         // without rewriting `.oxfmtrc.json`.
         let mut second = req("second");
-        second.changes.writes.push(write("src/b.ts", "const y = 2;\n"));
-        second.changes.writes.push(write("gen/b.ts", "const y = 2;\n"));
+        second
+            .changes
+            .writes
+            .push(write("src/b.ts", "const y = 2;\n"));
+        second
+            .changes
+            .writes
+            .push(write("gen/b.ts", "const y = 2;\n"));
         let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-ignore", second)
             .await
             .unwrap();
@@ -3565,9 +3750,15 @@ mod tests {
         let (_dir, cfg, store, sync) =
             setup_with_bin("fmt-real", Some(std::path::PathBuf::from(bin))).await;
         let mut r = req("format");
-        r.changes.writes.push(write(".oxfmtrc.json", "{\"singleQuote\": true}\n"));
-        r.changes.writes.push(write("app/a.js", "const s = \"hi\"\n"));
-        r.changes.writes.push(write("app/b.json", "{\"b\":1,\"a\":2}\n"));
+        r.changes
+            .writes
+            .push(write(".oxfmtrc.json", "{\"singleQuote\": true}\n"));
+        r.changes
+            .writes
+            .push(write("app/a.js", "const s = \"hi\"\n"));
+        r.changes
+            .writes
+            .push(write("app/b.json", "{\"b\":1,\"a\":2}\n"));
         r.changes.writes.push(write("app/c.css", "a{color:red}\n"));
         r.changes.writes.push(write("app/d.md", "# hi\n"));
         let outcome = commit_with_outcome(&store, &cfg, &sync, "fmt-real", r)
@@ -3806,9 +3997,7 @@ mod tests {
     async fn line_edits_replace_ranges_by_number() {
         let (_dir, cfg, store, sync) = setup("lines").await;
         let mut seed = req("seed");
-        seed.changes
-            .writes
-            .push(write("f.txt", "a\nb\nc\n"));
+        seed.changes.writes.push(write("f.txt", "a\nb\nc\n"));
         commit(&store, &cfg, &sync, "lines", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "lines");
 
@@ -3832,15 +4021,15 @@ mod tests {
         let mut seed = req("seed");
         seed.changes.writes.push(write("keep.txt", "a\nb\nc\n"));
         seed.changes.writes.push(write("bare.txt", "x\ny\nz"));
-        commit(&store, &cfg, &sync, "bounds", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "bounds", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "bounds");
 
         // A mid-file replace keeps the trailing newline, and a trailing
         // newline inside `new` is absorbed rather than doubled.
         let mut r = req("mid");
-        r.changes.line_edits.push(line_edit("keep.txt", 2, 2, "B\n"));
+        r.changes
+            .line_edits
+            .push(line_edit("keep.txt", 2, 2, "B\n"));
         let h = commit(&store, &cfg, &sync, "bounds", r).await.unwrap();
         assert_eq!(show(&bare, &h, "keep.txt").await, "a\nB\nc\n");
 
@@ -3854,7 +4043,9 @@ mod tests {
         // ...and a replacement touching the last line keeps it that way too:
         // line ops never flip the file's terminator.
         let mut r = req("last");
-        r.changes.line_edits.push(line_edit("bare.txt", 3, 3, "Z\n"));
+        r.changes
+            .line_edits
+            .push(line_edit("bare.txt", 3, 3, "Z\n"));
         let h = commit(&store, &cfg, &sync, "bounds", r).await.unwrap();
         assert_eq!(show(&bare, &h, "bare.txt").await, "X\ny\nZ");
     }
@@ -3876,7 +4067,9 @@ mod tests {
 
         // A replace range needs a line to replace.
         let mut r = req("range");
-        r.changes.line_edits.push(line_edit("empty2.txt", 1, 1, "x"));
+        r.changes
+            .line_edits
+            .push(line_edit("empty2.txt", 1, 1, "x"));
         match commit(&store, &cfg, &sync, "empty", r).await {
             Err(CommitError::OutOfRange {
                 path,
@@ -3911,9 +4104,7 @@ mod tests {
         let (_dir, cfg, store, sync) = setup("overlap").await;
         let mut seed = req("seed");
         seed.changes.writes.push(write("f.txt", "a\nb\nc\n"));
-        commit(&store, &cfg, &sync, "overlap", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "overlap", seed).await.unwrap();
 
         // Overlapping ranges in one file are refused before anything is read.
         let mut r = req("overlap");
@@ -3969,9 +4160,7 @@ mod tests {
         let (_dir, cfg, store, sync) = setup("inserts").await;
         let mut seed = req("seed");
         seed.changes.writes.push(write("f.txt", "b\nc\n"));
-        commit(&store, &cfg, &sync, "inserts", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "inserts", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "inserts");
 
         // Several inserts at one line run in input order; an insert at
@@ -4017,16 +4206,15 @@ mod tests {
     async fn patch_applies_with_exact_context() {
         let (_dir, cfg, store, sync) = setup("patch").await;
         let mut seed = req("seed");
-        seed.changes.writes.push(write("f.txt", "one\ntwo\nthree\n"));
-        commit(&store, &cfg, &sync, "patch", seed)
-            .await
-            .unwrap();
+        seed.changes
+            .writes
+            .push(write("f.txt", "one\ntwo\nthree\n"));
+        commit(&store, &cfg, &sync, "patch", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "patch");
 
         let mut r = req("patch");
         r.changes.patch = Some(
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
-                .to_string(),
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n".to_string(),
         );
         let h = commit(&store, &cfg, &sync, "patch", r).await.unwrap();
         assert_eq!(show(&bare, &h, "f.txt").await, "one\nTWO\nthree\n");
@@ -4038,9 +4226,7 @@ mod tests {
         let mut seed = req("seed");
         seed.changes.writes.push(write("f.txt", "a\nb\n"));
         seed.changes.writes.push(write("g.txt", "x\n"));
-        commit(&store, &cfg, &sync, "reject", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "reject", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "reject");
         assert_eq!(rev_list_count(&bare).await, 1);
 
@@ -4070,9 +4256,7 @@ mod tests {
         let mut seed = req("seed");
         seed.changes.writes.push(write("old.txt", "gone\n"));
         seed.changes.writes.push(write("mv.txt", "body\n"));
-        commit(&store, &cfg, &sync, "files", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "files", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "files");
         let git_dir = format!("--git-dir={}", bare.display());
 
@@ -4097,15 +4281,11 @@ mod tests {
         let (_dir, cfg, store, sync) = setup("alone").await;
         let mut seed = req("seed");
         seed.changes.writes.push(write("f.txt", "a\n"));
-        commit(&store, &cfg, &sync, "alone", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "alone", seed).await.unwrap();
 
         let mut r = req("mixed");
         r.changes.writes.push(write("g.txt", "g\n"));
-        r.changes.patch = Some(
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n".to_string(),
-        );
+        r.changes.patch = Some("--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n".to_string());
         match commit(&store, &cfg, &sync, "alone", r).await {
             Err(CommitError::MixedPatch) => {}
             other => panic!("a patch mixed with writes must fail, got {other:?}"),
@@ -4118,9 +4298,7 @@ mod tests {
         let mut seed = req("seed");
         seed.changes.writes.push(write("bare.txt", "a\nb"));
         seed.changes.writes.push(write("full.txt", "a\nb"));
-        commit(&store, &cfg, &sync, "noeol", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "noeol", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "noeol");
 
         // The marker keeps the file unterminated; without it a hunk touching
@@ -4143,9 +4321,7 @@ mod tests {
         seed.changes
             .writes
             .push(write("f.txt", "alpha\nbeta\ngamma\n"));
-        commit(&store, &cfg, &sync, "codex", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "codex", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "codex");
 
         // A bare `@@` hunk is located by its unique context.
@@ -4165,9 +4341,7 @@ mod tests {
         let mut seed = req("seed");
         seed.changes.writes.push(write("f.txt", "v1\n"));
         seed.changes.writes.push(write("g.txt", "v1\n"));
-        let h0 = commit(&store, &cfg, &sync, "cas-blob", seed)
-            .await
-            .unwrap();
+        let h0 = commit(&store, &cfg, &sync, "cas-blob", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "cas-blob");
         let blob_f0 = blob_of(&bare, &h0, "f.txt").await;
 
@@ -4185,9 +4359,7 @@ mod tests {
         let mut op = line_edit("f.txt", 1, 1, "v2");
         op.expect_blob = Some(blob_f0.clone());
         r.changes.line_edits.push(op);
-        let h2 = commit(&store, &cfg, &sync, "cas-blob", r)
-            .await
-            .unwrap();
+        let h2 = commit(&store, &cfg, &sync, "cas-blob", r).await.unwrap();
         assert_eq!(show(&bare, &h2, "f.txt").await, "v2\n");
 
         // The same blob is stale now: the conflict names the file and the
@@ -4197,11 +4369,7 @@ mod tests {
         op.expect_blob = Some(blob_f0);
         r.changes.line_edits.push(op);
         match commit(&store, &cfg, &sync, "cas-blob", r).await {
-            Err(CommitError::BlobConflict {
-                path,
-                current,
-                ..
-            }) => {
+            Err(CommitError::BlobConflict { path, current, .. }) => {
                 assert_eq!(path, "f.txt");
                 assert_eq!(current, blob_of(&bare, &h2, "f.txt").await);
             }
@@ -4224,9 +4392,7 @@ mod tests {
         let (_dir, cfg, store, sync) = setup("badblob").await;
         let mut seed = req("seed");
         seed.changes.writes.push(write("f.txt", "a\n"));
-        commit(&store, &cfg, &sync, "badblob", seed)
-            .await
-            .unwrap();
+        commit(&store, &cfg, &sync, "badblob", seed).await.unwrap();
 
         let mut r = req("bad");
         let mut op = line_edit("f.txt", 1, 1, "b");
