@@ -43,6 +43,7 @@ import { settingsActions } from "./actions/settings.ts";
 import { TelemetryCard, type TelemetrySummary } from "./views/telemetry.tsx";
 import {
   CopyButton,
+  linkTo,
   timeAgo,
   type ActionsPanel,
   type Panel,
@@ -525,6 +526,7 @@ export function OverviewView({
   actions,
   errors,
   onView,
+  viewHref,
   onRetry,
 }: {
   app: AppDetail;
@@ -532,6 +534,8 @@ export function OverviewView({
   actions: ActionsPanel;
   errors: Panel<ErrorsSummary>;
   onView: (view: ViewId) => void;
+  /** Canonical URL for a view (real links: new-tab keeps working). */
+  viewHref: (view: ViewId) => string;
   onRetry: () => void;
 }) {
   return (
@@ -549,13 +553,13 @@ export function OverviewView({
           <div class="card-body min-w-0">
             <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
               <h2 class="card-title min-w-0 truncate" title="Latest deploy">Latest deploy</h2>
-              <button
-                type="button"
+              <a
                 class="link shrink-0 text-sm"
-                onclick={() => onView("deploys")}
+                href={viewHref("deploys")}
+                onclick={(e: Event) => linkTo(e, () => onView("deploys"))}
               >
                 View all
-              </button>
+              </a>
             </div>
             {app.deploys.length === 0 ? (
               <EmptyState plain icon={<DeploysIcon />} title="No deploys yet">
@@ -572,13 +576,13 @@ export function OverviewView({
           <div class="card-body min-w-0">
             <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
               <h2 class="card-title min-w-0 truncate" title="Latest agent actions">Latest agent actions</h2>
-              <button
-                type="button"
+              <a
                 class="link shrink-0 text-sm"
-                onclick={() => onView("actions")}
+                href={viewHref("actions")}
+                onclick={(e: Event) => linkTo(e, () => onView("actions"))}
               >
                 View all
-              </button>
+              </a>
             </div>
             {actions.kind === "loading" && (
               <div class="flex min-w-0 flex-col gap-2" role="status" aria-label="Loading actions">
@@ -622,13 +626,13 @@ export function OverviewView({
           <div class="card-body min-w-0">
             <div class="mb-3 flex min-w-0 items-center justify-between gap-3">
               <h2 class="card-title min-w-0 truncate" title="Open errors">Open errors</h2>
-              <button
-                type="button"
+              <a
                 class="link shrink-0 text-sm"
-                onclick={() => onView("errors")}
+                href={viewHref("errors")}
+                onclick={(e: Event) => linkTo(e, () => onView("errors"))}
               >
                 View all
-              </button>
+              </a>
             </div>
             <ul class="list min-w-0">
               {errors.value.issues

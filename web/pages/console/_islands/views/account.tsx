@@ -589,11 +589,21 @@ export function UsageView({
   async function openCheckout(): Promise<void> {
     checkoutBusy.set(true);
     checkoutError.set(null);
+    // The tab opens synchronously in the click handler: anything after the
+    // await below would be popup-blocked. The blank tab then navigates to
+    // the minted URL (opener cleared, so it behaves like rel=noopener).
+    const tab = globalThis.open("about:blank", "_blank");
     try {
       const session = await createCheckout.run(undefined);
       upgradeOpen.set(false);
-      globalThis.open(session.checkout_url, "_blank", "noopener");
+      if (tab && !tab.closed) {
+        tab.opener = null;
+        tab.location.href = session.checkout_url;
+      } else {
+        globalThis.location.assign(session.checkout_url);
+      }
     } catch (err) {
+      tab?.close();
       checkoutError.set(err instanceof Error ? err.message : "checkout failed");
     } finally {
       checkoutBusy.set(false);
@@ -602,10 +612,19 @@ export function UsageView({
   async function openPortal(): Promise<void> {
     checkoutBusy.set(true);
     checkoutError.set(null);
+    // Same synchronous-tab dance as checkout: post-await window.open
+    // would be popup-blocked.
+    const tab = globalThis.open("about:blank", "_blank");
     try {
       const session = await createPortal.run(undefined);
-      globalThis.open(session.portal_url, "_blank", "noopener");
+      if (tab && !tab.closed) {
+        tab.opener = null;
+        tab.location.href = session.portal_url;
+      } else {
+        globalThis.location.assign(session.portal_url);
+      }
     } catch (err) {
+      tab?.close();
       checkoutError.set(err instanceof Error ? err.message : "portal failed");
     } finally {
       checkoutBusy.set(false);
