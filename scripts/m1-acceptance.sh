@@ -243,7 +243,7 @@ import json, os
 print(json.dumps({"app": os.environ["M1_APP"], "path": os.environ["M1_P"]}))
 EOF
     code=$(mcp_call "read_file")
-    [ "$code" = "200" ] && [ "$(jok "$RESP")" = "1" ] || return 1
+    if [ "$code" != "200" ] || [ "$(jok "$RESP")" != "1" ]; then return 1; fi
     jget "$RESP" 'v["result"]["structuredContent"]["text"]'
 }
 
