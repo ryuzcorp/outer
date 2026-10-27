@@ -584,10 +584,7 @@ mod tests {
     }
 
     fn text(path: &str, content: &str) -> FileWrite {
-        FileWrite {
-            path: path.to_string(),
-            body: WriteBody::Text(content.to_string()),
-        }
+        FileWrite { path: path.to_string(), body: WriteBody::Text(content.to_string()), expect_blob: None }
     }
 
     /// One account, one app, two commits (add/modify/delete), a small binary
@@ -623,50 +620,37 @@ mod tests {
             .unwrap();
         use base64::Engine as _;
         let engine = base64::engine::general_purpose::STANDARD;
-        let first = CommitRequest {
-            message: "first groceries".to_string(),
-            base: None,
-            writes: vec![
-                text(
-                    "pages/app.tsx",
-                    "export default function App() {\n  return <h1>Hi</h1>;\n}\n",
-                ),
-                text("README.md", "# groceries\n"),
-                text("notes/todo.txt", "milk\neggs\n"),
-                FileWrite {
-                    path: "img.bin".to_string(),
-                    body: WriteBody::Base64(engine.encode([0u8, 1, 2, 3, 255])),
-                },
-                FileWrite {
-                    path: "big.bin".to_string(),
-                    body: WriteBody::Base64(engine.encode(vec![b'x'; 300 * 1024])),
-                },
-            ],
-            edits: vec![],
-            deletes: vec![],
-            moves: vec![],
-            author: author(),
-        };
+        let first = CommitRequest { message: "first groceries".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![
+            text(
+                "pages/app.tsx",
+                "export default function App() {\n  return <h1>Hi</h1>;\n}\n",
+            ),
+            text("README.md", "# groceries\n"),
+            text("notes/todo.txt", "milk\neggs\n"),
+            FileWrite {
+                path: "img.bin".to_string(),
+                body: WriteBody::Base64(engine.encode([0u8, 1, 2, 3, 255])),
+                expect_blob: None,
+            },
+            FileWrite {
+                path: "big.bin".to_string(),
+                body: WriteBody::Base64(engine.encode(vec![b'x'; 300 * 1024])),
+                expect_blob: None,
+            },
+        ], edits: vec![], deletes: vec![], moves: vec![], ..Default::default() }, author: author() };
         let c1 = commit::commit(&mcp.store, &mcp.git, &mcp.sync, "groceries", first)
             .await
             .unwrap();
-        let second = CommitRequest {
-            message: "add about, drop notes".to_string(),
-            base: None,
-            writes: vec![text(
-                "pages/about.tsx",
-                "export default function About() {\n  return <p>us</p>;\n}\n",
-            )],
-            edits: vec![Edit {
-                path: "notes/todo.txt".to_string(),
-                old: "eggs\n".to_string(),
-                new: "eggs\nbread\n".to_string(),
-                replace_all: false,
-            }],
-            deletes: vec!["README.md".to_string()],
-            moves: vec![],
-            author: author(),
-        };
+        let second = CommitRequest { message: "add about, drop notes".to_string(), base: None, changes: crate::git::commit::CommitChanges { writes: vec![text(
+            "pages/about.tsx",
+            "export default function About() {\n  return <p>us</p>;\n}\n",
+        )], edits: vec![Edit {
+            path: "notes/todo.txt".to_string(),
+            old: "eggs\n".to_string(),
+            new: "eggs\nbread\n".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        }], deletes: vec!["README.md".to_string()], moves: vec![], ..Default::default() }, author: author() };
         let c2 = commit::commit(&mcp.store, &mcp.git, &mcp.sync, "groceries", second)
             .await
             .unwrap();

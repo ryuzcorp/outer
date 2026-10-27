@@ -82,6 +82,10 @@ pub struct FileWriteInput {
     pub content: Option<String>,
     /// Raw bytes, base64-encoded (exactly one of content, base64).
     pub base64: Option<String>,
+    /// Per-file CAS: the blob id read_files reported for this path. A stale
+    /// blob answers conflict with the current blob; unrelated files never
+    /// conflict.
+    pub expect_blob: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -94,6 +98,36 @@ pub struct EditInput {
     pub new: String,
     /// Replace every occurrence instead of requiring exactly one.
     pub replace_all: Option<bool>,
+    /// Per-file CAS: the blob id read_files reported. See writes.
+    pub expect_blob: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LineEditInput {
+    /// Repo-relative path.
+    pub path: String,
+    /// First line to replace (1-based, matches read_files numbering).
+    pub start_line: u64,
+    /// Last line to replace, inclusive.
+    pub end_line: u64,
+    /// Replacement text (empty deletes the lines). The file's trailing
+    /// newline is preserved unless the range touches the last line.
+    pub new: String,
+    /// Per-file CAS: the blob id read_files reported. See writes.
+    pub expect_blob: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InsertInput {
+    /// Repo-relative path.
+    pub path: String,
+    /// Line to insert after (0 is the top of the file, the line count is
+    /// the end). Several inserts at one line run in input order.
+    pub after_line: u64,
+    /// Text to insert.
+    pub insert: String,
+    /// Per-file CAS: the blob id read_files reported. See writes.
+    pub expect_blob: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -116,6 +150,16 @@ pub struct CommitInput {
     pub writes: Option<Vec<FileWriteInput>>,
     /// Exact-match replacements in existing files.
     pub edits: Option<Vec<EditInput>>,
+    /// Line-range replacements (inclusive, 1-based read_files numbering).
+    /// Ranges in one file must not overlap.
+    pub line_edits: Option<Vec<LineEditInput>>,
+    /// Insertions after a line (0 is the top). Must not land inside a
+    /// line_edits range of the same file.
+    pub inserts: Option<Vec<InsertInput>>,
+    /// One unified diff, or a Codex `*** Begin Patch` block. A commit
+    /// carrying patch carries no other change kind. Hunks apply with exact
+    /// context; any reject fails the whole commit.
+    pub patch: Option<String>,
     /// Paths to delete.
     pub deletes: Option<Vec<String>>,
     /// File renames.
@@ -606,6 +650,7 @@ fn to_commit_request(
         writes.push(git::FileWrite {
             path: w.path.clone(),
             body,
+            expect_blob: w.expect_blob.clone(),
         });
     }
     let mut edits = Vec::new();
@@ -615,24 +660,49 @@ fn to_commit_request(
             old: e.old.clone(),
             new: e.new.clone(),
             replace_all: e.replace_all.unwrap_or(false),
+            expect_blob: e.expect_blob.clone(),
+        });
+    }
+    let mut line_edits = Vec::new();
+    for e in input.line_edits.as_deref().unwrap_or(&[]) {
+        line_edits.push(git::LineEdit {
+            path: e.path.clone(),
+            start_line: e.start_line,
+            end_line: e.end_line,
+            new: e.new.clone(),
+            expect_blob: e.expect_blob.clone(),
+        });
+    }
+    let mut inserts = Vec::new();
+    for i in input.inserts.as_deref().unwrap_or(&[]) {
+        inserts.push(git::Insert {
+            path: i.path.clone(),
+            after_line: i.after_line,
+            text: i.insert.clone(),
+            expect_blob: i.expect_blob.clone(),
         });
     }
     Ok(git::CommitRequest {
         message: input.message.clone(),
         base: input.base.clone(),
-        writes,
-        edits,
-        deletes: input.deletes.clone().unwrap_or_default(),
-        moves: input
-            .moves
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|m| git::Move {
-                from: m.from.clone(),
-                to: m.to.clone(),
-            })
-            .collect(),
+        changes: git::CommitChanges {
+            writes,
+            edits,
+            line_edits,
+            inserts,
+            patch: input.patch.clone(),
+            deletes: input.deletes.clone().unwrap_or_default(),
+            moves: input
+                .moves
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|m| git::Move {
+                    from: m.from.clone(),
+                    to: m.to.clone(),
+                })
+                .collect(),
+        },
         author,
     })
 }

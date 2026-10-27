@@ -145,6 +145,18 @@ impl ToolError {
                 format!("unknown preview base {base:?}; preview is {current}"),
                 &current,
             ),
+            E::BlobConflict {
+                path,
+                expected,
+                current,
+            } => Self::new(
+                "conflict",
+                format!(
+                    "blob conflict in {path}: expected blob {expected}, current {current}; re-read the file and retry with the fresh blob"
+                ),
+            )
+            .with_extra("path", json!(path))
+            .with_extra("blob", json!(current)),
             E::Internal(e) => {
                 tracing::warn!("commit internal: {e:#}");
                 Self::internal("the commit failed on our side; try again in a minute")

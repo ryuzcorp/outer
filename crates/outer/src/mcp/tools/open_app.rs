@@ -873,7 +873,7 @@ pub async fn open_app_impl(input: OpenAppInput, ctx: &Ctx<'_>) -> Result<Value, 
         );
     } else {
         next.push(
-            "search_code {app, query} to find code; commit {app, edits} to change it".to_string(),
+            "search_code {app, query} to find code; commit {app, line_edits} to change it".to_string(),
         );
     }
     next.push(

@@ -8,7 +8,8 @@ pub mod local;
 pub mod manifest;
 pub mod symbol;
 pub use commit::{
-    Author, CommitError, CommitOutcome, CommitRequest, Edit, FileWrite, Move, WriteBody,
+    Author, CommitChanges, CommitError, CommitOutcome, CommitRequest, Edit, FileWrite, Insert,
+    LineEdit, Move, WriteBody,
 };
 pub use format::{FormatOutcome, FormatSkip};
 pub use manifest::{GitConfig, GitSync, Manifest, ManifestRef, MAIN_REF, PREVIEW_REF};

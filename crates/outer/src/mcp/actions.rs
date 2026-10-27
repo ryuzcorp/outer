@@ -131,8 +131,14 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             let message = truncate(arg_str(args, "message").unwrap_or(""), 200);
             let writes = args.get("writes").and_then(Value::as_array);
             let edits = args.get("edits").and_then(Value::as_array);
+            let line_edits = args.get("line_edits").and_then(Value::as_array);
+            let inserts = args.get("inserts").and_then(Value::as_array);
             let moves = args.get("moves").and_then(Value::as_array);
             let deletes = args.get("deletes").and_then(Value::as_array);
+            let has_patch = args
+                .get("patch")
+                .and_then(Value::as_str)
+                .is_some_and(|p| !p.is_empty());
             let write_bytes: usize = writes
                 .map(|ws| ws.iter().map(write_bytes).sum())
                 .unwrap_or(0);
@@ -144,7 +150,10 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
                 })
                 .unwrap_or(0);
             let mut paths: Vec<&str> = Vec::new();
-            for list in [writes, edits, moves].into_iter().flatten() {
+            for list in [writes, edits, line_edits, inserts, moves]
+                .into_iter()
+                .flatten()
+            {
                 for entry in list {
                     let path = entry
                         .get("path")
@@ -167,11 +176,14 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
                 }
             }
             format!(
-                "commit {message:?}: {} writes ({write_bytes} bytes), {} edits ({edit_bytes} bytes), {} moves, {} deletes [{}]",
+                "commit {message:?}: {} writes ({write_bytes} bytes), {} edits ({edit_bytes} bytes), {} line edits, {} inserts, {} moves, {} deletes{} [{}]",
                 writes.map_or(0, Vec::len),
                 edits.map_or(0, Vec::len),
+                line_edits.map_or(0, Vec::len),
+                inserts.map_or(0, Vec::len),
                 moves.map_or(0, Vec::len),
                 deletes.map_or(0, Vec::len),
+                if has_patch { ", patch" } else { "" },
                 paths.join(", "),
             )
         }
