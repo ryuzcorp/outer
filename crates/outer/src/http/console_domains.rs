@@ -94,6 +94,7 @@ async fn owner_app(
 /// fail closed on the admin-override path (a lost row answers 500 instead
 /// of success), refusals audit best-effort with a loud log on the admin
 /// path. A refused Pro-gated add is signal, not noise.
+#[allow(clippy::too_many_arguments)]
 async fn audit(
     pool: &sqlx::SqlitePool,
     account: &crate::auth::AccountRow,

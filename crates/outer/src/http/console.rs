@@ -448,6 +448,7 @@ pub(crate) async fn admin_guard(
 /// Where the mutation is truly gateable it is gated before: `api_delete`
 /// writes its durable `account_action` row first and keeps the app when
 /// the insert fails.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn audit_mutation(
     pool: &sqlx::SqlitePool,
     app_id: &str,

@@ -139,10 +139,7 @@ async fn api_logs_stream(
                 let live = crate::auth::account_from_session(&pool, &session)
                     .await
                     .ok()
-                    .flatten();
-                let Some(live) = live else {
-                    return None;
-                };
+                    .flatten()?;
                 if admin {
                     if !crate::auth::is_admin(&auth.config, &live.email) {
                         return None;
@@ -157,10 +154,7 @@ async fn api_logs_stream(
                     if !fresh {
                         return None;
                     }
-                    let still_there = crate::apps::get_by_slug(&pool, &slug).await.ok().flatten();
-                    if still_there.is_none() {
-                        return None;
-                    }
+                    crate::apps::get_by_slug(&pool, &slug).await.ok()??;
                 } else {
                     let visible = crate::apps::get_by_slug(&pool, &slug).await.ok()?;
                     let app = visible.as_ref()?;
@@ -307,13 +301,10 @@ async fn triage(
                     format!("{tool} {} issues", fingerprints.len())
                 };
                 let summary = super::console::audit_summary(account, &summary, admin);
-                if let Err(res) = super::console::audit_mutation(
+                super::console::audit_mutation(
                     pool, app_id, account, tool, &summary, "ok", None, 0, admin,
                 )
-                .await
-                {
-                    return Err(res);
-                }
+                .await?;
             }
             Ok(updated)
         }

@@ -421,6 +421,7 @@ pub async fn record(
 /// Insert one `agent_action` row for a console mutation, returning the
 /// insert result so admin-override paths can fail closed (a lost audit row
 /// on an admin act must surface as a 500, never a silent success).
+#[allow(clippy::too_many_arguments)]
 pub async fn try_record_console(
     pool: &SqlitePool,
     app_id: &str,
