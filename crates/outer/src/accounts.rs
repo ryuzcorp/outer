@@ -80,6 +80,36 @@ impl From<sqlx::Error> for AccountError {
     }
 }
 
+/// Insert one `account_action` row, returning the insert result so
+/// admin-override paths can fail closed (a lost audit row on an admin act
+/// must surface as a 500, never a silent success).
+pub async fn try_record_account_action(
+    pool: &SqlitePool,
+    user_id: &str,
+    tool: &str,
+    summary: &str,
+    outcome: &str,
+    error_code: Option<&str>,
+    started_ms: i64,
+) -> Result<(), sqlx::Error> {
+    let summary: String = summary.chars().take(2000).collect();
+    sqlx::query(
+        "INSERT INTO account_action (id, user_id, tool, summary, outcome, error_code, duration_ms, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(tool)
+    .bind(&summary)
+    .bind(outcome)
+    .bind(error_code)
+    .bind(now_ms().saturating_sub(started_ms).max(0))
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// One `account_action` row (migration 0005): the account-level equivalent
 /// of an `agent_action` row, with the MCP tool name and client "Console".
 /// A failed insert warns and the mutation result stands, like
@@ -93,20 +123,9 @@ pub async fn record_account_action(
     error_code: Option<&str>,
     started_ms: i64,
 ) {
-    let summary: String = summary.chars().take(2000).collect();
-    if let Err(err) = sqlx::query(
-        "INSERT INTO account_action (id, user_id, tool, summary, outcome, error_code, duration_ms, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    if let Err(err) = try_record_account_action(
+        pool, user_id, tool, summary, outcome, error_code, started_ms,
     )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(user_id)
-    .bind(tool)
-    .bind(&summary)
-    .bind(outcome)
-    .bind(error_code)
-    .bind(now_ms().saturating_sub(started_ms).max(0))
-    .bind(now_ms())
-    .execute(pool)
     .await
     {
         tracing::warn!(user = %user_id, tool, error = %format!("{err:#}"), "account_action insert failed");

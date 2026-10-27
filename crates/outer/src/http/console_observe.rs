@@ -63,7 +63,10 @@ pub fn routes() -> Router<super::AppState> {
 /// ignored here); `since` seeds the cursor, unset starts after the
 /// current tail. Every poll tick emits one `data: {"lines": [...]}` page
 /// (possibly empty), so the client just appends. The stream ends when the
-/// app stops being visible to the caller.
+/// caller stops being entitled to it: every tick re-verifies the session
+/// (live, unbanned), and admin streams additionally re-check the step-up
+/// window, the admin flag, and that the app still exists — reopening
+/// forces a fresh step-up check.
 async fn api_logs_stream(
     State(state): State<super::AppState>,
     headers: HeaderMap,
@@ -78,6 +81,15 @@ async fn api_logs_stream(
     let authz = match authorized_app(mcp, &account, &headers, &slug, Some("logs")).await {
         Ok(authz) => authz,
         Err(res) => return *res,
+    };
+    // The tick re-verifies against this session, so hold it: `guard` just
+    // proved it is present.
+    let Some(session) = crate::auth::session_from_headers(&headers) else {
+        return nostore_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "sign in at /console/sign-in",
+        );
     };
     let app = authz.app;
     let (filter, cursor, _) = match logs_query(&query) {
@@ -106,8 +118,8 @@ async fn api_logs_stream(
         (
             mcp.pool.clone(),
             mcp.fleets.clone(),
-            account.id.clone(),
-            account.email.clone(),
+            mcp.auth.clone(),
+            session,
             authz.admin,
             app.id.clone(),
             app.slug.clone(),
@@ -118,8 +130,8 @@ async fn api_logs_stream(
         move |(
             pool,
             fleets,
-            account_id,
-            account_email,
+            auth,
+            session,
             admin,
             app_id,
             slug,
@@ -127,23 +139,49 @@ async fn api_logs_stream(
             mut cursor,
             mut first,
         )| async move {
-            // The visibility check runs every tick: an app deleted,
-            // transferred, or unshared mid-follow ends the stream
-            // instead of leaking lines to a caller with no role left.
-            // Admins stream through the override they opened with (the
-            // step-up was checked at open); everyone else re-checks the
-            // collaborator role.
+            // Re-verified every tick: a revoked or expired session, or a
+            // ban, ends the stream for everyone (reopening signs in
+            // again). Admin streams additionally re-check the step-up
+            // window, the admin flag, and that the app still exists: the
+            // step-up was only checked at open, and must not leak future
+            // lines past its lapse.
             loop {
                 tokio::time::sleep(Duration::from_secs(FOLLOW_POLL_SECS)).await;
-                if !admin {
+                let live = crate::auth::account_from_session(&pool, &session)
+                    .await
+                    .ok()
+                    .flatten();
+                let Some(live) = live else {
+                    return None;
+                };
+                if admin {
+                    if !crate::auth::is_admin(&auth.config, &live.email) {
+                        return None;
+                    }
+                    let fresh = crate::auth::session_created_at(&pool, &session)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|created| {
+                            crate::auth::now_ms() - created <= crate::auth::ADMIN_STEP_UP_MS
+                        });
+                    if !fresh {
+                        return None;
+                    }
+                    let still_there =
+                        crate::apps::get_by_slug(&pool, &slug).await.ok().flatten();
+                    if still_there.is_none() {
+                        return None;
+                    }
+                } else {
                     let visible = crate::apps::get_by_slug(&pool, &slug).await.ok()?;
                     let app = visible.as_ref()?;
                     crate::collaborators::role(
                         &pool,
                         &app.id,
                         &app.owner_id,
-                        &account_id,
-                        &account_email,
+                        &live.id,
+                        &live.email,
                     )
                     .await
                     .ok()??;
@@ -170,8 +208,8 @@ async fn api_logs_stream(
                     let state = (
                         pool,
                         fleets,
-                        account_id,
-                        account_email,
+                        auth,
+                        session,
                         admin,
                         app_id,
                         slug,
@@ -289,17 +327,15 @@ async fn triage(
                 } else {
                     format!("{tool} {} issues", fingerprints.len())
                 };
-                crate::mcp::actions::record_console(
-                    pool,
-                    app_id,
-                    &account.id,
-                    tool,
-                    &super::console::audit_summary(account, &summary, admin),
-                    "ok",
-                    None,
-                    0,
+                let summary =
+                    super::console::audit_summary(account, &summary, admin);
+                if let Err(res) = super::console::audit_mutation(
+                    pool, app_id, account, tool, &summary, "ok", None, 0, admin,
                 )
-                .await;
+                .await
+                {
+                    return Err(res);
+                }
             }
             Ok(updated)
         }

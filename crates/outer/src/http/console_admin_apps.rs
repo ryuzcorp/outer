@@ -9,9 +9,12 @@
 //!
 //! From here the admin opens any app in the normal Console app views (see
 //! [`super::console::authorized_app`]): the same handlers and code paths,
-//! owner-equivalent through the single authorization point. The list itself
-//! writes no audit rows (it is the directory, not app content); opening an
-//! app audits the access, and every mutation audits itself.
+//! owner-equivalent through the single authorization point. The directory
+//! read itself writes one throttled `account_action` row per admin
+//! (`admin_list_apps`, at most one per minute — the list is the
+//! bulk-enumeration surface, so every page is traceable without flooding
+//! the log on fast paging); opening an app audits the access, and every
+//! mutation audits itself.
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -132,6 +135,7 @@ async fn api_list(
         }),
         false => (&rows[..], None),
     };
+    audit_list(&mcp.pool, &account, &q, query.state.as_deref(), query.plan.as_deref()).await;
     ok_json(serde_json::json!({
         "apps": page.iter().map(|row| {
             let mut v = serde_json::json!({
@@ -156,6 +160,49 @@ async fn api_list(
         }).collect::<Vec<_>>(),
         "next": next,
     }))
+}
+
+/// One throttled `account_action` row per admin directory read (tool
+/// `admin_list_apps`, under the admin's own account): the list is the
+/// bulk-enumeration surface, so every page is traceable. At most one row
+/// per minute per admin — fast paging must not flood the log, and the
+/// per-minute list rate limit bounds the read itself. Best-effort like any
+/// read audit: a lost row warns, the directory still answers.
+async fn audit_list(
+    pool: &sqlx::SqlitePool,
+    account: &AccountRow,
+    q: &str,
+    state: Option<&str>,
+    plan: Option<&str>,
+) {
+    let now = crate::auth::now_ms();
+    let recent: Option<(i64,)> = sqlx::query_as(
+        "SELECT created_at FROM account_action \
+         WHERE user_id = ?1 AND tool = 'admin_list_apps' AND created_at > ?2 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&account.id)
+    .bind(now - LIST_WINDOW_MS)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if recent.is_some() {
+        return;
+    }
+    crate::accounts::record_account_action(
+        pool,
+        &account.id,
+        "admin_list_apps",
+        &format!(
+            "admin_list_apps q={q:?} state={} plan={}",
+            state.unwrap_or("-"),
+            plan.unwrap_or("-"),
+        ),
+        "ok",
+        None,
+        now,
+    )
+    .await;
 }
 
 /// One directory row: the app, its owner's email and plan, and the latest
@@ -744,5 +791,35 @@ mod tests {
             "no secret value leaves the server: {body}"
         );
         assert!(!body.contains("sk-"), "no secret value leaves the server");
+    }
+
+    #[tokio::test]
+    async fn admin_list_writes_one_throttled_audit_row() {
+        let (app, pool, admin, _, _) = harness().await;
+        // Two rapid page reads ...
+        for _ in 0..2 {
+            let (status, _) = send(&app, authed("/api/console/admin/apps", &admin)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        // ... land a single throttled row under the admin's own account.
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT user_id, tool, summary FROM account_action WHERE tool = 'admin_list_apps'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "one throttled row, got: {rows:?}");
+        assert_eq!(rows[0].0, "acct-owner@example.com", "attributed to the admin");
+        // And the admin audit view surfaces it.
+        let (status, body) = send(&app, authed("/api/console/admin/audit", &admin)).await;
+        assert_eq!(status, StatusCode::OK);
+        let actions = body.parse::<serde_json::Value>().unwrap()["actions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            actions.iter().any(|a| a["tool"] == "admin_list_apps"),
+            "audit view carries the list read: {body}"
+        );
     }
 }

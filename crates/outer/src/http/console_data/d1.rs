@@ -1739,17 +1739,21 @@ async fn api_write(
         | Err(D1Error::UnknownDatabase(_)) => ("error", Some("invalid_argument")),
         Err(_) => ("error", Some("d1_unavailable")),
     };
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_write",
-        &crate::http::console::audit_summary(&account, &summary, admin),
-        o,
-        code,
-        0,
-    )
-    .await;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if outcome.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool, &app.id, &account, "d1_write", &summary, o, code, 0, admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool, &app.id, &account, "d1_write", &summary, code, 0, admin,
+        )
+        .await;
+    }
     d1_response(result)
 }
 
@@ -1804,17 +1808,21 @@ async fn api_delete_rows(
         | Err(D1Error::UnknownDatabase(_)) => ("error", Some("invalid_argument")),
         Err(_) => ("error", Some("d1_unavailable")),
     };
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_delete_rows",
-        &crate::http::console::audit_summary(&account, &summary, admin),
-        o,
-        code,
-        0,
-    )
-    .await;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if outcome.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool, &app.id, &account, "d1_delete_rows", &summary, o, code, 0, admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool, &app.id, &account, "d1_delete_rows", &summary, code, 0, admin,
+        )
+        .await;
+    }
     d1_response(result)
 }
 

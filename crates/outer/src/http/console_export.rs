@@ -102,22 +102,44 @@ async fn api_export(
     )
     .await;
     // Audited like the MCP tool (client "Console": both ids NULL). A
-    // refused Pro-gated export is signal, not noise.
+    // refused Pro-gated export is signal, not noise. Success on the
+    // admin-override path is fail-closed: a lost row answers 500.
     let (outcome_str, error_code) = match &outcome {
         Ok(_) => ("ok", None),
         Err(err) => ("error", Some(err.code)),
     };
-    crate::mcp::actions::record_console(
-        &state.mcp.pool,
-        &app.id,
-        &account.id,
-        "export_code",
-        &super::console::audit_summary(&account, &format!("export_code {}", app.slug), admin),
-        outcome_str,
-        error_code,
-        started.elapsed().as_millis().min(u128::from(u64::MAX)) as i64,
-    )
-    .await;
+    let summary =
+        super::console::audit_summary(&account, &format!("export_code {}", app.slug), admin);
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as i64;
+    if outcome.is_ok() {
+        if let Err(res) = super::console::audit_mutation(
+            &state.mcp.pool,
+            &app.id,
+            &account,
+            "export_code",
+            &summary,
+            outcome_str,
+            error_code,
+            duration_ms,
+            admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        super::console::audit_console_refusal(
+            &state.mcp.pool,
+            &app.id,
+            &account,
+            "export_code",
+            &summary,
+            error_code,
+            duration_ms,
+            admin,
+        )
+        .await;
+    }
     match outcome {
         Ok(outcome) => super::console::ok_json(json!({
             "url": outcome.url,

@@ -423,17 +423,90 @@ async fn api_me(State(state): State<super::AppState>, headers: HeaderMap) -> Res
         .into_response()
 }
 
-/// The `guard` plus the admin check: non-admins get 403, decided by the
-/// `OUTER_ADMIN_EMAILS` config like everywhere else.
+/// The `guard` plus the admin check. Signed-in non-admins get the same 404
+/// as an unknown slug — a 403 would oracle the admin surface (the admin
+/// app directory already hides behind 404 for this reason). Unauthenticated
+/// callers still get 401 from `guard`, and cross-site requests 403.
 pub(crate) async fn admin_guard(
     auth: &AuthState,
     headers: &HeaderMap,
 ) -> Result<AccountRow, Box<Response>> {
     let account = guard(auth, headers).await?;
     if !crate::auth::is_admin(&auth.config, &account.email) {
-        return Err(nostore_json(StatusCode::FORBIDDEN, "forbidden", "admin only").into());
+        return Err(not_found().into());
     }
     Ok(account)
+}
+/// Audit one console mutation, fail-closed on the admin-override path: when
+/// `admin` is true the audit insert must land — a failure logs loudly and
+/// the caller answers 500 instead of reporting success. Owner and
+/// collaborator paths keep the existing best-effort behaviour. Note the
+/// ordering: the mutation itself runs first (most console mutations have
+/// non-transactional side effects — deploys, DNS, fleet stops — so the
+/// audit cannot gate them), which means a failed admin audit surfaces as
+/// a loud 500 for an already-applied change, never as silent success.
+/// Where the mutation is truly gateable it is gated before: `api_delete`
+/// writes its durable `account_action` row first and keeps the app when
+/// the insert fails.
+pub(crate) async fn audit_mutation(
+    pool: &sqlx::SqlitePool,
+    app_id: &str,
+    account: &AccountRow,
+    tool: &str,
+    summary: &str,
+    outcome: &str,
+    error_code: Option<&str>,
+    duration_ms: i64,
+    admin: bool,
+) -> Result<(), Box<Response>> {
+    if !admin {
+        crate::mcp::actions::record_console(
+            pool, app_id, &account.id, tool, summary, outcome, error_code, duration_ms,
+        )
+        .await;
+        return Ok(());
+    }
+    if let Err(err) = crate::mcp::actions::try_record_console(
+        pool, app_id, &account.id, tool, summary, outcome, error_code, duration_ms,
+    )
+    .await
+    {
+        tracing::error!(user = %account.id, tool, error = %format!("{err:#}"), "admin console action audit failed");
+        return Err(nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not record the admin action right now",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Audit one refused console mutation: best-effort for everyone — refusing
+/// is already the closed outcome — but a lost row on the admin path logs
+/// loudly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn audit_console_refusal(
+    pool: &sqlx::SqlitePool,
+    app_id: &str,
+    account: &AccountRow,
+    tool: &str,
+    summary: &str,
+    error_code: Option<&str>,
+    duration_ms: i64,
+    admin: bool,
+) {
+    if let Err(err) = crate::mcp::actions::try_record_console(
+        pool, app_id, &account.id, tool, summary, "error", error_code, duration_ms,
+    )
+    .await
+    {
+        if admin {
+            tracing::error!(user = %account.id, tool, error = %format!("{err:#}"), "admin console refusal audit failed");
+        } else {
+            tracing::warn!(user = %account.id, tool, error = %format!("{err:#}"), "console refusal audit failed");
+        }
+    }
 }
 
 fn invite_json(row: &crate::auth::invites::InviteRow) -> serde_json::Value {
@@ -2954,16 +3027,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn console_admin_endpoints_forbid_non_admins() {
+    async fn console_admin_endpoints_hide_from_non_admins() {
         let (app, pool, _, _) = test_app().await;
         seed_account(&pool, "ana@example.com").await;
         let ana = login(&pool, "ana@example.com").await;
 
+        // Signed-in non-admins read 404, never 403: a 403 would oracle the
+        // admin surface.
         let (status, _, body) = send(&app, authed("/api/console/admin/invites", &ana)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
             body.parse::<serde_json::Value>().unwrap()["error"],
-            "forbidden"
+            "not_found"
         );
         let (status, _, _) = send(
             &app,
@@ -2974,7 +3049,7 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(
             &app,
             post_json(
@@ -2984,9 +3059,9 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(&app, authed("/api/console/admin/waitlist", &ana)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -4048,5 +4123,372 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let body: serde_json::Value = body.parse().unwrap();
         assert_eq!(body["deletes_at"], deadline(&pool, "groceries").await);
+    }
+
+    // --- Admin-override hardening (spec §15.3 review fixes) ---
+    //
+    // No migration: the durable admin audit reuses `account_action`
+    // (migration 0005), which carries no app foreign key, so its rows
+    // survive an app delete. Per-app admin reads and mutations stay in
+    // that app's `agent_action` log with the `admin <email>:` prefix.
+
+    #[tokio::test]
+    async fn admin_delete_leaves_owner_visible_audit() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_account(&pool, "owner@example.com").await;
+        let admin = login(&pool, "owner@example.com").await;
+        let ana = login(&pool, "ana@example.com").await;
+
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/delete",
+                &admin,
+                serde_json::json!({"confirm": "groceries"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The app row — and any `agent_action` row — is gone ...
+        let gone: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM app WHERE slug = 'groceries'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(gone.is_none(), "the app itself is deleted");
+
+        // ... but the durable copy survives, keyed to the owner's account,
+        // naming the slug, the app id, the owner, and the admin.
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT user_id, tool, summary FROM account_action WHERE tool = 'admin_delete_app'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one durable delete row");
+        assert_eq!(rows[0].0, "acct-ana@example.com", "keyed to the owner");
+        assert!(
+            rows[0].2.contains("owner@example.com") && rows[0].2.contains("groceries"),
+            "summary names the admin and the slug, got: {}",
+            rows[0].2
+        );
+
+        // The owner reads it in the Console account area ...
+        let (status, _, body) = send(&app, authed("/api/console/account/actions", &ana)).await;
+        assert_eq!(status, StatusCode::OK);
+        let actions = body.parse::<serde_json::Value>().unwrap()["actions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            actions.iter().any(|a| a["tool"] == "admin_delete_app"),
+            "owner sees the admin delete, got: {actions:?}"
+        );
+
+        // ... and admins in the admin audit view.
+        let (status, _, body) = send(&app, authed("/api/console/admin/audit", &admin)).await;
+        assert_eq!(status, StatusCode::OK);
+        let actions = body.parse::<serde_json::Value>().unwrap()["actions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            actions.iter().any(|a| a["tool"] == "admin_delete_app"),
+            "admin sees the delete in the audit view, got: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_delete_leaves_account_audit() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let ana = login(&pool, "ana@example.com").await;
+
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/delete",
+                &ana,
+                serde_json::json!({"confirm": "groceries"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT user_id, tool FROM account_action WHERE tool = 'delete_app'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "acct-ana@example.com");
+    }
+
+    #[tokio::test]
+    async fn admin_delete_fails_closed_when_audit_lost() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) \
+             VALUES ('app-shop', 'shop', 'acct-ana@example.com', 300002, 18002, 18003, ?1, ?1)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_account(&pool, "owner@example.com").await;
+        let admin = login(&pool, "owner@example.com").await;
+        let ana = login(&pool, "ana@example.com").await;
+        sqlx::query("DROP TABLE account_action")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Admin path: 500 and the app is kept.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/delete",
+                &admin,
+                serde_json::json!({"confirm": "groceries"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let kept: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM app WHERE slug = 'groceries'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(kept.is_some(), "failed admin audit keeps the app");
+
+        // Owner path: best-effort, the delete still goes through.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/shop/delete",
+                &ana,
+                serde_json::json!({"confirm": "shop"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_cannot_grant_collaborator_access() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_account(&pool, "owner@example.com").await;
+        let admin = login(&pool, "owner@example.com").await;
+        let ana = login(&pool, "ana@example.com").await;
+
+        // The admin cannot invite themselves (or anyone) ...
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators",
+                &admin,
+                serde_json::json!({"email": "owner@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["error"],
+            "forbidden"
+        );
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM app_collaborator WHERE app_id = 'app-groceries'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 0, "no collaborator row is created");
+        // ... and the refusal is audited with the admin prefix.
+        let refused: Vec<(String,)> = sqlx::query_as(
+            "SELECT summary FROM agent_action WHERE tool = 'add_collaborator' AND outcome = 'error'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].0.starts_with("admin owner@example.com:"),
+            "admin prefix, got: {}",
+            refused[0].0
+        );
+
+        // The true owner can still invite ...
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators",
+                &ana,
+                serde_json::json!({"email": "bruno@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // ... and the admin cannot remove that grant either.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/collaborators/remove",
+                &admin,
+                serde_json::json!({"email": "bruno@example.com"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM app_collaborator WHERE app_id = 'app-groceries' AND email = 'bruno@example.com'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "the owner's grant survives");
+    }
+
+    #[tokio::test]
+    async fn admin_mutation_fails_closed_when_audit_lost() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_account(&pool, "owner@example.com").await;
+        let admin = login(&pool, "owner@example.com").await;
+        let ana = login(&pool, "ana@example.com").await;
+        sqlx::query("DROP TABLE agent_action")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Admin path: the mutation is not reported as success.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/console/apps/groceries/rename",
+                &admin,
+                serde_json::json!({"slug": "shop2"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Owner path: best-effort, the rename still answers success. (The
+        // admin rename above applied server-side before its audit failed —
+        // the 500 is the loud signal, never silent success — so the owner
+        // continues from the renamed slug.)
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                "/api/console/apps/shop2/rename",
+                &ana,
+                serde_json::json!({"slug": "shop3"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "owner rename survives audit loss: {body}");
+    }
+
+    async fn open_stream(app: &Router, path: &str, cookie: &str) -> axum::body::Body {
+        let res = app
+            .clone()
+            .oneshot(peer(authed(path, cookie)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        res.into_body()
+    }
+
+    async fn first_frame(body: &mut axum::body::Body) {
+        use http_body_util::BodyExt as _;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), body.frame())
+            .await
+            .expect("first tick")
+            .expect("frame ok")
+            .expect("first frame");
+        let chunk = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(chunk.starts_with("data: "), "SSE data frame, got: {chunk}");
+    }
+
+    async fn expect_stream_end(body: &mut axum::body::Body, why: &str) {
+        use http_body_util::BodyExt as _;
+        let end = tokio::time::timeout(std::time::Duration::from_secs(10), body.frame())
+            .await
+            .expect("stream ends promptly");
+        assert!(end.is_none(), "{why}");
+    }
+
+    #[tokio::test]
+    async fn admin_stream_ends_when_step_up_lapses() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_account(&pool, "owner@example.com").await;
+        seed_log(&pool, 0, now / 1000, "stdout", "serving").await;
+        let admin = login(&pool, "owner@example.com").await;
+        let mut body = open_stream(&app, "/api/console/apps/groceries/logs/stream", &admin).await;
+        first_frame(&mut body).await;
+        // The 15-minute step-up lapses mid-stream; a new line arrives after.
+        let stale = now - crate::auth::ADMIN_STEP_UP_MS - 60_000;
+        sqlx::query("UPDATE session SET createdAt = ?1")
+            .bind(stale)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_log(&pool, 1, now / 1000, "stdout", "after the lapse").await;
+        // The stream ends instead of leaking the new line.
+        expect_stream_end(&mut body, "stale admin stream must end").await;
+    }
+
+    #[tokio::test]
+    async fn admin_stream_ends_when_app_deleted() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_account(&pool, "owner@example.com").await;
+        seed_log(&pool, 0, now / 1000, "stdout", "serving").await;
+        let admin = login(&pool, "owner@example.com").await;
+        let mut body = open_stream(&app, "/api/console/apps/groceries/logs/stream", &admin).await;
+        first_frame(&mut body).await;
+        sqlx::query("DELETE FROM app WHERE slug = 'groceries'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_log(&pool, 1, now / 1000, "stdout", "after the delete").await;
+        expect_stream_end(&mut body, "deleted-app admin stream must end").await;
+    }
+
+    #[tokio::test]
+    async fn stream_ends_when_caller_banned() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_log(&pool, 0, now / 1000, "stdout", "serving").await;
+        let ana = login(&pool, "ana@example.com").await;
+        let mut body = open_stream(&app, "/api/console/apps/groceries/logs/stream", &ana).await;
+        first_frame(&mut body).await;
+        sqlx::query("UPDATE user SET banned = 1 WHERE email = 'ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_log(&pool, 1, now / 1000, "stdout", "after the ban").await;
+        expect_stream_end(&mut body, "banned caller stream must end").await;
     }
 }

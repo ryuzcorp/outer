@@ -6,9 +6,10 @@
 //! `/api/console/admin/apps/:slug/code/…`, and call the same `*_for`
 //! domain functions — no second implementation, same bounds and errors.
 //! Every read is audited with [`crate::mcp::actions::record_console`]
-//! under the matching `code_*` console action name. Non-admins get the
-//! `admin_guard` 403; unknown slugs get the owner-scoped 404, and slugs
-//! the caller has no role on but is not admin for are unreachable here.
+//! under the matching `code_*` console action name. Signed-in non-admins
+//! get the same owner-scoped 404 as unknown slugs, so the mirror routes do
+//! not oracle the admin surface; slugs the caller has no role on but is
+//! not admin for are unreachable here.
 //!
 //! There are no writes on these routes: no data panels, no secrets, no
 //! deploys.
@@ -47,8 +48,9 @@ pub fn routes() -> Router<AppState> {
 /// Console authorization point ([`super::console::authorized_app`]): the
 /// admin needs a recent session (step-up) for apps they have no role on,
 /// audited per read below. Unknown slugs answer 404 like the role-scoped
-/// routes; non-admins keep the `admin_guard` 403 like the other admin
-/// endpoints. Reads audit themselves, so no read label.
+/// routes, and so do signed-in non-admins (via `admin_guard`), so the
+/// mirror routes do not oracle the admin surface. Reads audit themselves,
+/// so no read label.
 async fn admin_app(
     mcp: &McpState,
     headers: &HeaderMap,
@@ -454,17 +456,17 @@ mod tests {
     async fn admin_code_stays_admin_only() {
         let (app, _, admin, stranger, _) = harness().await;
 
-        // A non-admin on the admin routes reads 403, like the other admin
-        // endpoints — even though they could read nothing anyway.
+        // A non-admin on the admin routes reads the same 404 as an unknown
+        // slug, so the mirror routes do not oracle the admin surface.
         let (status, body) = send(
             &app,
             authed("/api/console/admin/apps/groceries/code/tree", &stranger),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
             body.parse::<serde_json::Value>().unwrap()["error"],
-            "forbidden"
+            "not_found"
         );
 
         // No session at all is 401, not 404: the guard runs before lookup.

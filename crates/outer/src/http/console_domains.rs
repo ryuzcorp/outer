@@ -90,10 +90,10 @@ async fn owner_app(
     }
 }
 
-/// One `agent_action` row through the single console audit writer
-/// ([`crate::mcp::actions::record_console`], client "Console"): successes
-/// and refusals both land, like the MCP path. A refused Pro-gated add is
-/// signal, not noise.
+/// One `agent_action` row through the single console audit policy: successes
+/// fail closed on the admin-override path (a lost row answers 500 instead
+/// of success), refusals audit best-effort with a loud log on the admin
+/// path. A refused Pro-gated add is signal, not noise.
 async fn audit(
     pool: &sqlx::SqlitePool,
     account: &crate::auth::AccountRow,
@@ -102,18 +102,21 @@ async fn audit(
     summary: &str,
     outcome: (&str, Option<&str>),
     started: Instant,
-) {
-    crate::mcp::actions::record_console(
-        pool,
-        &app.id,
-        &account.id,
-        tool,
-        summary,
-        outcome.0,
-        outcome.1,
-        started.elapsed().as_millis().min(u128::from(u64::MAX)) as i64,
-    )
-    .await;
+    admin: bool,
+) -> Result<(), Box<Response>> {
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as i64;
+    if outcome.0 == "ok" {
+        super::console::audit_mutation(
+            pool, &app.id, account, tool, summary, outcome.0, outcome.1, duration_ms, admin,
+        )
+        .await
+    } else {
+        super::console::audit_console_refusal(
+            pool, &app.id, account, tool, summary, outcome.1, duration_ms, admin,
+        )
+        .await;
+        Ok(())
+    }
 }
 
 async fn api_list(
@@ -222,7 +225,7 @@ async fn api_add(
         Ok(_) => ("ok", None),
         Err(err) => ("error", Some(err.code())),
     };
-    audit(
+    if let Err(res) = audit(
         &state.mcp.pool,
         &account,
         &app,
@@ -230,8 +233,12 @@ async fn api_add(
         &super::console::audit_summary(&account, &format!("add_domain {hostname}"), admin),
         (outcome_str, error_code),
         started,
+        admin,
     )
-    .await;
+    .await
+    {
+        return *res;
+    }
     match outcome {
         Ok(view) => super::console::ok_json(json!({"domain": domain_json(&view)})),
         Err(err) => super::console_actions::tool_response(
@@ -289,7 +296,7 @@ async fn api_remove(
         Ok(_) => ("ok", None),
         Err(err) => ("error", Some(err.code())),
     };
-    audit(
+    if let Err(res) = audit(
         &state.mcp.pool,
         &account,
         &app,
@@ -297,8 +304,12 @@ async fn api_remove(
         &super::console::audit_summary(&account, "remove_domain", admin),
         (outcome_str, error_code),
         started,
+        admin,
     )
-    .await;
+    .await
+    {
+        return *res;
+    }
     match outcome {
         Ok(hostname) => super::console::ok_json(json!({"removed": hostname})),
         Err(err) => super::console_actions::tool_response(

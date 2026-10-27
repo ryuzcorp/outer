@@ -943,38 +943,29 @@ async fn api_put(
             // above read it, so the upload's bytes join it now. Best effort —
             // a write failure here must not fail an upload that succeeded.
             adjust_r2_measured(&state.mcp.pool, &app.id, size as i64).await;
-            crate::mcp::actions::record_console(
-                &state.mcp.pool,
-                &app.id,
-                &account.id,
-                "r2_put",
-                &super::super::console::audit_summary(
-                    &account,
-                    &format!("r2_put {} {} ({} bytes)", query.bucket, query.key, size),
-                    admin,
-                ),
-                "ok",
-                None,
-                0,
+            let summary = super::super::console::audit_summary(
+                &account,
+                &format!("r2_put {} {} ({} bytes)", query.bucket, query.key, size),
+                admin,
+            );
+            if let Err(res) = super::super::console::audit_mutation(
+                &state.mcp.pool, &app.id, &account, "r2_put", &summary, "ok", None, 0, admin,
             )
-            .await;
+            .await
+            {
+                return *res;
+            }
             super::ok(serde_json::json!({"key": query.key, "size": size}))
         }
         Err(err) => {
             let msg = format!("{err:#}");
-            crate::mcp::actions::record_console(
-                &state.mcp.pool,
-                &app.id,
-                &account.id,
-                "r2_put",
-                &super::super::console::audit_summary(
-                    &account,
-                    &format!("r2_put {} {}", query.bucket, query.key),
-                    admin,
-                ),
-                "error",
-                None,
-                0,
+            let summary = super::super::console::audit_summary(
+                &account,
+                &format!("r2_put {} {}", query.bucket, query.key),
+                admin,
+            );
+            super::super::console::audit_console_refusal(
+                &state.mcp.pool, &app.id, &account, "r2_put", &summary, None, 0, admin,
             )
             .await;
             status_for(&msg, "Couldn't upload right now. Try again.")
@@ -1037,38 +1028,29 @@ async fn api_delete(
             // live instead of refusing against a stale-high number. Best
             // effort, like the put-side adjustment.
             clear_r2_measured(&state.mcp.pool, &app.id).await;
-            crate::mcp::actions::record_console(
-                &state.mcp.pool,
-                &app.id,
-                &account.id,
-                "r2_delete",
-                &super::super::console::audit_summary(
-                    &account,
-                    &format!("r2_delete {} ({} keys)", body.bucket, count),
-                    admin,
-                ),
-                "ok",
-                None,
-                0,
+            let summary = super::super::console::audit_summary(
+                &account,
+                &format!("r2_delete {} ({} keys)", body.bucket, count),
+                admin,
+            );
+            if let Err(res) = super::super::console::audit_mutation(
+                &state.mcp.pool, &app.id, &account, "r2_delete", &summary, "ok", None, 0, admin,
             )
-            .await;
+            .await
+            {
+                return *res;
+            }
             super::ok(serde_json::json!({"deleted": count}))
         }
         Err(err) => {
             let msg = format!("{err:#}");
-            crate::mcp::actions::record_console(
-                &state.mcp.pool,
-                &app.id,
-                &account.id,
-                "r2_delete",
-                &super::super::console::audit_summary(
-                    &account,
-                    &format!("r2_delete {}", body.bucket),
-                    admin,
-                ),
-                "error",
-                None,
-                0,
+            let summary = super::super::console::audit_summary(
+                &account,
+                &format!("r2_delete {}", body.bucket),
+                admin,
+            );
+            super::super::console::audit_console_refusal(
+                &state.mcp.pool, &app.id, &account, "r2_delete", &summary, None, 0, admin,
             )
             .await;
             status_for(&msg, "Couldn't delete right now. Try again.")

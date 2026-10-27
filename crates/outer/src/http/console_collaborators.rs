@@ -104,7 +104,10 @@ async fn api_collaborators(
 
 /// The owner check behind the two mutations: no role reads 404 (spec §8.2),
 /// a collaborator reads 403 (spec §8.2 table: owner-only). The admin
-/// override reports the owner role, so admins pass this check.
+/// override reports the owner role, but managing access itself stays with
+/// the true owner: an admin invite or removal would mint a step-up-free,
+/// unaudited foothold (or lock the owner out), so the admin path is refused
+/// below and the refusal is audited.
 async fn owner_app(
     mcp: &McpState,
     account: &AccountRow,
@@ -125,7 +128,44 @@ async fn owner_app(
     }
 }
 
-/// `POST /api/console/apps/:slug/collaborators {email}`.
+/// Refuse a collaborator add/remove that arrived through the admin override,
+/// and audit the refusal. Access management stays with the true owner: an
+/// admin could otherwise grant themselves (or a sockpuppet) a permanent,
+/// step-up-free collaborator role. The 403 itself is the closed outcome, so
+/// the audit is best-effort — but a lost row logs loudly.
+async fn refuse_admin_access_change(
+    mcp: &McpState,
+    account: &AccountRow,
+    app: &crate::apps::App,
+    tool: &str,
+    email: &str,
+) -> Response {
+    if let Err(err) = crate::mcp::actions::try_record_console(
+        &mcp.pool,
+        &app.id,
+        &account.id,
+        tool,
+        &super::console::audit_summary(
+            account,
+            &format!("{tool} {email} refused: admin cannot manage collaborators"),
+            true,
+        ),
+        "error",
+        Some("forbidden"),
+        0,
+    )
+    .await
+    {
+        tracing::error!(user = %account.id, tool, error = %format!("{err:#}"), "admin collaborator-refusal audit failed");
+    }
+    nostore_json_user(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        "admins cannot manage collaborators",
+        "Only the app owner can invite or remove collaborators. Admin access is read-and-mutate, never grant.",
+    )
+}
+
 async fn api_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -155,6 +195,10 @@ async fn api_invite(
         Ok(pair) => pair,
         Err(res) => return *res,
     };
+    if admin {
+        return refuse_admin_access_change(mcp, &account, &app, "add_collaborator", &body.email)
+            .await;
+    }
     match collaborators::add(
         &mcp.pool,
         &mcp.auth.config.email,
@@ -251,6 +295,10 @@ async fn api_remove(
         Ok(pair) => pair,
         Err(res) => return *res,
     };
+    if admin {
+        return refuse_admin_access_change(mcp, &account, &app, "remove_collaborator", &body.email)
+            .await;
+    }
     let email = crate::auth::normalize_email(&body.email);
     match collaborators::remove(&mcp.pool, &app.id, &email).await {
         Ok(true) => {

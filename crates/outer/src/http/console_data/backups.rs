@@ -159,17 +159,22 @@ async fn api_backup_now(
         Err(err) => (format!("failed d1 backup on {binding}"), Err(err)),
     };
     let (o, code) = audit_outcome(&result);
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_backup",
-        &crate::http::console::audit_summary(&account, &summary, admin),
-        o,
-        code,
-        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-    )
-    .await;
+    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if result.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool, &app.id, &account, "d1_backup", &summary, o, code, duration_ms, admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool, &app.id, &account, "d1_backup", &summary, code, duration_ms, admin,
+        )
+        .await;
+    }
     d1_response(result)
 }
 
@@ -298,16 +303,21 @@ async fn api_restore(
         Err(err) => (format!("failed d1 restore on {binding}"), Err(err)),
     };
     let (o, code) = audit_outcome(&result);
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_restore",
-        &crate::http::console::audit_summary(&account, &summary, admin),
-        o,
-        code,
-        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-    )
-    .await;
+    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if result.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool, &app.id, &account, "d1_restore", &summary, o, code, duration_ms, admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool, &app.id, &account, "d1_restore", &summary, code, duration_ms, admin,
+        )
+        .await;
+    }
     d1_response(result)
 }
