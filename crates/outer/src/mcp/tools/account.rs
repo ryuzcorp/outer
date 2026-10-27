@@ -326,6 +326,9 @@ pub async fn delete_account(input: DeleteAccountInput, ctx: &Ctx<'_>) -> Result<
     let out = crate::accounts::delete_account(&deps, &caller.account_id, &input.confirm)
         .await
         .map_err(|err| ToolError::new(err.code, err.message).with_user(err.user_message))?;
+    // Owned apps (and their uids) are gone: reinstall at once (best-effort;
+    // the sweep tick is the backstop).
+    ctx.state.egress.refresh(&ctx.state.pool).await;
     Ok(ok(
         format!("Account {} deleted.", out.email),
         json!({"deleted": true, "email": out.email, "deleted_apps": out.deleted_apps}),

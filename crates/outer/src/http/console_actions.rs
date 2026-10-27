@@ -319,6 +319,9 @@ async fn api_delete(
         .await
     {
         Ok(out) => {
+            // The uid set changed: reinstall at once (best-effort; the
+            // sweep tick is the backstop).
+            mcp.egress.refresh(&mcp.pool).await;
             let host = format!("{}.{}", out.slug, mcp.delete_cfg.apps_domain);
             ok_json(json!({
                 "deleted": true,

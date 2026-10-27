@@ -14,6 +14,11 @@ cargo test --locked
 OUTER_STORE=memory cargo run -- serve   # http://127.0.0.1:8080/health
 ```
 
+Localhost `serve` warns and runs without the per-app nft egress policy
+(`table inet outer` needs root + `CAP_NET_ADMIN`); set
+`OUTER_EGRESS_FIREWALL=off` to silence it. Production refuses to boot
+without the policy.
+
 CI (`.github/workflows/ci.yml`) runs exactly the first three. A PR is ready when they pass locally.
 
 ## Hostile suite (spec §12.7 beta gate)

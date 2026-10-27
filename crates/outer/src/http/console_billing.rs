@@ -128,6 +128,7 @@ async fn api_webhook(
         saas: crate::cloudflare::CustomHostnames::from_purge(mcp.delete_cfg.cache_purge.as_ref()),
         purge: mcp.delete_cfg.cache_purge.clone(),
         apps_domain: mcp.delete_cfg.apps_domain.clone(),
+        egress: mcp.egress.clone(),
     };
     match crate::billing::apply_event(&ctx, id, kind, &object, now_secs).await {
         Err(err) => {

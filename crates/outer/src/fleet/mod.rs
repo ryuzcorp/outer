@@ -2,6 +2,7 @@
 //! supervision and health.
 
 pub mod cgroups;
+pub mod egress;
 pub mod health;
 pub mod manager;
 pub mod nft;
