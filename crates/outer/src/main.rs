@@ -212,6 +212,23 @@ fn fleet_storage(config: &Config) -> anyhow::Result<FleetStorage> {
     })
 }
 
+/// Build the per-app egress handle from config plus the storage endpoint and
+/// install `table inet outer` before any fleet or build runs. Fails closed
+/// in production (`boot` bails); on a localhost dev domain a failed install
+/// logs loudly and stands down.
+async fn boot_egress(
+    pool: &sqlx::SqlitePool,
+    mode: outer::fleet::egress::EgressMode,
+    uid_range: (u32, u32),
+    storage_endpoint: &str,
+    local: bool,
+) -> anyhow::Result<outer::fleet::egress::EgressFirewall> {
+    let (host, port) = outer::fleet::egress::split_host_port(storage_endpoint);
+    let egress = outer::fleet::egress::EgressFirewall::new(mode, uid_range, host, port);
+    egress.boot(pool, local).await?;
+    Ok(egress)
+}
+
 /// Per-fleet cgroups when this process may manage them (root); dev runs
 /// without containment.
 fn cgroups() -> Option<std::path::PathBuf> {
@@ -276,13 +293,15 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
     let rt = &config.runtime;
     let jev = jev_client(config)?;
     let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
+    let storage = fleet_storage(config)?;
+    let storage_endpoint = storage.endpoint.clone();
     let deployer = Deployer::new(
         DeploySettings {
             data_dir: config.data_dir.clone(),
             celld_bin: rt.celld_bin.clone(),
             esbuild_bin: rt.esbuild_bin.clone(),
             bun_bin: rt.bun_bin.clone(),
-            storage: fleet_storage(config)?,
+            storage,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
             apps_domain: rt.apps_domain.clone(),
@@ -297,6 +316,18 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
         },
         rt.build_concurrency,
     );
+    // The CLI also builds as the app uid: install the policy here too and
+    // fail closed the same way (the server's sweep tick keeps it fresh while
+    // both run; a CLI-only host reinstalls on every invocation).
+    let egress = boot_egress(
+        &pool,
+        rt.egress_firewall,
+        rt.app_uid_range,
+        &storage_endpoint,
+        config.is_local(),
+    )
+    .await?;
+    deployer.set_egress(egress.clone());
     Ok(Platform {
         pool,
         store,
@@ -310,6 +341,7 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
         data_dir: config.data_dir.clone(),
         cgroups: cgroups(),
         domain: config.domain.clone(),
+        egress,
     })
 }
 
@@ -596,6 +628,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let rt = &config.runtime;
     let storage = fleet_storage(&config)?;
+    // Per-app egress firewall (`table inet outer`): install before any fleet
+    // or build runs. Fails closed in production; the wake and deploy gates
+    // below refuse while it is missing.
+    let egress = boot_egress(
+        &pool,
+        rt.egress_firewall,
+        rt.app_uid_range,
+        &storage.endpoint,
+        config.is_local(),
+    )
+    .await?;
     // Static local credentials never expire, but the sweep still recycles
     // long-lived dev fleets on the same schedule.
     let credential_refresh_after = config
@@ -617,6 +660,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         always_on_max: rt.always_on_max,
         preview_max: rt.preview_max,
     });
+    fleets.set_egress(egress.clone());
     // A previous process may have died between a rename's commit and its
     // post-commit deletes: drain pending prefix cleanups before serving, so
     // no old slug stays blocked (and no leftover prefix stays adoptable)
@@ -666,6 +710,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         },
         rt.build_concurrency,
     );
+    deployer.set_egress(egress.clone());
     let purges = deployer.purges();
     let auth = auth_state(&config, &pool)?;
     // Console-capture tokens: `look_at_app` mints into this table, the app
@@ -699,6 +744,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(&config),
         },
+        egress: egress.clone(),
         secrets_key,
         unsub_key: config.outer_secret.as_bytes().to_vec(),
         billing: outer::billing::BillingState::from_config(
@@ -732,6 +778,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         mcp.billing.clone(),
         pool.clone(),
         mcp.auth.config.email.clone(),
+        mcp.egress.clone(),
         retention.clone(),
     );
     // Sleep, preview-expiry, keep-warm, log flush and prefix-cleanup ticks

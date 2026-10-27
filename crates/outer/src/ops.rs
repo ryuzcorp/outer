@@ -26,9 +26,10 @@ pub struct Platform {
     pub cgroups: Option<std::path::PathBuf>,
     /// Commit identities are `<account-id>@users.noreply.<domain>`.
     pub domain: String,
+    /// The installed per-app egress policy: create/delete refreshes it.
+    pub egress: crate::fleet::egress::EgressFirewall,
 }
 
-/// The noreply identity commits are authored as.
 pub fn noreply_author(account_id: &str, email: &str, domain: &str) -> Author {
     let name = email.split('@').next().unwrap_or(email).to_string();
     Author {
@@ -126,6 +127,9 @@ pub async fn create_app(
             return Err(err.context(format!("seeding {slug} from the template")));
         }
     };
+    // The uid set changed: reinstall at once (best-effort; the sweep tick
+    // is the backstop).
+    p.egress.refresh(&p.pool).await;
     let outcome = p.deployer.deploy(&p.pool, &p.git, &app, &sha).await?;
     Ok((app, outcome))
 }
@@ -161,9 +165,13 @@ pub async fn delete_app(
         sync: &p.sync,
         fleets: None,
     };
-    crate::apps::delete::delete_app(&deps, cfg, slug, confirm, locks)
+    let out = crate::apps::delete::delete_app(&deps, cfg, slug, confirm, locks)
         .await
-        .map_err(|err| anyhow::anyhow!("{err:#}"))
+        .map_err(|err| anyhow::anyhow!("{err:#}"))?;
+    // The uid set changed: reinstall at once (best-effort; the sweep tick
+    // is the backstop).
+    p.egress.refresh(&p.pool).await;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -256,6 +264,7 @@ mod tests {
             data_dir: data.path().to_path_buf(),
             cgroups: None,
             domain: "outer.localhost".to_string(),
+            egress: crate::fleet::egress::EgressFirewall::disabled(),
         };
         let (app, outcome) = create_app(
             &p,

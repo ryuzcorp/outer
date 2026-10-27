@@ -266,6 +266,9 @@ pub struct WebhookCtx<'a> {
     pub saas: Option<crate::cloudflare::CustomHostnames>,
     pub purge: Option<crate::cloudflare::CachePurge>,
     pub apps_domain: String,
+    /// The installed per-app egress policy: plan transitions reclassify
+    /// uids, so they reinstall it at once (best-effort).
+    pub egress: crate::fleet::egress::EgressFirewall,
 }
 
 /// How the webhook answered: applied, or already seen. `stopped` names the
@@ -363,6 +366,11 @@ pub async fn apply_event(
             now_secs,
         )
         .await;
+    // A plan may have changed: reinstall so the owner's uids move rate
+    // class at once (best-effort; the sweep tick is the backstop).
+    if transition.account_id.is_some() {
+        ctx.egress.refresh(ctx.pool).await;
+    }
     Ok(ApplyOutcome::Applied {
         account_id: transition.account_id,
         stopped: transition.stopped,
@@ -896,6 +904,9 @@ pub async fn downgrade_account(
             now_secs,
         )
         .await;
+    // The owner is free now: reinstall so their uids move rate class at
+    // once (best-effort; the sweep tick is the backstop).
+    ctx.egress.refresh(ctx.pool).await;
     Ok(stopped)
 }
 
@@ -1034,6 +1045,7 @@ pub async fn run_grace_sweep(
     billing: &BillingState,
     pool: &SqlitePool,
     sender: &EmailSender,
+    egress: &crate::fleet::egress::EgressFirewall,
     delete_cfg: &crate::apps::delete::DeleteConfig,
     now_secs: i64,
 ) -> anyhow::Result<(usize, usize)> {
@@ -1070,6 +1082,7 @@ pub async fn run_grace_sweep(
                 ),
                 purge: delete_cfg.cache_purge.clone(),
                 apps_domain: delete_cfg.apps_domain.clone(),
+                egress: egress.clone(),
             };
             downgrade_account(&ctx, &user.id, None, now_secs).await?;
             downgraded += 1;
@@ -1108,6 +1121,7 @@ pub fn spawn_grace_sweep(
     billing: BillingState,
     pool: SqlitePool,
     sender: EmailSender,
+    egress: crate::fleet::egress::EgressFirewall,
     retention: RetentionDeps,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1117,7 +1131,16 @@ pub fn spawn_grace_sweep(
         loop {
             timer.tick().await;
             let now_secs = chrono::Utc::now().timestamp();
-            match run_grace_sweep(&billing, &pool, &sender, &retention.delete_cfg, now_secs).await {
+            match run_grace_sweep(
+                &billing,
+                &pool,
+                &sender,
+                &egress,
+                &retention.delete_cfg,
+                now_secs,
+            )
+            .await
+            {
                 Ok((0, 0)) => {}
                 Ok((reminded, downgraded)) => {
                     tracing::info!(
@@ -1229,6 +1252,7 @@ mod tests {
             saas: None,
             purge: None,
             apps_domain: "outer.now".to_string(),
+            egress: crate::fleet::egress::EgressFirewall::disabled(),
         }
     }
 
@@ -1939,9 +1963,16 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let (reminded, downgraded) = run_grace_sweep(&billing, &pool, &sender, &delete_cfg, NOW)
-            .await
-            .unwrap();
+        let (reminded, downgraded) = run_grace_sweep(
+            &billing,
+            &pool,
+            &sender,
+            &crate::fleet::egress::EgressFirewall::disabled(),
+            &delete_cfg,
+            NOW,
+        )
+        .await
+        .unwrap();
         assert_eq!((reminded, downgraded), (1, 0));
         assert_eq!(plan_of(&pool, "a1").await.0, "pro");
         let mail = captured
@@ -1958,9 +1989,16 @@ mod tests {
             .await
             .unwrap();
         seed_app(&pool, "app1", "solo", "a1", 1).await;
-        let (reminded, downgraded) = run_grace_sweep(&billing, &pool, &sender, &delete_cfg, NOW)
-            .await
-            .unwrap();
+        let (reminded, downgraded) = run_grace_sweep(
+            &billing,
+            &pool,
+            &sender,
+            &crate::fleet::egress::EgressFirewall::disabled(),
+            &delete_cfg,
+            NOW,
+        )
+        .await
+        .unwrap();
         assert_eq!((reminded, downgraded), (0, 1));
         assert_eq!(plan_of(&pool, "a1").await.0, "free");
     }
@@ -1979,9 +2017,16 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let (reminded, downgraded) = run_grace_sweep(&billing, &pool, &sender, &delete_cfg, NOW)
-            .await
-            .unwrap();
+        let (reminded, downgraded) = run_grace_sweep(
+            &billing,
+            &pool,
+            &sender,
+            &crate::fleet::egress::EgressFirewall::disabled(),
+            &delete_cfg,
+            NOW,
+        )
+        .await
+        .unwrap();
         assert_eq!((reminded, downgraded), (0, 0));
     }
 
@@ -2164,6 +2209,7 @@ mod tests {
             saas: Some(fake.cf()),
             purge: None,
             apps_domain: "outer.now".to_string(),
+            egress: crate::fleet::egress::EgressFirewall::disabled(),
         };
         let object = serde_json::json!({"id": "sub_1", "customer": "cus_1"});
         let outcome = apply_event(

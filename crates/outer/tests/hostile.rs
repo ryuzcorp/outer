@@ -118,8 +118,7 @@ fn hostile_nft_policy_blocks_every_fixture_egress_target() {
         storage_port: 443,
         free_uids: vec![200001],
         pro_uids: vec![200002],
-        free_new_conns_per_sec: 20,
-        pro_new_conns_per_sec: 100,
+        own_ports: vec![(200001, vec![20001])],
     });
     let range = "200000-299999";
     for blocked in [
@@ -413,25 +412,104 @@ fn js_runtime() -> Option<String> {
     None
 }
 
-/// The nft policy the non-privileged tests pin must actually be installed:
-/// without it a refused connection proves nothing (nothing may be listening),
-/// so the suite skips loudly instead of passing vacuously.
-fn require_nft_table() -> bool {
+/// The app uid range prod polices (`OUTER_APP_UID_RANGE`, `lo-hi` inclusive;
+/// default the range the image pre-creates). The hostile uids must live
+/// inside it, or the egress policy never applies to their probes.
+fn app_uid_range() -> Option<(u32, u32)> {
+    let raw = std::env::var("OUTER_APP_UID_RANGE").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Some((200_000, 201_023));
+    }
+    match raw
+        .split_once('-')
+        .and_then(|(lo, hi)| {
+            Some((
+                lo.trim().parse::<u32>().ok()?,
+                hi.trim().parse::<u32>().ok()?,
+            ))
+        })
+        .filter(|(lo, hi)| lo <= hi)
+    {
+        Some(range) => Some(range),
+        None => {
+            eprintln!("SKIP: OUTER_APP_UID_RANGE={raw:?} is not an inclusive lo-hi range");
+            None
+        }
+    }
+}
+
+/// Probe uids from inside the app range: `HOSTILE_UID_BASE` (default the top
+/// of the configured range) names the probe uid, the next uid the sibling.
+/// Real apps allocate from the bottom up, so the top never collides with one.
+fn hostile_uids(range: (u32, u32)) -> Option<(u32, u32)> {
+    let base: u32 = match std::env::var("HOSTILE_UID_BASE") {
+        Err(_) => range.1.saturating_sub(1),
+        Ok(raw) => match raw.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("SKIP: HOSTILE_UID_BASE={raw:?} is not a uid");
+                return None;
+            }
+        },
+    };
+    let (probe_uid, sibling_uid) = (base, base.saturating_add(1));
+    if probe_uid < range.0 || sibling_uid > range.1 {
+        eprintln!(
+            "SKIP: hostile uids {probe_uid}/{sibling_uid} fall outside OUTER_APP_UID_RANGE {}-{}; set HOSTILE_UID_BASE inside it",
+            range.0, range.1
+        );
+        return None;
+    }
+    Some((probe_uid, sibling_uid))
+}
+
+/// The nft policy the non-privileged tests pin must actually be installed
+/// AND cover `uid`: without it a refused connection proves nothing (nothing
+/// may be listening), so the suite skips loudly instead of passing vacuously.
+fn require_nft_table_covering(uid: u32) -> bool {
     let out = std::process::Command::new("nft")
         .args(["list", "table", "inet", "outer"])
         .output();
-    match out {
-        Ok(result)
-            if result.status.success()
-                && String::from_utf8_lossy(&result.stdout).contains("skuid") =>
-        {
-            true
+    let dumped = match out {
+        Ok(result) if result.status.success() => {
+            String::from_utf8_lossy(&result.stdout).into_owned()
         }
         _ => {
             eprintln!("SKIP: nft table `inet outer` not installed; the VPS installs it at boot");
-            false
+            return false;
+        }
+    };
+    if nft_covers_uid(&dumped, uid) {
+        return true;
+    }
+    eprintln!(
+        "SKIP: nft table `inet outer` is installed but no skuid rule covers uid {uid}; reinstall it for the configured OUTER_APP_UID_RANGE"
+    );
+    false
+}
+
+/// True when some `meta skuid <lo>-<hi>` (or bare `<uid>`) match in the
+/// ruleset dump encloses `uid`.
+fn nft_covers_uid(rules: &str, uid: u32) -> bool {
+    let mut rest = rules;
+    while let Some(at) = rest.find("skuid") {
+        rest = &rest[at + "skuid".len()..];
+        let token: String = rest
+            .chars()
+            .skip_while(|char| char.is_whitespace())
+            .take_while(|char| char.is_ascii_digit() || *char == '-')
+            .collect();
+        let covered = match token.split_once('-') {
+            Some((lo, hi)) => {
+                matches!((lo.parse::<u32>(), hi.parse::<u32>()), (Ok(lo), Ok(hi)) if lo <= uid && uid <= hi)
+            }
+            None => token.parse::<u32>().is_ok_and(|only| only == uid),
+        };
+        if covered {
+            return true;
         }
     }
+    false
 }
 
 /// A real cgroup leaf with kernel-enforced limits: the harness writes the
@@ -491,7 +569,13 @@ async fn hostile_build_probes_are_contained() {
     let Some(runtime) = js_runtime() else {
         return;
     };
-    if !require_nft_table() {
+    let Some(range) = app_uid_range() else {
+        return;
+    };
+    let Some((probe_uid, sibling_uid)) = hostile_uids(range) else {
+        return;
+    };
+    if !require_nft_table_covering(probe_uid) {
         return;
     }
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
@@ -512,10 +596,8 @@ async fn hostile_build_probes_are_contained() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     outer::fleet::sandbox::prepare_data_dir(dir.path()).expect("prepare");
-    let probe_uid = 61184;
-    let sibling_uid = 61185;
-    // Sibling app dirs: real 0700 dirs owned by another uid, each with a
-    // readable-looking file, so refusals prove isolation, not absence.
+    // Sibling app dirs: real 0700 dirs owned by another in-range uid, each
+    // with a readable-looking file, so refusals prove isolation, not absence.
     for (root, slug) in [("work", "neighbour"), ("fleets", "neighbour")] {
         let leaf = dir.path().join(root).join(slug);
         std::fs::create_dir_all(&leaf).expect("sibling leaf");

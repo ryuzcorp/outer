@@ -233,6 +233,9 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         template,
     )
     .await?;
+    // The uid set changed: reinstall so the new uid's per-uid rules exist
+    // at once (best-effort; the sweep tick is the backstop).
+    ctx.state.egress.refresh(&ctx.state.pool).await;
     // The seed deploy carries the shared admission gate: a capped or frozen
     // app refuses here with the quota shape, and the `?` leaves the seeded
     // app row in place — the agent retries the deploy after the reset.
@@ -524,6 +527,9 @@ pub async fn delete_app(input: DeleteAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         crate::apps::delete::DeleteError::Internal(err) => internal(err),
     })?;
     let host = format!("{}.{}", out.slug, ctx.state.delete_cfg.apps_domain);
+    // The uid set changed: reinstall so the deleted uid's per-uid rules go
+    // away at once (best-effort; the sweep tick is the backstop).
+    ctx.state.egress.refresh(&ctx.state.pool).await;
     let user_message = format!("{host} is deleted. The name is free to claim again.");
     Ok(ok(
         user_message.clone(),

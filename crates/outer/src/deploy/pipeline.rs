@@ -357,6 +357,10 @@ pub struct Deployer {
     semaphore: Arc<Semaphore>,
     app_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     purges: PurgeTasks,
+    /// The installed per-app egress policy. Disabled until `serve` (or the
+    /// operator CLI) sets the boot-installed handle; the deploy entries
+    /// refuse builds while a required policy is missing.
+    egress: std::sync::RwLock<crate::fleet::egress::EgressFirewall>,
 }
 
 /// Edge purges still in flight. Each runs detached so `deploy` never waits
@@ -617,7 +621,18 @@ impl Deployer {
             semaphore: Arc::new(Semaphore::new(build_concurrency)),
             app_locks: Mutex::new(HashMap::new()),
             purges: PurgeTasks::default(),
+            egress: std::sync::RwLock::new(crate::fleet::egress::EgressFirewall::disabled()),
         }
+    }
+
+    /// The boot-installed egress handle (`serve` and the operator CLI only).
+    /// Tests keep the disabled default, so deploys run without a policy.
+    pub fn set_egress(&self, egress: crate::fleet::egress::EgressFirewall) {
+        *self.egress.write().expect("egress lock") = egress;
+    }
+
+    fn egress(&self) -> crate::fleet::egress::EgressFirewall {
+        self.egress.read().expect("egress lock").clone()
     }
 
     /// The settings this deployer runs with (bucket, credentials, dirs,
@@ -646,6 +661,10 @@ impl Deployer {
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
+        // Fail closed: no build runs as the app uid while the required
+        // policy is missing.
+        self.egress()
+            .gate(&format!("build {} for {}", sha, app.slug))?;
         let slug = app.slug.clone();
         self.deploy_inner(pool, git, app, &slug, DeployKind::Main, sha)
             .await
@@ -664,6 +683,10 @@ impl Deployer {
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
+        // Fail closed: no build runs as the app uid while the required
+        // policy is missing.
+        self.egress()
+            .gate(&format!("build preview {} for {}", sha, app.slug))?;
         let Some(preview) = crate::preview::preview_app(app) else {
             anyhow::bail!("no preview fleet for {}", app.slug);
         };

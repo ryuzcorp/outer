@@ -14,6 +14,7 @@ use sqlx::SqlitePool;
 
 use crate::apps::{self, App};
 use crate::fleet::cgroups::{self, FleetLimits};
+use crate::fleet::egress::EgressFirewall;
 use crate::fleet::health;
 use crate::fleet::supervisor::{
     self, FleetOpts, FleetSpec, RunningFleet, SharedLogRing, StopGrace,
@@ -96,6 +97,10 @@ struct Inner {
     always_on_max: usize,
     preview_max: usize,
     wake_permits: tokio::sync::Semaphore,
+    /// The installed per-app egress policy. Disabled until `serve` sets the
+    /// boot-installed handle; the gates below refuse wakes while a required
+    /// policy is missing.
+    egress: std::sync::RwLock<EgressFirewall>,
     fleets: tokio::sync::Mutex<HashMap<String /* slug */, LiveFleet>>,
     wakes: tokio::sync::Mutex<HashMap<String /* slug */, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -172,12 +177,23 @@ impl FleetManager {
             always_on_max: settings.always_on_max,
             preview_max: settings.preview_max,
             wake_permits: tokio::sync::Semaphore::new(settings.wake_concurrency.max(1)),
+            egress: std::sync::RwLock::new(EgressFirewall::disabled()),
             fleets: tokio::sync::Mutex::new(HashMap::new()),
             wakes: tokio::sync::Mutex::new(HashMap::new()),
         };
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// The boot-installed egress handle (`serve` only). Tests keep the
+    /// disabled default, so wakes run without a policy there.
+    pub fn set_egress(&self, egress: EgressFirewall) {
+        *self.inner.egress.write().expect("egress lock") = egress;
+    }
+
+    fn egress(&self) -> EgressFirewall {
+        self.inner.egress.read().expect("egress lock").clone()
     }
 
     /// The celld binary console data panels shell out to (`celld d1 …`,
@@ -386,6 +402,9 @@ impl FleetManager {
     /// share a single start; concurrent wakes across apps are bounded by
     /// `wake_concurrency`.
     pub async fn ensure_awake(&self, pool: &SqlitePool, app: &App) -> anyhow::Result<()> {
+        // Fail closed: no fleet starts while the required policy is missing.
+        self.egress()
+            .gate(&format!("wake the fleet for {}", app.slug))?;
         // The wake lock comes first: the alive checks and the activity write
         // below must not interleave with the sweep's evaluate-and-stop for
         // this slug.
@@ -409,6 +428,9 @@ impl FleetManager {
     /// expiry, or a refreshed preview can't respawn the wrong fleet.
     /// Activity lands on the preview columns, never on the live row.
     pub async fn ensure_awake_preview(&self, pool: &SqlitePool, papp: &App) -> anyhow::Result<()> {
+        // Fail closed: no fleet starts while the required policy is missing.
+        self.egress()
+            .gate(&format!("wake the preview fleet for {}", papp.slug))?;
         let base_slug = crate::preview::strip_preview_key(&papp.slug)
             .ok_or_else(|| anyhow::anyhow!("not a preview fleet: {}", papp.slug))?;
         let key = self.wake_lock(&papp.slug).await;
@@ -905,6 +927,12 @@ impl FleetManager {
             let mut last_prune: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
+                // The policy's per-uid classes drift on app create/delete and
+                // plan change; the explicit refreshes at those sites cover the
+                // common paths, and this tick is the backstop (best-effort, a
+                // failure keeps the old table): operator-CLI mutations, R2 IP
+                // rotation, anything a hook missed.
+                this.egress().refresh(&pool).await;
                 if let Err(err) = this.sleep_idle(&pool).await {
                     tracing::warn!(error = %err, "sleep sweep failed");
                 }

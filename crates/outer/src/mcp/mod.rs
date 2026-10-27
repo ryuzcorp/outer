@@ -413,6 +413,9 @@ pub struct McpState {
     pub billing: crate::billing::BillingState,
     /// What `delete_app` wipes and purges: dirs, edge host, zone.
     pub delete_cfg: crate::apps::delete::DeleteConfig,
+    /// The installed per-app egress policy: app create/delete refreshes it
+    /// so the new uid set is covered at once.
+    pub egress: crate::fleet::egress::EgressFirewall,
 }
 impl McpState {
     /// `https://<slug>.outer.now`, or the localhost equivalent in dev.
@@ -530,6 +533,7 @@ impl McpState {
                 apps_domain: "outer.localhost".to_string(),
                 cache_purge: None,
             },
+            egress: crate::fleet::egress::EgressFirewall::disabled(),
         }
     }
 

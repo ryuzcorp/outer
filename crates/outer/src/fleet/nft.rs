@@ -10,15 +10,19 @@ use std::time::Duration;
 
 /// Everything the ruleset is built from. `uid_range` is (base, count) over
 /// the reserved per-app uid range; `free_uids`/`pro_uids` name the uids in
-/// each plan class for rate limits and counters.
+/// each plan class for the byte counters.
 pub struct NftConfig {
     pub uid_range: (u32, u32),
     pub storage_addrs: Vec<IpAddr>,
     pub storage_port: u16,
     pub free_uids: Vec<u32>,
     pub pro_uids: Vec<u32>,
-    pub free_new_conns_per_sec: u32,
-    pub pro_new_conns_per_sec: u32,
+    /// Each app uid's own loopback ports (live and preview, public and
+    /// internal). Its celld dials its own node there, e.g. `celld d1
+    /// migrations apply` at deploy, so exactly these stay reachable for that
+    /// uid ahead of the loopback reject; every other fleet's port stays
+    /// closed.
+    pub own_ports: Vec<(u32, Vec<u16>)>,
 }
 
 /// The nftables `skuid` match for the per-app range: nft takes a `lo-hi`
@@ -103,8 +107,25 @@ pub fn ruleset(cfg: &NftConfig) -> String {
     rules.push(format!(
         "    meta skuid {id} tcp dport {{ 25, 465, 587 }} reject"
     ));
-    // No new connection to loopback, any protocol: that is where outer, its
-    // proxy and every other fleet listen.
+    // An app may reach its own fleet on loopback and nothing else there.
+    for (uid, ports) in &cfg.own_ports {
+        if ports.is_empty() {
+            continue;
+        }
+        let list = ports
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        rules.push(format!(
+            "    meta skuid {uid} ip daddr 127.0.0.1 tcp dport {{ {list} }} accept"
+        ));
+        rules.push(format!(
+            "    meta skuid {uid} ip6 daddr ::1 tcp dport {{ {list} }} accept"
+        ));
+    }
+    // No other new connection to loopback, any protocol: that is where
+    // outer, its proxy and every other fleet listen.
     rules.push(format!("    meta skuid {id} ip daddr 127.0.0.0/8 reject"));
     rules.push(format!("    meta skuid {id} ip6 daddr ::1 reject"));
     rules.push(format!(
@@ -113,21 +134,10 @@ pub fn ruleset(cfg: &NftConfig) -> String {
     rules.push(format!(
         "    meta skuid {id} ip6 daddr {{ fc00::/7, fe80::/10 }} reject"
     ));
-    // Per-uid new-connection rate limits. The `limit` state is per rule, and
-    // each rule matches exactly one uid, so the limit is per uid. New
-    // connections only: replies were already accepted at the top.
-    for uid in &cfg.free_uids {
-        rules.push(format!(
-            "    meta skuid {uid} ct state new limit rate over {}/second burst {} packets counter drop",
-            cfg.free_new_conns_per_sec, cfg.free_new_conns_per_sec,
-        ));
-    }
-    for uid in &cfg.pro_uids {
-        rules.push(format!(
-            "    meta skuid {uid} ct state new limit rate over {}/second burst {} packets counter drop",
-            cfg.pro_new_conns_per_sec, cfg.pro_new_conns_per_sec,
-        ));
-    }
+    // No per-uid connection rate limit: a `drop` here stalled `bun install`
+    // (hundreds of parallel registry connections) until the build timed
+    // out, live on 2026-10-27, and the owner's plan table has no egress or
+    // connection caps. Every verdict for app uids is a fast `reject`.
     let mut counters = String::new();
     for uid in counted_uids(cfg) {
         counters.push_str(&format!("  counter app_{uid} {{\n  }}\n"));
@@ -236,9 +246,24 @@ mod tests {
             storage_port: 443,
             free_uids: vec![200001],
             pro_uids: vec![200002],
-            free_new_conns_per_sec: 20,
-            pro_new_conns_per_sec: 100,
+            own_ports: vec![(200001, vec![20001, 21001])],
         }
+    }
+
+    /// An app reaches its own fleet's loopback ports (its celld dials its
+    /// node at deploy) but no other fleet's: the allowance names the uid and
+    /// its ports, and sorts before the loopback reject.
+    #[test]
+    fn an_app_reaches_only_its_own_loopback_ports() {
+        let rules = ruleset(&test_config());
+        let own = rules
+            .find("meta skuid 200001 ip daddr 127.0.0.1 tcp dport { 20001, 21001 } accept")
+            .expect("own-port allowance");
+        let reject = rules
+            .find("ip daddr 127.0.0.0/8 reject")
+            .expect("loopback reject");
+        assert!(own < reject);
+        assert!(!rules.contains("meta skuid 200002 ip daddr 127.0.0.1"));
     }
 
     #[test]
@@ -300,18 +325,16 @@ mod tests {
         assert!(smtp < loopback);
     }
 
+    /// A silently dropped SYN hangs the client until its own timeout (a
+    /// `bun install` build died that way); app traffic is only ever
+    /// rejected, so a refusal is immediate and visible.
     #[test]
-    fn per_uid_rate_limits_follow_the_plan_class() {
+    fn app_traffic_is_never_silently_dropped() {
         let rules = ruleset(&test_config());
-        assert!(rules.contains(
-            "meta skuid 200001 ct state new limit rate over 20/second burst 20 packets counter drop"
-        ));
-        assert!(rules.contains(
-            "meta skuid 200002 ct state new limit rate over 100/second burst 100 packets counter drop"
-        ));
-        // New connections only: exactly the two per-uid rules match on new
-        // connections; established/related traffic was accepted at the top.
-        assert_eq!(rules.matches("ct state new").count(), 2);
+        for line in rules.lines().filter(|l| l.contains("skuid")) {
+            assert!(!line.trim_end().ends_with("drop"), "drop verdict: {line}");
+            assert!(!line.contains("limit rate"), "rate limit: {line}");
+        }
     }
 
     #[test]

@@ -406,22 +406,27 @@ async fn api_delete_account(
         delete_cfg: &mcp.delete_cfg,
     };
     match accounts::delete_account(&deps, &account.id, &confirm).await {
-        Ok(out) => (
-            StatusCode::OK,
-            [
-                ("cache-control", "no-store"),
-                ("content-type", "application/json"),
-                ("set-cookie", &auth::clear_session_cookie() as &str),
-            ],
-            json!({
-                "deleted": true,
-                "email": out.email,
-                "deleted_apps": out.deleted_apps,
-                "signed_out_sessions": out.signed_out_sessions,
-            })
-            .to_string(),
-        )
-            .into_response(),
+        Ok(out) => {
+            // Owned apps (and their uids) are gone: reinstall at once
+            // (best-effort; the sweep tick is the backstop).
+            mcp.egress.refresh(&mcp.pool).await;
+            (
+                StatusCode::OK,
+                [
+                    ("cache-control", "no-store"),
+                    ("content-type", "application/json"),
+                    ("set-cookie", &auth::clear_session_cookie() as &str),
+                ],
+                json!({
+                    "deleted": true,
+                    "email": out.email,
+                    "deleted_apps": out.deleted_apps,
+                    "signed_out_sessions": out.signed_out_sessions,
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
         Err(err) => err_json(err),
     }
 }

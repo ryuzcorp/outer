@@ -205,6 +205,11 @@ pub struct RuntimeConfig {
     pub apps_domain: String,
     /// Two loopback ports per app (`OUTER_FLEET_PORTS`, inclusive `lo-hi`).
     pub fleet_ports: (u16, u16),
+    /// Per-app egress firewall (`OUTER_EGRESS_FIREWALL`, `required`|`off`,
+    /// default `required`): `required` installs `table inet outer` at boot
+    /// and refuses fleets and builds while it is missing; `off` skips it
+    /// and is refused for non-localhost domains below.
+    pub egress_firewall: crate::fleet::egress::EgressMode,
     /// One uid per app (`OUTER_APP_UID_RANGE`, inclusive; the image pre-creates it).
     pub app_uid_range: (u32, u32),
     /// Idle time before an app's fleet is stopped (`OUTER_SLEEP_AFTER_S`).
@@ -437,6 +442,15 @@ impl Config {
                 (200_000, 201_023),
                 &mut problems,
             ),
+            egress_firewall: match crate::fleet::egress::EgressMode::parse(get(
+                "OUTER_EGRESS_FIREWALL",
+            )) {
+                Ok(mode) => mode,
+                Err(problem) => {
+                    problems.push(problem);
+                    crate::fleet::egress::EgressMode::Required
+                }
+            },
             sleep_after_secs: parse_num(
                 get("OUTER_SLEEP_AFTER_S"),
                 "OUTER_SLEEP_AFTER_S",
@@ -570,6 +584,13 @@ impl Config {
         if self.store == StoreKind::Memory && !self.is_local() {
             problems.push(format!(
                 "OUTER_STORE=memory loses every app on restart and is refused for OUTER_DOMAIN={}; use r2",
+                self.domain
+            ));
+        }
+        if self.runtime.egress_firewall == crate::fleet::egress::EgressMode::Off && !self.is_local()
+        {
+            problems.push(format!(
+                "OUTER_EGRESS_FIREWALL=off leaves app code unisolated and is refused for OUTER_DOMAIN={}; use required",
                 self.domain
             ));
         }
@@ -1223,6 +1244,57 @@ mod tests {
                 "missing {name} in {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn egress_firewall_defaults_to_required_and_off_is_local_only() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert_eq!(
+            cfg.runtime.egress_firewall,
+            crate::fleet::egress::EgressMode::Required
+        );
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_EGRESS_FIREWALL", "off"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.runtime.egress_firewall,
+            crate::fleet::egress::EgressMode::Off
+        );
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_EGRESS_FIREWALL", "sometimes"),
+        ]))
+        .unwrap_err();
+        assert!(err.iter().any(|p| p.starts_with("OUTER_EGRESS_FIREWALL")));
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_EGRESS_FIREWALL", "off"),
+            (
+                "OUTER_R2_ENDPOINT",
+                "https://acct.eu.r2.cloudflarestorage.com",
+            ),
+            ("OUTER_R2_BUCKET", "outer"),
+            ("R2_ACCESS_KEY_ID", "key"),
+            ("R2_SECRET_ACCESS_KEY", "s3cret"),
+            ("CLOUDFLARE_ACCOUNT_ID", "acct"),
+            ("CLOUDFLARE_API_TOKEN", "cf-token"),
+            ("OUTER_TLS_CERT", "/tls/cert.pem"),
+            ("OUTER_TLS_KEY", "/tls/key.pem"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+            ("OUTER_TERMS_VERSION", "2026-10-23"),
+            ("OUTER_SECRET", "test-outer-secret"),
+            ("STRIPE_SECRET_KEY", "sk_test_1"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_test"),
+            ("STRIPE_PRICE_PRO", "price_pro"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.starts_with("OUTER_EGRESS_FIREWALL=off")),
+            "off is refused for non-localhost domains: {err:?}"
+        );
     }
 
     #[test]
