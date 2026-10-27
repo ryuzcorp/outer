@@ -73,7 +73,6 @@ async fn list_examples(
                 "title": example.title,
                 "summary": example.summary,
                 "template": example.template,
-                "dependencies": example.dependencies,
                 "files": example.files.iter().map(|file| {
                     json!({"path": file.path, "lines": file.lines})
                 }).collect::<Vec<_>>(),
@@ -227,7 +226,6 @@ fn render_example(example: &crate::examples::Example, with_files: bool) -> Value
             json!({"href": item.href, "label": item.label, "icon": item.icon})
         }).collect::<Vec<_>>(),
         "bindings": example.bindings,
-        "dependencies": example.dependencies,
         "readme": example.readme,
         "files": files,
         "truncated": false,

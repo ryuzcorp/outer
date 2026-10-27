@@ -738,7 +738,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `add_example`
 
 - **Access:** signed in
-- **Description:** Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and deps in one change and deploys. Customise with commit after.
+- **Description:** Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and migrations in one change and deploys. Customise with commit after.
 
 **Input:**
 

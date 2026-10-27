@@ -1,0 +1,8 @@
+{
+  "name": "alpha",
+  "title": "Alpha",
+  "summary": "First fixture example.",
+  "template": "app",
+  "nav": [{ "href": "/alpha", "label": "Alpha", "icon": "Sparkles" }],
+  "bindings": { "r2_buckets": [{ "binding": "ALPHA_BUCKET", "bucket_name": "alpha" }] }
+}

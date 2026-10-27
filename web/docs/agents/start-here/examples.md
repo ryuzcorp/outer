@@ -12,9 +12,9 @@ deployed change — you only customise copy and design afterwards.
 
 Call `add_example {app, name}`. It resolves the example's `requires` first,
 copies every file to the same path, adds nav entries to `pages/_nav.ts`,
-merges `dependencies` into `package.json`, inserts `d1`/`r2` bindings into
-`void.config.ts`, renumbers migrations past the app's highest, and commits
-all of it in one change through the normal commit + gate + deploy path.
+inserts `d1`/`r2` bindings into `void.config.ts`, renumbers migrations past
+the app's highest, and commits all of it in one change through the normal
+commit + gate + deploy path.
 The result names the added examples, the written files, the live hrefs, and
 the deploy.
 
@@ -28,9 +28,8 @@ After applying, customise copy and design with `commit`, and verify with
 ## List them
 
 Call `examples` with no arguments. Filter with `template: "app"` or
-`template: "website"`. Each row names the pattern, its template, its
-dependencies, and its files with line counts. The result ends with its own
-`next` step.
+`template: "website"`. Each row names the pattern, its template, and its
+files with line counts. The result ends with its own `next` step.
 
 ## Inspect one
 

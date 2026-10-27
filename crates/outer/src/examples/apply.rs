@@ -3,9 +3,11 @@
 //! [`plan_apply`] takes the app's head tree (path → full text), the app's
 //! template id, the known examples, and the requested names, and returns the
 //! file writes for one commit — or a refusal naming what to fix by hand.
-//! No filesystem or git here, so the TypeScript apply engine (slice T) and
-//! this one stay byte-identical on the same inputs: every formatting rule is
-//! pinned below and by the golden fixtures in `tests/fixtures/apply/`.
+//! No filesystem or git here, so the TypeScript apply engine (slice T,
+//! `scripts/apply-example.ts`) and this one stay byte-identical on the same
+//! inputs: every formatting rule is pinned below and by the shared golden
+//! fixtures in `tests/fixtures/apply/` (a verbatim copy of outer-templates'
+//! `scripts/apply-fixtures/`), including every refusal message byte for byte.
 //!
 //! Formatting rules (both engines must match exactly):
 //!
@@ -13,15 +15,19 @@
 //!   own indentation, one per line:
 //!   `{ href: "/photos", label: "Photos", icon: Camera },`.
 //! - Nav icons merge into the braces on the `// outer:nav-icons` line,
-//!   deduplicated and sorted byte-wise, joined with `", "`.
+//!   deduplicated and sorted byte-wise, joined with `", "`. An href already
+//!   in the file is skipped. Nav is app-only: a website apply with nav
+//!   refuses.
 //! - Binding lines insert above the `// outer:bindings` marker at the
 //!   marker's own indentation, one key per line:
 //!   `r2_buckets: [{ binding: "PHOTOS", bucket_name: "photos" }],`.
 //!   Object keys sort byte-wise; entries join with `", "`. Keys insert in
-//!   byte-wise order.
-//! - `package.json` is re-serialized whole: all keys sorted byte-wise,
-//!   2-space indent, one trailing newline. New dependencies keep their given
-//!   versions; an existing different version refuses.
+//!   byte-wise order per example. A key already in the file skips when its
+//!   normalised value is equal, refuses when it differs.
+//! - `dependencies` is not supported: an `example.json` carrying it is
+//!   rejected by the loader, and neither engine touches `package.json`
+//!   (merging it needs order-preserving edits neither engine does, and
+//!   re-serialising would reorder the user's file).
 //! - Migrations (`db/migrations/NNNN_*.sql`) renumber to the next free
 //!   numbers after the app's highest existing migration number, keeping
 //!   their relative (byte-wise path) order. Numbers pad to at least 4
@@ -50,7 +56,6 @@ pub struct ExampleInput {
     pub nav: Vec<NavItem>,
     /// `d1_databases` / `r2_buckets`: key → entries of string pairs.
     pub bindings: BTreeMap<String, Vec<BTreeMap<String, String>>>,
-    pub dependencies: BTreeMap<String, String>,
     /// App-relative path → full text, byte-wise sorted.
     pub files: Vec<(String, String)>,
 }
@@ -109,7 +114,7 @@ pub fn plan_apply(
     for example in &order {
         if example.template != app_template {
             return Err(refuse(format!(
-                "example {:?} is for template {:?}, not {:?}",
+                "example {:?} is for the {} template and cannot apply to a {} app",
                 example.name, example.template, app_template
             )));
         }
@@ -119,6 +124,14 @@ pub fn plan_apply(
         .copied()
         .filter(|example| !is_applied(tree, example))
         .collect();
+    if let Some(navved) = order.iter().find(|example| !example.nav.is_empty()) {
+        if app_template != "app" {
+            return Err(refuse(format!(
+                "example {:?} declares nav but the {:?} template has no nav file",
+                navved.name, app_template
+            )));
+        }
+    }
     if fresh.is_empty() {
         let names: Vec<&str> = order.iter().map(|example| example.name.as_str()).collect();
         return Err(refuse(format!(
@@ -128,49 +141,54 @@ pub fn plan_apply(
         )));
     }
     let mut writes: BTreeMap<String, String> = BTreeMap::new();
+    let mut sources: HashMap<String, String> = HashMap::new();
     let mut nav: Vec<String> = Vec::new();
     // Migrations renumber against the app's highest existing number, shared
     // across every example in this apply.
     let mut next_migration = highest_migration(tree) + 1;
     for example in &fresh {
-        copy_files(tree, example, &mut writes, &mut next_migration)?;
+        copy_files(
+            tree,
+            example,
+            &mut writes,
+            &mut sources,
+            &mut next_migration,
+        )?;
+    }
+    // Nav first, then bindings: every fresh example reads the accumulated
+    // writes, so shared hrefs insert once and shared keys compare equal.
+    for example in &fresh {
+        if example.nav.is_empty() {
+            continue;
+        }
+        let current = writes
+            .get("pages/_nav.ts")
+            .or_else(|| tree.get("pages/_nav.ts"))
+            .ok_or_else(|| {
+                refuse(
+                    "refusing to apply nav: pages/_nav.ts is missing (add the nav lines by hand — see the example README \"Without add_example\")",
+                )
+            })?;
+        let (updated, inserted) = apply_nav(current, &example.nav)?;
+        if !inserted.is_empty() {
+            writes.insert("pages/_nav.ts".to_string(), updated);
+            nav.extend(inserted);
+        }
     }
     for example in &fresh {
-        if !example.nav.is_empty() {
-            if app_template != "app" {
-                return Err(refuse(format!(
-                    "example {:?} declares nav but the {:?} template has no nav file",
-                    example.name, app_template
-                )));
-            }
-            // Earlier examples in this apply win the read: prefer the
-            // accumulated writes over the head tree.
-            let current = writes
-                .get("pages/_nav.ts")
-                .or_else(|| tree.get("pages/_nav.ts"))
-                .ok_or_else(|| refuse("pages/_nav.ts is missing: restore it, then retry"))?;
-            let (updated, inserted) = apply_nav(current, &example.nav, &example.name)?;
-            if !inserted.is_empty() {
-                writes.insert("pages/_nav.ts".to_string(), updated);
-                nav.extend(inserted);
-            }
+        if example.bindings.is_empty() {
+            continue;
         }
-        if !example.bindings.is_empty() {
-            let current = writes
-                .get("void.config.ts")
-                .or_else(|| tree.get("void.config.ts"))
-                .ok_or_else(|| refuse("void.config.ts is missing: restore it, then retry"))?;
-            let updated = apply_bindings(current, &example.bindings, &example.name)?;
-            writes.insert("void.config.ts".to_string(), updated);
-        }
-        if !example.dependencies.is_empty() {
-            let current = writes
-                .get("package.json")
-                .or_else(|| tree.get("package.json"))
-                .ok_or_else(|| refuse("package.json is missing: restore it, then retry"))?;
-            let updated = apply_package_json(current, &example.dependencies)?;
-            writes.insert("package.json".to_string(), updated);
-        }
+        let current = writes
+            .get("void.config.ts")
+            .or_else(|| tree.get("void.config.ts"))
+            .ok_or_else(|| {
+                refuse(
+                    "refusing to apply bindings: void.config.ts is missing (add the bindings by hand — see the example README \"Without add_example\")",
+                )
+            })?;
+        let updated = apply_bindings(current, &example.bindings, &example.name)?;
+        writes.insert("void.config.ts".to_string(), updated);
     }
     let files: Vec<String> = writes.keys().cloned().collect();
     Ok(ApplyPlan {
@@ -181,7 +199,7 @@ pub fn plan_apply(
     })
 }
 
-/// Depth-first `requires` resolution: dependencies first, de-duplicated,
+/// Depth-first `requires` resolution: requires first, de-duplicated,
 /// request order kept. Refuses cycles and chains deeper than 3.
 fn resolve<'a>(
     requested: &[&str],
@@ -193,7 +211,6 @@ fn resolve<'a>(
         order: &mut Vec<&'a ExampleInput>,
         seen: &mut HashSet<String>,
         stack: &mut Vec<String>,
-        depth: usize,
     ) -> Result<(), Refusal> {
         if seen.contains(name) {
             return Ok(());
@@ -203,17 +220,24 @@ fn resolve<'a>(
             cycle.push(name.to_string());
             return Err(refuse(format!("requires cycle: {}", cycle.join(" -> "))));
         }
-        if depth > 3 {
+        if stack.len() >= 3 {
+            let mut chain = stack.clone();
+            chain.push(name.to_string());
             return Err(refuse(format!(
-                "requires chain for {name:?} is deeper than 3"
+                "requires chain deeper than 3: {}",
+                chain.join(" -> ")
             )));
         }
-        let example = known
-            .get(name)
-            .ok_or_else(|| refuse(format!("unknown example {name:?}")))?;
+        let example = known.get(name).ok_or_else(|| {
+            refuse(format!(
+                "example {:?} requires unknown example {:?}",
+                stack.last().map(String::as_str).unwrap_or(name),
+                name
+            ))
+        })?;
         stack.push(name.to_string());
         for dep in &example.requires {
-            visit(dep, known, order, seen, stack, depth + 1)?;
+            visit(dep, known, order, seen, stack)?;
         }
         stack.pop();
         seen.insert(name.to_string());
@@ -224,7 +248,7 @@ fn resolve<'a>(
     let mut seen = HashSet::new();
     let mut stack = Vec::new();
     for name in requested {
-        visit(name, known, &mut order, &mut seen, &mut stack, 0)?;
+        visit(name, known, &mut order, &mut seen, &mut stack)?;
     }
     Ok(order)
 }
@@ -265,11 +289,13 @@ fn highest_migration(tree: &BTreeMap<String, String>) -> u64 {
 }
 
 /// Copy an example's files: migrations renumber, other paths must be new or
-/// byte-identical.
+/// byte-identical. `sources` remembers which earlier example planned each
+/// path, so a clash between two examples names both.
 fn copy_files(
     tree: &BTreeMap<String, String>,
     example: &ExampleInput,
     writes: &mut BTreeMap<String, String>,
+    sources: &mut HashMap<String, String>,
     next_migration: &mut u64,
 ) -> Result<(), Refusal> {
     let mut migrations: Vec<&(String, String)> = Vec::new();
@@ -284,12 +310,20 @@ fn copy_files(
     for (path, text) in plain {
         if let Some(have) = tree.get(path).or_else(|| writes.get(path)) {
             if have != text {
+                if let Some(first) = sources.get(path) {
+                    return Err(refuse(format!(
+                        "refusing to apply {:?}: {path} is also shipped by {:?} with different content",
+                        example.name, first
+                    )));
+                }
                 return Err(refuse(format!(
-                    "{path} already exists with different content: move it aside or merge it by hand, then retry"
+                    "refusing to apply {:?}: {path} already exists with different content (delete or merge it by hand, then re-run)",
+                    example.name
                 )));
             }
         } else {
             writes.insert(path.clone(), text.clone());
+            sources.insert(path.clone(), example.name.clone());
         }
     }
     migrations.sort_by(|a, b| a.0.cmp(&b.0));
@@ -302,14 +336,24 @@ fn copy_files(
             .unwrap_or(path.as_str());
         let dest = format!("db/migrations/{:04}_{suffix}", *next_migration);
         *next_migration += 1;
-        if let Some(have) = tree.get(&dest).or_else(|| writes.get(&dest)) {
+        if let Some(have) = writes.get(&dest) {
             if have != text {
                 return Err(refuse(format!(
-                    "{dest} already exists with different content: move it aside or merge it by hand, then retry"
+                    "refusing to apply {:?}: {dest} collides (also shipped by {:?})",
+                    example.name,
+                    sources.get(&dest).map(String::as_str).unwrap_or("?")
+                )));
+            }
+        } else if let Some(have) = tree.get(&dest) {
+            if have != text {
+                return Err(refuse(format!(
+                    "refusing to apply {:?}: {dest} already exists with different content (delete or merge it by hand, then re-run)",
+                    example.name
                 )));
             }
         } else {
-            writes.insert(dest, text.clone());
+            writes.insert(dest.clone(), text.clone());
+            sources.insert(dest, example.name.clone());
         }
     }
     Ok(())
@@ -325,16 +369,13 @@ pub fn is_valid_icon(name: &str) -> bool {
 }
 
 /// Merge `items` into `pages/_nav.ts` at its marker lines.
-fn apply_nav(
-    nav_ts: &str,
-    items: &[NavItem],
-    example: &str,
-) -> Result<(String, Vec<String>), Refusal> {
+fn apply_nav(nav_ts: &str, items: &[NavItem]) -> Result<(String, Vec<String>), Refusal> {
     let manual = |marker: &str| {
         refuse(format!(
-            "pages/_nav.ts has no {marker} marker (the agent restructured it): add the {example} nav items by hand — see the {example} README's \"Without add_example\" section"
+            "refusing to apply nav: pages/_nav.ts has no {marker} marker (the nav was restructured). Add the nav lines by hand — see the example README \"Without add_example\""
         ))
     };
+
     let icons_idx = nav_ts
         .lines()
         .position(|line| line.contains("outer:nav-icons"))
@@ -394,7 +435,7 @@ fn apply_nav(
         lines.insert(
             items_idx + i,
             format!(
-                "{indent}{{ href: {:?}, label: {:?}, icon: {} }},",
+                "{indent}{{ href: \"{}\", label: \"{}\", icon: {} }},",
                 item.href, item.label, item.icon
             ),
         );
@@ -439,9 +480,9 @@ fn apply_bindings(
         .lines()
         .position(|line| line.contains("outer:bindings"))
         .ok_or_else(|| {
-            refuse(format!(
-                "void.config.ts has no // outer:bindings marker (the agent restructured it): add the {example} bindings by hand — see the {example} README's \"Without add_example\" section"
-            ))
+            refuse(
+                "refusing to apply bindings: void.config.ts has no // outer:bindings marker (the config was restructured). Add the bindings by hand — see the example README \"Without add_example\"",
+            )
         })?;
     let mut lines: Vec<String> = config.lines().map(str::to_string).collect();
     let trailing_newline = config.ends_with('\n');
@@ -461,7 +502,8 @@ fn apply_bindings(
                 let want = want.trim_end_matches(',');
                 if normalize(&have) != normalize(&format!("[{want}")) {
                     return Err(refuse(format!(
-                        "void.config.ts already declares {key} with a different value ({have}): the one-D1 / one-R2 cap allows a single entry — align it by hand, then retry"
+                        "refusing to apply {example:?}: void.config.ts already declares {key} with a different value (existing entry wins: {})",
+                        have.trim()
                     )));
                 }
             }
@@ -482,7 +524,7 @@ fn render_binding(key: &str, entries: &[BTreeMap<String, String>]) -> String {
     let parts: Vec<String> = entries
         .iter()
         .map(|entry| {
-            let fields: Vec<String> = entry.iter().map(|(k, v)| format!("{k}: {v:?}")).collect();
+            let fields: Vec<String> = entry.iter().map(|(k, v)| format!("{k}: \"{v}\"")).collect();
             format!("{{ {} }}", fields.join(", "))
         })
         .collect();
@@ -556,50 +598,6 @@ fn find_key(line: &str, key: &str) -> Option<usize> {
 
 fn normalize(value: &str) -> String {
     value.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-/// Merge `deps` into `package.json`'s `dependencies`. An existing different
-/// version refuses. The file re-serializes whole: keys sorted, 2-space
-/// indent, one trailing newline.
-fn apply_package_json(
-    package_json: &str,
-    deps: &BTreeMap<String, String>,
-) -> Result<String, Refusal> {
-    let mut value: serde_json::Value = serde_json::from_str(package_json)
-        .map_err(|err| refuse(format!("package.json is not valid JSON: {err}")))?;
-    let Some(obj) = value.as_object_mut() else {
-        return Err(refuse("package.json is not a JSON object".to_string()));
-    };
-    let entry = obj
-        .entry("dependencies".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let Some(current) = entry.as_object_mut() else {
-        return Err(refuse(
-            "package.json \"dependencies\" is not an object".to_string(),
-        ));
-    };
-    for (name, version) in deps {
-        match current.get(name) {
-            None => {
-                current.insert(name.clone(), serde_json::Value::String(version.clone()));
-            }
-            Some(have) => {
-                if have.as_str() != Some(version.as_str()) {
-                    return Err(refuse(format!(
-                        "package.json already depends on {name}@{have} (want {version}): align it by hand, then retry",
-                        have = have
-                            .as_str()
-                            .unwrap_or(&have.to_string())
-                            .trim_matches('"')
-                    )));
-                }
-            }
-        }
-    }
-    let mut out = serde_json::to_string_pretty(&value)
-        .map_err(|err| refuse(format!("package.json failed to serialize: {err}")))?;
-    out.push('\n');
-    Ok(out)
 }
 
 #[cfg(test)]

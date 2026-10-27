@@ -1,0 +1,3 @@
+# alpha
+
+Golden-fixture example.

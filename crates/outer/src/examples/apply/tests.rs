@@ -1,8 +1,8 @@
 //! Behaviour tests for the apply engine: the contract's formatting rules.
 //!
-//! The `golden/` directory holds the same cases as JSON so the TypeScript
-//! engine (slice T) tests against identical inputs; [`golden_cases`] runs
-//! them through [`plan_apply`](super::plan_apply).
+//! `tests/fixtures/apply/` is a verbatim copy of outer-templates'
+//! `scripts/apply-fixtures/`, the cases the TypeScript engine is tested on;
+//! [`shared_golden_cases_match_the_typescript_engine`] runs them here.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -21,7 +21,6 @@ fn example(name: &str, template: &str, files: &[(&str, &str)]) -> ExampleInput {
         requires: Vec::new(),
         nav: Vec::new(),
         bindings: BTreeMap::new(),
-        dependencies: BTreeMap::new(),
         files: files
             .iter()
             .map(|(path, text)| (path.to_string(), text.to_string()))
@@ -331,43 +330,6 @@ fn bindings_missing_marker_refuses() {
 }
 
 #[test]
-fn dependencies_merge_and_refuse_on_conflict() {
-    let tree = app_tree();
-    let mut ex = example("photos", "app", &[("pages/photos.tsx", "p\n")]);
-    ex.dependencies = BTreeMap::from([("some-pkg".to_string(), "^1.0.0".to_string())]);
-    let plan = plan_apply(&tree, "app", &[ex.clone()], &["photos"]).unwrap();
-    let pkg = plan
-        .writes
-        .iter()
-        .find(|(path, _)| path == "package.json")
-        .expect("package write")
-        .1
-        .clone();
-    assert_eq!(
-        pkg,
-        "{\n  \"dependencies\": {\n    \"some-pkg\": \"^1.0.0\"\n  },\n  \"name\": \"seed\",\n  \"private\": true\n}\n",
-        "package: {pkg}"
-    );
-    // Same version is fine; a different one refuses.
-    let mut tree2 = tree.clone();
-    tree2.insert("package.json".to_string(), pkg);
-    let plan2 = plan_apply(&tree2, "app", &[ex.clone()], &["photos"]).unwrap();
-    assert!(plan2
-        .writes
-        .iter()
-        .any(|(path, _)| path == "pages/photos.tsx"));
-    let mut ex3 = example("photos", "app", &[("pages/photos.tsx", "p\n")]);
-    ex3.dependencies = BTreeMap::from([("some-pkg".to_string(), "^2.0.0".to_string())]);
-    let mut tree3 = tree.clone();
-    tree3.insert(
-        "package.json".to_string(),
-        "{\n  \"dependencies\": {\n    \"some-pkg\": \"^1.0.0\"\n  }\n}\n".to_string(),
-    );
-    let err = plan_apply(&tree3, "app", &[ex3], &["photos"]).unwrap_err();
-    assert!(err.0.contains("some-pkg"), "unexpected: {}", err.0);
-}
-
-#[test]
 fn icon_names_validate() {
     assert!(is_valid_icon("Camera"));
     assert!(is_valid_icon("A1"));
@@ -377,129 +339,78 @@ fn icon_names_validate() {
     assert!(!is_valid_icon("Has Space"));
 }
 
-/// The JSON golden fixtures both engines test against: input tree +
-/// examples + request → expected writes or refusal.
+/// Every file under `dir` as app-relative path → text, byte-wise sorted.
+fn read_tree(dir: &std::path::Path) -> BTreeMap<String, String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.insert(rel, std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    if dir.is_dir() {
+        walk(dir, dir, &mut out);
+    }
+    out
+}
+
+/// The golden cases shared with the TypeScript engine in outer-templates
+/// (`scripts/apply-fixtures/`, vendored verbatim into
+/// `tests/fixtures/apply/`): each case is `tree/` + `examples/<name>/` +
+/// `request.json` → `expected/` (exactly the written files) or
+/// `expected-error.txt` (the refusal, byte for byte). Examples load through
+/// the real `example.json` loader, so both engines read the same inputs.
 #[test]
-fn golden_cases() {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apply");
-    let mut cases: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|_| panic!("missing golden fixtures at {}", dir.display()))
+fn shared_golden_cases_match_the_typescript_engine() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apply");
+    let mut cases: Vec<_> = std::fs::read_dir(&root)
+        .unwrap_or_else(|_| panic!("missing golden fixtures at {}", root.display()))
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| path.is_dir())
         .collect();
     cases.sort();
-    assert!(!cases.is_empty(), "no golden cases in {}", dir.display());
-    for path in cases {
-        let raw = std::fs::read(&path).unwrap();
-        let case: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        let tree: BTreeMap<String, String> = case["tree"]
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
-            .collect();
-        let examples: Vec<ExampleInput> = case["examples"]
+    assert!(cases.len() >= 5, "golden cases in {}", root.display());
+    for case in cases {
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(case.join("request.json")).unwrap()).unwrap();
+        let template = request["template"].as_str().unwrap();
+        let names: Vec<&str> = request["names"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|example| ExampleInput {
-                name: example["name"].as_str().unwrap().to_string(),
-                template: example["template"].as_str().unwrap().to_string(),
-                requires: example["requires"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|dep| dep.as_str().unwrap().to_string())
-                    .collect(),
-                nav: example["nav"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|item| NavItem {
-                        href: item["href"].as_str().unwrap().to_string(),
-                        label: item["label"].as_str().unwrap().to_string(),
-                        icon: item["icon"].as_str().unwrap().to_string(),
-                    })
-                    .collect(),
-                bindings: example["bindings"]
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            v.as_array()
-                                .unwrap()
-                                .iter()
-                                .map(|entry| {
-                                    entry
-                                        .as_object()
-                                        .unwrap()
-                                        .iter()
-                                        .map(|(fk, fv)| {
-                                            (fk.clone(), fv.as_str().unwrap().to_string())
-                                        })
-                                        .collect()
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-                dependencies: example["dependencies"]
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
-                    .collect(),
-                files: example["files"]
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
-                    .collect(),
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        let examples: Vec<ExampleInput> = std::fs::read_dir(case.join("examples"))
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                crate::examples::load_example(&entry.path(), &name)
+                    .unwrap_or_else(|| panic!("{}: example {name} fails to load", case.display()))
+                    .apply_input()
             })
             .collect();
-        let request: Vec<String> = case["request"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|name| name.as_str().unwrap().to_string())
-            .collect();
-        let borrowed: Vec<&str> = request.iter().map(String::as_str).collect();
-        let template = case["template"].as_str().unwrap();
-        match plan_apply(&tree, template, &examples, &borrowed) {
-            Ok(plan) => {
-                let expect = &case["expect"];
-                assert!(
-                    expect.get("writes").is_some(),
-                    "{}: planned but fixture expects refusal",
-                    path.display()
-                );
-                let mut writes: BTreeMap<String, String> = plan.writes.into_iter().collect();
-                let mut expected: BTreeMap<String, String> = expect["writes"]
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
-                    .collect();
-                // Fixture JSON escapes are exact; compare directly.
-                assert_eq!(writes, expected, "{}: writes differ", path.display());
-                let _ = &mut expected;
-                let _ = &mut writes;
-            }
-            Err(refusal) => {
-                let expect = &case["expect"];
-                let want = expect["refuse_contains"].as_str().unwrap_or_else(|| {
-                    panic!("{}: refused but fixture expects writes", path.display())
-                });
-                assert!(
-                    refusal.0.contains(want),
-                    "{}: refusal {:?} lacks {want:?}",
-                    path.display(),
-                    refusal.0
-                );
-            }
+        let tree = read_tree(&case.join("tree"));
+        let result = plan_apply(&tree, template, &examples, &names);
+        let error_file = case.join("expected-error.txt");
+        if error_file.is_file() {
+            let want = std::fs::read_to_string(&error_file).unwrap();
+            let got = result.expect_err(&format!("{}: expected a refusal", case.display()));
+            assert_eq!(got.0.trim_end(), want.trim_end(), "{}", case.display());
+        } else {
+            let plan = result.unwrap_or_else(|e| panic!("{}: {e}", case.display()));
+            let got: BTreeMap<String, String> = plan.writes.into_iter().collect();
+            assert_eq!(got, read_tree(&case.join("expected")), "{}", case.display());
         }
     }
 }

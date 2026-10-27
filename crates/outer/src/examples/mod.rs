@@ -32,7 +32,6 @@ pub struct Summary {
     pub title: String,
     pub summary: String,
     pub template: String,
-    pub dependencies: BTreeMap<String, String>,
     pub files: Vec<FileRef>,
 }
 
@@ -59,7 +58,6 @@ pub struct Example {
     pub title: String,
     pub summary: String,
     pub template: String,
-    pub dependencies: BTreeMap<String, String>,
     pub requires: Vec<String>,
     pub nav: Vec<NavEntry>,
     pub bindings: BTreeMap<String, Vec<BTreeMap<String, String>>>,
@@ -83,8 +81,8 @@ pub fn is_valid_name(name: &str) -> bool {
 }
 
 /// The `example.json` contract: title, summary, template, plus optional
-/// `requires`, `nav`, `bindings` and `dependencies`. Unknown fields are
-/// ignored.
+/// `requires`, `nav` and `bindings`. `dependencies` is not supported and
+/// rejects the example; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
 struct NavJson {
     href: String,
@@ -104,7 +102,7 @@ struct ExampleJson {
     #[serde(default)]
     bindings: BTreeMap<String, Vec<BTreeMap<String, String>>>,
     #[serde(default)]
-    dependencies: BTreeMap<String, String>,
+    dependencies: Option<serde_json::Value>,
 }
 
 /// Largest single file an example may carry (contract: 64 KiB).
@@ -162,7 +160,6 @@ impl Example {
             title: self.title.clone(),
             summary: self.summary.clone(),
             template: self.template.clone(),
-            dependencies: self.dependencies.clone(),
             files: self
                 .files
                 .iter()
@@ -190,7 +187,6 @@ impl Example {
                 })
                 .collect(),
             bindings: self.bindings.clone(),
-            dependencies: self.dependencies.clone(),
             files: self
                 .files
                 .iter()
@@ -403,6 +399,9 @@ fn load_example(dir: &Path, name: &str) -> Option<Example> {
     if crate::templates::Template::from_id(&meta.template).is_none() {
         return reject(&format!("bad template {:?}", meta.template));
     }
+    if meta.dependencies.is_some() {
+        return reject("example.json \"dependencies\" is not supported (examples ship files only; add_example never touches package.json)");
+    }
     for dep in &meta.requires {
         if !is_valid_name(dep) {
             return reject(&format!("bad requires entry {dep:?}"));
@@ -463,7 +462,6 @@ fn load_example(dir: &Path, name: &str) -> Option<Example> {
         title: meta.title,
         summary: meta.summary,
         template: meta.template,
-        dependencies: meta.dependencies,
         requires: meta.requires,
         nav,
         bindings: meta.bindings,
@@ -581,7 +579,6 @@ mod tests {
             "title": title,
             "summary": summary,
             "template": template,
-            "dependencies": {"left-pad": "^1.3.0"},
         })
         .to_string()
     }
@@ -646,10 +643,6 @@ mod tests {
         assert_eq!(all[1].title, "List form");
         assert_eq!(all[1].summary, "A D1-backed list with add and complete.");
         assert_eq!(all[1].template, "app");
-        assert_eq!(
-            all[1].dependencies.get("left-pad").map(String::as_str),
-            Some("^1.3.0")
-        );
         let paths: Vec<_> = all[1].files.iter().map(|file| file.path.as_str()).collect();
         assert_eq!(paths, ["pages/list.server.ts", "pages/list.tsx"]);
         assert!(all[1].files.iter().all(|file| file.lines > 0));
@@ -671,6 +664,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["blog"]
         );
+    }
+
+    #[tokio::test]
+    async fn an_example_carrying_dependencies_is_skipped() {
+        let store = Store::memory();
+        let json = serde_json::json!({
+            "name": "need",
+            "title": "Need",
+            "summary": "Wants a package.",
+            "template": "app",
+            "dependencies": {"some-pkg": "^1.0.0"},
+        })
+        .to_string();
+        fixture(
+            &store,
+            &[(
+                "need",
+                &[
+                    ("example.json", json.as_str()),
+                    ("README.md", "# Need\n"),
+                    ("pages/need.ts", "export const need = 1;\n"),
+                ],
+            )],
+            &[],
+        )
+        .await;
+        let state = tool_state(store).await;
+        let dir = &state.delete_cfg.data_dir;
+        assert!(list(&state.store, dir, None).await.unwrap().is_empty());
+        assert!(get(&state.store, dir, "need").await.unwrap().is_none());
     }
 
     #[tokio::test]

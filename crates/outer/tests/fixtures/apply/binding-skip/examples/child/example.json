@@ -1,0 +1,11 @@
+{
+  "name": "child",
+  "title": "Child",
+  "summary": "Fixture child example.",
+  "template": "app",
+  "requires": ["base"],
+  "bindings": {
+    "r2_buckets": [{ "bucket_name": "pics", "binding": "PICS" }],
+    "d1_databases": [{ "binding": "DB", "database_name": "app-db", "migrations_dir": "db/migrations" }]
+  }
+}

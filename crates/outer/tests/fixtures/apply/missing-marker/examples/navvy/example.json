@@ -1,0 +1,7 @@
+{
+  "name": "navvy",
+  "title": "Navvy",
+  "summary": "Fixture nav example.",
+  "template": "app",
+  "nav": [{ "href": "/navvy", "label": "Navvy", "icon": "Camera" }]
+}

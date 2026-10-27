@@ -31,7 +31,7 @@ The `website` shell serves mostly static, prerendered Astro pages with Ilha isla
 
 ## Apply features from the examples
 
-Real features live in [Examples](/agents/start-here/examples): `examples` lists them, `add_example {app, name}` commits one onto the app (nav, dependencies, bindings and migrations included), or pass `examples: [...]` to `create_app` to seed them in the first commit. Customise the copy with `commit` afterwards.
+Real features live in [Examples](/agents/start-here/examples): `examples` lists them, `add_example {app, name}` commits one onto the app (nav, bindings and migrations included), or pass `examples: [...]` to `create_app` to seed them in the first commit. Customise the copy with `commit` afterwards.
 
 ## Rebuild, never stretch
 

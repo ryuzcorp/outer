@@ -1,0 +1,3 @@
+# beta
+
+Golden-fixture example.

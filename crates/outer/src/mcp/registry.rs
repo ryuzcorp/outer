@@ -468,7 +468,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<add_example_inputs::AddExampleInput>(
             "add_example",
-            "Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and deps in one change and deploys. Customise with commit after.",
+            "Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and migrations in one change and deploys. Customise with commit after.",
             Account, false,
         ),
     ]

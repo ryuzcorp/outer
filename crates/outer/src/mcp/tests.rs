@@ -7988,7 +7988,7 @@ async fn setup_apply() -> (McpState, Codes) {
         &[
             (
                 "passkeys",
-                r#"{"title": "Passkeys", "summary": "Sign in with passkeys.", "template": "app", "requires": [], "nav": [{"href": "/sign-in", "label": "Sign in", "icon": "KeyRound"}, {"href": "/members", "label": "Members", "icon": "Users"}], "bindings": {}, "dependencies": {}}"#,
+                r#"{"title": "Passkeys", "summary": "Sign in with passkeys.", "template": "app", "requires": [], "nav": [{"href": "/sign-in", "label": "Sign in", "icon": "KeyRound"}, {"href": "/members", "label": "Members", "icon": "Users"}], "bindings": {}}"#,
                 &[
                     ("README.md", "# Passkeys\n\nSign in.\n"),
                     (
@@ -8003,7 +8003,7 @@ async fn setup_apply() -> (McpState, Codes) {
             ),
             (
                 "photos",
-                r#"{"title": "Photos", "summary": "A photo feed.", "template": "app", "requires": ["passkeys"], "nav": [{"href": "/photos", "label": "Photos", "icon": "Camera"}], "bindings": {"r2_buckets": [{"binding": "PHOTOS", "bucket_name": "photos"}]}, "dependencies": {"some-pkg": "^1.0.0"}}"#,
+                r#"{"title": "Photos", "summary": "A photo feed.", "template": "app", "requires": ["passkeys"], "nav": [{"href": "/photos", "label": "Photos", "icon": "Camera"}], "bindings": {"r2_buckets": [{"binding": "PHOTOS", "bucket_name": "photos"}]}}"#,
                 &[
                     ("README.md", "# Photos\n\nPost photos.\n"),
                     (
@@ -8018,7 +8018,7 @@ async fn setup_apply() -> (McpState, Codes) {
             ),
             (
                 "newsletter",
-                r#"{"title": "Newsletter", "summary": "Email signup.", "template": "website", "requires": [], "nav": [], "bindings": {"d1_databases": [{"binding": "DB", "database_name": "newsletter"}]}, "dependencies": {}}"#,
+                r#"{"title": "Newsletter", "summary": "Email signup.", "template": "website", "requires": [], "nav": [], "bindings": {"d1_databases": [{"binding": "DB", "database_name": "newsletter"}]}}"#,
                 &[
                     ("README.md", "# Newsletter\n\nSubscribe.\n"),
                     ("src/pages/subscribe.astro", "---\n---\n<h1>Subscribe</h1>\n"),
@@ -8133,8 +8133,8 @@ async fn add_example_applies_requires_nav_bindings_and_deploys() {
         config.contains("r2_buckets: [{ binding: \"PHOTOS\", bucket_name: \"photos\" }],"),
         "{config}"
     );
-    let package: Value = serde_json::from_str(&by_path("package.json")).unwrap();
-    assert_eq!(package["dependencies"]["some-pkg"], "^1.0.0");
+    // add_example never touches package.json: the seed file is byte-identical.
+    assert_eq!(by_path("package.json"), APPLY_PACKAGE);
     assert_eq!(
         by_path("pages/photos.tsx"),
         "export default function Photos() {\n  return <h1>Photos</h1>;\n}\n"

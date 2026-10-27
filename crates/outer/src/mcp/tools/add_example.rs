@@ -165,7 +165,7 @@ fn add_summary(
 
 /// The head tree as the apply engine sees it: every non-migration file the
 /// closure touches (with text), plus the `db/migrations/` names (numbers
-/// only) and the three edited files.
+/// only) and the two edited files.
 async fn head_tree(
     bare: &std::path::Path,
     inputs: &[crate::examples::apply::ExampleInput],
@@ -178,7 +178,6 @@ async fn head_tree(
     }
     need.insert("pages/_nav.ts");
     need.insert("void.config.ts");
-    need.insert("package.json");
     let mut tree = BTreeMap::new();
     for path in need {
         match crate::git::local::read_blob(bare, None, path).await {

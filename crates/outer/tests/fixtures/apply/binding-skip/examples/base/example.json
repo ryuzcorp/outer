@@ -1,0 +1,6 @@
+{
+  "name": "base",
+  "title": "Base",
+  "summary": "Fixture base example.",
+  "template": "app"
+}
