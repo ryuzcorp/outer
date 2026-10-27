@@ -1811,7 +1811,15 @@ async fn api_delete_rows(
     let summary = crate::http::console::audit_summary(&account, &summary, admin);
     if outcome.is_ok() {
         if let Err(res) = crate::http::console::audit_mutation(
-            &ctx.pool, &app.id, &account, "d1_delete_rows", &summary, o, code, 0, admin,
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_delete_rows",
+            &summary,
+            o,
+            code,
+            0,
+            admin,
         )
         .await
         {
@@ -1819,7 +1827,14 @@ async fn api_delete_rows(
         }
     } else {
         crate::http::console::audit_console_refusal(
-            &ctx.pool, &app.id, &account, "d1_delete_rows", &summary, code, 0, admin,
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_delete_rows",
+            &summary,
+            code,
+            0,
+            admin,
         )
         .await;
     }

@@ -107,12 +107,27 @@ async fn audit(
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as i64;
     if outcome.0 == "ok" {
         super::console::audit_mutation(
-            pool, &app.id, account, tool, summary, outcome.0, outcome.1, duration_ms, admin,
+            pool,
+            &app.id,
+            account,
+            tool,
+            summary,
+            outcome.0,
+            outcome.1,
+            duration_ms,
+            admin,
         )
         .await
     } else {
         super::console::audit_console_refusal(
-            pool, &app.id, account, tool, summary, outcome.1, duration_ms, admin,
+            pool,
+            &app.id,
+            account,
+            tool,
+            summary,
+            outcome.1,
+            duration_ms,
+            admin,
         )
         .await;
         Ok(())

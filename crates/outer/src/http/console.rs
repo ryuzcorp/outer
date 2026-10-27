@@ -461,13 +461,27 @@ pub(crate) async fn audit_mutation(
 ) -> Result<(), Box<Response>> {
     if !admin {
         crate::mcp::actions::record_console(
-            pool, app_id, &account.id, tool, summary, outcome, error_code, duration_ms,
+            pool,
+            app_id,
+            &account.id,
+            tool,
+            summary,
+            outcome,
+            error_code,
+            duration_ms,
         )
         .await;
         return Ok(());
     }
     if let Err(err) = crate::mcp::actions::try_record_console(
-        pool, app_id, &account.id, tool, summary, outcome, error_code, duration_ms,
+        pool,
+        app_id,
+        &account.id,
+        tool,
+        summary,
+        outcome,
+        error_code,
+        duration_ms,
     )
     .await
     {
@@ -497,7 +511,14 @@ pub(crate) async fn audit_console_refusal(
     admin: bool,
 ) {
     if let Err(err) = crate::mcp::actions::try_record_console(
-        pool, app_id, &account.id, tool, summary, "error", error_code, duration_ms,
+        pool,
+        app_id,
+        &account.id,
+        tool,
+        summary,
+        "error",
+        error_code,
+        duration_ms,
     )
     .await
     {
@@ -4153,11 +4174,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         // The app row — and any `agent_action` row — is gone ...
-        let gone: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM app WHERE slug = 'groceries'")
-                .fetch_optional(&pool)
-                .await
-                .unwrap();
+        let gone: Option<(String,)> = sqlx::query_as("SELECT id FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
         assert!(gone.is_none(), "the app itself is deleted");
 
         // ... but the durable copy survives, keyed to the owner's account,
@@ -4218,12 +4238,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT user_id, tool FROM account_action WHERE tool = 'delete_app'",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT user_id, tool FROM account_action WHERE tool = 'delete_app'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "acct-ana@example.com");
     }
@@ -4261,11 +4280,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        let kept: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM app WHERE slug = 'groceries'")
-                .fetch_optional(&pool)
-                .await
-                .unwrap();
+        let kept: Option<(String,)> = sqlx::query_as("SELECT id FROM app WHERE slug = 'groceries'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
         assert!(kept.is_some(), "failed admin audit keeps the app");
 
         // Owner path: best-effort, the delete still goes through.
@@ -4403,7 +4421,11 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "owner rename survives audit loss: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "owner rename survives audit loss: {body}"
+        );
     }
 
     async fn open_stream(app: &Router, path: &str, cookie: &str) -> axum::body::Body {
@@ -4473,6 +4495,28 @@ mod tests {
             .unwrap();
         seed_log(&pool, 1, now / 1000, "stdout", "after the delete").await;
         expect_stream_end(&mut body, "deleted-app admin stream must end").await;
+    }
+
+    #[tokio::test]
+    async fn admin_stream_ends_when_deadmined() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_account(&pool, "owner@example.com").await;
+        seed_log(&pool, 0, now / 1000, "stdout", "serving").await;
+        let admin = login(&pool, "owner@example.com").await;
+        let mut body = open_stream(&app, "/api/console/apps/groceries/logs/stream", &admin).await;
+        first_frame(&mut body).await;
+        // The address no longer matches OUTER_ADMIN_EMAILS mid-stream ...
+        sqlx::query(
+            "UPDATE user SET email = 'exowner@example.com' WHERE email = 'owner@example.com'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_log(&pool, 1, now / 1000, "stdout", "after the removal").await;
+        // ... so the tick's admin-flag recheck ends the stream.
+        expect_stream_end(&mut body, "de-admined stream must end").await;
     }
 
     #[tokio::test]

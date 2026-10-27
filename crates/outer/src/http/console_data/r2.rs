@@ -949,7 +949,15 @@ async fn api_put(
                 admin,
             );
             if let Err(res) = super::super::console::audit_mutation(
-                &state.mcp.pool, &app.id, &account, "r2_put", &summary, "ok", None, 0, admin,
+                &state.mcp.pool,
+                &app.id,
+                &account,
+                "r2_put",
+                &summary,
+                "ok",
+                None,
+                0,
+                admin,
             )
             .await
             {
@@ -965,7 +973,14 @@ async fn api_put(
                 admin,
             );
             super::super::console::audit_console_refusal(
-                &state.mcp.pool, &app.id, &account, "r2_put", &summary, None, 0, admin,
+                &state.mcp.pool,
+                &app.id,
+                &account,
+                "r2_put",
+                &summary,
+                None,
+                0,
+                admin,
             )
             .await;
             status_for(&msg, "Couldn't upload right now. Try again.")
@@ -1034,7 +1049,15 @@ async fn api_delete(
                 admin,
             );
             if let Err(res) = super::super::console::audit_mutation(
-                &state.mcp.pool, &app.id, &account, "r2_delete", &summary, "ok", None, 0, admin,
+                &state.mcp.pool,
+                &app.id,
+                &account,
+                "r2_delete",
+                &summary,
+                "ok",
+                None,
+                0,
+                admin,
             )
             .await
             {
@@ -1050,7 +1073,14 @@ async fn api_delete(
                 admin,
             );
             super::super::console::audit_console_refusal(
-                &state.mcp.pool, &app.id, &account, "r2_delete", &summary, None, 0, admin,
+                &state.mcp.pool,
+                &app.id,
+                &account,
+                "r2_delete",
+                &summary,
+                None,
+                0,
+                admin,
             )
             .await;
             status_for(&msg, "Couldn't delete right now. Try again.")

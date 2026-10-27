@@ -163,7 +163,15 @@ async fn api_backup_now(
     let summary = crate::http::console::audit_summary(&account, &summary, admin);
     if result.is_ok() {
         if let Err(res) = crate::http::console::audit_mutation(
-            &ctx.pool, &app.id, &account, "d1_backup", &summary, o, code, duration_ms, admin,
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_backup",
+            &summary,
+            o,
+            code,
+            duration_ms,
+            admin,
         )
         .await
         {
@@ -171,7 +179,14 @@ async fn api_backup_now(
         }
     } else {
         crate::http::console::audit_console_refusal(
-            &ctx.pool, &app.id, &account, "d1_backup", &summary, code, duration_ms, admin,
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_backup",
+            &summary,
+            code,
+            duration_ms,
+            admin,
         )
         .await;
     }
@@ -307,7 +322,15 @@ async fn api_restore(
     let summary = crate::http::console::audit_summary(&account, &summary, admin);
     if result.is_ok() {
         if let Err(res) = crate::http::console::audit_mutation(
-            &ctx.pool, &app.id, &account, "d1_restore", &summary, o, code, duration_ms, admin,
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_restore",
+            &summary,
+            o,
+            code,
+            duration_ms,
+            admin,
         )
         .await
         {
@@ -315,7 +338,14 @@ async fn api_restore(
         }
     } else {
         crate::http::console::audit_console_refusal(
-            &ctx.pool, &app.id, &account, "d1_restore", &summary, code, duration_ms, admin,
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_restore",
+            &summary,
+            code,
+            duration_ms,
+            admin,
         )
         .await;
     }

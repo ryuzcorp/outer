@@ -131,8 +131,7 @@ async fn api_review(
         }
     };
     if !applied.redeploy {
-        if let Err(res) = audit_review(mcp, &account, &applied.app_id, verdict, "ok", None).await
-        {
+        if let Err(res) = audit_review(mcp, &account, &applied.app_id, verdict, "ok", None).await {
             return *res;
         }
         return ok_json(json!({"reviewed": true, "redeployed": false}));
@@ -182,7 +181,15 @@ async fn audit_review(
         admin::Verdict::Deny => "admin_review deny",
     };
     audit_mutation(
-        &mcp.pool, app_id, account, "admin_review", summary, outcome, error_code, 0, true,
+        &mcp.pool,
+        app_id,
+        account,
+        "admin_review",
+        summary,
+        outcome,
+        error_code,
+        0,
+        true,
     )
     .await
 }
@@ -201,7 +208,14 @@ async fn audit_review_refusal(
         admin::Verdict::Deny => "admin_review deny",
     };
     if let Err(err) = crate::mcp::actions::try_record_console(
-        &mcp.pool, app_id, &account.id, "admin_review", summary, "error", error_code, 0,
+        &mcp.pool,
+        app_id,
+        &account.id,
+        "admin_review",
+        summary,
+        "error",
+        error_code,
+        0,
     )
     .await
     {

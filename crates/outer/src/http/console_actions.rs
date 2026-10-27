@@ -684,12 +684,24 @@ async fn api_rename(
         let err = ToolError::invalid_argument(format!(
             "the app is already named {slug:?}; nothing to rename"
         ));
-        let _ = audit(&summary_for(&slug, &new_slug), "error", Some(err.code), false).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     if let Err(e) = crate::apps::validate_slug(&new_slug) {
         let err = ToolError::invalid_argument(e.to_string());
-        let _ = audit(&summary_for(&slug, &new_slug), "error", Some(err.code), false).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     // After the cheap checks, before the quota claim: mirrors the MCP tool,
@@ -697,13 +709,25 @@ async fn api_rename(
     if let Err(e) = crate::apps::check_slug_profanity(mcp.jev.as_ref(), &new_slug, None, None).await
     {
         let err = ToolError::from_profanity(e);
-        let _ = audit(&summary_for(&slug, &new_slug), "error", Some(err.code), false).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     // Quota follows the app owner, never the admin acting on their behalf.
     let billing = super::console::billing_id(&account, &app, admin);
     if let Err(err) = claim_change(&mcp.pool, &mcp.billing, billing).await {
-        let _ = audit(&summary_for(&slug, &new_slug), "error", Some(err.code), false).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     // The rename redeploys a running app, so the redeploy's plan admission
@@ -715,13 +739,25 @@ async fn api_rename(
         crate::mcp::tools::check_build_quota(&mcp.pool, &mcp.billing, &account.id).await
     {
         let _ = refund_change(&mcp.pool, &account.id).await;
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     if let Err(err) = crate::mcp::tools::check_storage_writable(&mcp.pool, &mcp.billing, &app).await
     {
         let _ = refund_change(&mcp.pool, &account.id).await;
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     // Same locks as the MCP tool, in the same order (deploy, rollback, then
@@ -766,7 +802,13 @@ async fn api_rename(
             // so the rename never happened: refund the claimed change.
             let _ = refund_change(&mcp.pool, billing).await;
             let err = ToolError::from_rename(err);
-            let _ = audit(&summary_for(&slug, &new_slug), "error", Some(err.code), false).await;
+            let _ = audit(
+                &summary_for(&slug, &new_slug),
+                "error",
+                Some(err.code),
+                false,
+            )
+            .await;
             return tool_response(&err);
         }
     };
@@ -790,7 +832,13 @@ async fn api_rename(
     };
     // The rename itself succeeded, so the admin path is fail-closed even
     // when the follow-up redeploy did not.
-    if let Err(res) = audit(&summary_for(&slug, &out.app.slug), &deploy_status, None, true).await
+    if let Err(res) = audit(
+        &summary_for(&slug, &out.app.slug),
+        &deploy_status,
+        None,
+        true,
+    )
+    .await
     {
         return *res;
     }

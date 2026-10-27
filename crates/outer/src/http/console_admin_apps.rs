@@ -135,7 +135,14 @@ async fn api_list(
         }),
         false => (&rows[..], None),
     };
-    audit_list(&mcp.pool, &account, &q, query.state.as_deref(), query.plan.as_deref()).await;
+    audit_list(
+        &mcp.pool,
+        &account,
+        &q,
+        query.state.as_deref(),
+        query.plan.as_deref(),
+    )
+    .await;
     ok_json(serde_json::json!({
         "apps": page.iter().map(|row| {
             let mut v = serde_json::json!({
@@ -809,7 +816,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows.len(), 1, "one throttled row, got: {rows:?}");
-        assert_eq!(rows[0].0, "acct-owner@example.com", "attributed to the admin");
+        assert_eq!(
+            rows[0].0, "acct-owner@example.com",
+            "attributed to the admin"
+        );
         // And the admin audit view surfaces it.
         let (status, body) = send(&app, authed("/api/console/admin/audit", &admin)).await;
         assert_eq!(status, StatusCode::OK);

@@ -127,18 +127,7 @@ async fn api_logs_stream(
             seed,
             true,
         ),
-        move |(
-            pool,
-            fleets,
-            auth,
-            session,
-            admin,
-            app_id,
-            slug,
-            filter,
-            mut cursor,
-            mut first,
-        )| async move {
+        move |(pool, fleets, auth, session, admin, app_id, slug, filter, mut cursor, mut first)| async move {
             // Re-verified every tick: a revoked or expired session, or a
             // ban, ends the stream for everyone (reopening signs in
             // again). Admin streams additionally re-check the step-up
@@ -168,8 +157,7 @@ async fn api_logs_stream(
                     if !fresh {
                         return None;
                     }
-                    let still_there =
-                        crate::apps::get_by_slug(&pool, &slug).await.ok().flatten();
+                    let still_there = crate::apps::get_by_slug(&pool, &slug).await.ok().flatten();
                     if still_there.is_none() {
                         return None;
                     }
@@ -206,16 +194,7 @@ async fn api_logs_stream(
                     })
                     .to_string();
                     let state = (
-                        pool,
-                        fleets,
-                        auth,
-                        session,
-                        admin,
-                        app_id,
-                        slug,
-                        filter,
-                        cursor,
-                        first,
+                        pool, fleets, auth, session, admin, app_id, slug, filter, cursor, first,
                     );
                     return Some((Ok::<Event, Infallible>(Event::default().data(data)), state));
                 }
@@ -327,8 +306,7 @@ async fn triage(
                 } else {
                     format!("{tool} {} issues", fingerprints.len())
                 };
-                let summary =
-                    super::console::audit_summary(account, &summary, admin);
+                let summary = super::console::audit_summary(account, &summary, admin);
                 if let Err(res) = super::console::audit_mutation(
                     pool, app_id, account, tool, &summary, "ok", None, 0, admin,
                 )

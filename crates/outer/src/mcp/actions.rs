@@ -469,7 +469,14 @@ pub async fn record_console(
     duration_ms: i64,
 ) {
     if let Err(err) = try_record_console(
-        pool, app_id, user_id, tool, summary, outcome, error_code, duration_ms,
+        pool,
+        app_id,
+        user_id,
+        tool,
+        summary,
+        outcome,
+        error_code,
+        duration_ms,
     )
     .await
     {
