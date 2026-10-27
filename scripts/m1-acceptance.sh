@@ -305,7 +305,7 @@ EOF
                     await_terminal "$APP" >/dev/null; cp "$OUT.deploy" "$RESP" 2>/dev/null || true
                     DEPLOY=$(deploy_of "$RESP"); ST=$(dep_line 1 "$DEPLOY")
                 fi
-                [ "$ST" = "success" ] && pass "build:revert" "revert deployed ($ST)" || fail "build:revert" "revert status=$ST"
+                if [ "$ST" = "success" ]; then pass "build:revert" "revert deployed ($ST)"; else fail "build:revert" "revert status=$ST"; fi
             else
                 fail "build:revert" "commit HTTP $code"
             fi
@@ -431,7 +431,7 @@ EOF
                     COMMITS_N=$((COMMITS_N + 1))
                     DEPLOY=$(deploy_of "$RESP")
                     settle_deploy
-                    [ "$ST" = "success" ] && pass "allowed:revert" "revert deployed" || fail "allowed:revert" "revert status=$ST"
+                    if [ "$ST" = "success" ]; then pass "allowed:revert" "revert deployed"; else fail "allowed:revert" "revert status=$ST"; fi
                 else
                     fail "allowed:revert" "commit HTTP $code"
                 fi
@@ -491,7 +491,7 @@ if want visibility; then
         mcp_set_visibility "$APP" "$ORIG_VIS" >/dev/null
         VIS_CHANGED=0
         code=$(mcp_call "get_app"); V2=$(jget "$RESP" 'v["result"]["structuredContent"]["visibility"]')
-        [ "$V2" = "$ORIG_VIS" ] && pass "visibility:restore" "restored $ORIG_VIS" || fail "visibility:restore" "got $V2, want $ORIG_VIS"
+        if [ "$V2" = "$ORIG_VIS" ]; then pass "visibility:restore" "restored $ORIG_VIS"; else fail "visibility:restore" "got $V2, want $ORIG_VIS"; fi
     fi
 fi
 
