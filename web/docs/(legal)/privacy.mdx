@@ -15,18 +15,20 @@ This policy covers the platform at `outer.now` and the apps it serves at `<slug>
 
 ## What we store and why
 
-| Data | Why |
-| --- | --- |
-| Email address, plan, Stripe customer id, terms version and acceptance time, usage against quota | Run your account, bill you, enforce quotas, and prove you accepted the terms |
-| Invite codes you created or redeemed | Run the closed beta |
-| OAuth grants and API key metadata (names, prefixes, last use — never secrets) | Let your agent connect and let you revoke access |
-| Your apps' code and deploy history | Build, serve, and roll back your apps |
-| Your apps' data: databases, files, and secrets | Run your apps; secrets apply on the next deploy and are never shown again |
-| Logs, errors, deploys, and request metrics | Debug deploys, show the Console views, and count quota |
-| Emails we sent you (sign-in codes, quota and billing notices, inactivity reminders) | Necessary for the service; each carries a one-click unsubscribe where it is not security-critical |
-| Abuse reports and moderation findings | Keep the shared domain safe |
+| Data | Why | Legal basis |
+| --- | --- | --- |
+| Email address, plan, Stripe customer id, terms version and acceptance time, usage against quota | Run your account, bill you, enforce quotas, and prove you accepted the terms | contract (Art. 6(1)(b)); billing and tax records: legal obligation (Art. 6(1)(c)) |
+| Invite codes you created or redeemed | Run the closed beta | contract (Art. 6(1)(b)) |
+| OAuth grants and API key metadata (names, prefixes, last use — never secrets) | Let your agent connect and let you revoke access | contract (Art. 6(1)(b)) |
+| Your apps' code and deploy history | Build, serve, and roll back your apps | contract (Art. 6(1)(b)) |
+| Your apps' data: databases, files, and secrets | Run your apps; secrets apply on the next deploy and are never shown again | contract (Art. 6(1)(b)) |
+| Logs, errors, deploys, and request metrics | Debug deploys, show the Console views, and count quota | contract (Art. 6(1)(b)); security monitoring: legitimate interests (Art. 6(1)(f)) |
+| Emails we sent you (sign-in codes, quota and billing notices, inactivity reminders) | Necessary for the service; each carries a one-click unsubscribe where it is not security-critical | contract (Art. 6(1)(b)) |
+| Abuse reports and moderation findings | Keep the shared domain safe | legitimate interests (Art. 6(1)(f)) |
 
 We store secrets and codes as hashes or encrypted values, never in readable form. API keys, OAuth tokens, and sign-in codes are stored as hashes; app secret values are encrypted and write-only.
+
+[OWNER: confirm the legal bases above with counsel; they are the usual choices for a hosting service, not legal advice.]
 
 ## Processors
 
@@ -34,7 +36,7 @@ We do not sell your data. Three processors handle it on our behalf:
 
 - **Cloudflare** — edge network, DNS, DDoS protection, and TLS for `outer.now` and every app host; R2 object storage in the EU for code bundles, app data, snapshots, and exports; and the Email Service that delivers sign-in codes and notifications from `Outer <hello@outer.now>`.
 - **Stripe** — payments, subscription management, and tax calculation at checkout. Your email and billing details go to Stripe when you upgrade or manage billing.
-- **Jev, through Cloudflare** — content classification for the pre-live gate and after-live checks. Extracted app text (page copy, content files, seed strings, the slug and app name) is classified by Typesafe Jev on Workers AI through the AI Gateway, with log collection off. No file contents beyond the extracted text go to the classifier. Naming these processors in plain terms is required by our spec, and consenting to the [Terms](/terms) covers this processing.
+- **Jev, through Cloudflare** — content classification for the pre-live gate and after-live checks. Extracted app text (page copy, content files, seed strings, the slug and app name) is classified by Typesafe Jev on Workers AI through the AI Gateway, with log collection off. No file contents beyond the extracted text go to the classifier. The legal basis for this classification is our legitimate interest in keeping a shared domain free of abuse, profanity and phishing (Art. 6(1)(f) GDPR); it is limited to text that apps publish. You can object by writing to us, but the check is a condition of deploying on Outer.
 
 ## How long we keep it
 
