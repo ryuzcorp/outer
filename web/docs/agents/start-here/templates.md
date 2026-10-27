@@ -1,9 +1,9 @@
 ---
 title: Templates
-description: Pick the app or website starter, pass the template param, and rebuild instead of stretching.
+description: Pick the app or website shell, then copy proven patterns from the examples.
 ---
 
-Every `create_app` seeds from one of two pinned starters. The default is `app`. Pass `template: "website"` for the content-site starter. Both build with `bun run build` and deploy through the same [Pipeline](/agents/deploy/pipeline).
+Every `create_app` seeds an empty branded shell from one of two pinned minimal templates: nothing to delete, no demo to strip out. The default is `app`. Pass `template: "website"` for the content-site shell. Both build with `bun run build` and deploy through the same [Pipeline](/agents/deploy/pipeline).
 
 ## Brand the app at creation
 
@@ -11,7 +11,7 @@ Pass `name` (1–60 chars) and `description` (1–160 chars) to `create_app`: bo
 
 `brand.json` is the one place to rename or rebrand an app: edit it with `commit`, never the generated outputs.
 
-## Pick the right starter
+## Pick the right shell
 
 | Build | Template |
 | --- | --- |
@@ -23,9 +23,15 @@ Both live in [ryuzcorp/outer-templates](https://github.com/ryuzcorp/outer-templa
 
 ## Know what each ships
 
-The `app` template serves server-rendered Ilha pages in `pages/` with loaders + actions on D1 and `useForm` for mutations. Call `open_app {app}` first (it carries the `AGENTS.md` rules digest), then read the [Ilha](/agents/frontend/ilha) and [Void](/agents/frontend/void) guides before writing code.
+Both shells are minimal: layout, brand pipeline, settings, PWA shell, 404, and (for `app`) the D1 binding with an empty `db/migrations/` folder. No demo feature, no sample data.
 
-The `website` template serves mostly static, prerendered Astro pages with Ilha islands for interactive parts, at most one D1 database and one R2 bucket. Call `open_app {app}` first (it carries the `AGENTS.md` rules digest), then read [Website](/agents/frontend/website).
+The `app` shell serves server-rendered Ilha pages in `pages/` with loaders + actions on D1 and `useForm` for mutations. Call `open_app {app}` first (it carries the `AGENTS.md` rules digest), then read the [Ilha](/agents/frontend/ilha) and [Void](/agents/frontend/void) guides before writing code.
+
+The `website` shell serves mostly static, prerendered Astro pages with Ilha islands for interactive parts, at most one D1 database and one R2 bucket. Call `open_app {app}` first (it carries the `AGENTS.md` rules digest), then read [Website](/agents/frontend/website).
+
+## Copy patterns from the examples
+
+Real features live in [Examples](/agents/start-here/examples): `examples` lists them, `examples {name}` returns the README and files to copy onto the fresh shell. Copy each file to the same path, add the page to `pages/_nav.ts`, add any dependency or binding, and rename the migration when the app already has migrations.
 
 ## Rebuild, never stretch
 

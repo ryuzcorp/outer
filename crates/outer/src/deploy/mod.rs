@@ -5,6 +5,7 @@
 //! module owns everything under `src/deploy/`.
 
 pub mod check;
+pub mod manifest;
 pub mod migrate;
 pub mod pipeline;
 

@@ -44,7 +44,7 @@ await db.prepare("INSERT INTO item (text) VALUES (?)").bind(text).run();
 await db.prepare("DELETE FROM item WHERE id = ?").bind(id).run();
 ```
 
-Apps with no migration files skip the migrate step, so creating tables where you use them keeps working for tiny apps (`CREATE TABLE IF NOT EXISTS`, as the starter does).
+Apps with no migration files skip the migrate step, so creating tables where you use them keeps working for tiny apps (`CREATE TABLE IF NOT EXISTS`, as the examples do).
 
 Drizzle is optional: define tables in `db/schema.ts` with `void/schema-d1`, import them through the `@schema` alias, and query through `db` from `void/db`:
 

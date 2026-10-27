@@ -184,58 +184,11 @@ pub(crate) fn deploy_settings(
         .ok_or_else(|| anyhow::anyhow!("storage panels are unavailable in this build"))
 }
 
-/// The deploy pointer celld publishes per upload: `deploy/current.json`
-/// carries the versioned `prefix`, and the authoritative deployed config is
-/// the manifest at `fleets/{slug}/{prefix}/manifest.json`. There is no
-/// `fleets/{slug}/wrangler.json` in the bucket, and the worktree
-/// `dist/wrangler.json` is a wipeable build artifact — so the manifest is
-/// the only source of truth. This is the ONE manifest reader for every
-/// data panel: D1 parses `raw_metadata.bindings` type-d1 entries out of
-/// it, R2 parses `r2_bucket` entries, DO parses top-level
-/// `do_classes`/`sqlite_classes`. `vars` — which may carry injected secret
-/// values — is never read here and never lands in a response.
-///
-/// A missing pointer or manifest means never-deployed (`None`: D1 answers
-/// `NoConfig`, R2/DO fall back to the local build artifact); malformed JSON
-/// or an unsafe prefix is an error.
-pub(crate) async fn deployed_manifest(
-    store: &crate::store::Store,
-    slug: &str,
-) -> anyhow::Result<Option<serde_json::Value>> {
-    let pointer_key = format!("fleets/{slug}/deploy/current.json");
-    let Some(pointer) = store.get(&pointer_key).await? else {
-        return Ok(None);
-    };
-    let pointer: serde_json::Value = serde_json::from_slice(&pointer)
-        .map_err(|e| anyhow::anyhow!("parsing deploy pointer: {e:#}"))?;
-    let prefix = pointer
-        .get("prefix")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("deploy pointer has no prefix"))?;
-    validate_prefix(prefix)?;
-    let key = format!("fleets/{slug}/{prefix}/manifest.json");
-    let Some(manifest) = store.get(&key).await? else {
-        return Ok(None);
-    };
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest)
-        .map_err(|e| anyhow::anyhow!("parsing deployed manifest: {e:#}"))?;
-    Ok(Some(manifest))
-}
-
-/// The deploy pointer's versioned prefix must stay a relative deploy path:
-/// it becomes a store key suffix, so anything absolute or escaping fails the
-/// read instead of probing an unintended key.
-pub(crate) fn validate_prefix(prefix: &str) -> anyhow::Result<()> {
-    if prefix.is_empty()
-        || prefix.starts_with('/')
-        || prefix.contains("..")
-        || prefix.contains('\\')
-        || prefix.contains('\0')
-    {
-        anyhow::bail!("deploy pointer prefix {prefix:?} is not a relative deploy path");
-    }
-    Ok(())
-}
+/// The single live-manifest reader (see `deploy::manifest`): the deploy
+/// pointer celld publishes per upload plus the manifest it points at. R2, DO
+/// and D1 parse their own binding sections out of it; the pipeline reads the
+/// live D1 declarations out of it for the migrate/upload order.
+pub(crate) use crate::deploy::manifest::deployed_manifest;
 
 /// The deploy work dir the built wrangler config is read from at request
 /// time: `dist/wrangler.json`, then `wrangler.jsonc`, then `wrangler.json`

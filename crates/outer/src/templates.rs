@@ -21,7 +21,7 @@ use crate::store::Store;
 pub const TEMPLATES_URL: &str = "https://github.com/ryuzcorp/outer-templates";
 /// The pinned commit `outer templates sync` vendors. Repinning is a
 /// one-line change, then `outer templates sync`.
-pub const TEMPLATES_SHA: &str = "1ae125f38bc58c1fbe3cfa8925990a761ed092a6";
+pub const TEMPLATES_SHA: &str = "368cc59fa6704e5c3c7662ad84df83b3ae1eb24b";
 
 /// The store pointer to the vendored bundle.
 const CURRENT_KEY: &str = "outer/templates/current.json";
@@ -92,6 +92,15 @@ pub fn write_brand(
     crate::brand::write_brand_file(tree, &brand)
 }
 
+/// The `current.json` pointer [`sync`] vendors, if it has ever run: the
+/// commit [`materialize`] and the examples reader serve from.
+pub async fn current_reference(store: &Store) -> anyhow::Result<Option<TemplateRef>> {
+    match store.get(CURRENT_KEY).await? {
+        None => Ok(None),
+        Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+    }
+}
+
 /// Key of the vendored bundle for `sha` in the store.
 fn bundle_key(sha: &str) -> String {
     format!("outer/templates/{sha}.bundle")
@@ -111,7 +120,7 @@ pub struct TemplateRef {
 }
 
 /// Run git with a quiet, non-interactive env and a timeout.
-async fn run_git(
+pub(crate) async fn run_git(
     args: &[&str],
     cwd: Option<&Path>,
     env: &[(&str, &str)],

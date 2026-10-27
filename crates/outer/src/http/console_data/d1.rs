@@ -21,7 +21,8 @@ use serde_json::json;
 use sqlx::SqlitePool;
 
 use super::owner_app;
-use crate::deploy::migrate::{self, D1Database};
+use crate::deploy::manifest::manifest_dbs;
+use crate::deploy::migrate::D1Database;
 use crate::fleet::manager::{FleetManager, FleetStorage};
 use crate::http::console::guard;
 use crate::store::Store;
@@ -641,62 +642,6 @@ impl D1Error {
 
 fn bad_err(err: anyhow::Error) -> D1Error {
     D1Error::BadQuery(format!("{err:#}"))
-}
-
-/// The live manifest's declared D1 databases, from `raw_metadata.bindings`:
-/// `type: "d1"` entries map `name` → binding and
-/// `database_name`/`database_id` → identity. Other binding types are ignored.
-/// `vars` — which may carry injected secret values — is never read here and
-/// never lands in the synthesized cwd config, so secrets can't leak through
-/// the materialized project dir or the fake-celld-style logs that read it.
-fn manifest_dbs(manifest: &serde_json::Value) -> anyhow::Result<Vec<D1Database>> {
-    let Some(bindings) = manifest.pointer("/raw_metadata/bindings") else {
-        return Ok(Vec::new());
-    };
-    let bindings = bindings.as_array().ok_or_else(|| {
-        anyhow::anyhow!("deployed manifest raw_metadata.bindings must be an array")
-    })?;
-    let mut dbs = Vec::new();
-    for (i, entry) in bindings.iter().enumerate() {
-        let obj = entry
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("deployed manifest bindings[{i}] must be an object"))?;
-        let kind = obj.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
-            anyhow::anyhow!("deployed manifest bindings[{i}] needs a string type")
-        })?;
-        if kind != "d1" {
-            continue;
-        }
-        let binding = obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            anyhow::anyhow!("deployed manifest bindings[{i}] needs a string name")
-        })?;
-        let database_name = obj
-            .get("database_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!("deployed manifest bindings[{i}] needs a string database_name")
-            })?;
-        let database_id = match obj.get("database_id") {
-            None => None,
-            Some(v) => {
-                let id = v.as_str().ok_or_else(|| {
-                    anyhow::anyhow!("deployed manifest bindings[{i}] needs a string database_id")
-                })?;
-                migrate::validate_database_id(id)
-                    .map_err(|e| anyhow::anyhow!("deployed manifest bindings[{i}]: {e:#}"))?;
-                Some(id.to_string())
-            }
-        };
-        migrate::validate_database_name(database_name)
-            .map_err(|e| anyhow::anyhow!("deployed manifest bindings[{i}]: {e:#}"))?;
-        dbs.push(D1Database {
-            binding: binding.to_string(),
-            database_name: database_name.to_string(),
-            database_id,
-            migrations_dir: None,
-        });
-    }
-    Ok(dbs)
 }
 
 /// The minimal wrangler.json synthesized for the `celld d1 execute` cwd: only

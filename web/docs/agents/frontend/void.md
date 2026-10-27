@@ -3,7 +3,7 @@ title: Load data and handle forms with Void
 description: Write Void loaders, intent actions, forms, links, and routes.
 ---
 
-Put data loading in `pages/*.server.ts` and rendering in `pages/*.tsx`. Copy the starter shape below.
+Put data loading in `pages/*.server.ts` and rendering in `pages/*.tsx`. Copy this page-loader shape for a form:
 
 ```ts
 // pages/index.server.ts

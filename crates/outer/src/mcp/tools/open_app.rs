@@ -879,6 +879,9 @@ pub async fn open_app_impl(input: OpenAppInput, ctx: &Ctx<'_>) -> Result<Value, 
     next.push(
         "app_metrics {app} shows requests, visitors, errors and latency; db_query {app, sql} reads live D1 rows (single SELECT only)".to_string(),
     );
+    next.push(
+        "examples lists ready patterns for apps and sites; examples {name} returns the README and files to copy".to_string(),
+    );
 
     let summary = format!("{} at {}.", app.slug, &head[..head.len().min(12)]);
     Ok(ok(

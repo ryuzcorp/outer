@@ -20,7 +20,7 @@ Keep the first prompt to one screen: no login, no database yet.
 
 > Build a grocery list app for my family on Outer. One page: an input to add items, a list with checkboxes, a filter for bought vs. still needed. No login, no sharing yet — just the list.
 
-Before writing code, read the Ilha guide and the Void guide ([Void](/agents/frontend/void), [Ilha](/agents/frontend/ilha)). Then call `create_app` with a caller-picked slug, plus `name` and `description` so the app is branded from the first commit (see [Templates](/agents/start-here/templates)). A live app serves at `https://<slug>.outer.now` in seconds. Apps are unlisted by default: reachable by link, not indexed. For a landing page, portfolio, or blog, pass `template: "website"`. Then orient with `open_app {app}`: routes, tables, brand and rules in one call.
+Before writing code, read the Ilha guide and the Void guide ([Void](/agents/frontend/void), [Ilha](/agents/frontend/ilha)). Then call `create_app` with a caller-picked slug, plus `name` and `description` so the app is branded from the first commit (see [Templates](/agents/start-here/templates)). New apps are empty branded shells with nothing to delete: call [`examples`](/agents/start-here/examples) for ready patterns (forms + D1, passkey accounts, photo upload, blog, newsletter) and copy what the build needs. A live app serves at `https://<slug>.outer.now` in seconds. Apps are unlisted by default: reachable by link, not indexed. For a landing page, portfolio, or blog, pass `template: "website"`. Then orient with `open_app {app}`: routes, tables, brand and rules in one call.
 
 ## Make one small change
 

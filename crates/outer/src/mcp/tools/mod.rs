@@ -15,6 +15,7 @@ pub(crate) mod data;
 pub(crate) mod diagnostics;
 pub(crate) mod domains;
 pub(crate) mod drafts;
+pub(crate) mod examples;
 pub(crate) mod export;
 pub(crate) mod look;
 pub(crate) mod open_app;
@@ -861,6 +862,7 @@ async fn run_deploy_inner(
     check_storage_writable(&state.pool, &state.billing, app).await?;
     let deploys = state.deploys.clone();
     let pool = state.pool.clone();
+    let store = state.store.clone();
     let git = state.git.clone();
     let app_owned = app.clone();
     let sha_owned = sha.to_string();
@@ -881,11 +883,13 @@ async fn run_deploy_inner(
     let handle = tokio::spawn(async move {
         let outcome = match kind {
             crate::deploy::DeployKind::Main => {
-                deploys.deploy(&pool, &git, &app_owned, &sha_owned).await
+                deploys
+                    .deploy(&pool, &store, &git, &app_owned, &sha_owned)
+                    .await
             }
             crate::deploy::DeployKind::Preview => {
                 deploys
-                    .deploy_preview(&pool, &git, &app_owned, &sha_owned)
+                    .deploy_preview(&pool, &store, &git, &app_owned, &sha_owned)
                     .await
             }
         };
@@ -1235,6 +1239,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "restore_backup" => backups::restore_backup(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "examples" => examples::examples(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         _ => Err(CallError::Rpc(-32602, format!("unknown tool {tool:?}"))),

@@ -12,11 +12,15 @@
 //! Concurrency: a global semaphore bounds simultaneous builds and a per-app
 //! mutex serializes deploys of the same app. The `deploy` row is inserted as
 //! are held, and to `deploying` before the migrate/upload steps run. The
-//! migrate step runs under the same `deploying` status, before the upload
-//! for an existing app and after it for a first deploy: a blocked deploy
-//! (gate) never touches app data, a failed migration on an existing app
-//! leaves the previous version serving, and a failed first-deploy migration
-//! leaves the app not-live.
+//! migrate step runs under the same `deploying` status: before the upload
+//! when the live version declares every database being migrated (so a
+//! migrate failure uploads nothing and the previous version keeps serving),
+//! after the upload when there is no live version yet or the live version
+//! does not declare a database being migrated (the old code cannot reach
+//! that database, so nothing old depends on it). A failed migration after
+//! the upload means the new version is already published: the deploy still
+//! fails at `migrate`, with an error that says so, but the app's live
+//! pointer moves to the new version.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +34,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 use crate::apps::{self, App};
 use crate::cron;
+use crate::deploy::manifest as live_manifest;
 use crate::deploy::migrate;
 use crate::fleet::cgroups;
 use crate::fleet::manager::FleetStorage;
@@ -37,6 +42,7 @@ use crate::fleet::sandbox::{self, Sandbox};
 use crate::git::manifest::{self, GitConfig};
 use crate::moderation::gate;
 use crate::moderation::jev::JevClient;
+use crate::store::Store;
 
 /// What the pipeline needs: dirs, tool paths, storage creds, timeouts.
 #[derive(Clone)]
@@ -352,6 +358,27 @@ impl DeployKind {
         matches!(self, DeployKind::Preview)
     }
 }
+/// Where the D1 migrate step runs relative to the `celld deploy` upload.
+/// For an app with a live version the default is before the upload: when
+/// the new pointer becomes visible the schema is already ready, and a
+/// migrate failure uploads nothing. The upload goes first when there is no
+/// live fleet that could apply the migrations — no live version yet, or a
+/// live version that does not declare a database being migrated (asset-only
+/// sites, a first D1, a renamed database): the old code cannot reach that
+/// database anyway. A migrate failure after the upload still fails the
+/// deploy, but the new version is already published (see `StepFailed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrateOrder {
+    /// Migrate before uploading; a failure uploads nothing.
+    BeforeUpload,
+    /// First deploy: upload, wake the fleet, then migrate. Only a migrate
+    /// success marks the app live.
+    AfterUploadFirstDeploy,
+    /// The live version does not declare a database being migrated: upload,
+    /// wake, then migrate. A migrate failure still publishes the new
+    /// version, without the migrations.
+    AfterUploadLiveLacksDb,
+}
 pub struct Deployer {
     settings: DeploySettings,
     semaphore: Arc<Semaphore>,
@@ -657,6 +684,7 @@ impl Deployer {
     pub async fn deploy(
         &self,
         pool: &SqlitePool,
+        store: &Store,
         git: &GitConfig,
         app: &App,
         sha: &str,
@@ -666,7 +694,7 @@ impl Deployer {
         self.egress()
             .gate(&format!("build {} for {}", sha, app.slug))?;
         let slug = app.slug.clone();
-        self.deploy_inner(pool, git, app, &slug, DeployKind::Main, sha)
+        self.deploy_inner(pool, store, git, app, &slug, DeployKind::Main, sha)
             .await
     }
 
@@ -679,6 +707,7 @@ impl Deployer {
     pub async fn deploy_preview(
         &self,
         pool: &SqlitePool,
+        store: &Store,
         git: &GitConfig,
         app: &App,
         sha: &str,
@@ -690,13 +719,26 @@ impl Deployer {
         let Some(preview) = crate::preview::preview_app(app) else {
             anyhow::bail!("no preview fleet for {}", app.slug);
         };
-        self.deploy_inner(pool, git, &preview, &app.slug, DeployKind::Preview, sha)
-            .await
+        self.deploy_inner(
+            pool,
+            store,
+            git,
+            &preview,
+            &app.slug,
+            DeployKind::Preview,
+            sha,
+        )
+        .await
     }
 
+    // Eight params: the run identity (store, fleet app, mirror slug, kind)
+    // rides alongside the deploy identity. Splitting the struct would
+    // obscure the step order below, so the count stays.
+    #[allow(clippy::too_many_arguments)]
     async fn deploy_inner(
         &self,
         pool: &SqlitePool,
+        store: &Store,
         git: &GitConfig,
         app: &App,
         git_slug: &str,
@@ -723,6 +765,7 @@ impl Deployer {
         let result = self
             .run_steps(
                 pool,
+                store,
                 &deploy_id,
                 git,
                 app,
@@ -803,6 +846,42 @@ impl Deployer {
                 let log_tail = tail_cap(&log);
                 let steps_json = steps_json(&steps);
                 finish_failed(pool, &deploy_id, &failed.error, &steps_json, &log_tail).await?;
+                // The migrate step ran after the upload and failed: the new
+                // version is already published, so the app's live state moves
+                // exactly as on success — `last_deploy_sha` names what the
+                // fleet actually serves (the proxy forwards on it), the new
+                // version's crons go live, and the edge cache purges — while
+                // the deploy row (and `app_status`, which reads the latest
+                // row) still reports the migrate failure so the fix happens.
+                // A retry then sees a live version that declares the
+                // database and migrates before uploading again.
+                let reloaded = if failed.uploaded {
+                    // Same validated config the success path syncs: the
+                    // worktree still holds this sha's tree (only a failed
+                    // build wipes it, which never uploads first).
+                    let crons = self
+                        .deploy_root(app)
+                        .map(|(_, crons, _)| crons)
+                        .unwrap_or_default();
+                    match kind {
+                        DeployKind::Main => {
+                            apps::set_last_deploy(pool, &app.id, sha).await?;
+                            cron::sync_app_crons(pool, &app.id, &crons, apps::now_ms()).await?;
+                            let reloaded = reload_if_awake(app).await;
+                            self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
+                            reloaded
+                        }
+                        DeployKind::Preview => {
+                            let _ =
+                                crate::preview::touch_preview(pool, &app.id, apps::now_ms()).await;
+                            let reloaded = reload_if_awake(app).await;
+                            self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
+                            reloaded
+                        }
+                    }
+                } else {
+                    false
+                };
                 Ok(DeployOutcome {
                     deploy_id,
                     sha: sha.to_string(),
@@ -815,7 +894,7 @@ impl Deployer {
                     steps,
                     log_tail,
                     version: None,
-                    reloaded: false,
+                    reloaded,
                 })
             }
         }
@@ -870,17 +949,20 @@ impl Deployer {
     /// the celld version and the validated cron schedules on success. The
     /// review runs before `deploy-root`, and before migrations, so a blocked
     /// deploy never touches the app's data or uploads anything. For an app
-    /// with a live version migrations run before the upload, so no fleet can
-    /// ever serve new code against an unmigrated schema; for a first deploy
-    /// (no successful deploy yet) the upload runs first because `celld d1`
-    /// needs a running fleet and there is nothing to start one from yet.
-    // Nine params: the run identity (fleet app, mirror slug, kind) rides
+    /// whose live version declares every database being migrated, migrations
+    /// run before the upload, so no fleet can ever serve new code against an
+    /// unmigrated schema; otherwise the upload runs first because `celld d1`
+    /// needs a running fleet and there is nothing to start one from yet
+    /// (first deploy) or the live fleet cannot reach the database (the live
+    /// version does not declare it).
+    // Ten params: the run identity (fleet app, mirror slug, kind, store) rides
     // alongside the deploy identity. Splitting the struct would obscure
     // the step order below, so the count stays.
     #[allow(clippy::too_many_arguments)]
     async fn run_steps(
         &self,
         pool: &SqlitePool,
+        store: &Store,
         deploy_id: &str,
         git: &GitConfig,
         app: &App,
@@ -1005,33 +1087,92 @@ impl Deployer {
             }
         };
 
-        // 6+7. D1 migrations and the `celld deploy` upload. For an app with
-        // a live version the migrate step runs before the upload: celld
-        // offers no staged or invisible upload (the upload publishes
-        // `deploy/current.json` and every fleet adopts it on its own poll),
-        // so ordering is the only gate: when the new pointer becomes visible
-        // the schema is already ready, and a migrate failure uploads
-        // nothing, so the previous version keeps serving. The old code keeps
-        // serving during the migration (expand-first for destructive
-        // changes).
+        // 6+7. D1 migrations and the `celld deploy` upload. For an app whose
+        // live version declares every database being migrated, the migrate
+        // step runs before the upload: celld offers no staged or invisible
+        // upload (the upload publishes `deploy/current.json` and every fleet
+        // adopts it on its own poll), so ordering is the only gate: when the
+        // new pointer becomes visible the schema is already ready, and a
+        // migrate failure uploads nothing, so the previous version keeps
+        // serving. The old code keeps serving during the migration
+        // (expand-first for destructive changes).
         //
-        // A first deploy (`last_deploy_sha` is NULL: no successful deploy
-        // yet) reverses the order. `celld d1 migrations apply` finds its
-        // node through the bucket's node leases, and a first deploy has
-        // published nothing yet, so no fleet can start and the wake before
-        // the migrate step times out. The upload goes first, then the wake
-        // (now possible), then the migrations — and only a migrate success
-        // marks the deploy successful. Nothing is served before that: the
-        // proxy refuses to forward for an app with no successful deploy, so
-        // no fleet can serve the new code unmigrated.
+        // Otherwise the upload goes first, then the wake (now possible),
+        // then the migrations. That is the first-deploy case
+        // (`last_deploy_sha` is NULL: no successful deploy yet, so
+        // `celld d1 migrations apply` has no fleet to reach through the
+        // bucket's node leases), and the live-lacks-the-database case: the
+        // live manifest does not declare a database this deploy migrates
+        // (an asset-only live version, a first D1, a renamed database), so
+        // the woken live fleet cannot run the migration — retrying would
+        // fail forever and the site could never gain the database. The old
+        // live code cannot reach that database anyway, so nothing old
+        // depends on the new schema.
         //
         // The live-version signal comes from the row, not the caller's
         // snapshot: a previous deploy may have succeeded after the caller
         // loaded the app (the per-app lock serializes deploys, so the row
         // is current). `last_deploy_sha` NULL means no successful deploy yet.
-        // A preview deploy reads the preview signal instead: the first
-        // preview deploy (no successful preview run yet) uploads before
+        // A preview deploy reads the preview signal (and the preview
+        // manifest) instead: the first preview deploy uploads before
         // migrating for the same lease reason, against the preview fleet.
+        // A missing live manifest keeps the old order (migrate first): with
+        // no signal about the live version, the deploy fails exactly where
+        // it used to instead of guessing.
+        let order = self
+            .migrate_order(pool, store, app, kind, &deploy_root)
+            .await?;
+        set_status_blocking(pool, deploy_id)
+            .await
+            .map_err(StepEnd::Failed)?;
+        if order == MigrateOrder::BeforeUpload {
+            self.migrate_step(pool, app, deploy_id, &deploy_root, order, kind, journal)
+                .await?;
+            let version = self
+                .deploy_step(pool, app, deploy_id, &deploy_root, journal)
+                .await?;
+            Ok((version, crons))
+        } else {
+            let version = self
+                .deploy_step(pool, app, deploy_id, &deploy_root, journal)
+                .await?;
+            // A first deploy that fails here leaves the app not-live exactly
+            // as before: the proxy still refuses to forward (it gates on
+            // `last_deploy_sha`), so only a live app's upload-first failure
+            // marks the error published — the fleet already serves the new
+            // version, and the failure path moves the live pointer to it.
+            self.migrate_step(pool, app, deploy_id, &deploy_root, order, kind, journal)
+                .await
+                .map_err(|e| match e {
+                    StepEnd::Failed(mut failed) => {
+                        if order == MigrateOrder::AfterUploadLiveLacksDb {
+                            failed.uploaded = true;
+                        }
+                        StepEnd::Failed(failed)
+                    }
+                    StepEnd::Blocked(blocked) => StepEnd::Blocked(blocked),
+                })?;
+            Ok((version, crons))
+        }
+    }
+
+    /// Where the migrate step runs: before the upload when the live version
+    /// declares every database the new config migrates, after the upload
+    /// when there is no live fleet that could apply them. Reads the live
+    /// manifest through the shared `deploy::manifest` reader (the same
+    /// source the console data panels use); for a preview deploy `app` is
+    /// the preview identity, so this reads the preview fleet's manifest. A
+    /// missing manifest keeps `BeforeUpload`; an unreadable store or
+    /// manifest fails the deploy at the migrate step before anything
+    /// uploads.
+    async fn migrate_order(
+        &self,
+        pool: &SqlitePool,
+        store: &Store,
+        app: &App,
+        kind: DeployKind,
+        deploy_root: &DeployRoot,
+    ) -> Result<MigrateOrder, StepEnd> {
         let is_first_deploy = match kind {
             DeployKind::Main => last_deploy_sha(pool, &app.id)
                 .await
@@ -1042,47 +1183,46 @@ impl Deployer {
                 .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?
                 .is_none(),
         };
-        set_status_blocking(pool, deploy_id)
-            .await
-            .map_err(StepEnd::Failed)?;
         if is_first_deploy {
-            let version = self
-                .deploy_step(pool, app, deploy_id, &deploy_root, journal)
-                .await?;
-            self.migrate_step(
-                pool,
-                app,
-                deploy_id,
-                &deploy_root,
-                is_first_deploy,
-                kind,
-                journal,
-            )
-            .await?;
-            Ok((version, crons))
+            return Ok(MigrateOrder::AfterUploadFirstDeploy);
+        }
+        // The new config this deploy migrates: the same file the migrate
+        // step reads, so the order and the apply can never disagree. A
+        // config that fails to parse here fails again in the migrate step,
+        // before any upload.
+        let parsed = read_config_file(&deploy_root.config)
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?;
+        let databases = migrate::d1_databases(&parsed)
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?;
+        if databases.is_empty() {
+            return Ok(MigrateOrder::BeforeUpload);
+        }
+        let wanted: Vec<String> = databases
+            .iter()
+            .map(|db| db.database_name.clone())
+            .collect();
+        let live = live_manifest::deployed_manifest(store, &app.slug)
+            .await
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?;
+        let Some(live) = live else {
+            return Ok(MigrateOrder::BeforeUpload);
+        };
+        let live_dbs = live_manifest::manifest_dbs(&live)
+            .map_err(|e| StepEnd::Failed(StepFailed::plain("migrate", &e)))?;
+        if live_manifest::missing_from_live(&live_dbs, &wanted).is_empty() {
+            Ok(MigrateOrder::BeforeUpload)
         } else {
-            self.migrate_step(
-                pool,
-                app,
-                deploy_id,
-                &deploy_root,
-                is_first_deploy,
-                kind,
-                journal,
-            )
-            .await?;
-            let version = self
-                .deploy_step(pool, app, deploy_id, &deploy_root, journal)
-                .await?;
-            Ok((version, crons))
+            Ok(MigrateOrder::AfterUploadLiveLacksDb)
         }
     }
 
-    /// The `celld deploy <root> ... --json` upload step; returns the version.
+    /// The `celld deploy <root> ... --json` upload; returns the version.
     /// The upload publishes `deploy/current.json`, which every fleet adopts
-    /// on its own poll — so for an existing app it runs after the migrate
-    /// step (a migrate failure uploads nothing at all), while for a first
-    /// deploy it runs first (nothing to start a fleet from otherwise).
+    /// on its own poll — so it runs after the migrate step when the live
+    /// version declares every database being migrated (a migrate failure
+    /// uploads nothing at all), and first when no live fleet could apply the
+    /// migrations (first deploy, or a live version that lacks a database
+    /// being migrated).
     async fn deploy_step(
         &self,
         pool: &SqlitePool,
@@ -1121,10 +1261,11 @@ impl Deployer {
 
     /// The D1 migrations step: pending `NNNN_*.sql` files for the built
     /// config's `d1_databases`, applied with the app's scoped credentials.
-    /// For an existing app this runs before the upload makes the new code
-    /// visible to any fleet; for a first deploy it runs after the upload
-    /// (which is what lets the woken fleet exist at all). No files (or no
-    /// D1) skips the step without waking a sleeping fleet.
+    /// This runs before the upload makes the new code visible to any fleet
+    /// when the live version declares every database being migrated; after
+    /// the upload when there is no live fleet that could apply them (first
+    /// deploy, or a live version that lacks a database being migrated).
+    /// No files (or no D1) skips the step without waking a sleeping fleet.
     // The kind rides along for the wake target and the pin-record switch.
     #[allow(clippy::too_many_arguments)]
     async fn migrate_step(
@@ -1133,14 +1274,14 @@ impl Deployer {
         app: &App,
         deploy_id: &str,
         deploy_root: &DeployRoot,
-        is_first_deploy: bool,
+        order: MigrateOrder,
         kind: DeployKind,
         journal: &mut Journal,
     ) -> Result<(), StepEnd> {
         let Journal { steps, log } = journal;
         let started = Instant::now();
         match self
-            .migrate(pool, app, deploy_id, deploy_root, is_first_deploy, kind)
+            .migrate(pool, app, deploy_id, deploy_root, order, kind)
             .await
         {
             Ok((skipped, out)) => {
@@ -1502,18 +1643,19 @@ impl Deployer {
     /// credentials, and every file present is recorded in `d1_migration` so
     /// a later edit of an applied file fails the deploy instead of drifting.
     /// A failure names the migration file when celld's output identifies it
-    /// and carries an agent-facing line; the fleet is never reloaded, so an
-    /// existing app keeps serving its previous version while a first deploy
-    /// leaves the app not-live (the proxy forwards only after a success).
-    /// `is_first_deploy` selects that wording and the operator-CLI hint
-    /// below; the caller derives it from `last_deploy_sha` being NULL.
+    /// and carries an agent-facing line. When the step runs before the
+    /// upload, the fleet is never reloaded and an existing app keeps serving
+    /// its previous version; when it runs after the upload, the new version
+    /// is already published, so the error says the new version is live
+    /// without the migrations. `order` selects that wording and the
+    /// operator-CLI hint below (which only applies to a first deploy).
     async fn migrate(
         &self,
         pool: &SqlitePool,
         app: &App,
         deploy_id: &str,
         deploy_root: &DeployRoot,
-        is_first_deploy: bool,
+        order: MigrateOrder,
         kind: DeployKind,
     ) -> Result<(bool, String), StepFailed> {
         let root = &deploy_root.root;
@@ -1566,9 +1708,17 @@ impl Deployer {
         // to wake a sleeping fleet.
         // A first deploy that never went live has no previous version: say
         // the app isn't live yet instead of naming one that keeps serving.
+        // After the upload, the migrate failure does not roll the publish
+        // back, so the message must not claim the previous version keeps
+        // serving: it names the new version as live without the migrations.
+        // (Preview keeps its own line: the live app is untouched in every
+        // preview case, matching the first-preview-deploy failure.)
+        let published = kind == DeployKind::Main && order == MigrateOrder::AfterUploadLiveLacksDb;
         let live_line = if kind.is_preview() {
             "Your live app is untouched; only the preview failed to update."
-        } else if is_first_deploy {
+        } else if published {
+            "The new version is live without them — fix the migration and commit again."
+        } else if order == MigrateOrder::AfterUploadFirstDeploy {
             "Your app isn't live yet."
         } else {
             "Your app still shows the previous version."
@@ -1582,17 +1732,40 @@ impl Deployer {
                         .map_err(|e| StepFailed::plain("migrate", &e))?;
                 match recorded {
                     Some(sha) if sha != file.sha256 => {
-                        let error = format!(
-                            "migration {} for database {} was edited after it was applied; \
-                              write a new migration instead",
-                            file.name, db.database_name
-                        );
-                        let user_message = format!(
-                            "Outer couldn't publish this change because migration {} was edited \
-                              after it was already applied to database {}. {live_line} Write a \
-                              new migration file instead of editing an applied one.",
-                            file.name, db.database_name
-                        );
+                        // After the upload the refusal still means the new
+                        // version is live: celld never ran, so it serves
+                        // without this deploy's migration content.
+                        let (error, user_message) = if published {
+                            (
+                                format!(
+                                    "migration {} for database {} was edited after it was applied; \
+                                      the new version is live without it — write a new migration \
+                                      instead and commit again",
+                                    file.name, db.database_name
+                                ),
+                                format!(
+                                    "Outer published this change, but migration {} was edited \
+                                      after it was already applied to database {}. The new version \
+                                      is live without it — write a new migration instead and \
+                                      commit again.",
+                                    file.name, db.database_name
+                                ),
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "migration {} for database {} was edited after it was applied; \
+                                      write a new migration instead",
+                                    file.name, db.database_name
+                                ),
+                                format!(
+                                    "Outer couldn't publish this change because migration {} was edited \
+                                      after it was already applied to database {}. {live_line} Write a \
+                                      new migration file instead of editing an applied one.",
+                                    file.name, db.database_name
+                                ),
+                            )
+                        };
                         return Err(StepFailed::migration(error, user_message));
                     }
                     Some(_) => {}
@@ -1643,7 +1816,10 @@ impl Deployer {
                     // instead of surfacing celld's lease internals. (With a
                     // fleet manager the wake above runs first, so a lease
                     // error there is a real failure, not this hint.)
-                    if is_first_deploy && self.settings.wake.is_none() && text.contains("no node leases") {
+                    if order == MigrateOrder::AfterUploadFirstDeploy
+                        && self.settings.wake.is_none()
+                        && text.contains("no node leases")
+                    {
                         return StepFailed::migration(
                             format!(
                                 "first deploy with D1 migrations needs the server; deploy through MCP \
@@ -1658,6 +1834,10 @@ impl Deployer {
                         );
                     }
                     let failed = migrate::failing_file(&text);
+                    // After the upload the failure still means the new
+                    // version is live, so the message pairs the file with
+                    // that fact instead of claiming the previous version
+                    // keeps serving.
                     let error = match &failed {
                         Some(name) => format!(
                             "migration {name} for database {} failed: {}",
@@ -1670,7 +1850,25 @@ impl Deployer {
                             first_output_line(&text)
                         ),
                     };
+                    let error = if published {
+                        format!("{error}; the new version is live without them — fix the migration and commit again")
+                    } else {
+                        error
+                    };
                     let user_message = match &failed {
+                        Some(name) if published => format!(
+                            "Outer published this change, but migration {name} failed to apply \
+                             to database {}: {}. The new version is live without them — fix \
+                             the migration and commit again.",
+                            db.database_name,
+                            error_detail(&text, Some(name))
+                        ),
+                        None if published => format!(
+                            "Outer published this change, but the database migrations failed \
+                             to apply: {}. The new version is live without them — fix the \
+                             migration and commit again.",
+                            first_output_line(&text)
+                        ),
                         Some(name) => format!(
                             "Outer couldn't publish this change because migration {name} failed \
                              to apply to database {}: {}. {live_line}",
@@ -1954,11 +2152,17 @@ struct BlockedInfo {
 
 /// A step that failed: its name, the first meaningful output line, and an
 /// optional agent-facing line (the gate sets one for `review_unavailable`,
-/// migrate for file-specific failures).
+/// migrate for file-specific failures). `uploaded` is true when the failure
+/// came after an upload a live fleet already serves (an existing app's
+/// upload-first migrate failure): the failure path still moves the app's
+/// live pointer even though the deploy row records the failure. A first
+/// deploy's upload is never served (the proxy gates on `last_deploy_sha`),
+/// so its migrate failures leave `uploaded` false and the app not-live.
 struct StepFailed {
     step: &'static str,
     error: String,
     user_message: Option<String>,
+    uploaded: bool,
 }
 
 impl StepFailed {
@@ -1976,6 +2180,7 @@ impl StepFailed {
             step,
             error: cap_error(error),
             user_message: None,
+            uploaded: false,
         }
     }
 
@@ -1991,6 +2196,7 @@ impl StepFailed {
             step,
             error: cap_error(error),
             user_message: None,
+            uploaded: false,
         }
     }
 
@@ -2001,18 +2207,22 @@ impl StepFailed {
             step,
             error: "review_unavailable".to_string(),
             user_message: Some(user_message),
+            uploaded: false,
         }
     }
 
     /// For a failed migration: names the file when identifiable, with an
-    /// agent-facing line. The fleet is never reloaded, so an existing app
-    /// keeps serving its previous version while a first deploy stays
-    /// not-live.
+    /// agent-facing line. When the migrate step runs before the upload, the
+    /// fleet is never reloaded and an existing app keeps serving its
+    /// previous version; when it runs after the upload (`uploaded` is set
+    /// by the caller), the new version is already published and the error
+    /// says so.
     fn migration(error: String, user_message: String) -> Self {
         Self {
             step: "migrate",
             error: cap_error(&error),
             user_message: Some(user_message),
+            uploaded: false,
         }
     }
 
@@ -2023,6 +2233,7 @@ impl StepFailed {
             step,
             error: cap_error(&user_message),
             user_message: Some(user_message),
+            uploaded: false,
         }
     }
 }
@@ -3510,7 +3721,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_deploy_writes_row_and_leaves_last_deploy_sha() {
-        let (_mdir, cfg, _store, _sync, _sha_a, sha_b) = seed_mirror("grocery").await;
+        let (_mdir, cfg, store, _sync, _sha_a, sha_b) = seed_mirror("grocery").await;
         let (_ddir, pool) = test_pool().await;
         let app = test_app(10001);
         sqlx::query(
@@ -3529,7 +3740,10 @@ mod tests {
         // No package.json, no wrangler config: fails at deploy-root.
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 2);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
         assert!(
@@ -3639,7 +3853,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_deploy_issues_no_purge() {
-        let (_mdir, cfg, _store, _sync, _sha_a, sha_b) = seed_mirror("grocery").await;
+        let (_mdir, cfg, store, _sync, _sha_a, sha_b) = seed_mirror("grocery").await;
         let (_ddir, pool) = test_pool().await;
         let app = test_app(10001);
         sqlx::query(
@@ -3657,7 +3871,10 @@ mod tests {
         let purge = crate::cloudflare::fake::FakePurge::start().await;
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(purge_settings(&data, &purge), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         // No spawn happens on the failure path at all; the settle wait only
         // guards against a stray detached task.
@@ -3734,7 +3951,10 @@ mod tests {
         settings.celld_bin = "/nonexistent/celld-binary".to_string();
         settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "blocked");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(
@@ -3816,7 +4036,10 @@ mod tests {
         settings.celld_bin = "/nonexistent/celld-binary".to_string();
         settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "blocked");
         assert_eq!(outcome.failed_step.as_deref(), Some("gate"));
         assert_eq!(outcome.reason.as_deref(), Some("profanity"));
@@ -3936,7 +4159,10 @@ mod tests {
         settings.celld_bin = "/nonexistent/celld-binary".to_string();
         settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("gate"));
         assert_eq!(outcome.error.as_deref(), Some("review_unavailable"));
@@ -4225,7 +4451,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         // A first deploy (`last_deploy_sha` NULL) uploads before it
         // migrates: `celld d1` needs a running fleet and nothing is
@@ -4343,7 +4572,10 @@ exit 0
         let mut settings = migrate_settings(&data, state.path(), &script);
         settings.bun_bin = bun.to_string_lossy().into_owned();
         let deployer = Deployer::new(settings, 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         // The uploaded config carries the decrypted values: the fresh var,
         // the overwrite winning over code, and the untouched code var.
@@ -4680,7 +4912,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
         assert_eq!(first.status, "success", "error: {:?}", first.error);
         // The first deploy has no live version yet, so it uploads before it
         // migrates.
@@ -4723,7 +4958,10 @@ exit 0
         )
         .await
         .unwrap();
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -4781,7 +5019,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
         assert_eq!(first.status, "success", "error: {:?}", first.error);
         assert_eq!(upload_calls(state.path()), 1);
 
@@ -4810,7 +5051,10 @@ exit 0
         )
         .await
         .unwrap();
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("migrate"));
         assert_eq!(
@@ -4849,6 +5093,528 @@ exit 0
         assert_eq!(count, 1, "a failed apply records nothing new");
     }
 
+    /// The live manifest celld published for `slug`: `deploy/current.json`
+    /// pointing at a versioned prefix plus the manifest there, in the layout
+    /// `deploy::manifest::deployed_manifest` reads. The fake celld never
+    /// writes these (it has no store handle), so tests seed them directly.
+    async fn seed_live_manifest(store: &Store, slug: &str, manifest: serde_json::Value) {
+        let prefix = "deploy/outer-app/abcd1234";
+        store
+            .put(
+                &format!("fleets/{slug}/deploy/current.json"),
+                format!(
+                    "{{\"script_name\":\"{slug}\",\"version\":\"abcd1234\",\"prefix\":\"{prefix}\"}}"
+                )
+                .into_bytes(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &format!("fleets/{slug}/{prefix}/manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_uploads_first_when_live_manifest_lacks_the_database() {
+        // The live repro: a static site deploys first (no worker, no D1),
+        // then a tree adds the worker, the `d1_databases` binding and its
+        // first migration. The live manifest declares nothing, so the woken
+        // live fleet could never run the apply — retrying would fail forever
+        // and the site could never gain the database. The upload goes first.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "static site".to_string(),
+                base: None,
+                changes: commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","compatibility_date":"2026-01-01"}"#,
+                        ),
+                        write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10120);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+
+        // The live version celld published: an asset-only manifest with no
+        // worker module and no bindings declares nothing.
+        seed_live_manifest(
+            &store,
+            "grocery",
+            serde_json::json!({
+                "schema_version": 2,
+                "script_name": "grocery",
+                "raw_metadata": {"bindings": []},
+            }),
+        )
+        .await;
+
+        // The newsletter copy: an API route makes it a worker, the binding
+        // appears, and the first migration lands.
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "add newsletter".to_string(),
+                base: Some(sha_a.clone()),
+                changes: commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","d1_databases":[{"binding":"DB","database_name":"site-db"}]}"#,
+                        ),
+                        write(
+                            "db/migrations/0001_newsletter.sql",
+                            "CREATE TABLE subscriber (id INTEGER);",
+                        ),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "deploy",
+                "migrate"
+            ]
+        );
+        assert_eq!(
+            call_kinds(state.path()),
+            ["deploy", "deploy", "apply"],
+            "the first deploy uploads, then the D1 deploy uploads before it migrates"
+        );
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha_b.as_str()));
+    }
+
+    #[tokio::test]
+    async fn migrate_failure_after_upload_first_is_failed_but_live() {
+        // Same setup, but the first migration is broken: the deploy fails at
+        // `migrate` with an honest error, yet the new version is already
+        // published — so `last_deploy_sha` moves to it instead of pinning
+        // the old version while the fleet serves the new one.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "static site".to_string(),
+                base: None,
+                changes: commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","compatibility_date":"2026-01-01"}"#,
+                        ),
+                        write("pages/index.tsx", "export default () => <h1>hi</h1>;"),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10121);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+        seed_live_manifest(
+            &store,
+            "grocery",
+            serde_json::json!({
+                "schema_version": 2,
+                "script_name": "grocery",
+                "raw_metadata": {"bindings": []},
+            }),
+        )
+        .await;
+
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "broken newsletter migration".to_string(),
+                base: Some(sha_a.clone()),
+                changes: commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","d1_databases":[{"binding":"DB","database_name":"site-db"}]}"#,
+                        ),
+                        write(
+                            "db/migrations/0001_newsletter.sql",
+                            "CREATE TABLE oops (;",
+                        ),
+                        write("dist/.fake-fail", "0001_newsletter.sql"),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.failed_step.as_deref(), Some("migrate"));
+        let error = outcome.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("0001_newsletter.sql") && error.contains("live without them"),
+            "the error names the file and says the new version is live: {error}"
+        );
+        let message = outcome.user_message.as_deref().unwrap_or("");
+        assert!(
+            message.contains("published") && message.contains("live without them"),
+            "the agent learns the version published and the migration did not: {message}"
+        );
+        assert!(
+            outcome.log_tail.contains("0001_newsletter.sql"),
+            "the migration error is in the log tail"
+        );
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "deploy",
+                "migrate"
+            ],
+            "the upload ran before the failing migrate"
+        );
+        assert_eq!(
+            call_kinds(state.path()),
+            ["deploy", "deploy", "apply"],
+            "the second deploy uploaded before its migrate failed"
+        );
+        assert_eq!(upload_calls(state.path()), 2);
+        // The new version is what the fleet serves, so the live pointer
+        // moves to it even though the deploy failed; a retry then sees a
+        // live version that declares the database and migrates first.
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha_b.as_str()));
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM d1_migration")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a failed apply records nothing");
+    }
+
+    #[tokio::test]
+    async fn migrate_stays_first_when_live_manifest_declares_the_database() {
+        // The positive path, pinned explicitly: the live manifest declares
+        // the database being migrated, so the migrate step still runs before
+        // the upload — and a migrate failure would upload nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![write(
+                "db/migrations/0001_init.sql",
+                "CREATE TABLE item (id INTEGER);",
+            )],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10122);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+        seed_live_manifest(
+            &store,
+            "grocery",
+            serde_json::json!({
+                "schema_version": 2,
+                "script_name": "grocery",
+                "main_module": "index.js",
+                "raw_metadata": {"bindings": [
+                    {"type": "d1", "name": "DB", "database_name": "app-db"},
+                ]},
+            }),
+        )
+        .await;
+
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "second migration".to_string(),
+                base: Some(sha_a.clone()),
+                changes: commit::CommitChanges {
+                    writes: vec![write(
+                        "db/migrations/0002_add_owner.sql",
+                        "ALTER TABLE item ADD COLUMN owner TEXT;",
+                    )],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "migrate",
+                "deploy"
+            ]
+        );
+        assert_eq!(
+            call_kinds(state.path()),
+            ["deploy", "apply", "apply", "deploy"],
+            "a live version that declares the database migrates before it uploads"
+        );
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha_b.as_str()));
+    }
+
+    #[tokio::test]
+    async fn migrate_uploads_first_when_the_database_is_renamed() {
+        // The live version declares `app-db`; the new tree renames it to
+        // `site-db`. By name the live version lacks the database being
+        // migrated, so the upload goes first: the old fleet only knows the
+        // old name.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha_a = commit_tree(
+            &cfg,
+            &store,
+            &sync,
+            "grocery",
+            vec![write(
+                "db/migrations/0001_init.sql",
+                "CREATE TABLE item (id INTEGER);",
+            )],
+        )
+        .await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10123);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
+        assert_eq!(first.status, "success", "error: {:?}", first.error);
+        seed_live_manifest(
+            &store,
+            "grocery",
+            serde_json::json!({
+                "schema_version": 2,
+                "script_name": "grocery",
+                "main_module": "index.js",
+                "raw_metadata": {"bindings": [
+                    {"type": "d1", "name": "DB", "database_name": "app-db"},
+                ]},
+            }),
+        )
+        .await;
+
+        let sha_b = commit::commit(
+            &store,
+            &cfg,
+            &sync,
+            "grocery",
+            CommitRequest {
+                message: "rename database".to_string(),
+                base: Some(sha_a.clone()),
+                changes: commit::CommitChanges {
+                    writes: vec![
+                        write(
+                            "dist/wrangler.json",
+                            r#"{"name":"t","main":"index.js","compatibility_date":"2026-01-01","d1_databases":[{"binding":"DB","database_name":"site-db"}]}"#,
+                        ),
+                        write(
+                            "db/migrations/0002_add_owner.sql",
+                            "ALTER TABLE item ADD COLUMN owner TEXT;",
+                        ),
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "worktree",
+                "install",
+                "build",
+                "gate",
+                "deploy-root",
+                "deploy",
+                "migrate"
+            ]
+        );
+        assert_eq!(
+            call_kinds(state.path()),
+            ["deploy", "apply", "deploy", "apply"],
+            "a renamed database uploads before it migrates"
+        );
+        let (last_sha,): (Option<String>,) =
+            sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = ?1")
+                .bind(&app.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last_sha.as_deref(), Some(sha_b.as_str()));
+    }
+
     #[tokio::test]
     async fn migrate_skips_when_everything_is_already_applied() {
         let dir = tempfile::tempdir().unwrap();
@@ -4877,12 +5643,18 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let first = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(first.status, "success", "error: {:?}", first.error);
         assert_eq!(apply_calls(state.path()), 1);
 
         // Same tree again: nothing pending, no second apply, no wake.
-        let second = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let second = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(second.status, "success", "error: {:?}", second.error);
         let migrate = second
             .steps
@@ -4941,7 +5713,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         let migrate = outcome
             .steps
@@ -4975,7 +5750,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         let migrate = outcome
             .steps
@@ -5018,7 +5796,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("migrate"));
         let error = outcome.error.as_deref().unwrap_or("");
@@ -5103,7 +5884,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let failed = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        let failed = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.failed_step.as_deref(), Some("migrate"));
         // Still no successful deploy, so the retry is a first deploy too:
@@ -5136,7 +5920,10 @@ exit 0
         )
         .await
         .unwrap();
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -5193,7 +5980,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
         assert_eq!(first.status, "success", "error: {:?}", first.error);
         assert_eq!(apply_calls(state.path()), 1);
 
@@ -5224,7 +6014,10 @@ exit 0
         )
         .await
         .unwrap();
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("migrate"));
         let error = outcome.error.as_deref().unwrap_or("");
@@ -5296,7 +6089,10 @@ exit 0
         settings.bun_bin = "/bin/true".to_string();
         settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "blocked");
         assert_eq!(
             apply_calls(state.path()),
@@ -5346,7 +6142,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         assert_eq!(apply_calls(state.path()), 1, "one apply for the database");
         let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
@@ -5416,7 +6215,10 @@ exit 0
         let script = install_fake_celld(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
-        let first = deployer.deploy(&pool, &cfg, &app, &sha_a).await.unwrap();
+        let first = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_a)
+            .await
+            .unwrap();
         assert_eq!(first.status, "success", "error: {:?}", first.error);
         assert_eq!(apply_calls(state.path()), 1);
 
@@ -5442,7 +6244,10 @@ exit 0
         )
         .await
         .unwrap();
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha_b).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha_b)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         assert_eq!(apply_calls(state.path()), 2, "the new identity re-applies");
         let mut identities: Vec<(String,)> =
@@ -5618,7 +6423,10 @@ exit 0
         // bad cron stops the deploy at deploy-root, before celld runs.
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
         assert!(
@@ -5682,7 +6490,10 @@ exit 0
         // message, before migrations or celld run.
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
         assert_eq!(outcome.error.as_deref(), Some(BINDING_CAP_MESSAGE));
@@ -5730,7 +6541,10 @@ exit 0
 
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
         assert_eq!(outcome.error.as_deref(), Some(BINDING_CAP_MESSAGE));
@@ -5739,7 +6553,7 @@ exit 0
 
     #[tokio::test]
     async fn queued_row_is_visible_while_waiting_for_permits() {
-        let (_mdir, cfg, _store, _sync, _sha_a, sha_b) = seed_mirror("grocery").await;
+        let (_mdir, cfg, store, _sync, _sha_a, sha_b) = seed_mirror("grocery").await;
         let (_ddir, pool) = test_pool().await;
         let app = test_app(10002);
         sqlx::query(
@@ -5754,7 +6568,9 @@ exit 0
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 0);
         let pool2 = pool.clone();
-        let handle = tokio::spawn(async move { deployer.deploy(&pool2, &cfg, &app, &sha_b).await });
+        let store2 = store.clone();
+        let handle =
+            tokio::spawn(async move { deployer.deploy(&pool2, &store2, &cfg, &app, &sha_b).await });
         tokio::time::sleep(Duration::from_millis(300)).await;
         let (status,): (String,) =
             sqlx::query_as("SELECT status FROM deploy WHERE app_id = 'app1'")
@@ -5870,7 +6686,10 @@ exit 0
             secrets_key: crate::secrets::SecretsKey::test_key(),
         };
         let deployer = Deployer::new(settings, 1);
-        let outcome = deployer.deploy(&pool, &cfg, &app, &sha).await.unwrap();
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         assert!(
             outcome.version.is_some(),

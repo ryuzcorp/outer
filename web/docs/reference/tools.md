@@ -721,3 +721,15 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `binding` | string | no | The D1 binding. Omit to use the app's only declared binding. |
 | `confirm` | string | yes | Must equal `backup_id`: restoring overwrites the live database (a fresh backup is taken first, so a bad restore is itself restorable). |
 
+## `examples`
+
+- **Access:** anyone (no token needed)
+- **Description:** Copy-paste patterns for apps and sites: `examples` lists them, `examples {name}` returns the README and files to copy.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | no | An example name (`examples` lists them). Omit to list. |
+| `template` | string | no | Only examples for one template: "app" or "website". Omit for both. |
+
