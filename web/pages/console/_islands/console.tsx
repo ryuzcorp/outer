@@ -92,6 +92,7 @@ import {
   DATA_VIEWS,
   RANGES,
   VIEWS,
+  canOpenApp,
   readRoute,
   routeUrl,
   toAccountRoute,
@@ -798,7 +799,7 @@ export function Console() {
           }
           return;
         }
-        if (!data.apps.some((a) => a.slug === r.app)) {
+        if (!canOpenApp(isAdmin(), data.apps.map((a) => a.slug), r.app)) {
           detail.set({
             kind: "error",
             message: "request failed: 404",
@@ -857,7 +858,10 @@ export function Console() {
         return;
       }
       const known = apps();
-      if (known.kind === "ready" && !known.value.some((a) => a.slug === r.app)) {
+      if (
+        known.kind === "ready" && r.app &&
+        !canOpenApp(isAdmin(), known.value.map((a) => a.slug), r.app)
+      ) {
         detail.set({ kind: "error", message: "request failed: 404" });
         return;
       }
@@ -1070,6 +1074,31 @@ export function Console() {
               </span>
             </button>
           ))}
+          {active?.admin === true && (
+            <button
+              key={`admin-${active.slug}`}
+              type="button"
+              role="listitem"
+              class="rail-tile tooltip tooltip-right is-active"
+              data-tip={`${active.slug} · ${active.status} · Admin view`}
+              title={`${active.slug} · ${active.status} · Admin view`}
+              aria-label={`${active.slug}, ${active.status}, viewing as admin`}
+              aria-current="page"
+              onclick={() => navigate({ app: active.slug, view: "overview" })}
+            >
+              <span class="indicator">
+                <span
+                  class={`indicator-item status rail-dot ${statusDot(active.status)}`}
+                  aria-hidden="true"
+                />
+                <span class="avatar avatar-placeholder" aria-hidden="true">
+                  <span class="flex h-11 w-11 items-center justify-center text-xl font-bold">
+                    {monogram(active.slug)}
+                  </span>
+                </span>
+              </span>
+            </button>
+          )}
         </div>
         <div class={`dropdown dropdown-right${ui().createOpen ? " dropdown-open" : ""}`}>
           <button
@@ -1309,7 +1338,15 @@ export function Console() {
                       </div>
                     ))}
                 {!accountView && detailPanel.kind === "ready" && (
-                  <ViewBody
+                  <>
+                    {detailPanel.value.admin === true && (
+                      <div class="alert alert-soft alert-warning min-w-0 mb-3" role="note">
+                        <span class="min-w-0">
+                          Admin view of <strong class="truncate" title={detailPanel.value.slug}>{detailPanel.value.slug}</strong> — every read and mutation is audited.
+                        </span>
+                      </div>
+                    )}
+                    <ViewBody
                     route={r}
                     onView={(view) => navigate({ view })}
                     onRoute={(next) => navigate(next)}
@@ -1409,6 +1446,7 @@ export function Console() {
                       domains.set({ kind: "ready", value: summary });
                     }}
                   />
+                  </>
                 )}
               </div>
             </main>
@@ -1428,6 +1466,9 @@ export function Console() {
                 <span class={`badge badge-soft ${statusBadge(active.status)} shrink-0`} title={active.status}>{active.status}</span>
                 {active.role === "collaborator" && (
                   <span class="badge badge-soft badge-info shrink-0" title="Shared with you — you can change this app, but only the owner manages it">Shared</span>
+                )}
+                {active.admin === true && (
+                  <span class="badge badge-soft badge-warning shrink-0" title="Viewing as admin — every read and mutation is audited">Admin view</span>
                 )}
                 <button
                   type="button"

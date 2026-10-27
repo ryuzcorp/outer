@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  canOpenApp,
   readRoute,
   routeUrl,
   toAccountRoute,
@@ -97,5 +98,19 @@ describe("account hub routes", () => {
     expect(toAccountRoute("usage")).toEqual({ view: "account", acctab: "usage" });
     expect(toAcctab("connections")).toBe("connections");
     expect(toAcctab("nope")).toBe("account");
+  });
+});
+
+describe("foreign-app access", () => {
+  test("admins may open slugs outside their own rail", () => {
+    expect(canOpenApp(true, ["shop"], "groceries")).toBe(true);
+    expect(canOpenApp(true, ["shop"], "shop")).toBe(true);
+    expect(canOpenApp(true, [], "groceries")).toBe(true);
+  });
+
+  test("everyone else only opens rail apps", () => {
+    expect(canOpenApp(false, ["shop"], "shop")).toBe(true);
+    expect(canOpenApp(false, ["shop"], "groceries")).toBe(false);
+    expect(canOpenApp(false, [], "groceries")).toBe(false);
   });
 });
