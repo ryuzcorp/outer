@@ -23,6 +23,12 @@
 #   the same function `deploy::pipeline` runs install/build through — and
 #   the suite fails unless every must-fail probe stayed contained. Probes
 #   that cannot prove containment skip loudly instead of passing.
+# - VPS container path (no cargo on the box): `scripts/hostile-probe-vps.sh`
+#   runs the same build-probe layer as root inside `outer-outer-1` with bun
+#   + setpriv, against the live `inet outer` table and the real
+#   `/sys/fs/cgroup/outer` anchor. Fixtures ride in via scp + `docker cp`,
+#   the two top-of-range uids travel as arguments (verified spare on the
+#   host first). See that script's header for the exact commands.
 # - R2 layer (`--r2`): `r2-probe.mjs` checks a *scoped* key round-trips
 #   inside its own prefix and is refused (403/401) on a sibling prefix
 #   and the bucket root. Mint it first (Cloudflare API, temporary

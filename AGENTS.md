@@ -33,11 +33,16 @@ is `crates/outer/tests/hostile.rs`, in two layers:
   limits, `fleets/{slug}/` credential scope, reserved-env filter,
   loopback-only fleet command, data-dir layout.
 - **Privileged** (`cargo test --locked -- --ignored hostile`, VPS only via
-  `sudo scripts/hostile-suite.sh`): runs the real fixtures through
-  `run_sandboxed` as an app uid in a real cgroup leaf with the nft table
-  installed, plus the R2 scope check with scoped creds (`--r2`). Needs root,
-  cgroup v2 with delegation, nft and bun/node; anything missing skips loudly
-  instead of passing.
+  `sudo scripts/hostile-suite.sh` — or, where no cargo exists,
+  `scripts/hostile-probe-vps.sh` as root inside the container): runs the
+  real fixtures through `run_sandboxed` as an app uid in a real cgroup leaf
+  with the nft table installed, plus the R2 scope check with scoped creds
+  (`--r2`). Needs root, cgroup v2 with delegation, nft and bun/node;
+  anything missing skips loudly instead of passing. The build-probe uids
+  come from inside the configured app range (`HOSTILE_UID_BASE`, default
+  the top of `OUTER_APP_UID_RANGE`, so they never collide with real apps),
+  and the harness refuses to pass unless the installed `inet outer` table
+  covers the probe uid.
 
 The `worker.js` `/probes` check needs a live celld fleet with a deployed app
 and stays a manual VPS step (see the script header). A PR that changes escape
