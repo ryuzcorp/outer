@@ -1129,9 +1129,10 @@ fn push_text_result(
 /// one line run in input order). An insert after a replaced range's last
 /// line lands after the new block.
 ///
-/// The file's trailing newline is preserved unless an op touches the last
-/// line: then it comes from that op's text (the last insert at end-of-file
-/// wins over a replace ending there). An empty result stays empty.
+/// Line ops edit lines, not the file terminator: the trailing-newline state
+/// is preserved (an empty result stays empty). The only exception is an
+/// empty file, which has no state to preserve: there the inserted text's
+/// ending decides.
 async fn apply_line_ops(
     git_dir: &str,
     parent: Option<&str>,
@@ -1232,10 +1233,12 @@ async fn apply_line_ops(
         }
         let trailing = if out.is_empty() {
             false
-        } else if let Some(last) = insertions.iter().filter(|i| i.after_line == n).last() {
-            last.text.ends_with('\n')
-        } else if let Some(e) = reps.iter().find(|e| e.end_line == n) {
-            e.new.ends_with('\n')
+        } else if n == 0 {
+            insertions
+                .iter()
+                .filter(|i| i.after_line == 0)
+                .last()
+                .is_some_and(|last| last.text.ends_with('\n'))
         } else {
             base_trailing
         };
@@ -3848,11 +3851,12 @@ mod tests {
         let h = commit(&store, &cfg, &sync, "bounds", r).await.unwrap();
         assert_eq!(show(&bare, &h, "bare.txt").await, "X\ny\nz");
 
-        // ...and takes the replacement's ending when it does.
+        // ...and a replacement touching the last line keeps it that way too:
+        // line ops never flip the file's terminator.
         let mut r = req("last");
         r.changes.line_edits.push(line_edit("bare.txt", 3, 3, "Z\n"));
         let h = commit(&store, &cfg, &sync, "bounds", r).await.unwrap();
-        assert_eq!(show(&bare, &h, "bare.txt").await, "X\ny\nZ\n");
+        assert_eq!(show(&bare, &h, "bare.txt").await, "X\ny\nZ");
     }
 
     #[tokio::test]
@@ -3860,6 +3864,7 @@ mod tests {
         let (_dir, cfg, store, sync) = setup("empty").await;
         let mut seed = req("seed");
         seed.changes.writes.push(write("f.txt", ""));
+        seed.changes.writes.push(write("empty2.txt", ""));
         commit(&store, &cfg, &sync, "empty", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "empty");
 
@@ -3871,7 +3876,7 @@ mod tests {
 
         // A replace range needs a line to replace.
         let mut r = req("range");
-        r.changes.line_edits.push(line_edit("f.txt", 1, 1, "x"));
+        r.changes.line_edits.push(line_edit("empty2.txt", 1, 1, "x"));
         match commit(&store, &cfg, &sync, "empty", r).await {
             Err(CommitError::OutOfRange {
                 path,
@@ -3879,8 +3884,8 @@ mod tests {
                 end_line,
                 total,
             }) => {
-                assert_eq!(path, "f.txt");
-                assert_eq!((start_line, end_line, total), (1, 1, 1));
+                assert_eq!(path, "empty2.txt");
+                assert_eq!((start_line, end_line, total), (1, 1, 0));
             }
             other => panic!("an empty-file replace must fail, got {other:?}"),
         }
@@ -3982,13 +3987,14 @@ mod tests {
             "a\nb\nfirst\nsecond\nc\nd\n"
         );
 
-        // An insert without a trailing newline at EOF leaves none.
+        // The file's trailing newline survives inserts at end-of-file, even
+        // when the inserted text carries none.
         let mut r = req("bare");
         r.changes.inserts.push(insert_after("f.txt", 6, "z"));
         let h = commit(&store, &cfg, &sync, "inserts", r).await.unwrap();
         assert_eq!(
             show(&bare, &h, "f.txt").await,
-            "a\nb\nfirst\nsecond\nc\nd\nz"
+            "a\nb\nfirst\nsecond\nc\nd\nz\n"
         );
     }
 

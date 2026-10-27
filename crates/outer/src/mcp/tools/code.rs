@@ -110,8 +110,8 @@ pub struct LineEditInput {
     pub start_line: u64,
     /// Last line to replace, inclusive.
     pub end_line: u64,
-    /// Replacement text (empty deletes the lines). The file's trailing
-    /// newline is preserved unless the range touches the last line.
+    /// Replacement text (empty deletes the lines). Line ops never change
+    /// the file's trailing-newline state.
     pub new: String,
     /// Per-file CAS: the blob id read_files reported. See writes.
     pub expect_blob: Option<String>,
