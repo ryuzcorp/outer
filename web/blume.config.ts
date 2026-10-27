@@ -5,6 +5,9 @@ export default defineConfig({
   // Brand wordmark in the header (the Logo slot falls back to this), the
   // `<title>` suffix, and OG cards.
   title: "Outer",
+  // Logo mark beside the wordmark (Blume inlines web/public/logo.svg; the
+  // same file ships as /favicon.svg for the favicon).
+  logo: { image: "/logo.svg", text: "Outer" },
   // Ilha islands in the console pages (`pages/console/`): Astro renders
   // them server-side and hydrates them in the browser (`client:load`).
   // The islands use the automatic JSX runtime (`jsxImportSource: ilha`,

@@ -27,6 +27,7 @@ WORKDIR /site/web
 COPY web/package.json web/bun.lock web/blume.config.ts web/tsconfig.json web/components.ts ./
 COPY web/components ./components
 COPY web/docs ./docs
+COPY web/public ./public
 COPY web/pages ./pages
 RUN bun install --frozen-lockfile \
  && bun ./node_modules/blume/bin/blume.mjs build

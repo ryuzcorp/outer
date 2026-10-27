@@ -7,8 +7,7 @@
 // `createIcons()` DOM scanning, so the strict console CSP stays intact.
 // Every icon is a 24x24 stroke glyph at 1.5px (the reference weight);
 // pass `size` for pixel height/width.
-//
-// `OuterMark` is our own brand mark (three dots), not a Lucide glyph.
+
 import { h } from "ilha";
 import {
   Activity,
@@ -82,23 +81,6 @@ function Lucide({
       aria-hidden={label ? undefined : "true"}
     >
       {node.map(([tag, attrs], i) => h(tag, { ...attrs, key: i }))}
-    </svg>
-  );
-}
-
-export function OuterMark({ size = 22 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      role="img"
-      aria-label="Outer home"
-    >
-      <circle cx="12" cy="5.5" r="2" />
-      <circle cx="5.5" cy="17.5" r="2" />
-      <circle cx="18.5" cy="17.5" r="2" />
     </svg>
   );
 }
