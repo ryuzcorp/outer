@@ -1561,21 +1561,12 @@ mod tests {
             port
         }
 
-        /// An unused port number, for seeding an app whose health gate the
-        /// test answers itself (see `wake_then_idle`).
-        async fn free_port() -> u16 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-            port
-        }
-
         /// A port held open for the test, answering 503 to every probe: the
-        /// health gate treats it as a dead fleet. Unlike [`Self::free_port`],
-        /// the socket stays bound, so no parallel test can claim the port
-        /// mid-test and answer 200 — which the zero-timeout probe would
-        /// mistake for an already-healthy fleet, adopting it without a spawn
-        /// and breaking the attempt count.
+        /// health gate treats it as a dead fleet. The socket stays bound for
+        /// the whole test, so no parallel test can claim the port mid-test
+        /// and answer 200 — which the zero-timeout probe would mistake for
+        /// an already-healthy fleet, adopting it without a spawn and breaking
+        /// the attempt count.
         async fn dead_port(&mut self) -> u16 {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1642,23 +1633,34 @@ mod tests {
             .unwrap();
         }
 
+        /// A bound gate listener for an app whose health gate the test
+        /// answers itself (see `wake_then_idle`): holds an OS-assigned port
+        /// from seeding to the wake, so no parallel test can claim the
+        /// number mid-test and break the wake (or answer 200 on a stolen
+        /// number and get the wake adopted without a spawn).
+        async fn gated_listener() -> (tokio::net::TcpListener, u16) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            (listener, port)
+        }
+
         /// Start and health-gate the app's fleet, then backdate its
-        /// activity so the sweep sees it as idle. The port answers 503
-        /// until the wake is in flight: the zero-timeout probe can never
-        /// mistake it for an already-healthy fleet, so `ensure_awake`
-        /// always spawns (and tracks) the fake celld.
-        async fn wake_then_idle(&self, slug: &str, last_request_at: i64) {
+        /// activity so the sweep sees it as idle. Serves `listener`, bound
+        /// up front by [`Self::gated_listener`] and held since seeding:
+        /// rebinding a released port number here leaves a window where a
+        /// parallel test claims the number and the bind fails. The port
+        /// answers 503 until the wake is in flight: the zero-timeout probe
+        /// can never mistake it for an already-healthy fleet, so
+        /// `ensure_awake` always spawns (and tracks) the fake celld.
+        async fn wake_then_idle(
+            &self,
+            listener: tokio::net::TcpListener,
+            slug: &str,
+            last_request_at: i64,
+        ) {
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::Arc;
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let port: i64 = sqlx::query_scalar("SELECT port FROM app WHERE slug = ?1")
-                .bind(slug)
-                .fetch_one(&self.pool)
-                .await
-                .unwrap();
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port as u16))
-                .await
-                .unwrap();
             let ready = Arc::new(AtomicBool::new(false));
             let gate = ready.clone();
             let serving = tokio::spawn(async move {
@@ -1716,20 +1718,22 @@ mod tests {
     async fn sleep_sweep_skips_protected_always_on() {
         let rig = WarmRig::new(10).await;
         rig.seed_user("a1", "a@example.com", "pro").await;
-        let port = WarmRig::free_port().await as i64;
+        // Held from seeding to the wake: no parallel test can claim the
+        // number mid-test.
+        let (gate, port) = WarmRig::gated_listener().await;
         rig.seed_app(
             "app1",
             "warm",
             "a1",
             220101,
-            port,
+            port as i64,
             true,
             None,
             Some("sha"),
             None,
         )
         .await;
-        rig.wake_then_idle("warm", 0).await;
+        rig.wake_then_idle(gate, "warm", 0).await;
         let slept = rig.manager.sleep_idle(&rig.pool).await.unwrap();
         assert!(slept.is_empty(), "protected fleet sleeps: {slept:?}");
         assert!(rig.manager.logs("warm").is_some());
@@ -1746,13 +1750,15 @@ mod tests {
     async fn sleep_sweep_sleeps_free_always_on() {
         let rig = WarmRig::new(10).await;
         rig.seed_user("a1", "a@example.com", "free").await;
-        let port = WarmRig::free_port().await as i64;
+        // Held from seeding to the wake: no parallel test can claim the
+        // number mid-test.
+        let (gate, port) = WarmRig::gated_listener().await;
         rig.seed_app(
             "app1",
             "cold",
             "a1",
             220101,
-            port,
+            port as i64,
             true,
             None,
             Some("sha"),
@@ -1760,7 +1766,7 @@ mod tests {
         )
         .await;
         // The sweep ignores the flag on Free: the fleet sleeps normally.
-        rig.wake_then_idle("cold", 0).await;
+        rig.wake_then_idle(gate, "cold", 0).await;
         let slept = rig.manager.sleep_idle(&rig.pool).await.unwrap();
         assert_eq!(slept, vec!["cold"]);
         assert!(rig.manager.logs("cold").is_none());
@@ -1777,14 +1783,16 @@ mod tests {
     async fn sleep_sweep_cap_sleeps_the_oldest_idle() {
         let rig = WarmRig::new(1).await;
         rig.seed_user("a1", "a@example.com", "pro").await;
-        let old_port = WarmRig::free_port().await as i64;
-        let new_port = WarmRig::free_port().await as i64;
+        // Held from seeding to the wakes: no parallel test can claim either
+        // number mid-test, and the two seeds can never share one.
+        let (old_gate, old_port) = WarmRig::gated_listener().await;
+        let (new_gate, new_port) = WarmRig::gated_listener().await;
         rig.seed_app(
             "app1",
             "old",
             "a1",
             220101,
-            old_port,
+            old_port as i64,
             true,
             None,
             Some("sha"),
@@ -1796,16 +1804,16 @@ mod tests {
             "new",
             "a1",
             220102,
-            new_port,
+            new_port as i64,
             true,
             None,
             Some("sha"),
             None,
         )
         .await;
-        rig.wake_then_idle("old", 0).await;
+        rig.wake_then_idle(old_gate, "old", 0).await;
         // Stale too (so it would sleep unprotected), but newer than `old`.
-        rig.wake_then_idle("new", 1_000).await;
+        rig.wake_then_idle(new_gate, "new", 1_000).await;
         let slept = rig.manager.sleep_idle(&rig.pool).await.unwrap();
         assert_eq!(slept, vec!["old"], "cap victim is the oldest idle");
         assert!(rig.manager.logs("new").is_some());
