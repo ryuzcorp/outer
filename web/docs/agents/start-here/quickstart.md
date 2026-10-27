@@ -26,7 +26,7 @@ Before writing code, read the Ilha guide and the Void guide ([Void](/agents/fron
 
 > Add a "who bought it" label: tapping a bought item lets you type a name.
 
-Change code with `commit {app, message, edits}` using exact-match edits. Written code is formatted before the commit lands; `commit.formatted` lists touched files, so target that text with your next edits. Every code tool returns `success` + URL, `failed` + log tail, or `blocked` + lines to fix.
+Change code with `commit {app, message, line_edits}` using line-anchored edits (numbered lines from `read_files`); exact-match `edits` and a unified-diff `patch` work too. Written code is formatted before the commit lands; `commit.formatted` lists touched files, so target that text with your next edits. Every code tool returns `success` + URL, `failed` + log tail, or `blocked` + lines to fix.
 
 ## Share it
 

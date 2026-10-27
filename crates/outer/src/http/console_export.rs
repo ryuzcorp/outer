@@ -240,13 +240,17 @@ mod tests {
             CommitRequest {
                 message: "groceries".to_string(),
                 base: None,
-                writes: vec![FileWrite {
-                    path: "pages/index.tsx".to_string(),
-                    body: WriteBody::Text("<h1>Groceries</h1>\n".to_string()),
-                }],
-                edits: vec![],
-                deletes: vec![],
-                moves: vec![],
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![FileWrite {
+                        path: "pages/index.tsx".to_string(),
+                        body: WriteBody::Text("<h1>Groceries</h1>\n".to_string()),
+                        expect_blob: None,
+                    }],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
                 author: author(),
             },
         )

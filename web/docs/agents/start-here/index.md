@@ -9,7 +9,7 @@ You build apps through MCP tools. Every code change follows one loop: build, gat
 
 1. Call `create_app` with the slug you want. Outer rejects a taken slug; a deleted app's slug is free to claim again immediately.
 2. Call `open_app {app}` to orient: the file tree with roles, routes, D1 tables, bindings, brand, the `AGENTS.md` rules digest and quota in one call. Read deeper with `read_files` (up to 20 files or line ranges per call, numbered lines, or one `symbol` by name) and find code with `search_code` (path globs, `kind: "symbol"` for definitions; generated files skipped by default).
-3. Make small edits with `commit` using exact-match `edits`, one idea per message.
+3. Make small edits with `commit` using line-anchored `line_edits` (numbered lines from `read_files`), exact-match `edits`, or a unified-diff `patch`, one idea per message. Copy each file's `read_files` blob into its `expect_blob`: a file that changed underneath then answers `conflict` with its current blob — re-read and retry. Without it, line numbers apply to the current file unchecked. Never mix exact `edits` with `line_edits`/`inserts` on the same file in one commit.
 4. Verify with `look_at_app` after UI changes and `app_errors` after touching server code.
 
 Each code tool waits for the deploy. It returns `success` with the URL, `failed` with the build log, or `blocked` with the lines to fix. A blocked deploy never goes live; the previous version keeps serving. Fix the flagged lines and commit again.

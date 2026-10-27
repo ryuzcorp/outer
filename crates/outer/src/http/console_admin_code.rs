@@ -342,13 +342,17 @@ mod tests {
             CommitRequest {
                 message: "first groceries".to_string(),
                 base: None,
-                writes: vec![FileWrite {
-                    path: "pages/app.tsx".to_string(),
-                    body: WriteBody::Text("export default function App() {}\n".to_string()),
-                }],
-                edits: vec![],
-                deletes: vec![],
-                moves: vec![],
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![FileWrite {
+                        path: "pages/app.tsx".to_string(),
+                        body: WriteBody::Text("export default function App() {}\n".to_string()),
+                        expect_blob: None,
+                    }],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
                 author: commit::Author {
                     name: "ana".to_string(),
                     email: "ana@example.com".to_string(),

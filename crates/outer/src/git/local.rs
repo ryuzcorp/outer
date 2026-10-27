@@ -1094,6 +1094,7 @@ mod tests {
         FileWrite {
             path: path.to_string(),
             body: WriteBody::Text(content.to_string()),
+            expect_blob: None,
         }
     }
 
@@ -1113,13 +1114,16 @@ mod tests {
         let first = CommitRequest {
             message: "first".to_string(),
             base: None,
-            writes: vec![
-                write("pages/index.tsx", "<h1>Groceries</h1>\n"),
-                write("pages/about.ts", "about\n"),
-            ],
-            edits: vec![],
-            deletes: vec![],
-            moves: vec![],
+            changes: crate::git::commit::CommitChanges {
+                writes: vec![
+                    write("pages/index.tsx", "<h1>Groceries</h1>\n"),
+                    write("pages/about.ts", "about\n"),
+                ],
+                edits: vec![],
+                deletes: vec![],
+                moves: vec![],
+                ..Default::default()
+            },
             author: author(),
         };
         commit::commit(&store, &cfg, &sync, "grocery", first)
@@ -1201,10 +1205,13 @@ mod tests {
             CommitRequest {
                 message: "flood".to_string(),
                 base: None,
-                writes: big,
-                edits: vec![],
-                deletes: vec![],
-                moves: vec![],
+                changes: crate::git::commit::CommitChanges {
+                    writes: big,
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
                 author: author(),
             },
         )
@@ -1272,15 +1279,19 @@ mod tests {
         let second = CommitRequest {
             message: "second".to_string(),
             base: None,
-            writes: vec![write("pages/new.txt", "new\n")],
-            edits: vec![crate::git::commit::Edit {
-                path: "pages/index.tsx".to_string(),
-                old: "<h1>Groceries</h1>\n".to_string(),
-                new: "<h1>Groceries</h1>\n<p>fresh</p>\n".to_string(),
-                replace_all: false,
-            }],
-            deletes: vec!["pages/about.ts".to_string()],
-            moves: vec![],
+            changes: crate::git::commit::CommitChanges {
+                writes: vec![write("pages/new.txt", "new\n")],
+                edits: vec![crate::git::commit::Edit {
+                    path: "pages/index.tsx".to_string(),
+                    old: "<h1>Groceries</h1>\n".to_string(),
+                    new: "<h1>Groceries</h1>\n<p>fresh</p>\n".to_string(),
+                    replace_all: false,
+                    expect_blob: None,
+                }],
+                deletes: vec!["pages/about.ts".to_string()],
+                moves: vec![],
+                ..Default::default()
+            },
             author: author(),
         };
         let c2 = commit::commit(&store, &cfg, &sync, "grocery", second)
@@ -1353,19 +1364,24 @@ mod tests {
             CommitRequest {
                 message: "blobs".to_string(),
                 base: None,
-                writes: vec![
-                    FileWrite {
-                        path: "img.bin".to_string(),
-                        body: WriteBody::Base64(engine.encode(&small_bin)),
-                    },
-                    FileWrite {
-                        path: "big.bin".to_string(),
-                        body: WriteBody::Base64(engine.encode(&big)),
-                    },
-                ],
-                edits: vec![],
-                deletes: vec![],
-                moves: vec![],
+                changes: crate::git::commit::CommitChanges {
+                    writes: vec![
+                        FileWrite {
+                            path: "img.bin".to_string(),
+                            body: WriteBody::Base64(engine.encode(&small_bin)),
+                            expect_blob: None,
+                        },
+                        FileWrite {
+                            path: "big.bin".to_string(),
+                            body: WriteBody::Base64(engine.encode(&big)),
+                            expect_blob: None,
+                        },
+                    ],
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
                 author: author(),
             },
         )

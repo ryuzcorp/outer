@@ -367,7 +367,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `commit`
 
 - **Access:** signed in
-- **Description:** Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), deletes and moves. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.
+- **Description:** Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / Codex patch (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.
 
 **Input:**
 
@@ -376,9 +376,12 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `base` | string | no | Expected head (CAS): a moved head answers conflict with current_sha. |
 | `deletes` | array of string | no | Paths to delete. |
-| `edits` | array of object | no | Exact-match replacements in existing files. |
+| `edits` | array of object | no | Exact-match replacements in existing files. A file with exact edits carries no line_edits or inserts in the same commit; send them as separate commits. |
+| `inserts` | array of object | no | Insertions after a line (0 is the top). Must not land inside a line_edits range of the same file, nor on a file that also carries exact edits. |
+| `line_edits` | array of object | no | Line-range replacements (inclusive, 1-based read_files numbering). Ranges in one file must not overlap. Refused on a file that also carries exact edits. Copy the read_files blob into expect_blob: a shifted file then answers conflict instead of editing wrong lines. |
 | `message` | string | yes | Commit message, 1-500 chars. |
 | `moves` | array of object | no | File renames. |
+| `patch` | string | no | One unified diff, or a Codex `*** Begin Patch` block. A commit carrying patch carries no other change kind. Hunks apply with exact context; any reject fails the whole commit. |
 | `preview` | boolean | no | Preview the change instead of shipping it (Pro): commits to the preview ref, deploys to the `<slug>--preview` URL with a fresh, empty data namespace, and leaves live untouched. Counts a code change like a live commit. |
 | `wait` | boolean | no | Wait for the deploy (default true). False returns immediately; poll deploy_status (with preview: true for a preview commit). |
 | `writes` | array of object | no | Full-file writes (new files or replacements). |
