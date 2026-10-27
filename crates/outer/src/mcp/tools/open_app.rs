@@ -876,6 +876,9 @@ pub async fn open_app_impl(input: OpenAppInput, ctx: &Ctx<'_>) -> Result<Value, 
             "search_code {app, query} to find code; commit {app, edits} to change it".to_string(),
         );
     }
+    next.push(
+        "app_metrics {app} shows requests, visitors, errors and latency; db_query {app, sql} reads live D1 rows (single SELECT only)".to_string(),
+    );
 
     let summary = format!("{} at {}.", app.slug, &head[..head.len().min(12)]);
     Ok(ok(
