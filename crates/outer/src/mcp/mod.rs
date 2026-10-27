@@ -44,7 +44,7 @@ pub const LATEST_PROTOCOL: &str = "2025-11-25";
 
 /// Exactly the §8.1 text (Codex reads only this much). The length test pins
 /// it at or under 512 chars.
-pub const INSTRUCTIONS: &str = "Start with `open_app` to orient on the app. Read only what you need with `read_files` (batch up to 20 files, line ranges or one symbol), find code with `search_code`, change code with `commit` edits. Relay `user_message` verbatim. Guides: `docs {topic}` and /llms.txt.";
+pub const INSTRUCTIONS: &str = "Start with `open_app` to orient. Read with `read_files` (batches), find with `search_code`, iterate with `stage` then `check` then `ship` (`commit` ships at once). Relay `user_message` verbatim. Guides: `docs {topic}` and /llms.txt.";
 
 /// Largest `POST /mcp` body: one `commit` at the caps fits (spec §8.1).
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -71,14 +71,35 @@ impl Deploys {
         }
     }
 
-    /// A fake that answers every deploy with `outcome`, for tests.
+    /// A fake that answers every deploy with `outcome`, for tests. The fake
+    /// `check` answers every step skipped until `set_fake_check` says more.
     #[cfg(test)]
     pub fn fake(outcome: FakeOutcome) -> Self {
         Self {
             inner: Arc::new(DeploysInner::Fake(FakeDeploys {
                 outcome: std::sync::Mutex::new(outcome),
+                check: std::sync::Mutex::new(crate::deploy::CheckOutput {
+                    steps: ["install", "build", "typecheck", "lint", "tests"]
+                        .iter()
+                        .map(|name| crate::deploy::CheckStep {
+                            name: name.to_string(),
+                            ms: 1,
+                            skipped: true,
+                            ok: true,
+                        })
+                        .collect(),
+                    log: "fake check ok".to_string(),
+                }),
                 locks: std::sync::Mutex::new(HashMap::new()),
             })),
+        }
+    }
+
+    /// Change what the fake `check` answers (tests drive pass/fail paths).
+    #[cfg(test)]
+    pub fn set_fake_check(&self, output: crate::deploy::CheckOutput) {
+        if let DeploysInner::Fake(fake) = &*self.inner {
+            *fake.check.lock().expect("fake check poisoned") = output;
         }
     }
 
@@ -125,6 +146,25 @@ impl Deploys {
             DeploysInner::Live(deployer) => deployer.deploy(pool, git, app, sha).await,
             #[cfg(test)]
             DeploysInner::Fake(fake) => fake.deploy(pool, app, sha).await,
+        }
+    }
+
+    /// The `check` counterpart: steps over a draft tree in the check dir,
+    /// never deploying. `pool` charges nothing here; the caller charges the
+    /// elapsed wall time to build minutes so the fake path charges too.
+    pub async fn check(
+        &self,
+        pool: &SqlitePool,
+        git: &GitConfig,
+        app: &App,
+        draft_sha: &str,
+    ) -> anyhow::Result<crate::deploy::CheckOutput> {
+        match &*self.inner {
+            DeploysInner::Live(deployer) => {
+                deployer.check_tree(pool, git, app, draft_sha).await
+            }
+            #[cfg(test)]
+            DeploysInner::Fake(fake) => fake.check(),
         }
     }
 
@@ -234,6 +274,7 @@ impl FakeOutcome {
 #[cfg(test)]
 struct FakeDeploys {
     outcome: std::sync::Mutex<FakeOutcome>,
+    check: std::sync::Mutex<crate::deploy::CheckOutput>,
     locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -246,6 +287,10 @@ impl FakeDeploys {
             .entry(app_id.to_string())
             .or_default()
             .clone()
+    }
+
+    fn check(&self) -> anyhow::Result<crate::deploy::CheckOutput> {
+        Ok(self.check.lock().expect("fake check poisoned").clone())
     }
 
     async fn deploy(

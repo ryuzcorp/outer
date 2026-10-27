@@ -1823,7 +1823,7 @@ impl Deployer {
     }
 
     /// A per-step build leaf under the shared parent, or `None` on dev.
-    fn build_leaf(&self, deploy_id: &str, step: &str) -> anyhow::Result<Option<PathBuf>> {
+    pub(crate) fn build_leaf(&self, deploy_id: &str, step: &str) -> anyhow::Result<Option<PathBuf>> {
         let Some(anchor) = &self.settings.cgroups else {
             return Ok(None);
         };
@@ -2308,7 +2308,7 @@ async fn run_git(
 /// write into the tree as the app uid. Skipped when not root: an
 /// unprivileged outer cannot chown, and the steps then run as the current
 /// user anyway.
-fn hand_worktree_to_app(slug: &str, work: &Path, uid: u32) {
+pub(crate) fn hand_worktree_to_app(slug: &str, work: &Path, uid: u32) {
     #[cfg(unix)]
     {
         if unsafe { libc::geteuid() } != 0 {

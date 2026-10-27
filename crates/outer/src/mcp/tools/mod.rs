@@ -5,6 +5,8 @@
 //! that becomes `isError`). Argument-shape failures are the caller's bug
 //! and surface as JSON-RPC `-32602`, never as `isError`.
 
+pub(crate) mod diagnostics;
+pub(crate) mod drafts;
 pub(crate) mod account;
 pub(crate) mod apps;
 pub(crate) mod backups;
@@ -668,7 +670,7 @@ pub fn is_terminal(status: &str) -> bool {
 }
 
 /// Last 8 KiB of a failed build log (spec §10.3), cut on a UTF-8 boundary.
-fn tail_8k(log: &str) -> &str {
+pub(crate) fn tail_8k(log: &str) -> &str {
     const CAP: usize = 8 * 1024;
     if log.len() <= CAP {
         return log;
@@ -730,6 +732,11 @@ pub fn deploy_json(state: &McpState, app: &App, row: &DeployRow) -> Value {
         if row.status == "failed" {
             if let Some(log) = row.log_tail.as_deref() {
                 out["log_tail"] = json!(tail_8k(log));
+                let diagnostics = diagnostics::parse_diagnostics(log);
+                out["diagnostics"] = json!(diagnostics
+                    .iter()
+                    .map(|d| d.json())
+                    .collect::<Vec<_>>());
             }
         }
     } else {
@@ -802,6 +809,13 @@ pub fn outcome_json(state: &McpState, app: &App, outcome: &DeployOutcome, previe
     }
     if outcome.status == "failed" {
         out["log_tail"] = json!(tail_8k(&outcome.log_tail));
+        // Structured errors (§1.6): the same parsed diagnostics `check`
+        // returns, so agents fix builds without re-reading the raw log.
+        let diagnostics = diagnostics::parse_diagnostics(&outcome.log_tail);
+        out["diagnostics"] = json!(diagnostics
+            .iter()
+            .map(|d| d.json())
+            .collect::<Vec<_>>());
     }
     out
 }
@@ -1145,6 +1159,21 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "search_code" => code::search_code(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "stage" => drafts::stage(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "diff_draft" => drafts::diff_draft(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "check" => drafts::check(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "ship" => drafts::ship(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "discard_draft" => drafts::discard_draft(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "commit" => code::commit(parse_args(args)?, ctx)

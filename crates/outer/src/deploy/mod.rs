@@ -4,6 +4,7 @@
 //! The integration owner declares `pub mod deploy;` on the crate root; this
 //! module owns everything under `src/deploy/`.
 
+pub mod check;
 pub mod migrate;
 pub mod pipeline;
 
@@ -11,3 +12,4 @@ pub use pipeline::{
     fail_interrupted, prune_old, scrub_interrupted_injections, DeployKind, DeployOutcome,
     DeploySettings, Deployer, PurgeTasks, Step,
 };
+pub use check::{CheckOutput, CheckStep};

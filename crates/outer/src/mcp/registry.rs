@@ -7,8 +7,9 @@ use serde_json::Value;
 use crate::mcp::tools::{
     account, apps as app_inputs, backups as backup_inputs, code as code_inputs,
     collaborators as collab_inputs, data as data_inputs, domains as domain_inputs,
-    export as export_inputs, look as look_inputs, open_app as open_app_inputs,
-    preview as preview_inputs, runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
+    drafts as draft_inputs, export as export_inputs, look as look_inputs,
+    open_app as open_app_inputs, preview as preview_inputs, runtime as runtime_inputs,
+    secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -91,10 +92,13 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "get_app" | "share_app" | "look_at_app" | "open_app" | "list_files" | "read_files"
         | "search_code" | "history" | "show_commit" | "deploy_status" | "deploy_log"
         | "app_logs" | "app_errors" | "app_metrics" | "db_query" | "list_secrets"
-        | "list_collaborators" | "list_domains" | "export_code" | "list_backups" => Hints::READ,
+        | "list_collaborators" | "list_domains" | "export_code" | "list_backups" | "diff_draft" => {
+            Hints::READ
+        }
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
-        | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" => Hints::WRITE,
+        | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" | "stage"
+        | "check" | "ship" => Hints::WRITE,
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -111,7 +115,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             ..Hints::WRITE
         },
         "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
-        | "unset_secret" | "remove_domain" | "discard_preview" => Hints::DESTRUCTIVE,
+        | "unset_secret" | "remove_domain" | "discard_preview" | "discard_draft" => Hints::DESTRUCTIVE,
         // Repeating a restore takes another fresh backup, so one call is
         // never a no-op repeat of the last: not idempotent.
         "restore_backup" => Hints {
@@ -303,7 +307,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<open_app_inputs::OpenAppInput>(
             "open_app",
-            "Orient on an app in one call: head sha, role-tagged tree, routes, D1 tables, bindings, brand, AGENTS.md digest, last deploy, open errors and quota. Start here, then read_files (batched ranges), search_code, commit edits.",
+            "Orient on an app in one call: head sha, role-tagged tree, routes, D1 tables, bindings, brand, AGENTS.md digest, last deploy, open errors and quota. Start here, then read_files (batched ranges), search_code, stage, check and ship.",
             Account, false,
         ),
         tool::<code_inputs::ListFilesInput>(
@@ -324,6 +328,31 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<code_inputs::CommitInput>(
             "commit",
             "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / Codex patch (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.",
+            Account, false,
+        ),
+        tool::<draft_inputs::StageInput>(
+            "stage",
+            "Stage file changes into your per-app draft without deploying: full-file writes, exact-match edits, deletes and moves (same shapes as commit). No deploy, no code change. Then diff_draft to review, check to verify, ship to deploy as one commit.",
+            Account, false,
+        ),
+        tool::<draft_inputs::DraftAppInput>(
+            "diff_draft",
+            "Show your staged draft as a unified diff against its base commit, with per-file stats. Untrusted: the patch may hold visitor text.",
+            Account, true,
+        ),
+        tool::<draft_inputs::CheckInput>(
+            "check",
+            "Verify your draft in the build sandbox: install, build, typecheck (when the template has tsconfig), lint and tests. Never deploys, never spends a code change; charges build minutes. Returns pass/fail with structured diagnostics [{file, line, col, code, severity, message}].",
+            Account, false,
+        ),
+        tool::<draft_inputs::ShipInput>(
+            "ship",
+            "Ship your draft as one commit through the normal path (gate, deploy, one code change) and clear it. Rebases onto the current head when it moved, or answers conflict with current_sha when the draft no longer applies.",
+            Account, false,
+        ),
+        tool::<draft_inputs::DiscardDraftInput>(
+            "discard_draft",
+            "Drop your staged draft. The deployed app is untouched.",
             Account, false,
         ),
         tool::<code_inputs::HistoryInput>(
