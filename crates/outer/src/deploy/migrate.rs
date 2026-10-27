@@ -2,24 +2,34 @@
 //!
 //! After the gate passes, the pipeline applies pending
 //! `NNNN_description.sql` files with `celld d1 migrations apply` under the
-//! app's scoped credentials. For an app with a live version the apply runs
-//! BEFORE the `celld deploy` upload: celld offers no staged upload (the
-//! upload publishes `deploy/current.json` and every fleet adopts it on its
-//! own poll), so ordering is the only gate — when the new pointer becomes
-//! visible the schema is already ready, and a migrate failure uploads
-//! nothing, so no fleet can ever serve new code against an unmigrated
-//! schema. For a first deploy the order reverses: the apply needs a running
-//! node (found through the bucket's node leases) and nothing is published
-//! yet, so the upload goes first, the fleet wakes, and the migrations apply
-//! after — and only a migrate success marks the app live. The proxy refuses
-//! to forward for an app with no successful deploy, so the uploaded-but-
-//! unmigrated code is never served. celld reads the files relative to the
-//! deploy root, orders them by numeric prefix, and records applied
-//! files by name in the app's own `d1_migrations` table (the same table and
-//! columns `wrangler d1 migrations` uses, so the two never re-apply each
-//! other's files). Outer additionally pins the sha256 it saw in
-//! `d1_migration`, so a file edited after it was applied fails the deploy
-//! instead of silently drifting from what the database runs.
+//! app's scoped credentials. When the live version declares every database
+//! being migrated, the apply runs BEFORE the `celld deploy` upload: celld
+//! offers no staged upload (the upload publishes `deploy/current.json` and
+//! every fleet adopts it on its own poll), so ordering is the only gate —
+//! when the new pointer becomes visible the schema is already ready, and a
+//! migrate failure uploads nothing, so no fleet can ever serve new code
+//! against an unmigrated schema. The old code keeps serving during the
+//! migration (expand-first for destructive changes).
+//!
+//! Otherwise the order reverses: the upload goes first, then the wake, then
+//! the migrations. That is the first-deploy case (the apply needs a running
+//! node, found through the bucket's node leases, and nothing is published
+//! yet, so the fleet must be started by the upload) and the
+//! live-lacks-the-database case (the live manifest declares no D1 database
+//! being migrated — an asset-only live version, a first D1, a renamed
+//! database — so the woken live fleet cannot run the migration at all). The
+//! proxy refuses to forward for an app with no successful deploy, so an
+//! uploaded-but-unmigrated first deploy is never served; an uploaded-but-
+//! unmigrated existing app IS served (the pointer moved), so the deploy
+//! fails at `migrate` with an error that says the new version is live
+//! without the migrations, and the app's live pointer moves anyway.
+//! celld reads the files relative to the deploy root, orders them by
+//! numeric prefix, and records applied files by name in the app's own
+//! `d1_migrations` table (the same table and columns `wrangler d1
+//! migrations` uses, so the two never re-apply each other's files). Outer
+//! additionally pins the sha256 it saw in `d1_migration`, so a file edited
+//! after it was applied fails the deploy instead of silently drifting from
+//! what the database runs.
 //!
 //! Security model: everything celld reads or Outer copies here is
 //! attacker-influenced (the app's built config and build output are written

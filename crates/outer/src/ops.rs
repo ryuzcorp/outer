@@ -130,7 +130,10 @@ pub async fn create_app(
     // The uid set changed: reinstall at once (best-effort; the sweep tick
     // is the backstop).
     p.egress.refresh(&p.pool).await;
-    let outcome = p.deployer.deploy(&p.pool, &p.git, &app, &sha).await?;
+    let outcome = p
+        .deployer
+        .deploy(&p.pool, &p.store, &p.git, &app, &sha)
+        .await?;
     Ok((app, outcome))
 }
 
@@ -143,7 +146,9 @@ pub async fn deploy_app(p: &Platform, slug: &str) -> anyhow::Result<DeployOutcom
     let sha = manifest::head_of(&bare)
         .await?
         .with_context(|| format!("{slug} has no commits on main"))?;
-    p.deployer.deploy(&p.pool, &p.git, &app, &sha).await
+    p.deployer
+        .deploy(&p.pool, &p.store, &p.git, &app, &sha)
+        .await
 }
 
 /// Delete `slug`: the operator CLI's path to the same core the MCP

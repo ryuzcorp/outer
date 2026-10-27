@@ -862,6 +862,7 @@ async fn run_deploy_inner(
     check_storage_writable(&state.pool, &state.billing, app).await?;
     let deploys = state.deploys.clone();
     let pool = state.pool.clone();
+    let store = state.store.clone();
     let git = state.git.clone();
     let app_owned = app.clone();
     let sha_owned = sha.to_string();
@@ -882,11 +883,13 @@ async fn run_deploy_inner(
     let handle = tokio::spawn(async move {
         let outcome = match kind {
             crate::deploy::DeployKind::Main => {
-                deploys.deploy(&pool, &git, &app_owned, &sha_owned).await
+                deploys
+                    .deploy(&pool, &store, &git, &app_owned, &sha_owned)
+                    .await
             }
             crate::deploy::DeployKind::Preview => {
                 deploys
-                    .deploy_preview(&pool, &git, &app_owned, &sha_owned)
+                    .deploy_preview(&pool, &store, &git, &app_owned, &sha_owned)
                     .await
             }
         };

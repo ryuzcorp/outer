@@ -138,12 +138,13 @@ impl Deploys {
     pub async fn deploy(
         &self,
         pool: &SqlitePool,
+        store: &Store,
         git: &GitConfig,
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
         match &*self.inner {
-            DeploysInner::Live(deployer) => deployer.deploy(pool, git, app, sha).await,
+            DeploysInner::Live(deployer) => deployer.deploy(pool, store, git, app, sha).await,
             #[cfg(test)]
             DeploysInner::Fake(fake) => fake.deploy(pool, app, sha).await,
         }
@@ -172,12 +173,15 @@ impl Deploys {
     pub async fn deploy_preview(
         &self,
         pool: &SqlitePool,
+        store: &Store,
         git: &GitConfig,
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
         match &*self.inner {
-            DeploysInner::Live(deployer) => deployer.deploy_preview(pool, git, app, sha).await,
+            DeploysInner::Live(deployer) => {
+                deployer.deploy_preview(pool, store, git, app, sha).await
+            }
             #[cfg(test)]
             DeploysInner::Fake(fake) => fake.deploy_preview(pool, app, sha).await,
         }
