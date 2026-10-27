@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 54);
+        assert_eq!(tools.len(), 59);
     }
 }
 
@@ -514,6 +514,7 @@ mod hint_tests {
                     | "remove_collaborator"
                     | "remove_domain"
                     | "discard_preview"
+                    | "discard_draft"
                     | "restore_backup"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);

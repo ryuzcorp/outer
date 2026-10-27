@@ -197,6 +197,9 @@ pub struct FakeOutcome {
     pub user_message: Option<&'static str>,
     /// Answer only after this long (timeout-path tests).
     pub delay: Duration,
+    /// The build log the fake persists and returns. `None` keeps the stock
+    /// "fake deploy ok" line; tests set it to exercise log parsing.
+    pub log_tail: Option<&'static str>,
     /// Fail the deploy itself instead of answering an outcome (the pipeline
     /// blew up): `deploy` answers `Err`, so callers take their
     /// infrastructure-failure path.
@@ -214,6 +217,7 @@ impl FakeOutcome {
             user_message: None,
             delay: Duration::ZERO,
             transport_error: false,
+            log_tail: None,
         }
     }
 
@@ -236,6 +240,7 @@ impl FakeOutcome {
             user_message: None,
             delay: Duration::ZERO,
             transport_error: false,
+            log_tail: None,
         }
     }
 
@@ -258,6 +263,7 @@ impl FakeOutcome {
             ),
             delay: Duration::ZERO,
             transport_error: false,
+            log_tail: None,
         }
     }
 
@@ -341,9 +347,10 @@ impl FakeDeploys {
         let now = crate::apps::now_ms();
         let steps_json = r#"[{"name":"fake","ms":1,"skipped":false}]"#;
         let findings_json = serde_json::to_string(&outcome.findings)?;
+        let log_tail = outcome.log_tail.unwrap_or("fake deploy ok").to_string();
         sqlx::query(
             "INSERT INTO deploy (id, app_id, sha, kind, status, steps, error, findings, log_tail, created_at, finished_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'fake deploy ok', ?9, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
         )
         .bind(&deploy_id)
         .bind(&app.id)
@@ -353,6 +360,7 @@ impl FakeDeploys {
         .bind(steps_json)
         .bind(outcome.error)
         .bind(if outcome.findings.is_empty() { None } else { Some(findings_json) })
+        .bind(&log_tail)
         .bind(now)
         .execute(pool)
         .await?;
@@ -373,7 +381,7 @@ impl FakeDeploys {
                 ms: 1,
                 skipped: false,
             }],
-            log_tail: "fake deploy ok".to_string(),
+            log_tail,
             version: None,
             reloaded: false,
         })
