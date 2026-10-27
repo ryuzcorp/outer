@@ -261,14 +261,13 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         _ => "For ready patterns call examples.".to_string(),
     };
     let url = ctx.state.app_url(&app.slug);
+    let lead = seed_deploy_lead(&app.slug, &url, &deploy);
     let summary = match template {
         crate::templates::Template::App => format!(
-            "{} is live at {url}. It's an empty app shell: build what your user asked for. Pages go in pages/ (list them in pages/_nav.ts). {hint}",
-            app.slug,
+            "{lead} It's an empty app shell: build what your user asked for. Pages go in pages/ (list them in pages/_nav.ts). {hint}",
         ),
         crate::templates::Template::Website => format!(
-            "{} is live at {url}. It's an empty website shell: build what your user asked for. Content lives in Astro pages (islands for interactive parts). {hint}",
-            app.slug,
+            "{lead} It's an empty website shell: build what your user asked for. Content lives in Astro pages (islands for interactive parts). {hint}",
         ),
     };
     let structured = json!({
@@ -281,6 +280,33 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
         &structured["deploy"].clone(),
         structured,
     ))
+}
+
+/// The first sentence of `create_app`'s result, true to the seed deploy:
+/// only a `success` says "live". A failed or blocked first deploy names the
+/// step and error so the agent fixes it instead of reporting a dead link;
+/// one still running (`wait: false` or the wait cap) says how to follow it.
+fn seed_deploy_lead(slug: &str, url: &str, deploy: &Value) -> String {
+    let status = deploy["status"].as_str().unwrap_or("unknown");
+    match status {
+        "success" => format!("{slug} is live at {url}."),
+        "failed" | "blocked" => {
+            let step = deploy["failed_step"]
+                .as_str()
+                .map(|step| format!(" at {step}"))
+                .unwrap_or_default();
+            let error = deploy["error"]
+                .as_str()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default();
+            format!(
+                "{slug} was created, but its first deploy {status}{step}{error}. It is not live yet: fix it and commit (deploy_log {{app}} has the full log)."
+            )
+        }
+        _ => format!(
+            "{slug} was created; its first deploy is {status}. Call deploy_status {{app, wait: true}} until it reports success at {url}."
+        ),
+    }
 }
 
 pub(crate) fn app_status(app: &App, last_status: Option<&str>) -> &'static str {
@@ -688,5 +714,42 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
             ))
         }
         None => Ok(ok(summary, structured)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seed_deploy_lead;
+    use serde_json::json;
+
+    const URL: &str = "https://shop.outer.test";
+
+    #[test]
+    fn only_a_successful_seed_deploy_is_reported_live() {
+        let live = seed_deploy_lead("shop", URL, &json!({"status": "success"}));
+        assert_eq!(live, "shop is live at https://shop.outer.test.");
+
+        let failed = seed_deploy_lead(
+            "shop",
+            URL,
+            &json!({
+                "status": "failed",
+                "failed_step": "deploy",
+                "error": "Error: an asset-only project cannot declare Worker bindings",
+            }),
+        );
+        assert!(!failed.contains("is live"), "{failed}");
+        assert!(
+            failed.contains("first deploy failed at deploy: Error: an asset-only project"),
+            "{failed}"
+        );
+
+        let blocked = seed_deploy_lead("shop", URL, &json!({"status": "blocked"}));
+        assert!(blocked.contains("first deploy blocked."), "{blocked}");
+        assert!(!blocked.contains("is live"), "{blocked}");
+
+        let building = seed_deploy_lead("shop", URL, &json!({"status": "building"}));
+        assert!(building.contains("deploy_status"), "{building}");
+        assert!(!building.contains("is live"), "{building}");
     }
 }
