@@ -1651,61 +1651,58 @@ async fn rollback_in_flight_rejects_and_coalesces() {
     .await;
     assert!(result(&second).get("isError").is_none());
     state.deploys.set_fake(FakeOutcome::slow());
-    // Overlap the two rollbacks by construction, not by scheduler luck: the
-    // second waits until the first holds the app's rollback lock, so it must
-    // take the fail-fast refusal. (A bare `join!` can serialize under a
-    // loaded suite — the first returns `building` and drops the lock before
-    // the second tries it — and neither call is rate-limited.)
+    // The first rollback proceeds: past the cap it reports `building` once
+    // the short test `tool_wait` lapses. It is fully awaited, so no
+    // scheduler luck is involved.
+    let (_, first) = call(
+        &state,
+        Some(&token),
+        "rollback",
+        json!({"app": "groceries", "sha": sha1}),
+    )
+    .await;
+    assert!(
+        result(&first).get("isError").is_none(),
+        "first rollback should proceed, got {first}"
+    );
+    // Refusal by construction, not by scheduler luck: the test itself holds
+    // the app's rollback lock — exactly what a running rollback holds — so
+    // the second call must take the fail-fast refusal. Waiting until the
+    // first call holds the lock and then racing the second call's preamble
+    // against the first's bounded `tool_wait` remainder cannot guarantee
+    // overlap: under load the second's lock attempt routinely lands after
+    // the first returned `building` and released.
     let app_id = crate::apps::get_by_slug(&state.pool, "groceries")
         .await
         .unwrap()
         .unwrap()
         .id;
-    let (a, b) = tokio::join!(
-        call(
-            &state,
-            Some(&token),
-            "rollback",
-            json!({"app": "groceries", "sha": sha1})
-        ),
-        async {
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while state.rollback_locks.try_lock(&app_id).is_some() {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("first rollback never took the lock");
-            call(
-                &state,
-                Some(&token),
-                "rollback",
-                json!({"app": "groceries", "sha": sha1}),
-            )
-            .await
-        }
-    );
-    // The first proceeds (past the cap it reports building); the second
-    // fails fast instead of queueing another build.
-    assert!(
-        result(&a.1).get("isError").is_none(),
-        "first rollback should proceed, got {}",
-        a.1
-    );
+    let _held = state
+        .rollback_locks
+        .try_lock(&app_id)
+        .expect("no rollback is running");
+    let (_, refused) = call(
+        &state,
+        Some(&token),
+        "rollback",
+        json!({"app": "groceries", "sha": sha1}),
+    )
+    .await;
     assert_eq!(
-        is_error(&b.1)["error"],
+        is_error(&refused)["error"],
         "rate_limited",
         "second rollback is refused while the first runs"
     );
     assert_eq!(
-        is_error(&b.1)["retry_after_s"],
+        is_error(&refused)["retry_after_s"],
         30,
         "the in-flight refusal names its backoff"
     );
+    // The coalescing call below takes the same lock: release before it.
+    drop(_held);
     // A deploy row stuck non-terminal coalesces: no new commit, no budget
     // spent, just the running deploy reported. (The slow fake only writes
     // its row at completion, so the stuck row is inserted directly.)
-    // (`app_id` was resolved above, before the racing rollbacks.)
     sqlx::query(
         "INSERT INTO deploy (id, app_id, sha, status, created_at) VALUES (?1, ?2, ?3, 'building', ?4)",
     )
