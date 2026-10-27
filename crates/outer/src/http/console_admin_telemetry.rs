@@ -52,7 +52,7 @@ async fn api_telemetry(State(state): State<AppState>, headers: HeaderMap) -> Res
         Err(res) => return *res,
     };
     if !crate::auth::is_admin(&mcp.auth.config, &account.email) {
-        return nostore_json(StatusCode::NOT_FOUND, "not_found", "not found");
+        return super::console::not_found();
     }
     let now = crate::apps::now_ms();
     let (day, week) = match tokio::join!(

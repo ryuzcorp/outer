@@ -398,18 +398,43 @@ async fn api_delete(
                 ),
             }))
         }
-        Err(err) => tool_response(&match err {
-            crate::apps::delete::DeleteError::ConfirmMismatch(_, _) => {
-                ToolError::invalid_argument(format!(
-                    "confirm {:?} does not match the slug {:?}: pass the slug exactly to delete it",
-                    body.confirm, app.slug,
-                ))
+        Err(err) => {
+            // The audit row above was written before the delete, so a failed
+            // delete records its own outcome: the log never claims a delete
+            // that did not happen.
+            let code = match &err {
+                crate::apps::delete::DeleteError::ConfirmMismatch(_, _) => "invalid_argument",
+                crate::apps::delete::DeleteError::NotFound(_) => "not_found",
+                crate::apps::delete::DeleteError::Internal(_) => "internal",
+            };
+            if let Err(audit_err) = crate::accounts::try_record_account_action(
+                &mcp.pool,
+                &app.owner_id,
+                tool,
+                &format!("{summary}: failed"),
+                "error",
+                Some(code),
+                started,
+            )
+            .await
+            {
+                tracing::error!(user = %account.id, app = %app.id, error = %format!("{audit_err:#}"), "delete failure audit not recorded");
             }
-            crate::apps::delete::DeleteError::NotFound(slug) => {
-                ToolError::not_found(format!("no app named {slug:?}"))
-            }
-            crate::apps::delete::DeleteError::Internal(err) => crate::mcp::tools::internal(err),
-        }),
+            tool_response(&match err {
+                crate::apps::delete::DeleteError::ConfirmMismatch(_, _) => {
+                    ToolError::invalid_argument(format!(
+                        "confirm {:?} does not match the slug {:?}: pass the slug exactly to delete it",
+                        body.confirm, app.slug,
+                    ))
+                }
+                crate::apps::delete::DeleteError::NotFound(slug) => {
+                    ToolError::not_found(format!("no app named {slug:?}"))
+                }
+                crate::apps::delete::DeleteError::Internal(err) => {
+                    crate::mcp::tools::internal(err)
+                }
+            })
+        }
     }
 }
 
