@@ -62,6 +62,9 @@ import {
   UsersIcon,
 } from "./icons.tsx";
 import { actions as collaboratorActions } from "./actions/collaborators.ts";
+// admin-all-apps branch: the All Apps directory lives in its own view file
+// so the other Console branch owns this shell undisturbed.
+import { AdminAllAppsCard } from "./views/admin-apps.tsx";
 
 // --- Small pieces ------------------------------------------------------------
 
@@ -2886,6 +2889,8 @@ export function AdminView({
   onRetry,
   onMutated,
   onOpenCode,
+  // admin-all-apps branch: open an app from the directory in its normal views.
+  onOpenApp,
 }: {
   codes: Panel<AdminInvitesPage>;
   waitlist: Panel<WaitlistSummary>;
@@ -2899,6 +2904,8 @@ export function AdminView({
   onRetry: () => void;
   onMutated: () => void;
   onOpenCode: (slug: string, sha: string | null) => void;
+  // admin-all-apps branch: open an app from the directory in its normal views.
+  onOpenApp: (slug: string) => void;
 }) {
   if (!isAdmin) {
     return (
@@ -2919,6 +2926,8 @@ export function AdminView({
         onMutated={onMutated}
         onOpenCode={onOpenCode}
       />
+      {/* admin-all-apps branch: the all-apps directory card (own file). */}
+      <AdminAllAppsCard onOpenApp={onOpenApp} />
       <GenerateCard onGenerate={onGenerate} />
       <AdminCodesCard
         panel={codes}

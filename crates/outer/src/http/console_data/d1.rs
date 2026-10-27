@@ -1530,8 +1530,17 @@ async fn api_databases(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_d1"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
@@ -1558,8 +1567,17 @@ async fn api_tables(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_d1"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     if binding.len() > 128 {
@@ -1588,8 +1606,17 @@ async fn api_schema(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_d1"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
@@ -1619,8 +1646,17 @@ async fn api_rows(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_d1"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
@@ -1650,8 +1686,9 @@ async fn api_write(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &headers, &account, &slug, "this database", None).await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     // Frozen apps stay writable only for deletes (the escape hatch back
@@ -1702,17 +1739,21 @@ async fn api_write(
         | Err(D1Error::UnknownDatabase(_)) => ("error", Some("invalid_argument")),
         Err(_) => ("error", Some("d1_unavailable")),
     };
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_write",
-        &summary,
-        o,
-        code,
-        0,
-    )
-    .await;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if outcome.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool, &app.id, &account, "d1_write", &summary, o, code, 0, admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool, &app.id, &account, "d1_write", &summary, code, 0, admin,
+        )
+        .await;
+    }
     d1_response(result)
 }
 
@@ -1727,8 +1768,9 @@ async fn api_delete_rows(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &headers, &account, &slug, "this database", None).await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     let ctx = D1Ctx::from_state(&state);
@@ -1766,17 +1808,36 @@ async fn api_delete_rows(
         | Err(D1Error::UnknownDatabase(_)) => ("error", Some("invalid_argument")),
         Err(_) => ("error", Some("d1_unavailable")),
     };
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_delete_rows",
-        &summary,
-        o,
-        code,
-        0,
-    )
-    .await;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if outcome.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_delete_rows",
+            &summary,
+            o,
+            code,
+            0,
+            admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_delete_rows",
+            &summary,
+            code,
+            0,
+            admin,
+        )
+        .await;
+    }
     d1_response(result)
 }
 

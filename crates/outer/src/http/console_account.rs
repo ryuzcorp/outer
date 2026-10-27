@@ -30,6 +30,7 @@ use crate::auth::{self, now_ms};
 pub fn routes() -> Router<super::AppState> {
     Router::new()
         .route("/api/console/account", get(api_account))
+        .route("/api/console/account/actions", get(api_account_actions))
         .route("/api/console/alerts/prefs", post(api_update_prefs))
         .route(
             "/console/alerts/unsubscribe",
@@ -115,6 +116,64 @@ async fn api_account(State(state): State<super::AppState>, headers: HeaderMap) -
         },
         Err(err) => err_json(err),
     }
+}
+
+/// `GET /api/console/account/actions?limit=`: the caller's own
+/// `account_action` rows, newest first — the account-level audit trail.
+/// Besides the caller's own account mutations this carries admin acts
+/// against the account: an admin deleting one of the caller's apps cannot
+/// leave an `agent_action` row (the app row cascades, taking it with it),
+/// so the durable copy lands here, keyed to the owner's account. Only the
+/// caller's own rows ever match: the query is keyed by the session
+/// account, never by a slug parameter.
+#[derive(Debug, Deserialize)]
+struct ActionsQuery {
+    limit: Option<u64>,
+}
+
+async fn api_account_actions(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ActionsQuery>,
+) -> Response {
+    let mcp = &state.mcp;
+    let account = match guard(&mcp.auth, &headers).await {
+        Ok(account) => account,
+        Err(res) => return *res,
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let rows: Vec<(String, String, String, Option<String>, i64)> = match sqlx::query_as(
+        "SELECT tool, summary, outcome, error_code, created_at FROM account_action \
+         WHERE user_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+    )
+    .bind(&account.id)
+    .bind(limit as i64)
+    .fetch_all(&mcp.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load the account activity right now",
+            );
+        }
+    };
+    ok_json(json!({
+        "actions": rows
+            .iter()
+            .map(|(tool, summary, outcome, error_code, created_at)| {
+                json!({
+                    "tool": tool,
+                    "summary": summary,
+                    "outcome": outcome,
+                    "error_code": error_code,
+                    "created_at": created_at,
+                })
+            })
+            .collect::<Vec<_>>(),
+    }))
 }
 
 /// `GET /api/console/connections`: the caller's OAuth grants (same rows

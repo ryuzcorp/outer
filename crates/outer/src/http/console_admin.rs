@@ -4,13 +4,15 @@
 //! queue (held deploys and flagged apps with the gate's findings), approve
 //! and reject reviews, suspend/restore and account bans, and the overview
 //! panel. Every endpoint reuses `console.rs`'s `admin_guard` (session +
-//! same-origin + `OUTER_ADMIN_EMAILS`, 403 otherwise), calls the SAME
+//! same-origin + `OUTER_ADMIN_EMAILS`, 404 for signed-in non-admins so a
+//! 403 cannot oracle the admin surface), calls the SAME
 //! domain functions future MCP `admin_*` tools will call (no second
 //! implementation), audits under the MCP tool names (`agent_action` with
-//! client "Console" for app-scoped writes, `account_action` for the ban),
-//! and answers `{error, message}` with the MCP codes.
+//! client "Console" for app-scoped writes, `account_action` for the ban —
+//! fail-closed on the admin path: a lost audit row answers 500), and
+//! answers `{error, message}` with the MCP codes.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -18,7 +20,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::console::{admin_guard, nostore_json, ok_json};
+use super::console::{admin_guard, audit_mutation, nostore_json, ok_json};
 use super::console_actions::tool_response;
 use super::AppState;
 use crate::auth::AccountRow;
@@ -26,7 +28,6 @@ use crate::mcp::error::ToolError;
 use crate::mcp::McpState;
 use crate::moderation::admin;
 
-/// The Admin moderation routes, merged by [`super::console::router`].
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/console/admin/moderation/queue", get(api_queue))
@@ -35,6 +36,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/console/admin/apps/{slug}/suspend", post(api_suspend))
         .route("/api/console/admin/apps/{slug}/restore", post(api_restore))
         .route("/api/console/admin/accounts/ban", post(api_ban))
+        .route("/api/console/admin/audit", get(api_audit))
 }
 
 /// `GET /api/console/admin/moderation/queue`: the actionable moderation
@@ -129,32 +131,38 @@ async fn api_review(
         }
     };
     if !applied.redeploy {
-        audit_review(mcp, &account, &applied.app_id, verdict, "ok", None).await;
+        if let Err(res) = audit_review(mcp, &account, &applied.app_id, verdict, "ok", None).await {
+            return *res;
+        }
         return ok_json(json!({"reviewed": true, "redeployed": false}));
     }
     let sha = applied.sha.clone().unwrap_or_default();
     match crate::apps::get_by_slug(&mcp.pool, &applied.app_slug).await {
         Ok(Some(app)) => match crate::mcp::tools::run_deploy(mcp, &app, &sha, false).await {
             Ok(deploy) => {
-                audit_review(mcp, &account, &applied.app_id, verdict, "ok", None).await;
+                if let Err(res) =
+                    audit_review(mcp, &account, &applied.app_id, verdict, "ok", None).await
+                {
+                    return *res;
+                }
                 ok_json(json!({"reviewed": true, "redeployed": true, "deploy": deploy}))
             }
             Err(err) => {
                 let code = err.code;
-                audit_review(mcp, &account, &applied.app_id, verdict, "error", Some(code)).await;
+                audit_review_refusal(mcp, &account, &applied.app_id, verdict, Some(code)).await;
                 tool_response(&err)
             }
         },
         Ok(None) => {
             let err = ToolError::not_found(format!("no app {:?}", applied.app_slug));
             let code = err.code;
-            audit_review(mcp, &account, &applied.app_id, verdict, "error", Some(code)).await;
+            audit_review_refusal(mcp, &account, &applied.app_id, verdict, Some(code)).await;
             tool_response(&err)
         }
         Err(_) => {
             let err = ToolError::internal("could not load the app right now".to_string());
             let code = err.code;
-            audit_review(mcp, &account, &applied.app_id, verdict, "error", Some(code)).await;
+            audit_review_refusal(mcp, &account, &applied.app_id, verdict, Some(code)).await;
             tool_response(&err)
         }
     }
@@ -167,22 +175,52 @@ async fn audit_review(
     verdict: admin::Verdict,
     outcome: &str,
     error_code: Option<&str>,
-) {
+) -> Result<(), Box<Response>> {
     let summary = match verdict {
         admin::Verdict::Allow => "admin_review allow",
         admin::Verdict::Deny => "admin_review deny",
     };
-    crate::mcp::actions::record_console(
+    audit_mutation(
         &mcp.pool,
         app_id,
-        &account.id,
+        account,
         "admin_review",
         summary,
         outcome,
         error_code,
         0,
+        true,
     )
-    .await;
+    .await
+}
+
+/// A refused review is already the closed outcome, so its audit stays
+/// best-effort — but a lost row logs loudly.
+async fn audit_review_refusal(
+    mcp: &McpState,
+    account: &AccountRow,
+    app_id: &str,
+    verdict: admin::Verdict,
+    error_code: Option<&str>,
+) {
+    let summary = match verdict {
+        admin::Verdict::Allow => "admin_review allow",
+        admin::Verdict::Deny => "admin_review deny",
+    };
+    if let Err(err) = crate::mcp::actions::try_record_console(
+        &mcp.pool,
+        app_id,
+        &account.id,
+        "admin_review",
+        summary,
+        "error",
+        error_code,
+        0,
+    )
+    .await
+    {
+        tracing::error!(user = %account.id, error = %format!("{err:#}"), "admin review refusal audit failed");
+    }
 }
 
 /// `POST /api/console/admin/apps/{slug}/suspend`: the `admin_suspend_app`
@@ -205,17 +243,21 @@ async fn api_suspend(
         };
     mcp.fleets.stop_app(&slug).await;
     purge_host_cache(mcp, &slug).await;
-    crate::mcp::actions::record_console(
+    if let Err(res) = audit_mutation(
         &mcp.pool,
         &app_id,
-        &account.id,
+        &account,
         "admin_suspend_app",
         &format!("admin_suspend_app {slug}"),
         "ok",
         None,
         0,
+        true,
     )
-    .await;
+    .await
+    {
+        return *res;
+    }
     ok_json(json!({"suspended": true, "slug": slug}))
 }
 
@@ -236,17 +278,21 @@ async fn api_restore(
         Ok(pair) => pair,
         Err(err) => return tool_response(&err),
     };
-    crate::mcp::actions::record_console(
+    if let Err(res) = audit_mutation(
         &mcp.pool,
         &app_id,
-        &account.id,
+        &account,
         "admin_restore_app",
         &format!("admin_restore_app {slug}"),
         "ok",
         None,
         0,
+        true,
     )
-    .await;
+    .await
+    {
+        return *res;
+    }
     ok_json(json!({"restored": true, "slug": slug}))
 }
 
@@ -286,7 +332,9 @@ async fn api_ban(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
-            crate::accounts::record_account_action(
+            // A refused ban is already the closed outcome; its audit stays
+            // best-effort but a lost row logs loudly.
+            if let Err(audit_err) = crate::accounts::try_record_account_action(
                 &mcp.pool,
                 &account.id,
                 "admin_ban_account",
@@ -295,7 +343,10 @@ async fn api_ban(
                 Some(err.code),
                 started,
             )
-            .await;
+            .await
+            {
+                tracing::error!(user = %account.id, error = %format!("{audit_err:#}"), "admin ban refusal audit failed");
+            }
             return tool_response(&err);
         }
     };
@@ -303,7 +354,7 @@ async fn api_ban(
         mcp.fleets.stop_app(slug).await;
         purge_host_cache(mcp, slug).await;
     }
-    crate::accounts::record_account_action(
+    if let Err(err) = crate::accounts::try_record_account_action(
         &mcp.pool,
         &account.id,
         "admin_ban_account",
@@ -316,11 +367,76 @@ async fn api_ban(
         None,
         started,
     )
-    .await;
+    .await
+    {
+        tracing::error!(user = %account.id, error = %format!("{err:#}"), "admin ban audit failed");
+        return nostore_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unavailable",
+            "could not record the admin action right now",
+        );
+    }
     ok_json(json!({
         "banned": true,
         "email": outcome.email,
         "apps_stopped": outcome.app_slugs.len(),
+    }))
+}
+
+/// `GET /api/console/admin/audit?limit=`: the admin audit view — recent
+/// admin-tool `account_action` rows across accounts, newest first. This is
+/// where durable admin acts surface: directory reads (`admin_list_apps`,
+/// one throttled row per admin per minute), bans (`admin_ban_account`),
+/// and app deletes (`admin_delete_app`, keyed to the deleted app's owner
+/// because the app row — and any `agent_action` row — is gone). Per-app
+/// admin reads and mutations stay in that app's `agent_action` log with
+/// the `admin <email>:` prefix.
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    limit: Option<u64>,
+}
+
+async fn api_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Response {
+    let mcp = &state.mcp;
+    if let Err(res) = admin_guard(&mcp.auth, &headers).await {
+        return *res;
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let rows: Vec<(String, String, String, String, Option<String>, i64)> = match sqlx::query_as(
+        "SELECT user_id, tool, summary, outcome, error_code, created_at FROM account_action \
+         WHERE tool LIKE 'admin\\_%' ESCAPE '\\' ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+    )
+    .bind(limit as i64)
+    .fetch_all(&mcp.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => {
+            return nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not load the admin audit right now",
+            );
+        }
+    };
+    ok_json(json!({
+        "actions": rows
+            .iter()
+            .map(|(user_id, tool, summary, outcome, error_code, created_at)| {
+                json!({
+                    "user_id": user_id,
+                    "tool": tool,
+                    "summary": summary,
+                    "outcome": outcome,
+                    "error_code": error_code,
+                    "created_at": created_at,
+                })
+            })
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -458,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_admin_gets_403_on_every_admin_endpoint() {
+    async fn non_admin_gets_404_on_every_admin_endpoint() {
         let (app, pool) = test_app().await;
         let now = crate::auth::now_ms();
         seed_user(&pool, "ana@example.com", now).await;
@@ -466,11 +582,13 @@ mod tests {
         seed_app(&pool, "ana@example.com", "shop", now).await;
         let ana = login(&pool, "ana@example.com").await;
 
+        // 404, never 403: the admin surface must not reveal that it exists.
         for (status, _) in [
             send(&app, authed("/api/console/admin/moderation/queue", &ana)).await,
             send(&app, authed("/api/console/admin/stats", &ana)).await,
+            send(&app, authed("/api/console/admin/audit", &ana)).await,
         ] {
-            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(status, StatusCode::NOT_FOUND);
         }
         for (status, body) in [
             send(
@@ -510,10 +628,10 @@ mod tests {
             )
             .await,
         ] {
-            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(
                 body.parse::<serde_json::Value>().unwrap()["error"],
-                "forbidden"
+                "not_found"
             );
         }
     }

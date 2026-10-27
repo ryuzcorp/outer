@@ -73,6 +73,8 @@ export interface ConsoleApp {
   slug: string;
   url: string;
   role: string;
+  /** True when this detail was served through the admin override. */
+  admin?: boolean;
   visibility: string;
   /** Pro keep-warm flag; stored for every plan, ignored on Free. */
   always_on: boolean;

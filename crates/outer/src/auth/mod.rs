@@ -169,6 +169,7 @@ pub fn is_admin(cfg: &AuthConfig, email: &str) -> bool {
     cfg.admin_emails.iter().any(|admin| admin == email)
 }
 
+#[derive(Debug, Clone)]
 pub struct AccountRow {
     pub id: String,
     pub email: String,
@@ -946,6 +947,11 @@ pub fn www_authenticate(cfg: &AuthConfig) -> HeaderValue {
 
 /// Web sessions (`__Host-outer_sid`, 30 days). Only the hash is stored.
 pub const SESSION_COOKIE: &str = "__Host-outer_sid";
+/// How recently an admin must have signed in to act on an app they don't own
+/// (the step-up window, spec §15.3): every console sign-in mints a fresh
+/// session row, so the session's `createdAt` is the last re-verification.
+/// No migration: this reuses the existing `session.createdAt` column.
+pub const ADMIN_STEP_UP_MS: i64 = 15 * 60 * 1000;
 pub const SESSION_TTL_MS: i64 = 30 * 86_400_000;
 
 pub async fn create_session(pool: &SqlitePool, account_id: &str) -> anyhow::Result<String> {
@@ -987,6 +993,23 @@ pub async fn account_from_session(
         terms_version,
         banned: banned != 0,
     }))
+}
+/// When the presented session was created (`session.createdAt`), if it is
+/// still live. The admin step-up check uses this as the last re-verification
+/// time: a fresh sign-in means a fresh row.
+pub async fn session_created_at(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    let now = now_ms();
+    let hash = tokens::sha256_hex(session_id.trim());
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT createdAt FROM session WHERE token = ? AND expiresAt > ?")
+            .bind(&hash)
+            .bind(now)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(created_at,)| created_at))
 }
 
 pub fn set_session_cookie(session_id: &str) -> String {

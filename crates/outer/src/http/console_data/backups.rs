@@ -77,8 +77,17 @@ async fn api_list(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_backups"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     if binding.len() > 128 {
@@ -115,8 +124,9 @@ async fn api_backup_now(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &headers, &account, &slug, "this database", None).await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     if binding.len() > 128 {
@@ -149,17 +159,37 @@ async fn api_backup_now(
         Err(err) => (format!("failed d1 backup on {binding}"), Err(err)),
     };
     let (o, code) = audit_outcome(&result);
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_backup",
-        &summary,
-        o,
-        code,
-        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-    )
-    .await;
+    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if result.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_backup",
+            &summary,
+            o,
+            code,
+            duration_ms,
+            admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_backup",
+            &summary,
+            code,
+            duration_ms,
+            admin,
+        )
+        .await;
+    }
     d1_response(result)
 }
 
@@ -173,8 +203,17 @@ async fn api_download(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, _) = match owner_app(
+        mcp,
+        &headers,
+        &account,
+        &slug,
+        "this database",
+        Some("data_backups"),
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     let outcome = async {
@@ -230,8 +269,9 @@ async fn api_restore(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match owner_app(mcp, &account, &slug, "this database").await {
-        Ok(app) => app,
+    let (app, admin) = match owner_app(mcp, &headers, &account, &slug, "this database", None).await
+    {
+        Ok(pair) => pair,
         Err(res) => return *res,
     };
     // A restore rewrites live tables, so a frozen app refuses it like any
@@ -278,16 +318,36 @@ async fn api_restore(
         Err(err) => (format!("failed d1 restore on {binding}"), Err(err)),
     };
     let (o, code) = audit_outcome(&result);
-    crate::mcp::actions::record_console(
-        &ctx.pool,
-        &app.id,
-        &account.id,
-        "d1_restore",
-        &summary,
-        o,
-        code,
-        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-    )
-    .await;
+    let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let summary = crate::http::console::audit_summary(&account, &summary, admin);
+    if result.is_ok() {
+        if let Err(res) = crate::http::console::audit_mutation(
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_restore",
+            &summary,
+            o,
+            code,
+            duration_ms,
+            admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        crate::http::console::audit_console_refusal(
+            &ctx.pool,
+            &app.id,
+            &account,
+            "d1_restore",
+            &summary,
+            code,
+            duration_ms,
+            admin,
+        )
+        .await;
+    }
     d1_response(result)
 }

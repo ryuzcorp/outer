@@ -179,6 +179,18 @@ export function routeUrl(route: Route): string {
   return `/console?${q.toString()}`;
 }
 
+// Who may open an app page by slug. Admins may open apps outside their own
+// rail (the backend serves foreign apps to admins and 404s truly-missing
+// slugs, so the shell loads and lets the backend decide); everyone else
+// only opens rail apps, so an unknown slug is a local 404 without a fetch.
+export function canOpenApp(
+  isAdmin: boolean,
+  ownSlugs: readonly string[],
+  slug: string,
+): boolean {
+  return isAdmin || ownSlugs.includes(slug);
+}
+
 // Relative times with the absolute time on hover (Noite's convention).
 export function timeAgo(ms: number): string {
   const diff = Date.now() - ms;

@@ -418,6 +418,40 @@ pub async fn record(
     }
 }
 
+/// Insert one `agent_action` row for a console mutation, returning the
+/// insert result so admin-override paths can fail closed (a lost audit row
+/// on an admin act must surface as a 500, never a silent success).
+#[allow(clippy::too_many_arguments)]
+pub async fn try_record_console(
+    pool: &SqlitePool,
+    app_id: &str,
+    user_id: &str,
+    tool: &str,
+    summary: &str,
+    outcome: &str,
+    error_code: Option<&str>,
+    duration_ms: i64,
+) -> Result<(), sqlx::Error> {
+    let summary = truncate(summary, MAX_SUMMARY_CHARS);
+    sqlx::query(
+        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
+         tool, summary, outcome, error_code, duration_ms, created_at) \
+         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(app_id)
+    .bind(user_id)
+    .bind(tool)
+    .bind(&summary)
+    .bind(outcome)
+    .bind(error_code)
+    .bind(duration_ms)
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// Write one `agent_action` row for a console mutation, under the equivalent
 /// MCP tool name (`set_visibility`, `set_secret`, `unset_secret`, `rollback`,
 /// …). Both `consent_id` and `apikey_id` stay NULL — the console signs its
@@ -435,22 +469,16 @@ pub async fn record_console(
     error_code: Option<&str>,
     duration_ms: i64,
 ) {
-    let summary = truncate(summary, MAX_SUMMARY_CHARS);
-    if let Err(err) = sqlx::query(
-        "INSERT INTO agent_action (id, app_id, user_id, consent_id, apikey_id, \
-         tool, summary, outcome, error_code, duration_ms, created_at) \
-         VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9)",
+    if let Err(err) = try_record_console(
+        pool,
+        app_id,
+        user_id,
+        tool,
+        summary,
+        outcome,
+        error_code,
+        duration_ms,
     )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(app_id)
-    .bind(user_id)
-    .bind(tool)
-    .bind(&summary)
-    .bind(outcome)
-    .bind(error_code)
-    .bind(duration_ms)
-    .bind(now_ms())
-    .execute(pool)
     .await
     {
         tracing::warn!(tool, error = %format!("{err:#}"), "console action insert failed");

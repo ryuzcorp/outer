@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use serde_json::json;
 
-use super::console::{guard, visible_app};
+use super::console::guard;
 
 /// Routes for every data panel.
 pub fn routes() -> Router<super::AppState> {
@@ -82,16 +82,22 @@ pub(crate) fn data_json(status: StatusCode, value: serde_json::Value) -> Respons
 /// on answers 404 exactly like a missing one (spec §8.2); a collaborator
 /// reads 403 with a user message, the same shape the owner-only MCP tools
 /// answer. `noun` names what the panel opens ("this database", "this data")
-/// so the three panels share one message shape.
+/// so the three panels share one message shape. The admin override reports
+/// the owner role, so admins pass this check. `read_action` labels the
+/// access audit for reads; mutations audit themselves.
 pub(crate) async fn owner_app(
     mcp: &crate::mcp::McpState,
+    headers: &HeaderMap,
     account: &crate::auth::AccountRow,
     slug: &str,
     noun: &str,
-) -> Result<crate::apps::App, Box<Response>> {
-    match visible_app(mcp, account, slug).await {
-        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok(app),
-        Ok(Some(_)) => Err(data_error(
+    read_action: Option<&'static str>,
+) -> Result<(crate::apps::App, bool), Box<Response>> {
+    match super::console::authorized_app(mcp, account, headers, slug, read_action).await {
+        Ok(authz) if authz.role == crate::collaborators::Role::Owner => {
+            Ok((authz.app, authz.admin))
+        }
+        Ok(_) => Err(data_error(
             StatusCode::FORBIDDEN,
             "forbidden",
             format!("only the app owner may open {noun}"),
@@ -100,14 +106,7 @@ pub(crate) async fn owner_app(
             )),
         )
         .into()),
-        Ok(None) => Err(data_error(StatusCode::NOT_FOUND, "not_found", "no such app", None).into()),
-        Err(_) => Err(data_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-            None,
-        )
-        .into()),
+        Err(res) => Err(res),
     }
 }
 
@@ -162,11 +161,12 @@ pub(crate) async fn console_app(
     state: &super::AppState,
     headers: &HeaderMap,
     slug: &str,
-) -> Result<(crate::auth::AccountRow, crate::apps::App), Response> {
+    read_action: Option<&'static str>,
+) -> Result<(crate::auth::AccountRow, crate::apps::App, bool), Response> {
     let mcp = &state.mcp;
     let account = guard(&mcp.auth, headers).await.map_err(|b| *b)?;
-    match owner_app(mcp, &account, slug, "this data").await {
-        Ok(app) => Ok((account, app)),
+    match owner_app(mcp, headers, &account, slug, "this data", read_action).await {
+        Ok((app, admin)) => Ok((account, app, admin)),
         Err(res) => Err(*res),
     }
 }

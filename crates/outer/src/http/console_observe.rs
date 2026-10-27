@@ -25,7 +25,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::console::{guard, logs_query, nostore_json, not_found, ok_json, visible_app};
+use super::console::{authorized_app, guard, logs_query, nostore_json, not_found, ok_json};
 
 /// Seconds between follow polls; each tick emits at most one page.
 const FOLLOW_POLL_SECS: u64 = 2;
@@ -63,7 +63,10 @@ pub fn routes() -> Router<super::AppState> {
 /// ignored here); `since` seeds the cursor, unset starts after the
 /// current tail. Every poll tick emits one `data: {"lines": [...]}` page
 /// (possibly empty), so the client just appends. The stream ends when the
-/// app stops being visible to the caller.
+/// caller stops being entitled to it: every tick re-verifies the session
+/// (live, unbanned), and admin streams additionally re-check the step-up
+/// window, the admin flag, and that the app still exists — reopening
+/// forces a fresh step-up check.
 async fn api_logs_stream(
     State(state): State<super::AppState>,
     headers: HeaderMap,
@@ -75,17 +78,20 @@ async fn api_logs_stream(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match visible_app(mcp, &account, &slug).await {
-        Ok(Some((app, _))) => app,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("logs")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    // The tick re-verifies against this session, so hold it: `guard` just
+    // proved it is present.
+    let Some(session) = crate::auth::session_from_headers(&headers) else {
+        return nostore_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "sign in at /console/sign-in",
+        );
+    };
+    let app = authz.app;
     let (filter, cursor, _) = match logs_query(&query) {
         Ok(parsed) => parsed,
         Err(res) => return *res,
@@ -112,41 +118,56 @@ async fn api_logs_stream(
         (
             mcp.pool.clone(),
             mcp.fleets.clone(),
-            account.id.clone(),
-            account.email.clone(),
+            mcp.auth.clone(),
+            session,
+            authz.admin,
             app.id.clone(),
             app.slug.clone(),
             filter,
             seed,
             true,
         ),
-        move |(
-            pool,
-            fleets,
-            account_id,
-            account_email,
-            app_id,
-            slug,
-            filter,
-            mut cursor,
-            mut first,
-        )| async move {
-            // The visibility check runs every tick: an app deleted,
-            // transferred, or unshared mid-follow ends the stream
-            // instead of leaking lines to a caller with no role left.
+        move |(pool, fleets, auth, session, admin, app_id, slug, filter, mut cursor, mut first)| async move {
+            // Re-verified every tick: a revoked or expired session, or a
+            // ban, ends the stream for everyone (reopening signs in
+            // again). Admin streams additionally re-check the step-up
+            // window, the admin flag, and that the app still exists: the
+            // step-up was only checked at open, and must not leak future
+            // lines past its lapse.
             loop {
                 tokio::time::sleep(Duration::from_secs(FOLLOW_POLL_SECS)).await;
-                let visible = crate::apps::get_by_slug(&pool, &slug).await.ok()?;
-                let app = visible.as_ref()?;
-                crate::collaborators::role(
-                    &pool,
-                    &app.id,
-                    &app.owner_id,
-                    &account_id,
-                    &account_email,
-                )
-                .await
-                .ok()??;
+                let live = crate::auth::account_from_session(&pool, &session)
+                    .await
+                    .ok()
+                    .flatten()?;
+                if admin {
+                    if !crate::auth::is_admin(&auth.config, &live.email) {
+                        return None;
+                    }
+                    let fresh = crate::auth::session_created_at(&pool, &session)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|created| {
+                            crate::auth::now_ms() - created <= crate::auth::ADMIN_STEP_UP_MS
+                        });
+                    if !fresh {
+                        return None;
+                    }
+                    crate::apps::get_by_slug(&pool, &slug).await.ok()??;
+                } else {
+                    let visible = crate::apps::get_by_slug(&pool, &slug).await.ok()?;
+                    let app = visible.as_ref()?;
+                    crate::collaborators::role(
+                        &pool,
+                        &app.id,
+                        &app.owner_id,
+                        &live.id,
+                        &live.email,
+                    )
+                    .await
+                    .ok()??;
+                }
                 let lines = crate::observe::logs::read_filtered(
                     &pool,
                     &fleets,
@@ -167,15 +188,7 @@ async fn api_logs_stream(
                     })
                     .to_string();
                     let state = (
-                        pool,
-                        fleets,
-                        account_id,
-                        account_email,
-                        app_id,
-                        slug,
-                        filter,
-                        cursor,
-                        first,
+                        pool, fleets, auth, session, admin, app_id, slug, filter, cursor, first,
                     );
                     return Some((Ok::<Event, Infallible>(Event::default().data(data)), state));
                 }
@@ -205,17 +218,11 @@ async fn api_error_detail(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match visible_app(mcp, &account, &slug).await {
-        Ok(Some((app, _))) => app,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the app right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, Some("errors")).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     if fingerprint.is_empty() || fingerprint.len() > 64 {
         return not_found();
     }
@@ -258,10 +265,11 @@ async fn api_error_detail(
 /// domain function the MCP triage tools call, and record the console
 /// mutation as an `agent_action` row under the MCP tool's name.
 /// Collaborators may triage, like the MCP tools (spec §7.4): the endpoints
-/// below gate on `visible_app`, not the owner.
+/// below gate on [`authorized_app`], not the owner.
 async fn triage(
     pool: &sqlx::SqlitePool,
-    account_id: &str,
+    account: &crate::auth::AccountRow,
+    admin: bool,
     app_id: &str,
     fingerprints: &[&str],
     status: &str,
@@ -292,10 +300,11 @@ async fn triage(
                 } else {
                     format!("{tool} {} issues", fingerprints.len())
                 };
-                crate::mcp::actions::record_console(
-                    pool, app_id, account_id, tool, &summary, "ok", None, 0,
+                let summary = super::console::audit_summary(account, &summary, admin);
+                super::console::audit_mutation(
+                    pool, app_id, account, tool, &summary, "ok", None, 0, admin,
                 )
-                .await;
+                .await?;
             }
             Ok(updated)
         }
@@ -343,21 +352,24 @@ async fn api_error_triage_one(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match visible_app(mcp, &account, &slug).await {
-        Ok(Some((app, _))) => app,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not update the error right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, None).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     if fingerprint.is_empty() || fingerprint.len() > 64 {
         return not_found();
     }
-    match triage(&mcp.pool, &account.id, &app.id, &[&fingerprint], status).await {
+    match triage(
+        &mcp.pool,
+        &account,
+        authz.admin,
+        &app.id,
+        &[&fingerprint],
+        status,
+    )
+    .await
+    {
         Ok(0) => not_found(),
         Ok(updated) => {
             ok_json(json!({"fingerprint": fingerprint, "status": status, "updated": updated}))
@@ -386,17 +398,11 @@ async fn api_errors_bulk(
         Ok(account) => account,
         Err(res) => return *res,
     };
-    let app = match visible_app(mcp, &account, &slug).await {
-        Ok(Some((app, _))) => app,
-        Ok(None) => return not_found(),
-        Err(_) => {
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not update the errors right now",
-            );
-        }
+    let authz = match authorized_app(mcp, &account, &headers, &slug, None).await {
+        Ok(authz) => authz,
+        Err(res) => return *res,
     };
+    let app = authz.app;
     let status = match body.action.as_str() {
         "resolve" => "resolved",
         "ignore" => "ignored",
@@ -430,7 +436,7 @@ async fn api_errors_bulk(
         );
     }
     let refs: Vec<&str> = body.fingerprints.iter().map(String::as_str).collect();
-    match triage(&mcp.pool, &account.id, &app.id, &refs, status).await {
+    match triage(&mcp.pool, &account, authz.admin, &app.id, &refs, status).await {
         Ok(updated) => {
             ok_json(json!({"action": body.action, "status": status, "updated": updated}))
         }

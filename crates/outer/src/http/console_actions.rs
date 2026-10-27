@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::console::{guard, nostore_json, not_found, ok_json, visible_app};
+use super::console::{authorized_app, guard, ok_json};
 use super::AppState;
 use crate::auth::AccountRow;
 use crate::mcp::error::ToolError;
@@ -85,68 +85,69 @@ pub(crate) fn tool_response(err: &ToolError) -> Response {
 /// The session plus the visible app, or the error response. Every mutating
 /// console endpoint starts here: a foreign or missing slug answers 404
 /// exactly like a missing one (spec §8.2), and cross-site requests never
-/// reach the mutation (the same-origin check inside [`guard`]).
+/// reach the mutation (the same-origin check inside [`guard`]). An admin
+/// with a recent session acts here with owner-equivalent access (see
+/// [`authorized_app`]); collaborators keep their role.
 async fn mutation_app(
     mcp: &McpState,
     headers: &HeaderMap,
     slug: &str,
-) -> Result<(AccountRow, crate::apps::App), Box<Response>> {
+) -> Result<(AccountRow, crate::apps::App, bool), Box<Response>> {
     let account = match guard(&mcp.auth, headers).await {
         Ok(account) => account,
         Err(res) => return Err(res),
     };
-    match visible_app(mcp, &account, slug).await {
-        Ok(Some((app, _))) => Ok((account, app)),
-        Ok(None) => Err(not_found().into()),
-        Err(_) => Err(nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+    // Mutations audit themselves (see `audited`), so no read label.
+    match authorized_app(mcp, &account, headers, slug, None).await {
+        Ok(authz) => Ok((authz.account, authz.app, authz.admin)),
+        Err(res) => Err(res),
     }
 }
 
 /// [`mutation_app`] plus the owner check: visibility, delete and secret
 /// writes stay owner-only (spec §7.4), so a collaborator reads 403 with the
 /// same code and user message the MCP tool answers — never 404 (spec §8.2
-/// reserves 404 for slugs the caller has no role on).
+/// reserves 404 for slugs the caller has no role on). The admin override
+/// reports the owner role, so admins pass this check.
 async fn owner_mutation_app(
     mcp: &McpState,
     headers: &HeaderMap,
     slug: &str,
-) -> Result<(AccountRow, crate::apps::App), Box<Response>> {
+) -> Result<(AccountRow, crate::apps::App, bool), Box<Response>> {
     let account = match guard(&mcp.auth, headers).await {
         Ok(account) => account,
         Err(res) => return Err(res),
     };
-    match visible_app(mcp, &account, slug).await {
-        Ok(Some((app, crate::collaborators::Role::Owner))) => Ok((account, app)),
-        Ok(Some(_)) => Err(tool_response(
+    // Mutations audit themselves (see `audited`), so no read label.
+    match authorized_app(mcp, &account, headers, slug, None).await {
+        Ok(authz) if authz.role == crate::collaborators::Role::Owner => {
+            Ok((authz.account, authz.app, authz.admin))
+        }
+        Ok(_) => Err(tool_response(
             &ToolError::forbidden(format!(
                 "only the app owner may change {slug:?} this way"
             ))
             .with_user("Only the app owner can do that. Collaborators can read and deploy, but not change these settings."),
         )
         .into()),
-        Ok(None) => Err(not_found().into()),
-        Err(_) => Err(nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "could not load the app right now",
-        )
-        .into()),
+        Err(res) => Err(res),
     }
 }
 
 /// Record the console mutation under its MCP tool name, then render the
 /// result. Successes and refusals both land in `agent_action` (like the MCP
 /// log); both `consent_id` and `apikey_id` stay NULL, so the log labels the
-/// client "Console".
+/// client "Console". Admin-override rows carry the `admin <email>:` prefix
+/// (see [`authorized_app`]) so the owner can tell them apart. On the admin
+/// path the audit insert is fail-closed: a lost row answers 500 (and logs
+/// loudly) instead of reporting success; owners keep best-effort. When the
+/// mutation itself was refused, the refusal stands even if the audit write
+/// also failed — refusing is already the closed outcome.
 async fn audited(
     mcp: &McpState,
     account: &AccountRow,
     app: &crate::apps::App,
+    admin: bool,
     tool: &str,
     summary: &str,
     result: Result<serde_json::Value, ToolError>,
@@ -155,17 +156,21 @@ async fn audited(
         Ok(_) => ("ok", None),
         Err(err) => ("error", Some(err.code)),
     };
-    crate::mcp::actions::record_console(
-        &mcp.pool,
-        &app.id,
-        &account.id,
-        tool,
-        summary,
-        outcome,
-        error_code,
-        0,
-    )
-    .await;
+    let summary = super::console::audit_summary(account, summary, admin);
+    if result.is_ok() {
+        if let Err(res) = super::console::audit_mutation(
+            &mcp.pool, &app.id, account, tool, &summary, outcome, error_code, 0, admin,
+        )
+        .await
+        {
+            return *res;
+        }
+    } else {
+        super::console::audit_console_refusal(
+            &mcp.pool, &app.id, account, tool, &summary, error_code, 0, admin,
+        )
+        .await;
+    }
     match result {
         Ok(body) => ok_json(body),
         Err(err) => tool_response(&err),
@@ -187,7 +192,7 @@ async fn api_visibility(
     Json(body): Json<VisibilityBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -199,7 +204,16 @@ async fn api_visibility(
             "visibility must be unlisted or public, got {other:?}"
         ))),
     };
-    audited(mcp, &account, &app, "set_visibility", &summary, result).await
+    audited(
+        mcp,
+        &account,
+        &app,
+        admin,
+        "set_visibility",
+        &summary,
+        result,
+    )
+    .await
 }
 
 /// The domain call plus the edge purge, shared by the visibility endpoint's
@@ -242,13 +256,22 @@ async fn api_always_on(
     Json(body): Json<AlwaysOnBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
     let summary = format!("set_always_on {}", if body.on { "on" } else { "off" });
     let result = set_app_always_on(mcp, &app, body.on).await;
-    audited(mcp, &account, &app, "set_always_on", &summary, result).await
+    audited(
+        mcp,
+        &account,
+        &app,
+        admin,
+        "set_always_on",
+        &summary,
+        result,
+    )
+    .await
 }
 
 /// The domain call, shared by the always-on endpoint's single input.
@@ -277,9 +300,15 @@ struct DeleteBody {
 }
 
 /// `POST /api/console/apps/:slug/delete {confirm}`: the MCP `delete_app`
-/// path — same locks, same domain function, same confirm rule. No audit row:
-/// the app row cascades, taking the entry with it (the MCP tool is unlogged
-/// for the same reason).
+/// path — same locks, same domain function, same confirm rule. The
+/// `agent_action` row cannot survive the delete (the app row cascades,
+/// taking the entry with it — the MCP tool is unlogged for the same
+/// reason), so the audit lands in `account_action` BEFORE the delete, keyed
+/// to the owner's account with no app foreign key: the row survives the
+/// app. The owner reads it back at `GET /api/console/account/actions` and
+/// admins at `GET /api/console/admin/audit`. On the admin path the insert
+/// is fail-closed — a lost row answers 500 and the app is kept; owners
+/// keep best-effort.
 async fn api_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -287,7 +316,7 @@ async fn api_delete(
     Json(body): Json<DeleteBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (_, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -296,6 +325,47 @@ async fn api_delete(
             "confirm {:?} does not match the slug {:?}: pass the slug exactly to delete it",
             body.confirm, app.slug,
         )));
+    }
+    // The exact confirm rule `delete_app` enforces, checked before the
+    // audit write so mistyped confirms leave no trace.
+    if body.confirm != app.slug {
+        return tool_response(&ToolError::invalid_argument(format!(
+            "confirm {:?} does not match the slug {:?}: pass the slug exactly to delete it",
+            body.confirm, app.slug,
+        )));
+    }
+    let started = crate::auth::now_ms();
+    let (tool, summary) = if admin {
+        (
+            "admin_delete_app",
+            format!(
+                "admin {}: delete_app {} (app {}, owner {})",
+                account.email, app.slug, app.id, app.owner_id,
+            ),
+        )
+    } else {
+        ("delete_app", format!("delete_app {}", app.slug))
+    };
+    if let Err(err) = crate::accounts::try_record_account_action(
+        &mcp.pool,
+        &app.owner_id,
+        tool,
+        &summary,
+        "ok",
+        None,
+        started,
+    )
+    .await
+    {
+        if admin {
+            tracing::error!(user = %account.id, app = %app.id, error = %format!("{err:#}"), "admin delete audit failed; app kept");
+            return super::console::nostore_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unavailable",
+                "could not record the admin action right now",
+            );
+        }
+        tracing::warn!(user = %account.id, app = %app.id, error = %format!("{err:#}"), "delete audit failed");
     }
     // Same lock trio as the MCP tool: serialize against a racing rollback,
     // deploy and wake.
@@ -331,18 +401,43 @@ async fn api_delete(
                 ),
             }))
         }
-        Err(err) => tool_response(&match err {
-            crate::apps::delete::DeleteError::ConfirmMismatch(_, _) => {
-                ToolError::invalid_argument(format!(
-                    "confirm {:?} does not match the slug {:?}: pass the slug exactly to delete it",
-                    body.confirm, app.slug,
-                ))
+        Err(err) => {
+            // The audit row above was written before the delete, so a failed
+            // delete records its own outcome: the log never claims a delete
+            // that did not happen.
+            let code = match &err {
+                crate::apps::delete::DeleteError::ConfirmMismatch(_, _) => "invalid_argument",
+                crate::apps::delete::DeleteError::NotFound(_) => "not_found",
+                crate::apps::delete::DeleteError::Internal(_) => "internal",
+            };
+            if let Err(audit_err) = crate::accounts::try_record_account_action(
+                &mcp.pool,
+                &app.owner_id,
+                tool,
+                &format!("{summary}: failed"),
+                "error",
+                Some(code),
+                started,
+            )
+            .await
+            {
+                tracing::error!(user = %account.id, app = %app.id, error = %format!("{audit_err:#}"), "delete failure audit not recorded");
             }
-            crate::apps::delete::DeleteError::NotFound(slug) => {
-                ToolError::not_found(format!("no app named {slug:?}"))
-            }
-            crate::apps::delete::DeleteError::Internal(err) => crate::mcp::tools::internal(err),
-        }),
+            tool_response(&match err {
+                crate::apps::delete::DeleteError::ConfirmMismatch(_, _) => {
+                    ToolError::invalid_argument(format!(
+                        "confirm {:?} does not match the slug {:?}: pass the slug exactly to delete it",
+                        body.confirm, app.slug,
+                    ))
+                }
+                crate::apps::delete::DeleteError::NotFound(slug) => {
+                    ToolError::not_found(format!("no app named {slug:?}"))
+                }
+                crate::apps::delete::DeleteError::Internal(err) => {
+                    crate::mcp::tools::internal(err)
+                }
+            })
+        }
     }
 }
 
@@ -362,13 +457,13 @@ async fn api_secret_put(
     Json(body): Json<SecretValueBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
     let summary = format!("set_secret {name}");
     let result = set_app_secret(mcp, &app, &name, &body.value).await;
-    audited(mcp, &account, &app, "set_secret", &summary, result).await
+    audited(mcp, &account, &app, admin, "set_secret", &summary, result).await
 }
 
 async fn set_app_secret(
@@ -409,7 +504,7 @@ async fn api_secret_delete(
     Path((slug, name)): Path<(String, String)>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -428,7 +523,7 @@ async fn api_secret_delete(
         Ok(json!({"name": name, "applies": "next deploy"}))
     }
     .await;
-    audited(mcp, &account, &app, "unset_secret", &summary, result).await
+    audited(mcp, &account, &app, admin, "unset_secret", &summary, result).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,7 +542,7 @@ async fn api_rollback(
     Json(body): Json<RollbackBody>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -474,7 +569,7 @@ async fn api_rollback(
         }))
     }
     .await;
-    audited(mcp, &account, &app, "rollback", &summary, result).await
+    audited(mcp, &account, &app, admin, "rollback", &summary, result).await
 }
 
 /// `POST /api/console/apps/:slug/preview/promote`: the MCP
@@ -488,7 +583,7 @@ async fn api_preview_promote(
     Path(slug): Path<String>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -505,6 +600,7 @@ async fn api_preview_promote(
         mcp,
         &account,
         &app,
+        admin,
         "promote_preview",
         "promote preview to live",
         result,
@@ -520,7 +616,7 @@ async fn api_preview_discard(
     Path(slug): Path<String>,
 ) -> Response {
     let mcp = &state.mcp;
-    let (account, app) = match mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
@@ -536,6 +632,7 @@ async fn api_preview_discard(
         mcp,
         &account,
         &app,
+        admin,
         "discard_preview",
         "discard preview",
         result,
@@ -556,33 +653,49 @@ async fn api_rename(
 ) -> Response {
     let started = std::time::Instant::now();
     let mcp = &state.mcp;
-    let (account, app) = match owner_mutation_app(mcp, &headers, &slug).await {
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
         Ok(pair) => pair,
         Err(res) => return *res,
     };
     // One audit row whatever the outcome (mirrors the MCP path, which logs
     // refused calls too): the app is owner-gated above, so the row always
     // resolves.
-    let audit = |summary: &str, outcome: &str, error_code: Option<&str>| {
+    let audit = |summary: &str, outcome: &str, error_code: Option<&str>, mutation_ok: bool| {
         let pool = mcp.pool.clone();
         let app_id = app.id.clone();
-        let account_id = account.id.clone();
-        let summary = summary.to_string();
+        let account = account.clone();
+        let summary = super::console::audit_summary(&account, summary, admin);
         let outcome = outcome.to_string();
         let error_code = error_code.map(str::to_string);
         let duration_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
         async move {
-            crate::mcp::actions::record_console(
-                &pool,
-                &app_id,
-                &account_id,
-                "rename_app",
-                &summary,
-                &outcome,
-                error_code.as_deref(),
-                duration_ms,
-            )
-            .await;
+            if mutation_ok {
+                super::console::audit_mutation(
+                    &pool,
+                    &app_id,
+                    &account,
+                    "rename_app",
+                    &summary,
+                    &outcome,
+                    error_code.as_deref(),
+                    duration_ms,
+                    admin,
+                )
+                .await
+            } else {
+                super::console::audit_console_refusal(
+                    &pool,
+                    &app_id,
+                    &account,
+                    "rename_app",
+                    &summary,
+                    error_code.as_deref(),
+                    duration_ms,
+                    admin,
+                )
+                .await;
+                Ok(())
+            }
         }
     };
     let summary_for = |old: &str, new: &str| format!("rename_app {old} to {new}");
@@ -592,19 +705,31 @@ async fn api_rename(
         .map(str::to_string);
     let Some(new_slug) = new_slug.filter(|s| !s.is_empty()) else {
         let err = ToolError::invalid_argument("body must be {\"slug\": \"<new-slug>\"}");
-        audit(&summary_for(&slug, "?"), "error", Some(err.code)).await;
+        let _ = audit(&summary_for(&slug, "?"), "error", Some(err.code), false).await;
         return tool_response(&err);
     };
     if slug == new_slug {
         let err = ToolError::invalid_argument(format!(
             "the app is already named {slug:?}; nothing to rename"
         ));
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     if let Err(e) = crate::apps::validate_slug(&new_slug) {
         let err = ToolError::invalid_argument(e.to_string());
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     // After the cheap checks, before the quota claim: mirrors the MCP tool,
@@ -612,11 +737,25 @@ async fn api_rename(
     if let Err(e) = crate::apps::check_slug_profanity(mcp.jev.as_ref(), &new_slug, None, None).await
     {
         let err = ToolError::from_profanity(e);
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
-    if let Err(err) = claim_change(&mcp.pool, &mcp.billing, &account.id).await {
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+    // Quota follows the app owner, never the admin acting on their behalf.
+    let billing = super::console::billing_id(&account, &app, admin);
+    if let Err(err) = claim_change(&mcp.pool, &mcp.billing, billing).await {
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     // The rename redeploys a running app, so the redeploy's plan admission
@@ -628,13 +767,25 @@ async fn api_rename(
         crate::mcp::tools::check_build_quota(&mcp.pool, &mcp.billing, &account.id).await
     {
         let _ = refund_change(&mcp.pool, &account.id).await;
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     if let Err(err) = crate::mcp::tools::check_storage_writable(&mcp.pool, &mcp.billing, &app).await
     {
         let _ = refund_change(&mcp.pool, &account.id).await;
-        audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+        let _ = audit(
+            &summary_for(&slug, &new_slug),
+            "error",
+            Some(err.code),
+            false,
+        )
+        .await;
         return tool_response(&err);
     }
     // Same locks as the MCP tool, in the same order (deploy, rollback, then
@@ -677,9 +828,15 @@ async fn api_rename(
         Err(err) => {
             // Any domain error is pre-commit (post-commit steps never fail),
             // so the rename never happened: refund the claimed change.
-            let _ = refund_change(&mcp.pool, &account.id).await;
+            let _ = refund_change(&mcp.pool, billing).await;
             let err = ToolError::from_rename(err);
-            audit(&summary_for(&slug, &new_slug), "error", Some(err.code)).await;
+            let _ = audit(
+                &summary_for(&slug, &new_slug),
+                "error",
+                Some(err.code),
+                false,
+            )
+            .await;
             return tool_response(&err);
         }
     };
@@ -701,6 +858,17 @@ async fn api_rename(
         },
         None => "ok".to_string(),
     };
-    audit(&summary_for(&slug, &out.app.slug), &deploy_status, None).await;
+    // The rename itself succeeded, so the admin path is fail-closed even
+    // when the follow-up redeploy did not.
+    if let Err(res) = audit(
+        &summary_for(&slug, &out.app.slug),
+        &deploy_status,
+        None,
+        true,
+    )
+    .await
+    {
+        return *res;
+    }
     ok_json(json!({"slug": out.app.slug, "url": url}))
 }
