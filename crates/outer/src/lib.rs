@@ -17,6 +17,7 @@ pub mod cron;
 pub mod d1_backup;
 pub mod db;
 pub mod deploy;
+pub mod examples;
 pub mod fleet;
 pub mod git;
 pub mod http;

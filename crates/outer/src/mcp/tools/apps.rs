@@ -240,15 +240,41 @@ pub async fn create_app(input: CreateAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     // app refuses here with the quota shape, and the `?` leaves the seeded
     // app row in place — the agent retries the deploy after the reset.
     let deploy = run_deploy(ctx.state, &app, &sha, input.wait.unwrap_or(true)).await?;
-    let summary = format!(
-        "{} is live at {}. Open it with open_app to keep working.",
-        app.slug,
-        ctx.state.app_url(&app.slug)
-    );
+    // Name the ready patterns for this template from the live examples
+    // list; a missing or empty list falls back to a plain pointer. Never
+    // fails the creation: examples are a hint, not the app.
+    let hint = match crate::examples::list(
+        &ctx.state.store,
+        &ctx.state.delete_cfg.data_dir,
+        Some(template),
+    )
+    .await
+    {
+        Ok(examples) if !examples.is_empty() => {
+            let names = examples
+                .iter()
+                .map(|example| example.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("For ready patterns ({names}) call examples {{name}} for the README and files to copy.")
+        }
+        _ => "For ready patterns call examples.".to_string(),
+    };
+    let url = ctx.state.app_url(&app.slug);
+    let summary = match template {
+        crate::templates::Template::App => format!(
+            "{} is live at {url}. It's an empty app shell: build what your user asked for. Pages go in pages/ (list them in pages/_nav.ts). {hint}",
+            app.slug,
+        ),
+        crate::templates::Template::Website => format!(
+            "{} is live at {url}. It's an empty website shell: build what your user asked for. Content lives in Astro pages (islands for interactive parts). {hint}",
+            app.slug,
+        ),
+    };
     let structured = json!({
         "app": {"slug": app.slug, "url": ctx.state.app_url(&app.slug), "visibility": app.visibility.as_str()},
         "deploy": deploy,
-        "next": "open_app {app} to orient, then read_files (batched ranges), search_code, commit edits",
+        "next": "open_app {app} to orient, then read_files (batched ranges), search_code, examples for ready patterns, commit edits",
     });
     Ok(super::ok_deploy(
         summary,

@@ -7,9 +7,9 @@ use serde_json::Value;
 use crate::mcp::tools::{
     account, apps as app_inputs, backups as backup_inputs, code as code_inputs,
     collaborators as collab_inputs, data as data_inputs, domains as domain_inputs,
-    drafts as draft_inputs, export as export_inputs, look as look_inputs,
-    open_app as open_app_inputs, preview as preview_inputs, runtime as runtime_inputs,
-    secrets as secrets_inputs, NoArgs,
+    drafts as draft_inputs, examples as examples_inputs, export as export_inputs,
+    look as look_inputs, open_app as open_app_inputs, preview as preview_inputs,
+    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -92,9 +92,8 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "get_app" | "share_app" | "look_at_app" | "open_app" | "list_files" | "read_files"
         | "search_code" | "history" | "show_commit" | "deploy_status" | "deploy_log"
         | "app_logs" | "app_errors" | "app_metrics" | "db_query" | "list_secrets"
-        | "list_collaborators" | "list_domains" | "export_code" | "list_backups" | "diff_draft" => {
-            Hints::READ
-        }
+        | "list_collaborators" | "list_domains" | "export_code" | "list_backups" | "diff_draft"
+        | "examples" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
         | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" | "stage"
@@ -462,6 +461,11 @@ pub fn registry() -> Vec<ToolDef> {
             "Restore an app's D1 database from a backup: {app, binding?, backup_id, confirm} with confirm equal to backup_id. Takes a fresh backup first, then replaces the live tables with the dump. Owner only.",
             Account, false,
         ),
+        tool::<examples_inputs::ExamplesInput>(
+            "examples",
+            "Copy-paste patterns for apps and sites: `examples` lists them, `examples {name}` returns the README and files to copy.",
+            Public, false,
+        ),
     ]
 }
 
@@ -488,7 +492,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 59);
+        assert_eq!(tools.len(), 60);
     }
 }
 

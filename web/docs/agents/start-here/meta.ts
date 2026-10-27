@@ -4,5 +4,5 @@ export default defineMeta({
   title: "Start here",
   icon: "rocket",
   order: 1,
-  pages: ["index", "quickstart", "templates"],
+  pages: ["index", "quickstart", "templates", "examples"],
 });

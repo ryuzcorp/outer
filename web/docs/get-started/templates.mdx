@@ -1,11 +1,10 @@
 ---
 title: Pick a template
-description: Pick the right starter for your idea — an interactive app or a content site.
+description: Pick the right shell for your idea — an empty interactive app or an empty content site.
 ---
 
 Your app gets its name, colour and icon automatically from what you ask for: tell your agent the app's name and what it does in your first prompt. To rename it later, ask your agent — it edits one file (`brand.json`) and everything follows.
-Every Outer app starts from one of two starters. Tell your agent which one
-you want in your first prompt. The default is `app`.
+Every Outer app starts as an empty shell from one of two minimal templates: layout, brand, settings, and nothing to delete. Real features (lists, accounts, uploads, blog, newsletter) come from proven patterns your agent copies over with the `examples` tool. Tell your agent which shell you want in your first prompt. The default is `app`.
 
 Building it? The agent reads Agents → [Templates](/agents/start-here/templates)
 for the technical details.
@@ -21,21 +20,21 @@ for the technical details.
 Ask like this: "Build a portfolio site on Outer with the website template."
 Or: "Build a grocery list app for my family on Outer."
 
-## The app starter
+## The `app` shell
 
 The `app` is an interactive app: accounts, live state,
 dashboards, anything with more than one database table. Pages read and
 write the database directly. Pick it when people
 sign in, save things, or see live updates. Every app is installable on phones: [Install on phones](/frontend/install-on-phones).
 
-## The website starter
+## The `website` shell
 
 The `website` is a content site: landing pages, portfolios, blogs, event
 pages. Pages are mostly static, prerendered HTML with Astro routing. Small
 interactive parts (like a newsletter form) run as islands. It fits at most
 one server route or two talking to D1.
 
-## When your site outgrows the website starter
+## When your site outgrows the website shell
 
 A website that needs sign-in, live collaboration, or a second database
 table has outgrown the website template. Rebuild it on `app` rather than

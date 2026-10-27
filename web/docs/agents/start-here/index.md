@@ -18,11 +18,13 @@ Each code tool waits for the deploy. It returns `success` with the URL, `failed`
 
 When a tool refuses something, pass its `user_message` to your person verbatim. Never improvise around it or soften the limit.
 
-## Know the starters
+## Know the shells
 
 | Build | Start with |
 | --- | --- |
 | Interactive app: accounts, live state, dashboards, more than one table | [Templates](/agents/start-here/templates) (`app`) |
 | Content site: landing page, portfolio, blog, event page | [Templates](/agents/start-here/templates) (`website`) |
+
+Both shells are empty branded shells with nothing to delete. Copy ready patterns from [Examples](/agents/start-here/examples): `examples` lists them, `examples {name}` returns the README and files.
 
 New to the loop? Work [Quickstart](/agents/start-here/quickstart) end to end. The person-facing version lives at [Quickstart](/get-started/quickstart).

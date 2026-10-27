@@ -15,6 +15,7 @@ pub(crate) mod data;
 pub(crate) mod diagnostics;
 pub(crate) mod domains;
 pub(crate) mod drafts;
+pub(crate) mod examples;
 pub(crate) mod export;
 pub(crate) mod look;
 pub(crate) mod open_app;
@@ -1235,6 +1236,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "restore_backup" => backups::restore_backup(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "examples" => examples::examples(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         _ => Err(CallError::Rpc(-32602, format!("unknown tool {tool:?}"))),
