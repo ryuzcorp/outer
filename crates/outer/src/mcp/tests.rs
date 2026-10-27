@@ -7769,7 +7769,13 @@ async fn draft_stage_line_edits_and_inserts_ship() {
     let draft = &result(&staged)["structuredContent"]["draft"];
     assert_eq!(draft["staged"]["line_edits"], 1);
     assert_eq!(draft["staged"]["inserts"], 1);
-    let (_, diff) = call(&state, Some(&token), "diff_draft", json!({"app": "groceries"})).await;
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
     let patch = result(&diff)["structuredContent"]["draft"]["patch"]
         .as_str()
         .unwrap()
@@ -7783,7 +7789,10 @@ async fn draft_stage_line_edits_and_inserts_ship() {
         json!({"app": "groceries", "message": "line edits"}),
     )
     .await;
-    assert_eq!(result(&shipped)["structuredContent"]["deploy"]["status"], "success");
+    assert_eq!(
+        result(&shipped)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
     assert_eq!(history_len(&state, &token, "groceries").await, 2);
 }
 
@@ -7800,7 +7809,10 @@ async fn draft_stage_patch_ships() {
         json!({"app": "groceries", "patch": patch}),
     )
     .await;
-    assert_eq!(result(&staged)["structuredContent"]["draft"]["staged"]["patch"], true);
+    assert_eq!(
+        result(&staged)["structuredContent"]["draft"]["staged"]["patch"],
+        true
+    );
     let (_, shipped) = call(
         &state,
         Some(&token),
@@ -7808,7 +7820,10 @@ async fn draft_stage_patch_ships() {
         json!({"app": "groceries", "message": "patched"}),
     )
     .await;
-    assert_eq!(result(&shipped)["structuredContent"]["deploy"]["status"], "success");
+    assert_eq!(
+        result(&shipped)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
     let (_, read) = call(
         &state,
         Some(&token),
@@ -7816,12 +7831,10 @@ async fn draft_stage_patch_ships() {
         json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
     )
     .await;
-    assert!(
-        result(&read)["structuredContent"]["files"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Figs")
-    );
+    assert!(result(&read)["structuredContent"]["files"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Figs"));
 }
 
 #[tokio::test]
@@ -7871,9 +7884,18 @@ async fn draft_patch_refuses_mixing_and_second_patch() {
         json!({"app": "groceries", "patch": patch}),
     )
     .await;
-    assert_eq!(result(&denied)["structuredContent"]["error"], "invalid_argument");
+    assert_eq!(
+        result(&denied)["structuredContent"]["error"],
+        "invalid_argument"
+    );
     // The first refusal kept nothing partial: the draft still holds the write.
-    let (_, diff) = call(&state, Some(&token), "diff_draft", json!({"app": "groceries"})).await;
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
     let paths: Vec<&str> = result(&diff)["structuredContent"]["draft"]["files"]
         .as_array()
         .unwrap()
@@ -7921,5 +7943,8 @@ async fn draft_stale_expect_blob_conflicts_at_stage() {
                           "expect_blob": blob}]}),
     )
     .await;
-    assert_eq!(result(&staged)["structuredContent"]["draft"]["staged"]["edits"], 1);
+    assert_eq!(
+        result(&staged)["structuredContent"]["draft"]["staged"]["edits"],
+        1
+    );
 }

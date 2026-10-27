@@ -389,7 +389,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `stage`
 
 - **Access:** signed in
-- **Description:** Stage file changes into your per-app draft without deploying: full-file writes, exact-match edits, deletes and moves (same shapes as commit). No deploy, no code change. Then diff_draft to review, check to verify, ship to deploy as one commit.
+- **Description:** Stage file changes into your per-app draft without deploying: writes, exact-match edits, line edits, inserts, a patch, deletes and moves â€” every commit shape, with optional per-file expect_blob CAS. No deploy, no code change. A patch stages alone, never mixed. Then diff_draft to review, check to verify, ship to deploy as one commit.
 
 **Input:**
 
@@ -398,7 +398,10 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `deletes` | array of string | no | Paths to delete. |
 | `edits` | array of object | no | Exact-match replacements in existing files. |
+| `inserts` | array of object | no | Insertions after a line (0 is the top). |
+| `line_edits` | array of object | no | Line-range replacements (inclusive, 1-based read_files numbering). |
 | `moves` | array of object | no | File renames. |
+| `patch` | string | no | One unified diff, or a Codex `*** Begin Patch` block. A draft carrying a patch carries nothing else: stage it alone, then ship. |
 | `writes` | array of object | no | Full-file writes (new files or replacements). |
 
 ## `diff_draft`

@@ -232,7 +232,15 @@ pub async fn check_ops(
     let (_, mut files) = validate_request(&req)?;
     let mut deletes = req.changes.deletes.clone();
     let mut moves = req.changes.moves.clone();
-    apply_changes(&bare, Some(base), &req.changes, &mut files, &mut deletes, &mut moves).await
+    apply_changes(
+        bare,
+        Some(base),
+        &req.changes,
+        &mut files,
+        &mut deletes,
+        &mut moves,
+    )
+    .await
 }
 
 /// Build the draft tree on `base` and return a dangling commit parented on
@@ -248,9 +256,17 @@ pub async fn build_draft_commit(
     let (message, mut files) = validate_request(&req)?;
     let mut deletes = req.changes.deletes.clone();
     let mut moves = req.changes.moves.clone();
-    apply_changes(&bare, Some(base), &req.changes, &mut files, &mut deletes, &mut moves).await?;
+    apply_changes(
+        bare,
+        Some(base),
+        &req.changes,
+        &mut files,
+        &mut deletes,
+        &mut moves,
+    )
+    .await?;
     build_commit(
-        &bare,
+        bare,
         Some(base),
         &req.author,
         &message,

@@ -142,7 +142,7 @@ async fn clear_draft(pool: &SqlitePool, app_id: &str, account_id: &str) -> Resul
 
 /// The mirror head, or `not_found` when the app has no commits yet.
 async fn draft_head(bare: &std::path::Path) -> Result<String, ToolError> {
-    crate::git::manifest::head_of(&bare)
+    crate::git::manifest::head_of(bare)
         .await
         .map_err(internal)?
         .ok_or_else(|| ToolError::not_found("app has no commits yet"))
@@ -372,7 +372,10 @@ pub async fn stage(input: StageInput, ctx: &Ctx<'_>) -> Result<Value, ToolError>
     save_draft(&ctx.state.pool, &app.id, &caller.account_id, &base, &ops).await?;
     let summary = format!(
         "Staged {} file(s) in the draft for {}.",
-        ops_summary(&ops)["files"].as_array().map(Vec::len).unwrap_or(0),
+        ops_summary(&ops)["files"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
         app.slug,
     );
     Ok(ok(
@@ -481,7 +484,11 @@ pub async fn check(input: CheckInput, ctx: &Ctx<'_>) -> Result<Value, ToolError>
         "pass"
     };
     let summary = if status == "pass" {
-        format!("Check passed for {} ({} diagnostic(s)).", app.slug, diagnostics.len())
+        format!(
+            "Check passed for {} ({} diagnostic(s)).",
+            app.slug,
+            diagnostics.len()
+        )
     } else {
         format!(
             "Check failed for {} ({} diagnostic(s)): fix them, stage again, re-check.",
