@@ -305,7 +305,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 54);
+    assert_eq!(anon.len(), 59);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
 
@@ -322,7 +322,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 52);
+    assert_eq!(authed.len(), 57);
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
     assert!(authed.contains(&"upgrade".to_string()));
@@ -409,6 +409,7 @@ async fn registry_schemas_are_valid_json_schema() {
         vec![
             "read_files",
             "search_code",
+            "diff_draft",
             "show_commit",
             "deploy_log",
             "app_logs",
@@ -7286,4 +7287,664 @@ async fn db_query_resolves_the_default_binding() {
     .await;
     assert_eq!(is_error(&out)["error"], "invalid_argument");
     assert!(!q2.statedir.path().join("calls.log").exists());
+}
+// Drafts (spec §1.5/§1.6): stage → diff/check/ship, discard, rebase,
+// conflicts, collaborator/stranger access, structured deploy diagnostics.
+
+/// A build log in the shapes the real tools emit: esbuild-style failure
+/// plus one tsc error.
+const DRAFT_TSC_LOG: &str = "=== install ===\ninstalled\n=== build ===\n✘ [ERROR] Could not resolve \"missing-dep\"\n    src/main.ts:3:7:\nerror: build failed\nsrc/routes/index.tsx(12,34): error TS2322: Type 'number' is not assignable to type 'string'.\n";
+
+async fn account_id(state: &McpState, email: &str) -> String {
+    sqlx::query_scalar("SELECT id FROM user WHERE email = ?1")
+        .bind(email)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+}
+
+async fn code_changes(state: &McpState, email: &str) -> i64 {
+    sqlx::query_scalar("SELECT COALESCE(SUM(code_changes), 0) FROM usage_day WHERE userId = ?1")
+        .bind(account_id(state, email).await)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+}
+
+async fn build_ms_used(state: &McpState, email: &str) -> Option<i64> {
+    sqlx::query_scalar("SELECT build_ms FROM usage_day WHERE userId = ?1")
+        .bind(account_id(state, email).await)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap()
+}
+
+async fn history_len(state: &McpState, token: &str, slug: &str) -> usize {
+    let (_, history) = call(state, Some(token), "history", json!({"app": slug})).await;
+    result(&history)["structuredContent"]["commits"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+#[tokio::test]
+async fn draft_stage_accumulates_and_diffs_without_spending() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({
+            "app": "groceries",
+            "writes": [{"path": "notes.txt", "content": "hello\n"}],
+            "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Berries"}],
+        }),
+    )
+    .await;
+    let draft = result(&staged)["structuredContent"]["draft"].clone();
+    assert_eq!(draft["staged"]["writes"], 1);
+    assert_eq!(draft["staged"]["edits"], 1);
+    let base = draft["base"].as_str().unwrap().to_string();
+
+    // A second stage accumulates onto the same base.
+    let (_, staged2) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "deletes": ["lib/moderate.ts"]}),
+    )
+    .await;
+    let draft2 = result(&staged2)["structuredContent"]["draft"].clone();
+    assert_eq!(draft2["base"], base);
+    assert_eq!(draft2["staged"]["deletes"], 1);
+    assert_eq!(draft2["staged"]["writes"], 1);
+
+    // Staging spends nothing and starts no deploy.
+    assert_eq!(code_changes(&state, "ana@example.com").await, 0);
+    let deploys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM deploy WHERE app_id = (SELECT id FROM app WHERE slug = 'groceries')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(deploys, 1, "only the seed deploy exists");
+
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let shown = result(&diff)["structuredContent"]["draft"].clone();
+    assert_eq!(shown["base"], base);
+    let paths: Vec<&str> = shown["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"notes.txt"), "{paths:?}");
+    assert!(paths.contains(&"pages/index.tsx"), "{paths:?}");
+    assert!(paths.contains(&"lib/moderate.ts"), "{paths:?}");
+    assert!(shown["patch"].as_str().unwrap().contains("Berries"));
+}
+
+#[tokio::test]
+async fn draft_check_pass_charges_build_minutes_not_code_changes() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "writes": [{"path": "notes.txt", "content": "hi\n"}]}),
+    )
+    .await;
+
+    let (_, checked) = call(&state, Some(&token), "check", json!({"app": "groceries"})).await;
+    let check = &result(&checked)["structuredContent"]["check"];
+    assert_eq!(check["status"], "pass");
+    assert_eq!(check["diagnostics"].as_array().unwrap().len(), 0);
+
+    // Build minutes move, code changes do not.
+    assert!(
+        build_ms_used(&state, "ana@example.com").await.is_some(),
+        "the check charges its wall time"
+    );
+    assert_eq!(code_changes(&state, "ana@example.com").await, 0);
+}
+
+#[tokio::test]
+async fn draft_check_fail_returns_structured_diagnostics() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "writes": [{"path": "notes.txt", "content": "hi\n"}]}),
+    )
+    .await;
+    state.deploys.set_fake_check(crate::deploy::CheckOutput {
+        steps: vec![
+            crate::deploy::CheckStep {
+                name: "install".to_string(),
+                ms: 1,
+                skipped: false,
+                ok: true,
+            },
+            crate::deploy::CheckStep {
+                name: "build".to_string(),
+                ms: 1,
+                skipped: false,
+                ok: false,
+            },
+            crate::deploy::CheckStep {
+                name: "typecheck".to_string(),
+                ms: 1,
+                skipped: false,
+                ok: false,
+            },
+            crate::deploy::CheckStep {
+                name: "lint".to_string(),
+                ms: 1,
+                skipped: true,
+                ok: true,
+            },
+            crate::deploy::CheckStep {
+                name: "tests".to_string(),
+                ms: 1,
+                skipped: true,
+                ok: true,
+            },
+        ],
+        log: DRAFT_TSC_LOG.to_string(),
+    });
+
+    let (_, checked) = call(&state, Some(&token), "check", json!({"app": "groceries"})).await;
+    let check = &result(&checked)["structuredContent"]["check"];
+    assert_eq!(check["status"], "fail");
+    let diagnostics = check["diagnostics"].as_array().unwrap();
+    assert!(!diagnostics.is_empty(), "a failed check names its errors");
+    assert!(
+        diagnostics.iter().any(|d| d["code"] == "TS2322"
+            && d["file"] == "src/routes/index.tsx"
+            && d["line"] == 12),
+        "{diagnostics:?}"
+    );
+    assert_eq!(code_changes(&state, "ana@example.com").await, 0);
+}
+
+#[tokio::test]
+async fn draft_ship_is_one_commit_and_clears() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    assert_eq!(history_len(&state, &token, "groceries").await, 1);
+
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "writes": [{"path": "notes.txt", "content": "hi\n"}]}),
+    )
+    .await;
+    let (_, shipped) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "add notes"}),
+    )
+    .await;
+    let structured = &result(&shipped)["structuredContent"];
+    assert_eq!(structured["deploy"]["status"], "success");
+    assert_eq!(
+        structured["draft"],
+        json!({"cleared": true, "rebased": false})
+    );
+    assert!(structured["commit"]["sha"].as_str().unwrap().len() == 40);
+    assert_eq!(history_len(&state, &token, "groceries").await, 2);
+    assert_eq!(code_changes(&state, "ana@example.com").await, 1);
+
+    // The draft is gone: diff and ship both report it.
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(result(&diff)["structuredContent"]["error"], "not_found");
+    let (_, reship) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "again"}),
+    )
+    .await;
+    assert_eq!(result(&reship)["structuredContent"]["error"], "not_found");
+}
+
+#[tokio::test]
+async fn draft_ship_rebases_onto_a_moved_head() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Berries"}]}),
+    )
+    .await;
+    // Someone else lands first, on a different file: the head moves but the
+    // draft still applies.
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "other file",
+               "writes": [{"path": "lib/other.ts", "content": "export {};\n"}]}),
+    )
+    .await;
+    let (_, shipped) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "berries"}),
+    )
+    .await;
+    let structured = &result(&shipped)["structuredContent"];
+    assert_eq!(structured["deploy"]["status"], "success");
+    assert_eq!(
+        structured["draft"],
+        json!({"cleared": true, "rebased": true})
+    );
+    assert_eq!(history_len(&state, &token, "groceries").await, 3);
+    assert_eq!(code_changes(&state, "ana@example.com").await, 2);
+}
+
+#[tokio::test]
+async fn draft_ship_conflict_keeps_the_draft() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Berries"}]}),
+    )
+    .await;
+    // The head moves through the same text: the draft no longer applies.
+    let (_, moved) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "apples",
+               "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Apples"}]}),
+    )
+    .await;
+    let current = result(&moved)["structuredContent"]["commit"]["sha"].clone();
+
+    let (_, shipped) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "berries"}),
+    )
+    .await;
+    let err = is_error(&shipped);
+    assert_eq!(err["error"], "conflict");
+    assert_eq!(err["current_sha"], current);
+
+    // The draft survives the conflict.
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert!(result(&diff).get("isError").is_none());
+    assert_eq!(history_len(&state, &token, "groceries").await, 2);
+}
+
+#[tokio::test]
+async fn draft_discard_is_idempotent() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "writes": [{"path": "notes.txt", "content": "hi\n"}]}),
+    )
+    .await;
+    let (_, dropped) = call(
+        &state,
+        Some(&token),
+        "discard_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&dropped)["structuredContent"]["draft"]["dropped"],
+        true
+    );
+    let (_, dropped2) = call(
+        &state,
+        Some(&token),
+        "discard_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&dropped2)["structuredContent"]["draft"]["dropped"],
+        false
+    );
+    assert_eq!(code_changes(&state, "ana@example.com").await, 0);
+}
+
+#[tokio::test]
+async fn draft_tools_refuse_strangers_but_serve_collaborators() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let stranger = api_key_for(&state, "stranger@example.com").await;
+
+    for tool in ["stage", "diff_draft", "check", "ship", "discard_draft"] {
+        let args = if tool == "stage" {
+            json!({"app": "groceries", "writes": [{"path": "x.txt", "content": "x\n"}]})
+        } else if tool == "ship" {
+            json!({"app": "groceries", "message": "x"})
+        } else {
+            json!({"app": "groceries"})
+        };
+        let (_, denied) = call(&state, Some(&stranger), tool, args).await;
+        assert_eq!(
+            result(&denied)["structuredContent"]["error"],
+            "not_found",
+            "{tool} leaks nothing to strangers"
+        );
+    }
+
+    // A collaborator stages onto their own draft (Pro owner, spec §7.4).
+    sqlx::query("UPDATE user SET plan = 'pro' WHERE email = 'ana@example.com'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "add_collaborator",
+        json!({"app": "groceries", "email": "cara@example.com"}),
+    )
+    .await;
+    let cara = api_key_for(&state, "cara@example.com").await;
+    let (_, staged) = call(
+        &state,
+        Some(&cara),
+        "stage",
+        json!({"app": "groceries", "writes": [{"path": "cara.txt", "content": "hi\n"}]}),
+    )
+    .await;
+    assert_eq!(
+        result(&staged)["structuredContent"]["draft"]["staged"]["writes"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_commit_deploy_returns_structured_diagnostics() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let mut failed = FakeOutcome::failed();
+    failed.log_tail = Some(DRAFT_TSC_LOG);
+    state.deploys.set_fake(failed);
+
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "broken",
+               "writes": [{"path": "q.txt", "content": "q"}]}),
+    )
+    .await;
+    let deploy = &result(&committed)["structuredContent"]["deploy"];
+    assert_eq!(deploy["status"], "failed");
+    let diagnostics = deploy["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d["code"] == "TS2322" && d["file"] == "src/routes/index.tsx"),
+        "{diagnostics:?}"
+    );
+
+    // The follow-up read carries the same diagnostics.
+    let (_, status) = call(
+        &state,
+        Some(&token),
+        "deploy_status",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let seen = &result(&status)["structuredContent"]["diagnostics"];
+    assert!(
+        seen.as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "TS2322"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn draft_stage_line_edits_and_inserts_ship() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    // pages/index.tsx is one line: "<h1>Groceries</h1>".
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "line_edits": [{"path": "pages/index.tsx", "start_line": 1, "end_line": 1,
+                               "new": "<h1>Berries</h1>"}],
+               "inserts": [{"path": "pages/index.tsx", "after_line": 1,
+                             "insert": "<p>fresh</p>\n"}]}),
+    )
+    .await;
+    let draft = &result(&staged)["structuredContent"]["draft"];
+    assert_eq!(draft["staged"]["line_edits"], 1);
+    assert_eq!(draft["staged"]["inserts"], 1);
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let patch = result(&diff)["structuredContent"]["draft"]["patch"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(patch.contains("Berries"), "{patch}");
+    assert!(patch.contains("fresh"), "{patch}");
+    let (_, shipped) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "line edits"}),
+    )
+    .await;
+    assert_eq!(
+        result(&shipped)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+    assert_eq!(history_len(&state, &token, "groceries").await, 2);
+}
+
+#[tokio::test]
+async fn draft_stage_patch_ships() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let patch = "--- a/pages/index.tsx\n+++ b/pages/index.tsx\n@@ -1 +1 @@\n-<h1>Groceries</h1>\n+<h1>Figs</h1>\n";
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "patch": patch}),
+    )
+    .await;
+    assert_eq!(
+        result(&staged)["structuredContent"]["draft"]["staged"]["patch"],
+        true
+    );
+    let (_, shipped) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "patched"}),
+    )
+    .await;
+    assert_eq!(
+        result(&shipped)["structuredContent"]["deploy"]["status"],
+        "success"
+    );
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
+    )
+    .await;
+    assert!(result(&read)["structuredContent"]["files"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Figs"));
+}
+
+#[tokio::test]
+async fn draft_patch_refuses_mixing_and_second_patch() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let patch = "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "patch": patch}),
+    )
+    .await;
+    // Other ops on a patch draft refuse, and a second patch refuses too.
+    for args in [
+        json!({"app": "groceries", "writes": [{"path": "x.txt", "content": "x"}]}),
+        json!({"app": "groceries", "patch": patch}),
+    ] {
+        let (_, denied) = call(&state, Some(&token), "stage", args).await;
+        assert_eq!(
+            result(&denied)["structuredContent"]["error"],
+            "invalid_argument",
+            "a patch stages alone"
+        );
+    }
+    // The reverse order refuses the same way.
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "discard_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "writes": [{"path": "x.txt", "content": "x"}]}),
+    )
+    .await;
+    let (_, denied) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "patch": patch}),
+    )
+    .await;
+    assert_eq!(
+        result(&denied)["structuredContent"]["error"],
+        "invalid_argument"
+    );
+    // The first refusal kept nothing partial: the draft still holds the write.
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let paths: Vec<&str> = result(&diff)["structuredContent"]["draft"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["x.txt"], "{paths:?}");
+}
+
+#[tokio::test]
+async fn draft_stale_expect_blob_conflicts_at_stage() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, denied) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Berries",
+                          "expect_blob": "0000000000000000000000000000000000000000"}]}),
+    )
+    .await;
+    let err = is_error(&denied);
+    assert_eq!(err["error"], "conflict");
+    assert_eq!(err["path"], "pages/index.tsx");
+    // The fresh blob from read_files stages cleanly.
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
+    )
+    .await;
+    let blob = result(&read)["structuredContent"]["files"][0]["blob"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Berries",
+                          "expect_blob": blob}]}),
+    )
+    .await;
+    assert_eq!(
+        result(&staged)["structuredContent"]["draft"]["staged"]["edits"],
+        1
+    );
 }

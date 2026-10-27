@@ -2,6 +2,7 @@
 //! ref (`refs/heads/preview`, Pro preview deploys), changed only by Outer.
 
 pub mod commit;
+pub mod drafts;
 pub mod export;
 pub mod format;
 pub mod local;
@@ -11,5 +12,5 @@ pub use commit::{
     Author, CommitChanges, CommitError, CommitOutcome, CommitRequest, Edit, FileWrite, Insert,
     LineEdit, Move, WriteBody,
 };
-pub use format::{FormatOutcome, FormatSkip};
+pub use drafts::{Draft, DraftEdit, DraftInsert, DraftLineEdit, DraftMove, DraftOps, DraftWrite};
 pub use manifest::{GitConfig, GitSync, Manifest, ManifestRef, MAIN_REF, PREVIEW_REF};

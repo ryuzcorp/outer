@@ -203,12 +203,12 @@ pub(crate) fn lchown_one(path: &Path, uid: u32, gid: u32) -> bool {
 
 /// Top-level dirs under the data dir that app uids must traverse into (their
 /// own `<root>/<slug>` only). Everything else there is platform-private.
-pub const APP_ROOTS: [&str; 3] = ["work", "cache", "fleets"];
+pub const APP_ROOTS: [&str; 4] = ["work", "cache", "fleets", "checks"];
 
 /// Lock down the data dir before anything else touches it, when outer runs
 /// as root (production). The dir is `0711`: app uids can reach their own
-/// worktree, cache and fleet state by path but cannot list or open anything
-/// else. App roots are `0711` too (each `<slug>` below them is `0700` and
+/// worktree, cache, fleet state and check scratch by path but cannot list
+/// or open anything else. App roots are `0711` too (each `<slug>` below them is `0700` and
 /// owned by the app uid); every other top-level entry (SQLite, git mirrors,
 /// templates) is `0700` / `0600`. The process umask becomes `077`, so
 /// whatever outer or a sandboxed step creates later starts private.
