@@ -2517,6 +2517,34 @@ mod tests {
         }
     }
 
+    fn line_edit(path: &str, start_line: u64, end_line: u64, new: &str) -> LineEdit {
+        LineEdit {
+            path: path.to_string(),
+            start_line,
+            end_line,
+            new: new.to_string(),
+            expect_blob: None,
+        }
+    }
+
+    fn insert_after(path: &str, after_line: u64, text: &str) -> Insert {
+        Insert {
+            path: path.to_string(),
+            after_line,
+            text: text.to_string(),
+            expect_blob: None,
+        }
+    }
+
+    async fn blob_of(bare: &Path, rev: &str, path: &str) -> String {
+        let git_dir = format!("--git-dir={}", bare.display());
+        tree_blob(&git_dir, rev, path)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} missing at {rev}"))
+            .sha
+    }
+
     async fn show(bare: &Path, sha: &str, path: &str) -> String {
         let git_dir = format!("--git-dir={}", bare.display());
         manifest::run_git(
@@ -3769,5 +3797,438 @@ mod tests {
         assert!(!manifest::clear_preview(&store, &cfg, &sync, "prevhyd")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn line_edits_replace_ranges_by_number() {
+        let (_dir, cfg, store, sync) = setup("lines").await;
+        let mut seed = req("seed");
+        seed.changes
+            .writes
+            .push(write("f.txt", "a\nb\nc\n"));
+        commit(&store, &cfg, &sync, "lines", seed).await.unwrap();
+        let bare = manifest::mirror_path(&cfg, "lines");
+
+        // Two entries for one file replace disjoint ranges in one commit.
+        let mut r = req("lines");
+        r.changes.line_edits.push(line_edit("f.txt", 1, 1, "A"));
+        r.changes.line_edits.push(line_edit("f.txt", 3, 3, "C"));
+        let h = commit(&store, &cfg, &sync, "lines", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "f.txt").await, "A\nb\nC\n");
+
+        // A multi-line range with an empty replacement deletes the lines.
+        let mut r = req("delete");
+        r.changes.line_edits.push(line_edit("f.txt", 1, 2, ""));
+        let h = commit(&store, &cfg, &sync, "lines", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "f.txt").await, "C\n");
+    }
+
+    #[tokio::test]
+    async fn line_edits_hold_boundaries_and_trailing_newlines() {
+        let (_dir, cfg, store, sync) = setup("bounds").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("keep.txt", "a\nb\nc\n"));
+        seed.changes.writes.push(write("bare.txt", "x\ny\nz"));
+        commit(&store, &cfg, &sync, "bounds", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "bounds");
+
+        // A mid-file replace keeps the trailing newline, and a trailing
+        // newline inside `new` is absorbed rather than doubled.
+        let mut r = req("mid");
+        r.changes.line_edits.push(line_edit("keep.txt", 2, 2, "B\n"));
+        let h = commit(&store, &cfg, &sync, "bounds", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "keep.txt").await, "a\nB\nc\n");
+
+        // A file without a trailing newline keeps it that way when the
+        // replacement does not touch the last line...
+        let mut r = req("first");
+        r.changes.line_edits.push(line_edit("bare.txt", 1, 1, "X"));
+        let h = commit(&store, &cfg, &sync, "bounds", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "bare.txt").await, "X\ny\nz");
+
+        // ...and takes the replacement's ending when it does.
+        let mut r = req("last");
+        r.changes.line_edits.push(line_edit("bare.txt", 3, 3, "Z\n"));
+        let h = commit(&store, &cfg, &sync, "bounds", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "bare.txt").await, "X\ny\nZ\n");
+    }
+
+    #[tokio::test]
+    async fn line_ops_on_an_empty_file() {
+        let (_dir, cfg, store, sync) = setup("empty").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", ""));
+        commit(&store, &cfg, &sync, "empty", seed).await.unwrap();
+        let bare = manifest::mirror_path(&cfg, "empty");
+
+        // Inserting at 0 populates the file; the ending comes from the text.
+        let mut r = req("fill");
+        r.changes.inserts.push(insert_after("f.txt", 0, "hello\n"));
+        let h = commit(&store, &cfg, &sync, "empty", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "f.txt").await, "hello\n");
+
+        // A replace range needs a line to replace.
+        let mut r = req("range");
+        r.changes.line_edits.push(line_edit("f.txt", 1, 1, "x"));
+        match commit(&store, &cfg, &sync, "empty", r).await {
+            Err(CommitError::OutOfRange {
+                path,
+                start_line,
+                end_line,
+                total,
+            }) => {
+                assert_eq!(path, "f.txt");
+                assert_eq!((start_line, end_line, total), (1, 1, 1));
+            }
+            other => panic!("an empty-file replace must fail, got {other:?}"),
+        }
+
+        // Nothing follows line 1 of a one-line file.
+        let mut r = req("past");
+        r.changes.inserts.push(insert_after("f.txt", 2, "x"));
+        match commit(&store, &cfg, &sync, "empty", r).await {
+            Err(CommitError::InsertOutOfRange {
+                path,
+                after_line,
+                total,
+            }) => {
+                assert_eq!(path, "f.txt");
+                assert_eq!((after_line, total), (2, 1));
+            }
+            other => panic!("an insert past EOF must fail, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_and_out_of_range_line_edits_fail() {
+        let (_dir, cfg, store, sync) = setup("overlap").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "a\nb\nc\n"));
+        commit(&store, &cfg, &sync, "overlap", seed)
+            .await
+            .unwrap();
+
+        // Overlapping ranges in one file are refused before anything is read.
+        let mut r = req("overlap");
+        r.changes.line_edits.push(line_edit("f.txt", 1, 2, "x"));
+        r.changes.line_edits.push(line_edit("f.txt", 2, 3, "y"));
+        match commit(&store, &cfg, &sync, "overlap", r).await {
+            Err(CommitError::OverlappingLines { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("overlapping ranges must fail, got {other:?}"),
+        }
+
+        // An insert strictly inside a replaced range would not survive it.
+        let mut r = req("inside");
+        r.changes.line_edits.push(line_edit("f.txt", 1, 3, "x"));
+        r.changes.inserts.push(insert_after("f.txt", 1, "y"));
+        match commit(&store, &cfg, &sync, "overlap", r).await {
+            Err(CommitError::OverlappingLines { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("an insert inside a range must fail, got {other:?}"),
+        }
+
+        // A range past the last line names the file, the range and the count.
+        let mut r = req("past");
+        r.changes.line_edits.push(line_edit("f.txt", 2, 4, "x"));
+        match commit(&store, &cfg, &sync, "overlap", r).await {
+            Err(CommitError::OutOfRange {
+                path,
+                start_line,
+                end_line,
+                total,
+            }) => {
+                assert_eq!(path, "f.txt");
+                assert_eq!((start_line, end_line, total), (2, 4, 3));
+            }
+            other => panic!("a past-the-end range must fail, got {other:?}"),
+        }
+
+        let mut r = req("past-insert");
+        r.changes.inserts.push(insert_after("f.txt", 4, "x"));
+        match commit(&store, &cfg, &sync, "overlap", r).await {
+            Err(CommitError::InsertOutOfRange {
+                path,
+                after_line,
+                total,
+            }) => {
+                assert_eq!(path, "f.txt");
+                assert_eq!((after_line, total), (4, 3));
+            }
+            other => panic!("a past-the-end insert must fail, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inserts_run_at_top_and_end_in_input_order() {
+        let (_dir, cfg, store, sync) = setup("inserts").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "b\nc\n"));
+        commit(&store, &cfg, &sync, "inserts", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "inserts");
+
+        // Several inserts at one line run in input order; an insert at
+        // end-of-file takes the inserted text's ending.
+        let mut r = req("inserts");
+        r.changes.inserts.push(insert_after("f.txt", 0, "a"));
+        r.changes.inserts.push(insert_after("f.txt", 1, "first"));
+        r.changes.inserts.push(insert_after("f.txt", 1, "second"));
+        r.changes.inserts.push(insert_after("f.txt", 2, "d\n"));
+        let h = commit(&store, &cfg, &sync, "inserts", r).await.unwrap();
+        assert_eq!(
+            show(&bare, &h, "f.txt").await,
+            "a\nb\nfirst\nsecond\nc\nd\n"
+        );
+
+        // An insert without a trailing newline at EOF leaves none.
+        let mut r = req("bare");
+        r.changes.inserts.push(insert_after("f.txt", 6, "z"));
+        let h = commit(&store, &cfg, &sync, "inserts", r).await.unwrap();
+        assert_eq!(
+            show(&bare, &h, "f.txt").await,
+            "a\nb\nfirst\nsecond\nc\nd\nz"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_edits_run_before_line_edits() {
+        let (_dir, cfg, store, sync) = setup("mix").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "aaa\nbbb\nccc\n"));
+        commit(&store, &cfg, &sync, "mix", seed).await.unwrap();
+        let bare = manifest::mirror_path(&cfg, "mix");
+
+        let mut r = req("mix");
+        r.changes.edits.push(edit("f.txt", "bbb", "BBB"));
+        r.changes.line_edits.push(line_edit("f.txt", 3, 3, "CCC"));
+        let h = commit(&store, &cfg, &sync, "mix", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "f.txt").await, "aaa\nBBB\nCCC\n");
+    }
+
+    #[tokio::test]
+    async fn patch_applies_with_exact_context() {
+        let (_dir, cfg, store, sync) = setup("patch").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "one\ntwo\nthree\n"));
+        commit(&store, &cfg, &sync, "patch", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "patch");
+
+        let mut r = req("patch");
+        r.changes.patch = Some(
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+                .to_string(),
+        );
+        let h = commit(&store, &cfg, &sync, "patch", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "f.txt").await, "one\nTWO\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn patch_reject_fails_the_whole_commit() {
+        let (_dir, cfg, store, sync) = setup("reject").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "a\nb\n"));
+        seed.changes.writes.push(write("g.txt", "x\n"));
+        commit(&store, &cfg, &sync, "reject", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "reject");
+        assert_eq!(rev_list_count(&bare).await, 1);
+
+        // The first hunk would apply; the second file's context is stale.
+        let mut r = req("reject");
+        r.changes.patch = Some(
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n\
+             --- a/g.txt\n+++ b/g.txt\n@@ -1 +1 @@\n-stale\n+y\n"
+                .to_string(),
+        );
+        match commit(&store, &cfg, &sync, "reject", r).await {
+            Err(CommitError::PatchReject { file, hunk, .. }) => {
+                assert_eq!(file, "g.txt");
+                assert_eq!(hunk, 1);
+            }
+            other => panic!("a stale hunk must fail the commit, got {other:?}"),
+        }
+        // Nothing landed: same head, same content.
+        assert_eq!(rev_list_count(&bare).await, 1);
+        let head = manifest::head_of(&bare).await.unwrap().unwrap();
+        assert_eq!(show(&bare, &head, "f.txt").await, "a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn patch_adds_deletes_and_renames() {
+        let (_dir, cfg, store, sync) = setup("files").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("old.txt", "gone\n"));
+        seed.changes.writes.push(write("mv.txt", "body\n"));
+        commit(&store, &cfg, &sync, "files", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "files");
+        let git_dir = format!("--git-dir={}", bare.display());
+
+        let mut r = req("files");
+        r.changes.patch = Some(
+            "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n\
+             --- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n\
+             diff --git a/mv.txt b/moved.txt\nrename from mv.txt\nrename to moved.txt\n--- a/mv.txt\n+++ b/moved.txt\n"
+                .to_string(),
+        );
+        let h = commit(&store, &cfg, &sync, "files", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "new.txt").await, "hello\n");
+        assert_eq!(show(&bare, &h, "moved.txt").await, "body\n");
+        assert!(
+            tree_blob(&git_dir, &h, "old.txt").await.unwrap().is_none(),
+            "the patch deleted old.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_stands_alone() {
+        let (_dir, cfg, store, sync) = setup("alone").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "a\n"));
+        commit(&store, &cfg, &sync, "alone", seed)
+            .await
+            .unwrap();
+
+        let mut r = req("mixed");
+        r.changes.writes.push(write("g.txt", "g\n"));
+        r.changes.patch = Some(
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n".to_string(),
+        );
+        match commit(&store, &cfg, &sync, "alone", r).await {
+            Err(CommitError::MixedPatch) => {}
+            other => panic!("a patch mixed with writes must fail, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_honors_no_newline_markers() {
+        let (_dir, cfg, store, sync) = setup("noeol").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("bare.txt", "a\nb"));
+        seed.changes.writes.push(write("full.txt", "a\nb"));
+        commit(&store, &cfg, &sync, "noeol", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "noeol");
+
+        // The marker keeps the file unterminated; without it a hunk touching
+        // EOF terminates the file.
+        let mut r = req("noeol");
+        r.changes.patch = Some(
+            "--- a/bare.txt\n+++ b/bare.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n\\ No newline at end of file\n\
+             --- a/full.txt\n+++ b/full.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n"
+                .to_string(),
+        );
+        let h = commit(&store, &cfg, &sync, "noeol", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "bare.txt").await, "a\nB");
+        assert_eq!(show(&bare, &h, "full.txt").await, "a\nB\n");
+    }
+
+    #[tokio::test]
+    async fn codex_patch_updates_and_adds() {
+        let (_dir, cfg, store, sync) = setup("codex").await;
+        let mut seed = req("seed");
+        seed.changes
+            .writes
+            .push(write("f.txt", "alpha\nbeta\ngamma\n"));
+        commit(&store, &cfg, &sync, "codex", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "codex");
+
+        // A bare `@@` hunk is located by its unique context.
+        let mut r = req("codex");
+        r.changes.patch = Some(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n alpha\n-beta\n+BETA\n gamma\n*** Add File: added.txt\n+new here\n*** End Patch\n"
+                .to_string(),
+        );
+        let h = commit(&store, &cfg, &sync, "codex", r).await.unwrap();
+        assert_eq!(show(&bare, &h, "f.txt").await, "alpha\nBETA\ngamma\n");
+        assert_eq!(show(&bare, &h, "added.txt").await, "new here\n");
+    }
+
+    #[tokio::test]
+    async fn per_file_cas_conflicts_on_stale_blobs_only() {
+        let (_dir, cfg, store, sync) = setup("cas-blob").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "v1\n"));
+        seed.changes.writes.push(write("g.txt", "v1\n"));
+        let h0 = commit(&store, &cfg, &sync, "cas-blob", seed)
+            .await
+            .unwrap();
+        let bare = manifest::mirror_path(&cfg, "cas-blob");
+        let blob_f0 = blob_of(&bare, &h0, "f.txt").await;
+
+        // A concurrent commit touches only g.txt; the head moved.
+        let mut other = req("other");
+        other.changes.writes.push(write("g.txt", "v2\n"));
+        let h1 = commit(&store, &cfg, &sync, "cas-blob", other)
+            .await
+            .unwrap();
+        assert_ne!(h0, h1);
+
+        // f.txt's blob is unchanged, so the line edit lands without a head
+        // CAS: no unrelated conflict.
+        let mut r = req("edit");
+        let mut op = line_edit("f.txt", 1, 1, "v2");
+        op.expect_blob = Some(blob_f0.clone());
+        r.changes.line_edits.push(op);
+        let h2 = commit(&store, &cfg, &sync, "cas-blob", r)
+            .await
+            .unwrap();
+        assert_eq!(show(&bare, &h2, "f.txt").await, "v2\n");
+
+        // The same blob is stale now: the conflict names the file and the
+        // current blob.
+        let mut r = req("stale");
+        let mut op = line_edit("f.txt", 1, 1, "v3");
+        op.expect_blob = Some(blob_f0);
+        r.changes.line_edits.push(op);
+        match commit(&store, &cfg, &sync, "cas-blob", r).await {
+            Err(CommitError::BlobConflict {
+                path,
+                current,
+                ..
+            }) => {
+                assert_eq!(path, "f.txt");
+                assert_eq!(current, blob_of(&bare, &h2, "f.txt").await);
+            }
+            other => panic!("a stale blob must conflict, got {other:?}"),
+        }
+
+        // Writes pin the blob the same way.
+        let mut r = req("write-stale");
+        let mut w = write("g.txt", "v3\n");
+        w.expect_blob = Some("0".repeat(40));
+        r.changes.writes.push(w);
+        match commit(&store, &cfg, &sync, "cas-blob", r).await {
+            Err(CommitError::BlobConflict { path, .. }) => assert_eq!(path, "g.txt"),
+            other => panic!("a stale write blob must conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_expect_blob_is_invalid() {
+        let (_dir, cfg, store, sync) = setup("badblob").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "a\n"));
+        commit(&store, &cfg, &sync, "badblob", seed)
+            .await
+            .unwrap();
+
+        let mut r = req("bad");
+        let mut op = line_edit("f.txt", 1, 1, "b");
+        op.expect_blob = Some("not-a-blob".to_string());
+        r.changes.line_edits.push(op);
+        match commit(&store, &cfg, &sync, "badblob", r).await {
+            Err(CommitError::InvalidEdit { path, .. }) => assert_eq!(path, "f.txt"),
+            other => panic!("a malformed blob must be invalid, got {other:?}"),
+        }
     }
 }
