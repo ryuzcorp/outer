@@ -49,6 +49,10 @@ else
     exit 1
 fi
 echo "remote: rolling back to $target"
+# The per-app egress table lives in the host netns and outlives the
+# container. A build that predates the firewall would never manage it, so
+# drop it here; a build that has the firewall reinstalls it at boot.
+nft delete table inet outer 2>/dev/null || true
 
 docker compose --env-file /srv/outer/release.env \
     -f /srv/outer/compose.yaml up -d

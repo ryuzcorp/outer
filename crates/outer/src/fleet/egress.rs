@@ -7,8 +7,8 @@
 //! ports 25/465/587, accepts DNS (matched on the connection's original
 //! destination port, so it works whatever resolver the host uses —
 //! systemd-resolved's 127.0.0.53 stub, Docker's embedded 127.0.0.11, or a
-//! plain upstream), accepts the object-store endpoint first, and adds
-//! per-uid new-connection rate limits plus per-uid byte counters. The chain
+//! plain upstream), accepts the object-store endpoint first, and keeps
+//! per-uid byte counters (no connection rate limit: see `nft::ruleset`). The chain
 //! policy stays `accept`, so public-Internet egress (npm, R2, webhooks an
 //! app calls) keeps working; replies are accepted first, so the proxy (which
 //! runs as root, not as an app uid) reaching a fleet's loopback port is
@@ -42,12 +42,6 @@ use std::sync::{
 use sqlx::SqlitePool;
 
 use super::nft::{self, NftConfig};
-
-/// New connections per second per app uid, by plan class. The per-uid
-/// `limit` rule state is per rule and each rule matches exactly one uid, so
-/// this is a per-app rate, new connections only.
-pub const FREE_NEW_CONNS_PER_SEC: u32 = 20;
-pub const PRO_NEW_CONNS_PER_SEC: u32 = 100;
 
 /// `OUTER_EGRESS_FIREWALL=required|off` (default `required`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,8 +316,6 @@ impl EgressFirewall {
             storage_port: self.inner.storage_port,
             free_uids: free_uids.clone(),
             pro_uids: pro_uids.clone(),
-            free_new_conns_per_sec: FREE_NEW_CONNS_PER_SEC,
-            pro_new_conns_per_sec: PRO_NEW_CONNS_PER_SEC,
         });
         match &self.inner.apply {
             Apply::Live => nft::apply(&rules).await?,
@@ -498,14 +490,11 @@ mod tests {
         let rules = rules.lock().unwrap();
         assert_eq!(rules.len(), 1);
         assert!(rules[0].contains("meta skuid 200000-200007 "));
-        assert!(rules[0].contains(
-            "meta skuid 200001 ct state new limit rate over 20/second burst 20 packets counter drop"
-        ));
-        assert!(rules[0].contains(
-            "meta skuid 200002 ct state new limit rate over 100/second burst 100 packets counter drop"
-        ));
-        // The ghost row (no account) counts as free.
-        assert!(rules[0].contains("meta skuid 200004 ct state new limit rate over 20/second"));
+        // Per-uid rules are byte counters only, for every app uid, ghost
+        // rows (no account) included.
+        for uid in [200001, 200002, 200004] {
+            assert!(rules[0].contains(&format!("counter app_{uid} {{")), "{uid}");
+        }
     }
 
     #[tokio::test]
@@ -530,10 +519,7 @@ mod tests {
             .unwrap();
         fw.refresh(&pool).await;
         assert_eq!(log.lock().unwrap().len(), 2);
-        assert!(log.lock().unwrap()[1]
-            .contains("meta skuid 200001 ct state new limit rate over 100/second"));
-        assert!(log.lock().unwrap()[1]
-            .contains("meta skuid 200005 ct state new limit rate over 100/second"));
+        assert!(log.lock().unwrap()[1].contains("counter app_200005 {"));
         // A delete drops the uid's rules on the next refresh.
         sqlx::query("DELETE FROM app WHERE id = 'app1'")
             .execute(&pool)

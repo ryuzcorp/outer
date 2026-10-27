@@ -118,8 +118,6 @@ fn hostile_nft_policy_blocks_every_fixture_egress_target() {
         storage_port: 443,
         free_uids: vec![200001],
         pro_uids: vec![200002],
-        free_new_conns_per_sec: 20,
-        pro_new_conns_per_sec: 100,
     });
     let range = "200000-299999";
     for blocked in [
