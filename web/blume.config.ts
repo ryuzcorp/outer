@@ -2,6 +2,9 @@ import ilha from "@ilha/astro";
 import { defineConfig } from "blume";
 
 export default defineConfig({
+  // Brand wordmark in the header (the Logo slot falls back to this), the
+  // `<title>` suffix, and OG cards.
+  title: "Outer",
   // Ilha islands in the console pages (`pages/console/`): Astro renders
   // them server-side and hydrates them in the browser (`client:load`).
   // The islands use the automatic JSX runtime (`jsxImportSource: ilha`,

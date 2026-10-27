@@ -1,14 +1,45 @@
 ---
 title: Outer
 description: A personal software forge for AI agents — your agent builds the app, Outer serves it at <slug>.outer.now.
+mode: frame
+sidebar:
+  hidden: true
 ---
 
-Outer is a personal software forge for AI agents. You tell your agent what
-you want, like "make my family a grocery list app", and it builds the app and
-hands you a live `https://<slug>.outer.now` link you can share.
+{/* Landing hero: `frame` mode renders no page title, so the hero owns the
+    page's H1 (an intentional exception to STYLE.md's no-manual-H1 rule).
+    Layout in Tailwind + a scoped inline gradient; all colors are Blume theme
+    tokens or a translucent brand tint, so light and dark both work. */}
 
-These docs have two tabs. This Guide speaks to you, the person.
-The For agents tab speaks to your agent while it builds.
+<div className="mb-12 overflow-hidden rounded-3xl border border-border px-6 py-14 text-center sm:px-12 sm:py-20" style={{ backgroundImage: "linear-gradient(to bottom right, color-mix(in oklch, oklch(55% 0.2 275) 13%, transparent), transparent 70%)" }}>
+
+<p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">Outer</p>
+
+<h1 className="mx-auto mt-4 max-w-2xl text-balance text-4xl font-bold leading-tight tracking-tight text-foreground sm:text-5xl" style={{ marginLeft: "auto", marginRight: "auto", textAlign: "center" }}>Your agent's own app cloud</h1>
+
+<p className="mx-auto mt-4 max-w-xl text-lg text-muted-foreground">Tell your agent what you want, and it builds the app and hands you a live link to share.</p>
+
+<div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
+<a className="inline-flex w-full items-center justify-center gap-2 rounded-full bg-accent px-6 py-3 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90 sm:w-auto" href="/get-started/connect" style={{ color: "var(--blume-accent-foreground)", textDecoration: "none" }}>Connect your agent</a>
+
+<a className="inline-flex w-full items-center justify-center gap-2 rounded-full border border-border bg-background px-6 py-3 text-sm font-medium text-foreground transition-colors hover:bg-muted sm:w-auto" href="/console" style={{ textDecoration: "none" }}>Open Console</a>
+
+</div>
+
+<div className="mx-auto mt-8 max-w-md text-left">
+
+```text MCP endpoint
+https://outer.now/mcp
+```
+
+</div>
+
+</div>
+
+## How it works
+
+Connect your agent, ask for an app, refine it by chatting, and share the live
+link. The full loop takes about ten minutes: [Quickstart](/get-started/quickstart).
 
 ## Core concepts
 
@@ -23,28 +54,6 @@ Three terms, used everywhere in these docs:
   reports back: `success` with the URL, `failed` with the log tail, or
   `blocked` with the exact lines to fix.
 
-## The core loop
-
-<Steps>
-<Step title="Connect your agent">
-Point it at `https://outer.now/mcp`: one line per client in [Connect your agent](/get-started/connect).
-Sign-in is one OAuth approval, or an emailed code for clients without OAuth.
-</Step>
-<Step title="Ask for an app">
-"Make a grocery list app for my family." Your agent calls `create_app` and
-a live Ilha + Void app serves in seconds.
-</Step>
-<Step title="Refine it">
-"Add a filter for who bought what." Every change ships through the same
-loop: build, review, deploy. The previous version keeps serving until the
-new one is healthy.
-</Step>
-<Step title="Share the link">
-Your agent returns the URL plus a QR code for the family chat
-(`share_app`). Open the [Console](/get-started/console-tour) to see what it built.
-</Step>
-</Steps>
-
 ## What you can build
 
 Anything the Ilha + Void template can express, backed by D1, KV, Durable
@@ -52,24 +61,10 @@ Objects, R2, queues, cron and realtime: family tools, sign-up sheets,
 dashboards, games, chat rooms, scheduled digests. Concrete starters with
 copy-paste prompts: [What you can build](/get-started/what-you-can-build).
 
-:::note
+::::note
 Outer is in closed beta. New accounts need an invite code (`OUTER-XXXX-XXXX`). If your email is not allowed in yet and you have no code, sign-in tells you
 that you are on the waitlist. [Sign in](/get-started/sign-in) has the details.
-:::
-
-## Start here
-
-<CardGroup cols={3}>
-<Card title="Quickstart" href="/get-started/quickstart" icon="rocket">
-Connect your chat app, ask for an app, see it live in about ten minutes.
-</Card>
-<Card title="Connect your agent" href="/get-started/connect" icon="plug">
-One line per client: Claude, Codex, ChatGPT, Gemini, Perplexity, anything else.
-</Card>
-<Card title="Console" href="/get-started/console-tour" icon="layout-dashboard">
-Watch your apps: deploys, logs, errors, data, secrets, settings.
-</Card>
-</CardGroup>
+::::
 
 ## Get help
 
@@ -80,3 +75,11 @@ Watch your apps: deploys, logs, errors, data, secrets, settings.
   sign-in, blocked deploys, and cold starts.
 - Prompting tips: how to ask so your agent gets it right the first time:
   [Prompting your agent](/get-started/prompting).
+
+<div className="mt-16 flex items-center justify-center gap-5 text-sm text-muted-foreground">
+
+<a className="transition-colors hover:text-foreground" href="/terms">Terms</a>
+
+<a className="transition-colors hover:text-foreground" href="/privacy">Privacy</a>
+
+</div>

@@ -1,0 +1,74 @@
+---
+// Section switcher + sidebar tree. Blume scopes the sidebar to the active
+// `navigation.tabs` section per route (`sidebarForRoute`); this renders those
+// same tabs as rows at the top of the sidebar instead of the header's tab bar.
+// Row markup mirrors the tabs list Blume renders at the top of the mobile nav
+// drawer, so desktop and phones switch sections the same way.
+import data from "blume:data";
+import Icon from "blume/components/Icon.astro";
+import { withMountedBase } from "blume/components/islands/base-path.ts";
+import NavTabMenu from "blume/components/layout/NavTabMenu.astro";
+import {
+  currentTabForRoute,
+} from "blume/components/layout/nav-utils.ts";
+import { EN_UI } from "blume/core/i18n-ui.ts";
+import type { UIStrings } from "blume/core/i18n-ui.ts";
+import type { NavNode } from "blume/core/types.ts";
+import NavTree from "./blume/NavTree.astro";
+
+interface Props {
+  items: NavNode[];
+  currentRoute: string;
+  strings?: UIStrings["nav"];
+  ids?: Map<NavNode, string>;
+  fragmentBase?: string;
+}
+
+const { items, currentRoute, strings, ids, fragmentBase } = Astro.props;
+const n = { ...EN_UI.nav, ...strings };
+const tabs = data.navigation.tabs;
+const activeTab = currentTabForRoute(
+  tabs,
+  currentRoute,
+  data.navigation.root
+);
+---
+
+{
+  tabs.length > 0 && (
+    <nav aria-label={n.sections} class="mb-4 border-border border-b pb-4">
+      <ul class="m-0 list-none p-0">
+        {tabs.map((tab) => (
+          <li>
+            {tab.items && tab.items.length > 0 ? (
+              <NavTabMenu
+                active={tab === activeTab}
+                route={currentRoute}
+                tab={tab}
+                variant="drawer"
+              />
+            ) : (
+              <a
+                aria-current={tab === activeTab ? "page" : undefined}
+                class="flex items-center gap-2 rounded-[0.65rem] px-2.5 py-1.5 font-medium text-muted-foreground text-sm transition-colors hover:bg-muted hover:text-foreground aria-[current=page]:bg-muted aria-[current=page]:text-foreground"
+                href={withMountedBase(tab.href ?? tab.path)}
+              >
+                {tab.icon && (
+                  <Icon class="shrink-0" name={tab.icon} size={14} />
+                )}
+                <span class="flex-1 truncate">{tab.label}</span>
+              </a>
+            )}
+          </li>
+        ))}
+      </ul>
+    </nav>
+  )
+}
+<NavTree
+  currentRoute={currentRoute}
+  fragmentBase={fragmentBase}
+  ids={ids}
+  items={items}
+  strings={strings}
+/>
