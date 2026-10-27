@@ -88,6 +88,7 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
         .route("/api/console/apps/{slug}/secrets", get(api_secrets))
         .merge(super::console_actions::routes())
         .merge(super::console_code::routes())
+        .merge(super::console_admin_code::routes())
         .merge(super::console_admin_apps::routes())
         .merge(super::console_domains::routes())
         .merge(super::console_export::routes())
