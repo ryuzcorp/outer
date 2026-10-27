@@ -12,5 +12,5 @@ pub use commit::{
     Author, CommitChanges, CommitError, CommitOutcome, CommitRequest, Edit, FileWrite, Insert,
     LineEdit, Move, WriteBody,
 };
-pub use drafts::{Draft, DraftEdit, DraftMove, DraftOps, DraftWrite};
+pub use drafts::{Draft, DraftEdit, DraftInsert, DraftLineEdit, DraftMove, DraftOps, DraftWrite};
 pub use manifest::{GitConfig, GitSync, Manifest, ManifestRef, MAIN_REF, PREVIEW_REF};

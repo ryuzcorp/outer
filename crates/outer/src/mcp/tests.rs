@@ -7748,3 +7748,178 @@ async fn failed_commit_deploy_returns_structured_diagnostics() {
         "{seen:?}"
     );
 }
+
+#[tokio::test]
+async fn draft_stage_line_edits_and_inserts_ship() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    // pages/index.tsx is one line: "<h1>Groceries</h1>".
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "line_edits": [{"path": "pages/index.tsx", "start_line": 1, "end_line": 1,
+                               "new": "<h1>Berries</h1>"}],
+               "inserts": [{"path": "pages/index.tsx", "after_line": 1,
+                             "insert": "<p>fresh</p>\n"}]}),
+    )
+    .await;
+    let draft = &result(&staged)["structuredContent"]["draft"];
+    assert_eq!(draft["staged"]["line_edits"], 1);
+    assert_eq!(draft["staged"]["inserts"], 1);
+    let (_, diff) = call(&state, Some(&token), "diff_draft", json!({"app": "groceries"})).await;
+    let patch = result(&diff)["structuredContent"]["draft"]["patch"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(patch.contains("Berries"), "{patch}");
+    assert!(patch.contains("fresh"), "{patch}");
+    let (_, shipped) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "line edits"}),
+    )
+    .await;
+    assert_eq!(result(&shipped)["structuredContent"]["deploy"]["status"], "success");
+    assert_eq!(history_len(&state, &token, "groceries").await, 2);
+}
+
+#[tokio::test]
+async fn draft_stage_patch_ships() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let patch = "--- a/pages/index.tsx\n+++ b/pages/index.tsx\n@@ -1 +1 @@\n-<h1>Groceries</h1>\n+<h1>Figs</h1>\n";
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "patch": patch}),
+    )
+    .await;
+    assert_eq!(result(&staged)["structuredContent"]["draft"]["staged"]["patch"], true);
+    let (_, shipped) = call(
+        &state,
+        Some(&token),
+        "ship",
+        json!({"app": "groceries", "message": "patched"}),
+    )
+    .await;
+    assert_eq!(result(&shipped)["structuredContent"]["deploy"]["status"], "success");
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
+    )
+    .await;
+    assert!(
+        result(&read)["structuredContent"]["files"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Figs")
+    );
+}
+
+#[tokio::test]
+async fn draft_patch_refuses_mixing_and_second_patch() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let patch = "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "patch": patch}),
+    )
+    .await;
+    // Other ops on a patch draft refuse, and a second patch refuses too.
+    for args in [
+        json!({"app": "groceries", "writes": [{"path": "x.txt", "content": "x"}]}),
+        json!({"app": "groceries", "patch": patch}),
+    ] {
+        let (_, denied) = call(&state, Some(&token), "stage", args).await;
+        assert_eq!(
+            result(&denied)["structuredContent"]["error"],
+            "invalid_argument",
+            "a patch stages alone"
+        );
+    }
+    // The reverse order refuses the same way.
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "discard_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let (_, _) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "writes": [{"path": "x.txt", "content": "x"}]}),
+    )
+    .await;
+    let (_, denied) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries", "patch": patch}),
+    )
+    .await;
+    assert_eq!(result(&denied)["structuredContent"]["error"], "invalid_argument");
+    // The first refusal kept nothing partial: the draft still holds the write.
+    let (_, diff) = call(&state, Some(&token), "diff_draft", json!({"app": "groceries"})).await;
+    let paths: Vec<&str> = result(&diff)["structuredContent"]["draft"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["x.txt"], "{paths:?}");
+}
+
+#[tokio::test]
+async fn draft_stale_expect_blob_conflicts_at_stage() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, denied) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Berries",
+                          "expect_blob": "0000000000000000000000000000000000000000"}]}),
+    )
+    .await;
+    let err = is_error(&denied);
+    assert_eq!(err["error"], "conflict");
+    assert_eq!(err["path"], "pages/index.tsx");
+    // The fresh blob from read_files stages cleanly.
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
+    )
+    .await;
+    let blob = result(&read)["structuredContent"]["files"][0]["blob"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Berries",
+                          "expect_blob": blob}]}),
+    )
+    .await;
+    assert_eq!(result(&staged)["structuredContent"]["draft"]["staged"]["edits"], 1);
+}

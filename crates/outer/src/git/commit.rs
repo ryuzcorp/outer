@@ -752,7 +752,7 @@ fn validate_line_overlap(line_edits: &[LineEdit], inserts: &[Insert]) -> Result<
     Ok(())
 }
 
-fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), CommitError> {
+pub(crate) fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), CommitError> {
     let changes = &req.changes;
     if changes.writes.is_empty()
         && changes.edits.is_empty()
@@ -2252,7 +2252,7 @@ async fn tree_blob(git_dir: &str, rev: &str, path: &str) -> anyhow::Result<Optio
 /// own index (there is none) is never touched. Order: moves (re-point blobs
 /// read from the parent tree), then writes, then deletes.
 #[allow(clippy::too_many_arguments)]
-async fn build_commit(
+pub(crate) async fn build_commit(
     bare: &Path,
     parent: Option<&str>,
     author: &Author,

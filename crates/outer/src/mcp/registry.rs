@@ -334,7 +334,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<draft_inputs::StageInput>(
             "stage",
-            "Stage file changes into your per-app draft without deploying: full-file writes, exact-match edits, deletes and moves (same shapes as commit). No deploy, no code change. Then diff_draft to review, check to verify, ship to deploy as one commit.",
+            "Stage file changes into your per-app draft without deploying: writes, exact-match edits, line edits, inserts, a patch, deletes and moves — every commit shape, with optional per-file expect_blob CAS. No deploy, no code change. A patch stages alone, never mixed. Then diff_draft to review, check to verify, ship to deploy as one commit.",
             Account, false,
         ),
         tool::<draft_inputs::DraftAppInput>(
