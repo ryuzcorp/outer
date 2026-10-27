@@ -44,7 +44,6 @@ import {
   LogsIcon,
   MenuIcon,
   MetricsIcon,
-  OuterMark,
   OverviewIcon,
   PlusIcon,
   SearchIcon,
@@ -910,7 +909,7 @@ export function Console() {
   if (list.length === 0 && !accountView && detailPanel.kind !== "ready") {
     return (
       <div class="console-empty" role="status">
-        <OuterMark size={28} />
+        <img src="/logo.svg" alt="" width={28} height={28} />
         <h1>No apps yet</h1>
         <p>
           Apps are created by your agent over MCP at{" "}
@@ -1039,7 +1038,7 @@ export function Console() {
             }
           }}
         >
-          <OuterMark />
+          <img src="/logo.svg" alt="" width={22} height={22} />
         </a>
         <div class="rail-apps" role="list">
           {list.map((a) => (
