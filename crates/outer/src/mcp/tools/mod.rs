@@ -5,8 +5,6 @@
 //! that becomes `isError`). Argument-shape failures are the caller's bug
 //! and surface as JSON-RPC `-32602`, never as `isError`.
 
-pub(crate) mod diagnostics;
-pub(crate) mod drafts;
 pub(crate) mod account;
 pub(crate) mod apps;
 pub(crate) mod backups;
@@ -14,7 +12,9 @@ pub(crate) mod billing;
 pub(crate) mod code;
 pub(crate) mod collaborators;
 pub(crate) mod data;
+pub(crate) mod diagnostics;
 pub(crate) mod domains;
+pub(crate) mod drafts;
 pub(crate) mod export;
 pub(crate) mod look;
 pub(crate) mod open_app;
@@ -733,10 +733,8 @@ pub fn deploy_json(state: &McpState, app: &App, row: &DeployRow) -> Value {
             if let Some(log) = row.log_tail.as_deref() {
                 out["log_tail"] = json!(tail_8k(log));
                 let diagnostics = diagnostics::parse_diagnostics(log);
-                out["diagnostics"] = json!(diagnostics
-                    .iter()
-                    .map(|d| d.json())
-                    .collect::<Vec<_>>());
+                out["diagnostics"] =
+                    json!(diagnostics.iter().map(|d| d.json()).collect::<Vec<_>>());
             }
         }
     } else {
@@ -812,10 +810,7 @@ pub fn outcome_json(state: &McpState, app: &App, outcome: &DeployOutcome, previe
         // Structured errors (§1.6): the same parsed diagnostics `check`
         // returns, so agents fix builds without re-reading the raw log.
         let diagnostics = diagnostics::parse_diagnostics(&outcome.log_tail);
-        out["diagnostics"] = json!(diagnostics
-            .iter()
-            .map(|d| d.json())
-            .collect::<Vec<_>>());
+        out["diagnostics"] = json!(diagnostics.iter().map(|d| d.json()).collect::<Vec<_>>());
     }
     out
 }

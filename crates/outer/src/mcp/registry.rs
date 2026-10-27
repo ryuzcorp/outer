@@ -115,7 +115,9 @@ pub fn hints_for(name: &str) -> Option<Hints> {
             ..Hints::WRITE
         },
         "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
-        | "unset_secret" | "remove_domain" | "discard_preview" | "discard_draft" => Hints::DESTRUCTIVE,
+        | "unset_secret" | "remove_domain" | "discard_preview" | "discard_draft" => {
+            Hints::DESTRUCTIVE
+        }
         // Repeating a restore takes another fresh backup, so one call is
         // never a no-op repeat of the last: not idempotent.
         "restore_backup" => Hints {

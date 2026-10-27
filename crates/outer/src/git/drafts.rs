@@ -163,12 +163,8 @@ pub fn validate_ops(ops: &DraftOps) -> Result<(), CommitError> {
     }
     for path in &ops.deletes {
         validate_path(path)?;
-        if ops.writes.iter().any(|f| &f.path == path)
-            || ops.edits.iter().any(|e| &e.path == path)
-        {
-            return Err(CommitError::BothWrittenAndDeleted {
-                path: path.clone(),
-            });
+        if ops.writes.iter().any(|f| &f.path == path) || ops.edits.iter().any(|e| &e.path == path) {
+            return Err(CommitError::BothWrittenAndDeleted { path: path.clone() });
         }
     }
     let mut seen_edits = std::collections::HashSet::new();
@@ -337,13 +333,13 @@ pub async fn build_draft_commit(
         let mut removals = String::new();
         let mut additions = String::new();
         for m in &ops.moves {
-            let entry = tree_blob(&git_dir, base, &m.from)
-                .await?
-                .ok_or_else(|| CommitError::NotFound {
-                    path: m.from.clone(),
-                })?;
-            let vacated =
-                ops.deletes.contains(&m.to) || ops.moves.iter().any(|o| o.from == m.to);
+            let entry =
+                tree_blob(&git_dir, base, &m.from)
+                    .await?
+                    .ok_or_else(|| CommitError::NotFound {
+                        path: m.from.clone(),
+                    })?;
+            let vacated = ops.deletes.contains(&m.to) || ops.moves.iter().any(|o| o.from == m.to);
             if !vacated && tree_entry(&git_dir, base, &m.to).await?.is_some() {
                 return Err(CommitError::Internal(anyhow::anyhow!(
                     "{} already exists",
@@ -394,15 +390,14 @@ pub async fn build_draft_commit(
                 &[],
                 Duration::from_secs(30),
             )
-                .await
-                .map_err(|_| CommitError::NotFound {
-                    path: e.path.clone(),
-                })?;
-            let content =
-                std::str::from_utf8(&bytes).map_err(|_| CommitError::InvalidEdit {
-                    path: e.path.clone(),
-                    reason: "file is not UTF-8 text",
-                })?;
+            .await
+            .map_err(|_| CommitError::NotFound {
+                path: e.path.clone(),
+            })?;
+            let content = std::str::from_utf8(&bytes).map_err(|_| CommitError::InvalidEdit {
+                path: e.path.clone(),
+                reason: "file is not UTF-8 text",
+            })?;
             let count = content.matches(&e.old).count();
             if count == 0 || (!e.replace_all && count > 1) {
                 return Err(CommitError::EditMatch {
@@ -459,9 +454,7 @@ pub async fn build_draft_commit(
         // Deletes last.
         for path in &ops.deletes {
             if tree_blob(&git_dir, base, path).await?.is_none() {
-                return Err(CommitError::NotFound {
-                    path: path.clone(),
-                });
+                return Err(CommitError::NotFound { path: path.clone() });
             }
             let removal = format!("0 {}\t{path}\0", "0".repeat(40));
             run_git_stdin(
@@ -472,9 +465,22 @@ pub async fn build_draft_commit(
             )
             .await?;
         }
-        let tree = run_git(&[&git_dir, "write-tree"], &env_index, Duration::from_secs(30)).await?;
+        let tree = run_git(
+            &[&git_dir, "write-tree"],
+            &env_index,
+            Duration::from_secs(30),
+        )
+        .await?;
         let commit = run_git(
-            &[&git_dir, "commit-tree", tree.trim(), "-p", base, "-m", "draft"],
+            &[
+                &git_dir,
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                base,
+                "-m",
+                "draft",
+            ],
             &author_env(author),
             Duration::from_secs(30),
         )

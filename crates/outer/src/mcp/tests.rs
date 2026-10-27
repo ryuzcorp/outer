@@ -7364,14 +7364,21 @@ async fn draft_stage_accumulates_and_diffs_without_spending() {
 
     // Staging spends nothing and starts no deploy.
     assert_eq!(code_changes(&state, "ana@example.com").await, 0);
-    let deploys: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM deploy WHERE app_id = (SELECT id FROM app WHERE slug = 'groceries')")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+    let deploys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM deploy WHERE app_id = (SELECT id FROM app WHERE slug = 'groceries')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
     assert_eq!(deploys, 1, "only the seed deploy exists");
 
-    let (_, diff) = call(&state, Some(&token), "diff_draft", json!({"app": "groceries"})).await;
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
     let shown = result(&diff)["structuredContent"]["draft"].clone();
     assert_eq!(shown["base"], base);
     let paths: Vec<&str> = shown["files"]
@@ -7426,11 +7433,36 @@ async fn draft_check_fail_returns_structured_diagnostics() {
     .await;
     state.deploys.set_fake_check(crate::deploy::CheckOutput {
         steps: vec![
-            crate::deploy::CheckStep { name: "install".to_string(), ms: 1, skipped: false, ok: true },
-            crate::deploy::CheckStep { name: "build".to_string(), ms: 1, skipped: false, ok: false },
-            crate::deploy::CheckStep { name: "typecheck".to_string(), ms: 1, skipped: false, ok: false },
-            crate::deploy::CheckStep { name: "lint".to_string(), ms: 1, skipped: true, ok: true },
-            crate::deploy::CheckStep { name: "tests".to_string(), ms: 1, skipped: true, ok: true },
+            crate::deploy::CheckStep {
+                name: "install".to_string(),
+                ms: 1,
+                skipped: false,
+                ok: true,
+            },
+            crate::deploy::CheckStep {
+                name: "build".to_string(),
+                ms: 1,
+                skipped: false,
+                ok: false,
+            },
+            crate::deploy::CheckStep {
+                name: "typecheck".to_string(),
+                ms: 1,
+                skipped: false,
+                ok: false,
+            },
+            crate::deploy::CheckStep {
+                name: "lint".to_string(),
+                ms: 1,
+                skipped: true,
+                ok: true,
+            },
+            crate::deploy::CheckStep {
+                name: "tests".to_string(),
+                ms: 1,
+                skipped: true,
+                ok: true,
+            },
         ],
         log: DRAFT_TSC_LOG.to_string(),
     });
@@ -7472,13 +7504,22 @@ async fn draft_ship_is_one_commit_and_clears() {
     .await;
     let structured = &result(&shipped)["structuredContent"];
     assert_eq!(structured["deploy"]["status"], "success");
-    assert_eq!(structured["draft"], json!({"cleared": true, "rebased": false}));
+    assert_eq!(
+        structured["draft"],
+        json!({"cleared": true, "rebased": false})
+    );
     assert!(structured["commit"]["sha"].as_str().unwrap().len() == 40);
     assert_eq!(history_len(&state, &token, "groceries").await, 2);
     assert_eq!(code_changes(&state, "ana@example.com").await, 1);
 
     // The draft is gone: diff and ship both report it.
-    let (_, diff) = call(&state, Some(&token), "diff_draft", json!({"app": "groceries"})).await;
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
     assert_eq!(result(&diff)["structuredContent"]["error"], "not_found");
     let (_, reship) = call(
         &state,
@@ -7522,7 +7563,10 @@ async fn draft_ship_rebases_onto_a_moved_head() {
     .await;
     let structured = &result(&shipped)["structuredContent"];
     assert_eq!(structured["deploy"]["status"], "success");
-    assert_eq!(structured["draft"], json!({"cleared": true, "rebased": true}));
+    assert_eq!(
+        structured["draft"],
+        json!({"cleared": true, "rebased": true})
+    );
     assert_eq!(history_len(&state, &token, "groceries").await, 3);
     assert_eq!(code_changes(&state, "ana@example.com").await, 2);
 }
@@ -7563,7 +7607,13 @@ async fn draft_ship_conflict_keeps_the_draft() {
     assert_eq!(err["current_sha"], current);
 
     // The draft survives the conflict.
-    let (_, diff) = call(&state, Some(&token), "diff_draft", json!({"app": "groceries"})).await;
+    let (_, diff) = call(
+        &state,
+        Some(&token),
+        "diff_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
     assert!(result(&diff).get("isError").is_none());
     assert_eq!(history_len(&state, &token, "groceries").await, 2);
 }
@@ -7580,10 +7630,28 @@ async fn draft_discard_is_idempotent() {
         json!({"app": "groceries", "writes": [{"path": "notes.txt", "content": "hi\n"}]}),
     )
     .await;
-    let (_, dropped) = call(&state, Some(&token), "discard_draft", json!({"app": "groceries"})).await;
-    assert_eq!(result(&dropped)["structuredContent"]["draft"]["dropped"], true);
-    let (_, dropped2) = call(&state, Some(&token), "discard_draft", json!({"app": "groceries"})).await;
-    assert_eq!(result(&dropped2)["structuredContent"]["draft"]["dropped"], false);
+    let (_, dropped) = call(
+        &state,
+        Some(&token),
+        "discard_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&dropped)["structuredContent"]["draft"]["dropped"],
+        true
+    );
+    let (_, dropped2) = call(
+        &state,
+        Some(&token),
+        "discard_draft",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(
+        result(&dropped2)["structuredContent"]["draft"]["dropped"],
+        false
+    );
     assert_eq!(code_changes(&state, "ana@example.com").await, 0);
 }
 
@@ -7657,8 +7725,9 @@ async fn failed_commit_deploy_returns_structured_diagnostics() {
     assert_eq!(deploy["status"], "failed");
     let diagnostics = deploy["diagnostics"].as_array().unwrap();
     assert!(
-        diagnostics.iter().any(|d| d["code"] == "TS2322"
-            && d["file"] == "src/routes/index.tsx"),
+        diagnostics
+            .iter()
+            .any(|d| d["code"] == "TS2322" && d["file"] == "src/routes/index.tsx"),
         "{diagnostics:?}"
     );
 
@@ -7672,7 +7741,10 @@ async fn failed_commit_deploy_returns_structured_diagnostics() {
     .await;
     let seen = &result(&status)["structuredContent"]["diagnostics"];
     assert!(
-        seen.as_array().unwrap().iter().any(|d| d["code"] == "TS2322"),
+        seen.as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "TS2322"),
         "{seen:?}"
     );
 }

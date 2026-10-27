@@ -189,7 +189,13 @@ fn stage_ops(input: StageInput) -> DraftOps {
 }
 
 /// Map staged ops back onto a commit input for `ship`.
-fn ship_input(app: &str, message: String, base: String, ops: &DraftOps, wait: Option<bool>) -> CommitInput {
+fn ship_input(
+    app: &str,
+    message: String,
+    base: String,
+    ops: &DraftOps,
+    wait: Option<bool>,
+) -> CommitInput {
     CommitInput {
         app: app.to_string(),
         message,
@@ -282,7 +288,10 @@ pub async fn stage(input: StageInput, ctx: &Ctx<'_>) -> Result<Value, ToolError>
         .unwrap_or(head);
     let summary = format!(
         "Staged {} file(s) in the draft for {}.",
-        ops_summary(&draft)["files"].as_array().map(Vec::len).unwrap_or(0),
+        ops_summary(&draft)["files"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
         app.slug,
     );
     Ok(ok(
@@ -310,9 +319,10 @@ pub async fn diff_draft(input: DraftAppInput, ctx: &Ctx<'_>) -> Result<Value, To
     .await
     .map_err(internal)?;
     let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
-    let draft_sha = crate::git::drafts::build_draft_commit(&bare, &draft.base_sha, &draft.ops, &author)
-        .await
-        .map_err(ToolError::from_commit)?;
+    let draft_sha =
+        crate::git::drafts::build_draft_commit(&bare, &draft.base_sha, &draft.ops, &author)
+            .await
+            .map_err(ToolError::from_commit)?;
     let (from, to, stats, patch, truncated) =
         crate::git::local::diff_range(&bare, &draft.base_sha, &draft_sha)
             .await
@@ -365,9 +375,10 @@ pub async fn check(input: CheckInput, ctx: &Ctx<'_>) -> Result<Value, ToolError>
     .await
     .map_err(internal)?;
     let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
-    let draft_sha = crate::git::drafts::build_draft_commit(&bare, &draft.base_sha, &draft.ops, &author)
-        .await
-        .map_err(ToolError::from_commit)?;
+    let draft_sha =
+        crate::git::drafts::build_draft_commit(&bare, &draft.base_sha, &draft.ops, &author)
+            .await
+            .map_err(ToolError::from_commit)?;
     let started = std::time::Instant::now();
     let output = ctx
         .state
@@ -389,7 +400,11 @@ pub async fn check(input: CheckInput, ctx: &Ctx<'_>) -> Result<Value, ToolError>
         "pass"
     };
     let summary = if status == "pass" {
-        format!("Check passed for {} ({} diagnostic(s)).", app.slug, diagnostics.len())
+        format!(
+            "Check passed for {} ({} diagnostic(s)).",
+            app.slug,
+            diagnostics.len()
+        )
     } else {
         format!(
             "Check failed for {} ({} diagnostic(s)): fix them, stage again, re-check.",

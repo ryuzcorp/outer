@@ -60,7 +60,7 @@ pub struct Deploys {
 enum DeploysInner {
     Live(Box<Deployer>),
     #[cfg(test)]
-    Fake(FakeDeploys),
+    Fake(Box<FakeDeploys>),
 }
 
 impl Deploys {
@@ -76,7 +76,7 @@ impl Deploys {
     #[cfg(test)]
     pub fn fake(outcome: FakeOutcome) -> Self {
         Self {
-            inner: Arc::new(DeploysInner::Fake(FakeDeploys {
+            inner: Arc::new(DeploysInner::Fake(Box::new(FakeDeploys {
                 outcome: std::sync::Mutex::new(outcome),
                 check: std::sync::Mutex::new(crate::deploy::CheckOutput {
                     steps: ["install", "build", "typecheck", "lint", "tests"]
@@ -91,7 +91,7 @@ impl Deploys {
                     log: "fake check ok".to_string(),
                 }),
                 locks: std::sync::Mutex::new(HashMap::new()),
-            })),
+            }))),
         }
     }
 
@@ -160,9 +160,7 @@ impl Deploys {
         draft_sha: &str,
     ) -> anyhow::Result<crate::deploy::CheckOutput> {
         match &*self.inner {
-            DeploysInner::Live(deployer) => {
-                deployer.check_tree(pool, git, app, draft_sha).await
-            }
+            DeploysInner::Live(deployer) => deployer.check_tree(pool, git, app, draft_sha).await,
             #[cfg(test)]
             DeploysInner::Fake(fake) => fake.check(),
         }

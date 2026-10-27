@@ -1823,7 +1823,11 @@ impl Deployer {
     }
 
     /// A per-step build leaf under the shared parent, or `None` on dev.
-    pub(crate) fn build_leaf(&self, deploy_id: &str, step: &str) -> anyhow::Result<Option<PathBuf>> {
+    pub(crate) fn build_leaf(
+        &self,
+        deploy_id: &str,
+        step: &str,
+    ) -> anyhow::Result<Option<PathBuf>> {
         let Some(anchor) = &self.settings.cgroups else {
             return Ok(None);
         };

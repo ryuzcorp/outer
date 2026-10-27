@@ -70,7 +70,15 @@ impl Deployer {
         push_check(&mut steps, &mut log, "build", started, skipped, ok, &out);
         let started = Instant::now();
         let (skipped, ok, out) = self.check_typecheck(app, &work).await;
-        push_check(&mut steps, &mut log, "typecheck", started, skipped, ok, &out);
+        push_check(
+            &mut steps,
+            &mut log,
+            "typecheck",
+            started,
+            skipped,
+            ok,
+            &out,
+        );
         let started = Instant::now();
         let (skipped, ok, out) = self.check_lint(app, &work).await;
         push_check(&mut steps, &mut log, "lint", started, skipped, ok, &out);
@@ -139,11 +147,7 @@ impl Deployer {
             app,
             work,
             "typecheck",
-            &[
-                "x".to_string(),
-                "tsc".to_string(),
-                "--noEmit".to_string(),
-            ],
+            &["x".to_string(), "tsc".to_string(), "--noEmit".to_string()],
         )
         .await
     }
@@ -156,11 +160,9 @@ impl Deployer {
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .map(|pkg| {
-                ["dependencies", "devDependencies"].iter().any(|scope| {
-                    pkg.get(scope)
-                        .and_then(|d| d.get("oxlint"))
-                        .is_some()
-                })
+                ["dependencies", "devDependencies"]
+                    .iter()
+                    .any(|scope| pkg.get(scope).and_then(|d| d.get("oxlint")).is_some())
             })
             .unwrap_or(false);
         if !has_config && !has_dep {

@@ -414,7 +414,8 @@ mod tests {
 
     #[test]
     fn tsc_pretty_form_parses() {
-        let log = "src/lib/db.ts:7:3 - error TS2561: Object literal may only specify known properties.\n";
+        let log =
+            "src/lib/db.ts:7:3 - error TS2561: Object literal may only specify known properties.\n";
         let ds = parse_diagnostics(log);
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].file, "src/lib/db.ts");
