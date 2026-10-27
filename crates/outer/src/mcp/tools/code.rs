@@ -148,13 +148,18 @@ pub struct CommitInput {
     pub base: Option<String>,
     /// Full-file writes (new files or replacements).
     pub writes: Option<Vec<FileWriteInput>>,
-    /// Exact-match replacements in existing files.
+    /// Exact-match replacements in existing files. A file with exact edits
+    /// carries no line_edits or inserts in the same commit; send them as
+    /// separate commits.
     pub edits: Option<Vec<EditInput>>,
     /// Line-range replacements (inclusive, 1-based read_files numbering).
-    /// Ranges in one file must not overlap.
+    /// Ranges in one file must not overlap. Refused on a file that also
+    /// carries exact edits. Copy the read_files blob into expect_blob: a
+    /// shifted file then answers conflict instead of editing wrong lines.
     pub line_edits: Option<Vec<LineEditInput>>,
     /// Insertions after a line (0 is the top). Must not land inside a
-    /// line_edits range of the same file.
+    /// line_edits range of the same file, nor on a file that also carries
+    /// exact edits.
     pub inserts: Option<Vec<InsertInput>>,
     /// One unified diff, or a Codex `*** Begin Patch` block. A commit
     /// carrying patch carries no other change kind. Hunks apply with exact

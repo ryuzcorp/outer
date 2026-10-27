@@ -191,6 +191,8 @@ pub enum CommitError {
     },
     #[error("overlapping line edits in {path}: ranges must not overlap, and inserts must not land inside a replaced range")]
     OverlappingLines { path: String },
+    #[error("{path} mixes exact edits with line edits or inserts in one commit; send them as separate commits")]
+    MixedLineOps { path: String },
     #[error("a commit carrying patch cannot also carry writes, edits, line edits, inserts, deletes or moves")]
     MixedPatch,
     #[error("patch is too large ({bytes} bytes, over {MAX_PATCH_BYTES})")]
@@ -914,6 +916,16 @@ fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFile>), Commi
         if changes.deletes.iter().any(|d| d == &i.path) {
             return Err(CommitError::BothWrittenAndDeleted {
                 path: i.path.clone(),
+            });
+        }
+    }
+    // Exact edits apply before line replaces and inserts, so a same-file
+    // mix would interpret line numbers against the already-edited text.
+    // Refuse it: the caller retries as two commits.
+    for e in &changes.edits {
+        if line_touched(&e.path) {
+            return Err(CommitError::MixedLineOps {
+                path: e.path.clone(),
             });
         }
     }
@@ -4188,21 +4200,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_edits_run_before_line_edits() {
-        let (_dir, cfg, store, sync) = setup("mix").await;
-        let mut seed = req("seed");
-        seed.changes.writes.push(write("f.txt", "aaa\nbbb\nccc\n"));
-        commit(&store, &cfg, &sync, "mix", seed).await.unwrap();
-        let bare = manifest::mirror_path(&cfg, "mix");
-
-        let mut r = req("mix");
-        r.changes.edits.push(edit("f.txt", "bbb", "BBB"));
-        r.changes.line_edits.push(line_edit("f.txt", 3, 3, "CCC"));
-        let h = commit(&store, &cfg, &sync, "mix", r).await.unwrap();
-        assert_eq!(show(&bare, &h, "f.txt").await, "aaa\nBBB\nCCC\n");
-    }
-
-    #[tokio::test]
     async fn patch_applies_with_exact_context() {
         let (_dir, cfg, store, sync) = setup("patch").await;
         let mut seed = req("seed");
@@ -4290,6 +4287,43 @@ mod tests {
             Err(CommitError::MixedPatch) => {}
             other => panic!("a patch mixed with writes must fail, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exact_edits_reject_same_file_line_ops() {
+        let (_dir, cfg, store, sync) = setup("mixedops").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write("f.txt", "a\nb\nc\n"));
+        seed.changes.writes.push(write("g.txt", "g\n"));
+        commit(&store, &cfg, &sync, "mixedops", seed).await.unwrap();
+
+        // An exact edit that adds a line would shift the line edit's range
+        // onto the wrong text, so the mix is refused before touching git.
+        let mut r = req("mixed exact + line");
+        r.changes.edits.push(edit("f.txt", "a\n", "A\ninserted\n"));
+        r.changes.line_edits.push(line_edit("f.txt", 2, 2, "Z"));
+        match commit(&store, &cfg, &sync, "mixedops", r).await {
+            Err(CommitError::MixedLineOps { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("exact edits mixed with line edits must fail, got {other:?}"),
+        }
+
+        let mut r = req("mixed exact + insert");
+        r.changes.edits.push(edit("f.txt", "a\n", "A\ninserted\n"));
+        r.changes.inserts.push(insert_after("f.txt", 1, "mid"));
+        match commit(&store, &cfg, &sync, "mixedops", r).await {
+            Err(CommitError::MixedLineOps { .. }) => {}
+            other => panic!("exact edits mixed with inserts must fail, got {other:?}"),
+        }
+
+        // The rule is per file: exact edits on one path with line ops on
+        // another still land.
+        let mut r = req("mixed across files");
+        r.changes.edits.push(edit("f.txt", "a\n", "A\n"));
+        r.changes.line_edits.push(line_edit("g.txt", 1, 1, "G"));
+        let head = commit(&store, &cfg, &sync, "mixedops", r).await.unwrap();
+        let bare = manifest::mirror_path(&cfg, "mixedops");
+        assert_eq!(show(&bare, &head, "f.txt").await, "A\nb\nc\n");
+        assert_eq!(show(&bare, &head, "g.txt").await, "G\n");
     }
 
     #[tokio::test]

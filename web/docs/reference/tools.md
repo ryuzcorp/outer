@@ -376,9 +376,9 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `base` | string | no | Expected head (CAS): a moved head answers conflict with current_sha. |
 | `deletes` | array of string | no | Paths to delete. |
-| `edits` | array of object | no | Exact-match replacements in existing files. |
-| `inserts` | array of object | no | Insertions after a line (0 is the top). Must not land inside a line_edits range of the same file. |
-| `line_edits` | array of object | no | Line-range replacements (inclusive, 1-based read_files numbering). Ranges in one file must not overlap. |
+| `edits` | array of object | no | Exact-match replacements in existing files. A file with exact edits carries no line_edits or inserts in the same commit; send them as separate commits. |
+| `inserts` | array of object | no | Insertions after a line (0 is the top). Must not land inside a line_edits range of the same file, nor on a file that also carries exact edits. |
+| `line_edits` | array of object | no | Line-range replacements (inclusive, 1-based read_files numbering). Ranges in one file must not overlap. Refused on a file that also carries exact edits. Copy the read_files blob into expect_blob: a shifted file then answers conflict instead of editing wrong lines. |
 | `message` | string | yes | Commit message, 1-500 chars. |
 | `moves` | array of object | no | File renames. |
 | `patch` | string | no | One unified diff, or a Codex `*** Begin Patch` block. A commit carrying patch carries no other change kind. Hunks apply with exact context; any reject fails the whole commit. |
