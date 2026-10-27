@@ -232,8 +232,9 @@ pub enum CommitError {
 
 /// One decoded file, ready for the scratch index. `is_text` marks full-file
 /// text writes and edit results: the only candidates oxfmt ever sees.
-/// Uploads (base64), moves and deletes are never formatted.
-pub(crate) struct RawFile {
+/// Uploads (base64), moves and deletes are never formatted. Callers treat
+/// this as opaque: build an empty `Vec` and hand it to [`apply_changes`].
+pub struct RawFile {
     pub(crate) path: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) is_text: bool,
@@ -1931,58 +1932,6 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<PatchFile>, CommitError> {
     let mut cur_hunks: Vec<Hunk> = Vec::new();
     let mut cur_hunk: Option<Hunk> = None;
     let mut rename_to: Option<String> = None;
-    let mut flush_hunk = |cur_hunk: &mut Option<Hunk>, cur_hunks: &mut Vec<Hunk>| {
-        if let Some(mut h) = cur_hunk.take() {
-            if !h.numbered {
-                let (mut old_count, mut new_count) = (0u64, 0u64);
-                for line in &h.lines {
-                    match line {
-                        HunkLine::Context(_) => {
-                            old_count += 1;
-                            new_count += 1;
-                        }
-                        HunkLine::Remove(_) => old_count += 1,
-                        HunkLine::Add(_) => new_count += 1,
-                        HunkLine::NoNewline => {}
-                    }
-                }
-                h.old_count = old_count;
-                h.new_count = new_count;
-            }
-            cur_hunks.push(h);
-        }
-    };
-    let mut flush_file = |cur_path: &mut Option<String>,
-                          cur_add: &mut bool,
-                          cur_hunk: &mut Option<Hunk>,
-                          cur_hunks: &mut Vec<Hunk>,
-                          rename_to: &mut Option<String>,
-                          out: &mut Vec<PatchFile>| {
-        flush_hunk(cur_hunk, cur_hunks);
-        if let Some(path) = cur_path.take() {
-            let hunks = std::mem::take(cur_hunks);
-            if *cur_add {
-                out.push(PatchFile {
-                    old_path: None,
-                    new_path: Some(path),
-                    rename_from: None,
-                    rename_to: rename_to.take(),
-                    hunks,
-                });
-            } else {
-                out.push(PatchFile {
-                    old_path: Some(path.clone()),
-                    new_path: Some(path),
-                    rename_from: None,
-                    rename_to: rename_to.take(),
-                    hunks,
-                });
-            }
-            *cur_add = false;
-        } else {
-            rename_to.take();
-        }
-    };
     let mut begun = false;
     let mut done = false;
     for raw in patch.lines() {
@@ -2161,6 +2110,65 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<PatchFile>, CommitError> {
         return Err(bad("bad patch: missing `*** End Patch`".to_string()));
     }
     Ok(out)
+}
+
+/// Push the open Codex hunk, inferring its line counts for a bare `@@`.
+fn flush_hunk(cur_hunk: &mut Option<Hunk>, cur_hunks: &mut Vec<Hunk>) {
+    if let Some(mut h) = cur_hunk.take() {
+        if !h.numbered {
+            let (mut old_count, mut new_count) = (0u64, 0u64);
+            for line in &h.lines {
+                match line {
+                    HunkLine::Context(_) => {
+                        old_count += 1;
+                        new_count += 1;
+                    }
+                    HunkLine::Remove(_) => old_count += 1,
+                    HunkLine::Add(_) => new_count += 1,
+                    HunkLine::NoNewline => {}
+                }
+            }
+            h.old_count = old_count;
+            h.new_count = new_count;
+        }
+        cur_hunks.push(h);
+    }
+}
+
+/// Push the open Codex file: an add, or an update (possibly renamed by a
+/// following `*** Move to:`, carried in `rename_to`).
+fn flush_file(
+    cur_path: &mut Option<String>,
+    cur_add: &mut bool,
+    cur_hunk: &mut Option<Hunk>,
+    cur_hunks: &mut Vec<Hunk>,
+    rename_to: &mut Option<String>,
+    out: &mut Vec<PatchFile>,
+) {
+    flush_hunk(cur_hunk, cur_hunks);
+    if let Some(path) = cur_path.take() {
+        let hunks = std::mem::take(cur_hunks);
+        if *cur_add {
+            out.push(PatchFile {
+                old_path: None,
+                new_path: Some(path),
+                rename_from: None,
+                rename_to: rename_to.take(),
+                hunks,
+            });
+        } else {
+            out.push(PatchFile {
+                old_path: Some(path.clone()),
+                new_path: Some(path),
+                rename_from: None,
+                rename_to: rename_to.take(),
+                hunks,
+            });
+        }
+        *cur_add = false;
+    } else {
+        rename_to.take();
+    }
 }
 
 /// Deletes and move sources must name a file in the base tree. Without this

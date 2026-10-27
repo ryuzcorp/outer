@@ -4112,10 +4112,13 @@ exit 0
             CommitRequest {
                 message: "migrate test".to_string(),
                 base: None,
-                writes,
-                edits: vec![],
-                deletes: vec![],
-                moves: vec![],
+                changes: crate::git::commit::CommitChanges {
+                    writes,
+                    edits: vec![],
+                    deletes: vec![],
+                    moves: vec![],
+                    ..Default::default()
+                },
                 author: author(),
             },
         )
