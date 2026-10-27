@@ -102,9 +102,10 @@ export function toAcctab(raw: string | null): AccountTabId {
   return "account";
 }
 
-/** Old top-level account views live on as hub tabs now. */
+/** Old top-level account views live on as hub tabs now (`account` is the
+ * hub itself rather than a legacy view, so it maps to nothing: merging
+ * `{ view: "account", acctab }` must keep the explicit tab). */
 const LEGACY_ACCOUNT_TABS: Record<string, AccountTabId> = {
-  account: "account",
   usage: "usage",
   connections: "connections",
   invites: "invites",
@@ -117,6 +118,40 @@ const LEGACY_ACCOUNT_TABS: Record<string, AccountTabId> = {
 export function toAccountRoute(view: ViewId): { view: "account"; acctab: AccountTabId } | null {
   const tab = LEGACY_ACCOUNT_TABS[view];
   return tab === undefined ? null : { view: "account", acctab: tab };
+}
+
+/**
+ * Merge a route patch the way the shell's `navigate` does: the patch wins,
+ * then a legacy top-level `?t=` view lands on its hub tab. Anchors use this
+ * so their `href` always matches the SPA navigation.
+ */
+export function mergeRoute(prev: Route, next: Partial<Route>): Route {
+  const r: Route = { ...prev, ...next };
+  const mapped = toAccountRoute(r.view);
+  if (mapped) {
+    r.view = mapped.view;
+    r.acctab = mapped.acctab;
+  }
+  return r;
+}
+
+/** The URL `navigate(next)` would push from `prev`. */
+export function hrefFor(prev: Route, next: Partial<Route>): string {
+  return routeUrl(mergeRoute(prev, next));
+}
+
+/**
+ * Plain left-clicks run the SPA navigation; modified clicks and
+ * middle-clicks fall through to the anchor so open-in-new-tab (and the
+ * copied URL) keeps working.
+ */
+export function linkTo(e: Event, go: () => void): void {
+  const m = e as MouseEvent;
+  if (m.ctrlKey || m.metaKey || m.shiftKey || m.altKey || (m.button ?? 0) !== 0) {
+    return;
+  }
+  e.preventDefault();
+  go();
 }
 
 

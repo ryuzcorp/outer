@@ -6,6 +6,7 @@ import type {
   D1DatabasesOutput,
 } from "../actions/data-d1.ts";
 import type { Route } from "../common.tsx";
+import { linkTo } from "../common.tsx";
 import { DatabaseIcon } from "../icons.tsx";
 import { BackupsPanel } from "../data/d1/backups.tsx";
 import { D1Editor } from "../data/d1/panel.tsx";
@@ -296,25 +297,26 @@ function D1DatabaseView({
  * list and no count badge. */
 export function D1Nav({
   active,
+  href,
   setRoute,
 }: {
   /** Whether the D1 view is showing. */
   active: boolean;
+  /** Canonical URL for the D1 view (real link: new-tab keeps working). */
+  href: string;
   setRoute: (next: Partial<Route>) => void;
 }) {
   return (
     <li class="min-w-0">
-      <button
-        type="button"
+      <a
+        href={href}
         class={active ? "menu-active min-w-0" : "min-w-0"}
         aria-current={active ? "page" : undefined}
-        onclick={() => {
-          setRoute({ view: "d1" });
-        }}
+        onclick={(e: Event) => linkTo(e, () => setRoute({ view: "d1" }))}
       >
         <DatabaseIcon />
         <span class="min-w-0 flex-1 truncate">D1</span>
-      </button>
+      </a>
     </li>
   );
 }

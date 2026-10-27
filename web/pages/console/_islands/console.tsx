@@ -93,9 +93,11 @@ import {
   RANGES,
   VIEWS,
   canOpenApp,
+  hrefFor,
+  linkTo,
+  mergeRoute,
   readRoute,
   routeUrl,
-  toAccountRoute,
   type ActionsPanel,
   type Panel,
   type Route,
@@ -656,14 +658,10 @@ export function Console() {
 
   function navigate(next: Partial<Route>, replace = false): void {
     const prev = route();
-    const r: Route = { ...prev, ...next };
     // Agents and old callers may still navigate by legacy top-level
-    // account view (`usage`, …): land on the matching hub tab instead.
-    const mapped = toAccountRoute(r.view);
-    if (mapped) {
-      r.view = mapped.view;
-      r.acctab = mapped.acctab;
-    }
+    // account view (`usage`, …): mergeRoute lands them on the matching
+    // hub tab, and anchors share the same merge through hrefFor.
+    const r = mergeRoute(prev, next);
     const url = routeUrl(r);
     if (replace) {
       window.history.replaceState(null, "", url);
@@ -1033,12 +1031,11 @@ export function Console() {
         <a
           class="rail-tile rail-logo tooltip tooltip-right"
           data-tip="Outer console"
-          href="/console"
+          href={list.length > 0 ? hrefFor(r, { app: list[0].slug, view: "overview" }) : "/console"}
           aria-label="Outer console"
           onclick={(e: Event) => {
-            e.preventDefault();
             if (list.length > 0) {
-              navigate({ app: list[0].slug, view: "overview" });
+              linkTo(e, () => navigate({ app: list[0].slug, view: "overview" }));
             }
           }}
         >
@@ -1046,18 +1043,20 @@ export function Console() {
         </a>
         <div class="rail-apps" role="list">
           {list.map((a) => (
-            <button
+            <a
               key={a.slug}
-              type="button"
               role="listitem"
+              href={hrefFor(r, { app: a.slug, view: "overview" })}
               class={`rail-tile tooltip tooltip-right${a.slug === r.app ? " is-active" : ""}`}
               data-tip={appTip(a, " · ")}
               title={appTip(a, " · ")}
               aria-label={a.role === "collaborator" ? `${a.slug}, ${a.status}, shared with you${a.deletes_at != null ? `, deletes ${when(a.deletes_at)}` : ""}` : `${a.slug}, ${a.status}${a.deletes_at != null ? `, deletes ${when(a.deletes_at)}` : ""}`}
               aria-current={a.slug === r.app ? "page" : undefined}
-              onclick={() => {
+              onclick={(e: Event) => {
                 if (a.slug !== r.app) {
-                  navigate({ app: a.slug, view: "overview" });
+                  linkTo(e, () => navigate({ app: a.slug, view: "overview" }));
+                } else {
+                  linkTo(e, () => {});
                 }
               }}
             >
@@ -1072,19 +1071,19 @@ export function Console() {
                   </span>
                 </span>
               </span>
-            </button>
+            </a>
           ))}
           {active?.admin === true && (
-            <button
+            <a
               key={`admin-${active.slug}`}
-              type="button"
+              href={hrefFor(r, { app: active.slug, view: "overview" })}
               role="listitem"
               class="rail-tile tooltip tooltip-right is-active"
               data-tip={`${active.slug} · ${active.status} · Admin view`}
               title={`${active.slug} · ${active.status} · Admin view`}
               aria-label={`${active.slug}, ${active.status}, viewing as admin`}
               aria-current="page"
-              onclick={() => navigate({ app: active.slug, view: "overview" })}
+              onclick={(e: Event) => linkTo(e, () => navigate({ app: active.slug, view: "overview" }))}
             >
               <span class="indicator">
                 <span
@@ -1097,7 +1096,7 @@ export function Console() {
                   </span>
                 </span>
               </span>
-            </button>
+            </a>
           )}
         </div>
         <div class={`dropdown dropdown-right${ui().createOpen ? " dropdown-open" : ""}`}>
@@ -1180,29 +1179,33 @@ export function Console() {
                   </span>
                 </li>
                 <li>
-                  <button
-                    type="button"
-                    onclick={() => {
-                      patchUi({ accountOpen: false });
-                      navigate({ view: "account" });
+                  <a
+                    href={hrefFor(r, { view: "account", acctab: "account" })}
+                    onclick={(e: Event) => {
+                      linkTo(e, () => {
+                        patchUi({ accountOpen: false });
+                        navigate({ view: "account", acctab: "account" });
+                      });
                     }}
                   >
                     <AccountIcon size={16} />
                     Account
-                  </button>
+                  </a>
                 </li>
                 {isAdmin() && (
                   <li>
-                    <button
-                      type="button"
-                      onclick={() => {
-                        patchUi({ accountOpen: false });
-                        navigate({ view: "admin" });
+                    <a
+                      href={hrefFor(r, { view: "admin" })}
+                      onclick={(e: Event) => {
+                        linkTo(e, () => {
+                          patchUi({ accountOpen: false });
+                          navigate({ view: "admin" });
+                        });
                       }}
                     >
                       <ShieldIcon size={16} />
                       Admin
-                    </button>
+                    </a>
                   </li>
                 )}
                 <li>
@@ -1226,7 +1229,7 @@ export function Console() {
         </div>
       </nav>
 
-      {active && r.view !== "account" && (
+      {active && !accountView && (
         <div class={`drawer min-w-0${ui().collapsed ? "" : " md:drawer-open"}`}>
           <input
             id="console-nav"
@@ -1263,36 +1266,35 @@ export function Console() {
                 {(r.view === "overview" || r.view === "metrics") && (
                   <div class="join border border-base-300 ml-auto shrink-0 rounded-full p-1" role="group" aria-label="Metrics range">
                     {RANGES.map((opt) => (
-                      <button
+                      <a
                         key={opt.hours}
-                        type="button"
+                        href={hrefFor(r, { range: opt.hours })}
                         class={`btn btn-sm join-item border-0 rounded-full${r.range === opt.hours ? " bg-base-200" : " btn-ghost"}`}
                         title={opt.title}
                         aria-pressed={r.range === opt.hours}
-                        onclick={() => navigate({ r: opt.hours } as Partial<Route>)}
+                        onclick={(e: Event) => linkTo(e, () => navigate({ range: opt.hours }))}
                       >
                         {opt.label}
-                      </button>
+                      </a>
                     ))}
                   </div>
                 )}
               </div>
               <div class="tabs tabs-box tabs-sm mb-3 w-full min-w-0 overflow-x-auto md:hidden" role="tablist" aria-label="Views">
                 {VIEWS.filter((v) => v.id !== "d1").map((v) => (
-                  <button
+                  <a
                     key={v.id}
-                    type="button"
+                    href={hrefFor(r, { view: v.id as ViewId, codeTab: null })}
                     role="tab"
                     aria-selected={r.view === v.id}
                     class={`tab shrink-0${r.view === v.id ? " tab-active" : ""}`}
-                    onclick={() => navigate({ view: v.id as ViewId, codeTab: null })}
+                    onclick={(e: Event) => linkTo(e, () => navigate({ view: v.id as ViewId, codeTab: null }))}
                   >
                     {v.label}
-                  </button>
+                  </a>
                 ))}
               </div>
               <div class="main-body">
-                {accountView && accountPanel}
                 {!accountView && detailPanel.kind === "loading" && (
                   <div class="flex min-w-0 flex-col gap-3" role="status" aria-label="Loading app">
                     <div class="skeleton rounded-box h-30 w-full" />
@@ -1324,17 +1326,27 @@ export function Console() {
                     : (
                       <div class="alert alert-error alert-soft" role="alert">
                         <span class="min-w-0">Couldn't load this app (unknown or not yours).</span>
-                        <button
-                          type="button"
-                          class="btn btn-sm min-w-0 max-w-full shrink-0"
-                          // admin-all-apps branch: a pure admin has no rail apps;
-                          // back out to the directory instead of crashing on list[0].
-                          onclick={() => navigate(list.length > 0 ? { app: list[0].slug, view: "overview" } : { app: null, view: "admin" })}
-                        >
-                          <span class="truncate" title={list.length > 0 ? `Back to ${list[0].slug}` : "Back to Admin"}>
-                            {list.length > 0 ? `Back to ${list[0].slug}` : "Back to Admin"}
-                          </span>
-                        </button>
+                        {list.length > 0 ? (
+                          <a
+                            class="btn btn-sm min-w-0 max-w-full shrink-0"
+                            href={hrefFor(r, { app: list[0].slug, view: "overview" })}
+                            onclick={(e: Event) => linkTo(e, () => navigate({ app: list[0].slug, view: "overview" }))}
+                          >
+                            <span class="truncate" title={`Back to ${list[0].slug}`}>
+                              Back to {list[0].slug}
+                            </span>
+                          </a>
+                        ) : (
+                          <a
+                            class="btn btn-sm min-w-0 max-w-full shrink-0"
+                            href={hrefFor(r, isAdmin() ? { app: null, view: "admin" } : { app: null, view: "account", acctab: "account" })}
+                            onclick={(e: Event) => linkTo(e, () => navigate(isAdmin() ? { app: null, view: "admin" } : { app: null, view: "account", acctab: "account" }))}
+                          >
+                            <span class="truncate" title={isAdmin() ? "Back to Admin" : "Back to Account"}>
+                              {isAdmin() ? "Back to Admin" : "Back to Account"}
+                            </span>
+                          </a>
+                        )}
                       </div>
                     ))}
                 {!accountView && detailPanel.kind === "ready" && (
@@ -1349,6 +1361,7 @@ export function Console() {
                     <ViewBody
                     route={r}
                     onView={(view) => navigate({ view })}
+                    viewHref={(view) => hrefFor(route(), { view })}
                     onRoute={(next) => navigate(next)}
                     app={detailPanel.value}
                     slug={r.app as string}
@@ -1484,11 +1497,11 @@ export function Console() {
                 <li class="menu-title text-xs font-medium uppercase tracking-wider">App</li>
                 {VIEWS.filter((v) => v.id !== "d1").map((v) => (
                   <li key={v.id} class="min-w-0">
-                    <button
-                      type="button"
+                    <a
+                      href={hrefFor(r, { view: v.id as ViewId, codeTab: null })}
                       class={r.view === v.id ? "menu-active min-w-0" : "min-w-0"}
                       aria-current={r.view === v.id ? "page" : undefined}
-                      onclick={() => navigate({ view: v.id as ViewId, codeTab: null })}
+                      onclick={(e: Event) => linkTo(e, () => navigate({ view: v.id as ViewId, codeTab: null }))}
                     >
                       <ViewIcon id={v.id as ViewId} />
                       <span class="min-w-0 flex-1 truncate">{v.label}</span>
@@ -1497,7 +1510,7 @@ export function Console() {
                           {openErrors}
                         </span>
                       )}
-                    </button>
+                    </a>
                   </li>
                 ))}
                 <li class="menu-title text-xs font-medium uppercase tracking-wider">Data</li>
@@ -1506,19 +1519,20 @@ export function Console() {
                   <>
                     <D1Nav
                       active={r.view === "d1"}
+                      href={hrefFor(r, { view: "d1" })}
                       setRoute={(next) => navigate(next)}
                     />
                     {DATA_VIEWS.map((v) => (
                       <li key={v.id} class="min-w-0">
-                        <button
-                          type="button"
+                        <a
+                          href={hrefFor(r, { view: v.id })}
                           class={r.view === v.id ? "menu-active min-w-0" : "min-w-0"}
                           aria-current={r.view === v.id ? "page" : undefined}
-                          onclick={() => navigate({ view: v.id })}
+                          onclick={(e: Event) => linkTo(e, () => navigate({ view: v.id }))}
                         >
                           <DatabaseIcon />
                           <span class="min-w-0 flex-1 truncate">{v.label}</span>
-                        </button>
+                        </a>
                       </li>
                     ))}
                   </>
@@ -1577,16 +1591,16 @@ export function Console() {
               </div>
               <div class="tabs tabs-box tabs-sm mb-3 w-full min-w-0 overflow-x-auto md:hidden" role="tablist" aria-label="Account">
                 {ACCOUNT_TABS.map((t) => (
-                  <button
+                  <a
                     key={t.id}
-                    type="button"
+                    href={hrefFor(r, { view: "account", acctab: t.id })}
                     role="tab"
                     aria-selected={r.acctab === t.id}
                     class={`tab shrink-0${r.acctab === t.id ? " tab-active" : ""}`}
-                    onclick={() => navigate({ view: "account", acctab: t.id })}
+                    onclick={(e: Event) => linkTo(e, () => navigate({ view: "account", acctab: t.id }))}
                   >
                     {t.label}
-                  </button>
+                  </a>
                 ))}
               </div>
               <div class="main-body">{hubPanel}</div>
@@ -1618,15 +1632,15 @@ export function Console() {
                 <li class="menu-title text-xs font-medium uppercase tracking-wider">Account</li>
                 {ACCOUNT_TABS.map((t) => (
                   <li key={t.id} class="min-w-0">
-                    <button
-                      type="button"
+                    <a
+                      href={hrefFor(r, { view: "account", acctab: t.id })}
                       class={r.acctab === t.id ? "menu-active min-w-0" : "min-w-0"}
                       aria-current={r.acctab === t.id ? "page" : undefined}
-                      onclick={() => navigate({ view: "account", acctab: t.id })}
+                      onclick={(e: Event) => linkTo(e, () => navigate({ view: "account", acctab: t.id }))}
                     >
                       <ViewIcon id={t.id} />
                       <span class="min-w-0 flex-1 truncate">{t.label}</span>
-                    </button>
+                    </a>
                   </li>
                 ))}
               </ul>
@@ -1640,7 +1654,7 @@ export function Console() {
           </div>
         </div>
       )}
-      {!active && r.view === "admin" && (
+      {r.view === "admin" && (
         <div class="drawer min-w-0">
           <div class="drawer-content min-w-0">
             <main class="main" id="console-main" tabindex={-1}>
@@ -1779,6 +1793,8 @@ function ViewBody(props: {
   onDeleted: () => void;
   /** Switch the current app's view (ViewBody is outside `navigate`'s scope). */
   onView: (view: ViewId) => void;
+  /** Canonical URL for a view, for the overview's "View all" links. */
+  viewHref: (view: ViewId) => string;
   /** Patch the route (views with their own URL state, e.g. D1). */
   onRoute: (next: Partial<Route>) => void;
 }) {
@@ -1791,6 +1807,7 @@ function ViewBody(props: {
           actions={props.actions}
           errors={props.errors}
           onView={props.onView}
+          viewHref={props.viewHref}
           onRetry={props.onRetry}
         />
       );

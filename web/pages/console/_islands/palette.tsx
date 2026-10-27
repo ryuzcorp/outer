@@ -552,15 +552,15 @@ export function Palette(props: PaletteProps) {
             </pre>
           )}
         </div>
-        <button
-          type="button"
-          class="modal-backdrop"
-          aria-label="Close"
-          onclick={props.onClose}
-        >
-          Close
-        </button>
       </div>
+      <button
+        type="button"
+        class="modal-backdrop"
+        aria-label="Close"
+        onclick={props.onClose}
+      >
+        Close
+      </button>
     </div>
   );
 }
