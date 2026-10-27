@@ -909,7 +909,7 @@ export function Console() {
   if (list.length === 0 && !accountView && detailPanel.kind !== "ready") {
     return (
       <div class="console-empty" role="status">
-        <img src="/logo.svg" alt="" width={28} height={28} />
+        <img src="/logo.svg" alt="Outer home" width={28} height={28} />
         <h1>No apps yet</h1>
         <p>
           Apps are created by your agent over MCP at{" "}
