@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-[ -n "$KEY_FILE" ] && [ -n "$APP" ] || { echo "usage: $0 --base URL --key-file KEY_FILE --app SLUG [--only CHECKS] [--page PATH]" >&2; exit 2; }
+if [ -z "$KEY_FILE" ] || [ -z "$APP" ]; then echo "usage: $0 --base URL --key-file KEY_FILE --app SLUG [--only CHECKS] [--page PATH]" >&2; exit 2; fi
 
 command -v curl >/dev/null || { echo "need curl" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "need python3" >&2; exit 2; }
@@ -214,7 +214,7 @@ import json, os
 print(json.dumps({"app": os.environ["M1_APP"]}))
 EOF
 code=$(mcp_call "get_app")
-[ "$code" = "200" ] && [ "$(jok "$RESP")" = "1" ] || { fail "setup" "get_app HTTP $code"; exit 1; }
+if [ "$code" != "200" ] || [ "$(jok "$RESP")" != "1" ]; then fail "setup" "get_app HTTP $code"; exit 1; fi
 APP_URL=$(jget "$RESP" 'v["result"]["structuredContent"]["url"]')
 ORIG_VIS=$(jget "$RESP" 'v["result"]["structuredContent"]["visibility"]')
 BASE_SHA=$(jget "$RESP" 'v["result"]["structuredContent"].get("last_deploy", {}).get("sha", "")')
@@ -234,7 +234,7 @@ import json, os
 print(json.dumps({"app": os.environ["M1_APP"]}))
 EOF
     code=$(mcp_call "list_files")
-    [ "$code" = "200" ] && [ "$(jok "$RESP")" = "1" ] || { echo ""; return 1; }
+    if [ "$code" != "200" ] || [ "$(jok "$RESP")" != "1" ]; then echo ""; return 1; fi
     jget "$RESP" '(([(f["path"]) for f in v["result"]["structuredContent"]["files"] if f["path"] == "pages/index.tsx"] + [f["path"] for f in v["result"]["structuredContent"]["files"] if f["path"].endswith(".tsx")] + [f["path"] for f in v["result"]["structuredContent"]["files"] if f["path"].endswith((".ts", ".jsx", ".js", ".mjs"))]) or ["None"])[0]'
 }
 read_page() { # $1 path -> prints file text to stdout
@@ -243,7 +243,7 @@ import json, os
 print(json.dumps({"app": os.environ["M1_APP"], "path": os.environ["M1_P"]}))
 EOF
     code=$(mcp_call "read_file")
-    [ "$code" = "200" ] && [ "$(jok "$RESP")" = "1" ] || return 1
+    if [ "$code" != "200" ] || [ "$(jok "$RESP")" != "1" ]; then return 1; fi
     jget "$RESP" 'v["result"]["structuredContent"]["text"]'
 }
 
@@ -305,7 +305,7 @@ EOF
                     await_terminal "$APP" >/dev/null; cp "$OUT.deploy" "$RESP" 2>/dev/null || true
                     DEPLOY=$(deploy_of "$RESP"); ST=$(dep_line 1 "$DEPLOY")
                 fi
-                [ "$ST" = "success" ] && pass "build:revert" "revert deployed ($ST)" || fail "build:revert" "revert status=$ST"
+                if [ "$ST" = "success" ]; then pass "build:revert" "revert deployed ($ST)"; else fail "build:revert" "revert status=$ST"; fi
             else
                 fail "build:revert" "commit HTTP $code"
             fi
@@ -431,7 +431,7 @@ EOF
                     COMMITS_N=$((COMMITS_N + 1))
                     DEPLOY=$(deploy_of "$RESP")
                     settle_deploy
-                    [ "$ST" = "success" ] && pass "allowed:revert" "revert deployed" || fail "allowed:revert" "revert status=$ST"
+                    if [ "$ST" = "success" ]; then pass "allowed:revert" "revert deployed"; else fail "allowed:revert" "revert status=$ST"; fi
                 else
                     fail "allowed:revert" "commit HTTP $code"
                 fi
@@ -491,7 +491,7 @@ if want visibility; then
         mcp_set_visibility "$APP" "$ORIG_VIS" >/dev/null
         VIS_CHANGED=0
         code=$(mcp_call "get_app"); V2=$(jget "$RESP" 'v["result"]["structuredContent"]["visibility"]')
-        [ "$V2" = "$ORIG_VIS" ] && pass "visibility:restore" "restored $ORIG_VIS" || fail "visibility:restore" "got $V2, want $ORIG_VIS"
+        if [ "$V2" = "$ORIG_VIS" ]; then pass "visibility:restore" "restored $ORIG_VIS"; else fail "visibility:restore" "got $V2, want $ORIG_VIS"; fi
     fi
 fi
 
