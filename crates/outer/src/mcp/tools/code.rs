@@ -25,8 +25,10 @@ pub struct ListFilesInput {
     pub path_prefix: Option<String>,
 }
 
-/// One file inside a `read_files` call.
-#[derive(Debug, Deserialize, JsonSchema)]
+/// One file inside a `read_files` call. Weak models send a bare path string;
+/// that means the whole file. The JSON Schema stays canonical (always an
+/// object) so stronger clients still learn one shape.
+#[derive(Debug, JsonSchema)]
 pub struct ReadFileEntry {
     /// Repo-relative path.
     pub path: String,
@@ -40,7 +42,7 @@ pub struct ReadFileEntry {
     pub symbol: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, JsonSchema)]
 pub struct ReadFilesInput {
     /// The app slug.
     pub app: String,
@@ -50,7 +52,7 @@ pub struct ReadFilesInput {
     pub files: Vec<ReadFileEntry>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, JsonSchema)]
 pub struct SearchCodeInput {
     /// The app slug.
     pub app: String,
@@ -72,6 +74,221 @@ pub struct SearchCodeInput {
     /// Search generated files too (`node_modules/`, `dist/`, lockfiles are
     /// skipped by default).
     pub include_generated: Option<bool>,
+}
+
+/// The `read_files` shapes weak models actually send, normalised into the
+/// canonical input before validation: `files` strings, a `paths` alias, a
+/// single `path` (plus `start_line`/`end_line`) or a single `file`.
+/// Failures name the tool, the field and the expected shape.
+impl<'de> Deserialize<'de> for ReadFileEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(d)?;
+        parse_read_entry(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReadFilesInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            app: Option<String>,
+            sha: Option<String>,
+            files: Option<Value>,
+            paths: Option<Value>,
+            path: Option<Value>,
+            file: Option<Value>,
+            start_line: Option<u64>,
+            end_line: Option<u64>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let app = raw.app.ok_or_else(|| {
+            serde::de::Error::custom("read_files: `app` is required (the app slug)")
+        })?;
+        let files = if let Some(files) = raw.files {
+            parse_files_value(&files).map_err(serde::de::Error::custom)?
+        } else if let Some(paths) = raw.paths {
+            parse_string_list(&paths, "`paths`")
+                .map_err(serde::de::Error::custom)?
+                .into_iter()
+                .map(|path| ReadFileEntry {
+                    path,
+                    start_line: None,
+                    end_line: None,
+                    symbol: None,
+                })
+                .collect()
+        } else if let Some(single) = raw.path.as_ref().or(raw.file.as_ref()) {
+            let path = single.as_str().ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "read_files: `path` must be a string; got {}",
+                    json_kind(single),
+                ))
+            })?;
+            vec![ReadFileEntry {
+                path: path.to_string(),
+                start_line: raw.start_line,
+                end_line: raw.end_line,
+                symbol: None,
+            }]
+        } else {
+            return Err(serde::de::Error::custom(
+                "read_files: `files` is required: an array of {path, start_line?, end_line?} (or `paths`, `path`, or `file`)",
+            ));
+        };
+        if files.is_empty() || files.len() > MAX_READ_FILES {
+            return Err(serde::de::Error::custom(format!(
+                "read_files: `files` holds 1-{MAX_READ_FILES} entries"
+            )));
+        }
+        Ok(Self {
+            app,
+            sha: raw.sha,
+            files,
+        })
+    }
+}
+
+/// `search_code` takes the same string-or-array leniency for `paths` (plus
+/// a `glob` alias weak models reach for). The schema stays canonical.
+impl<'de> Deserialize<'de> for SearchCodeInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            app: Option<String>,
+            query: Option<String>,
+            regex: Option<bool>,
+            paths: Option<Value>,
+            glob: Option<Value>,
+            context: Option<u8>,
+            case_insensitive: Option<bool>,
+            word: Option<bool>,
+            kind: Option<String>,
+            include_generated: Option<bool>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let app = raw.app.ok_or_else(|| {
+            serde::de::Error::custom("search_code: `app` is required (the app slug)")
+        })?;
+        let query = raw.query.ok_or_else(|| {
+            serde::de::Error::custom("search_code: `query` is required (the text to find)")
+        })?;
+        let mut paths = match raw.paths {
+            Some(paths) => {
+                parse_string_list(&paths, "`paths`").map_err(serde::de::Error::custom)?
+            }
+            None => Vec::new(),
+        };
+        if let Some(glob) = raw.glob {
+            paths.extend(parse_string_list(&glob, "`glob`").map_err(serde::de::Error::custom)?);
+        }
+        Ok(Self {
+            app,
+            query,
+            regex: raw.regex,
+            paths: if paths.is_empty() { None } else { Some(paths) },
+            context: raw.context,
+            case_insensitive: raw.case_insensitive,
+            word: raw.word,
+            kind: raw.kind,
+            include_generated: raw.include_generated,
+        })
+    }
+}
+
+/// The fields of one `files` entry, without the string shorthand (handled in
+/// [`parse_read_entry`] so this struct never recurses).
+#[derive(Deserialize)]
+struct ReadFileFields {
+    path: Option<String>,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+    symbol: Option<String>,
+}
+
+/// "a string", "an array", ...: what the client sent, never the value.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// One `files` entry: a bare path string or the canonical object.
+fn parse_read_entry(value: &Value) -> Result<ReadFileEntry, String> {
+    match value {
+        Value::String(path) => Ok(ReadFileEntry {
+            path: path.clone(),
+            start_line: None,
+            end_line: None,
+            symbol: None,
+        }),
+        Value::Object(_) => {
+            let fields: ReadFileFields = serde_json::from_value(value.clone())
+                .map_err(|e| format!("read_files: a `files` entry is not a file: {e}"))?;
+            let path = fields
+                .path
+                .ok_or_else(|| "read_files: a `files` entry needs `path`".to_string())?;
+            Ok(ReadFileEntry {
+                path,
+                start_line: fields.start_line,
+                end_line: fields.end_line,
+                symbol: fields.symbol,
+            })
+        }
+        other => Err(format!(
+            "read_files: `files` must be an array of {{path, start_line?, end_line?}}; got {}",
+            json_kind(other),
+        )),
+    }
+}
+
+/// The `files` value: an array of entries (each a path string or an object)
+/// or a single path string.
+fn parse_files_value(value: &Value) -> Result<Vec<ReadFileEntry>, String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| parse_read_entry(item).map_err(|e| format!("{e} (at index {i})")))
+            .collect(),
+        Value::String(path) => Ok(vec![ReadFileEntry {
+            path: path.clone(),
+            start_line: None,
+            end_line: None,
+            symbol: None,
+        }]),
+        other => Err(format!(
+            "read_files: `files` must be an array of {{path, start_line?, end_line?}}; got {}",
+            json_kind(other),
+        )),
+    }
+}
+
+/// A string-or-array-of-strings field (`paths`, `glob`).
+fn parse_string_list(value: &Value, field: &str) -> Result<Vec<String>, String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    format!(
+                        "read_files: {field} must be an array of strings; got {} at index {i}",
+                        json_kind(item),
+                    )
+                })
+            })
+            .collect(),
+        Value::String(one) => Ok(vec![one.clone()]),
+        other => Err(format!(
+            "read_files: {field} must be an array of strings; got {}",
+            json_kind(other),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -195,6 +412,11 @@ pub struct ShowCommitInput {
     pub app: String,
     /// The commit sha to show.
     pub sha: String,
+    /// Only these files' patch (repo-relative). The stat list still names
+    /// every changed file.
+    pub paths: Option<Vec<String>>,
+    /// One file's patch (same as `paths` with one entry).
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -974,11 +1196,24 @@ pub async fn history(input: HistoryInput, ctx: &Ctx<'_>) -> Result<Value, ToolEr
     ))
 }
 
+/// Most patch bytes one `show_commit` call returns: a root commit's whole
+/// tree would otherwise eat the model's context. The per-file stat list is
+/// never cut, so the call still names every file.
+pub const MAX_SHOW_PATCH_BYTES: usize = 20 * 1024;
+
 pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let (app, _) = visible_app(ctx, &input.app).await?;
     check_rev("sha", &input.sha)?;
+    let mut paths = input.paths.unwrap_or_default();
+    if let Some(path) = input.path {
+        paths.push(path);
+    }
+    for path in &paths {
+        crate::git::local::validate_read_path(path)
+            .map_err(|e| ToolError::invalid_argument(e.to_string()))?;
+    }
     let bare = mirror(ctx, &app.slug).await?;
-    let shown = crate::git::local::show(&bare, &input.sha)
+    let shown = crate::git::local::show(&bare, &input.sha, &paths)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -988,6 +1223,41 @@ pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value,
                 internal(e)
             }
         })?;
+    // The read_files budget helper, on the patch only: stats are never cut.
+    let patch = truncate_utf8(&shown.patch, MAX_SHOW_PATCH_BYTES);
+    let cut = patch.len() < shown.patch.len();
+    let truncated = shown.truncated || cut;
+    let mut stat_lines = Vec::with_capacity(shown.stats.len());
+    let mut files = Vec::with_capacity(shown.stats.len());
+    for stat in &shown.stats {
+        let status = stat.status.to_string();
+        stat_lines.push(if stat.binary {
+            format!("{status} {} binary", stat.path)
+        } else {
+            format!("{} {} +{}/-{}", status, stat.path, stat.added, stat.removed)
+        });
+        files.push(json!({
+            "path": stat.path,
+            "status": status,
+            "added": stat.added,
+            "removed": stat.removed,
+        }));
+    }
+    let mut summary = format!(
+        "{} ({} file(s)).\n{}",
+        &shown.commit.sha[..12.min(shown.commit.sha.len())],
+        files.len(),
+        stat_lines.join("\n"),
+    );
+    if truncated {
+        summary.push_str(
+            "\nPatch cut at 20 KB. To see files, call open_app for the tree, or read_files {paths} for contents.",
+        );
+    } else if shown.root {
+        summary.push_str(
+            "\nRoot commit: the patch is the whole tree. To see files, call open_app for the tree, or read_files {paths} for contents.",
+        );
+    }
     let structured = json!({
         "commit": {
             "sha": shown.commit.sha,
@@ -996,19 +1266,13 @@ pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value,
             "at": shown.commit.at,
             "message": shown.commit.message,
         },
-        "files": shown.files,
-        "patch": shown.patch,
-        "truncated": shown.truncated,
+        "files": files,
+        // The patch rides in the text block only (like `read_files`):
+        // duplicating it here doubled every response.
+        "truncated": truncated,
+        "root": shown.root,
     });
-    Ok(ok_untrusted(
-        format!(
-            "{} ({} file(s)).",
-            &shown.commit.sha[..12.min(shown.commit.sha.len())],
-            shown.files.len()
-        ),
-        shown.patch.clone(),
-        structured,
-    ))
+    Ok(ok_untrusted(summary, patch.to_string(), structured))
 }
 
 pub async fn rollback(input: RollbackInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {

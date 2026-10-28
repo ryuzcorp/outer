@@ -162,8 +162,6 @@ pub enum CommitError {
     BothWrittenAndDeleted { path: String },
     #[error("{path} is written more than once in one commit")]
     DuplicateWrite { path: String },
-    #[error("{path} is edited more than once in one commit")]
-    DuplicateEdit { path: String },
     #[error("{path} is both written and edited in one commit")]
     BothWrittenAndEdited { path: String },
     #[error("blob conflict in {path}: expected blob {expected}, current {current}; re-read the file and retry with the fresh blob")]
@@ -209,8 +207,12 @@ pub enum CommitError {
     BadMove(String),
     #[error("invalid edit in {path}: {reason}")]
     InvalidEdit { path: String, reason: &'static str },
-    #[error("edit in {path} matched {count} times (need exactly 1, or set replace_all)")]
-    EditMatch { path: String, count: usize },
+    /// Exact-match edits whose `old` did not occur exactly once. Every
+    /// failure is reported together (index into the request's edits, match
+    /// count, and the closest file region for zero matches) so the agent
+    /// fixes them in one retry.
+    #[error("exact edits do not match:{0}")]
+    EditMismatches(EditMismatches),
     #[error("{path} not found")]
     NotFound { path: String },
     #[error("unknown base {base:?}; main is {current}")]
@@ -234,6 +236,94 @@ pub enum CommitError {
     BadSlug(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+/// One exact-match edit that failed: its index into the request's `edits`,
+/// the match count (0, or more than 1 without `replace_all`), and — for
+/// zero matches — the file region the `old` text most resembles.
+#[derive(Debug, Clone)]
+pub struct EditFailure {
+    /// Index into the request's `edits` array (0-based).
+    pub index: usize,
+    /// Repo-relative path of the file the edit targeted.
+    pub path: String,
+    /// How many times `old` occurred in the base file.
+    pub matches: usize,
+    /// The best-matching window, for zero matches only.
+    pub closest: Option<ClosestRegion>,
+}
+
+/// The file window a zero-match edit most resembles: 1-based inclusive
+/// line numbers with the window rendered as numbered text (at most
+/// [`MAX_CLOSEST_LINES`] lines, in `read_files` numbering).
+#[derive(Debug, Clone)]
+pub struct ClosestRegion {
+    /// First line of the window (1-based).
+    pub start_line: u64,
+    /// Last line shown (1-based, inclusive).
+    pub end_line: u64,
+    /// The window as `N│ line` text.
+    pub text: String,
+    /// The window matches `old` once whitespace is ignored: the fix is
+    /// `line_edits`, not a retried exact edit.
+    pub whitespace_only: bool,
+}
+
+/// Most lines [`ClosestRegion::text`] carries: the hint stays scannable.
+pub const MAX_CLOSEST_LINES: usize = 15;
+
+/// Every exact-match edit that failed in one commit, in request order.
+#[derive(Debug, Clone)]
+pub struct EditMismatches(pub Vec<EditFailure>);
+
+impl std::fmt::Display for EditMismatches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, failure) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, "; ")?;
+            }
+            write!(f, " {failure}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for EditFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.matches == 0 {
+            write!(
+                f,
+                "edit {} in {:?} matched 0 times (need exactly 1, or set replace_all)",
+                self.index, self.path,
+            )?;
+            if let Some(closest) = &self.closest {
+                write!(
+                    f,
+                    "; closest lines {}-{}:\n{}",
+                    closest.start_line, closest.end_line, closest.text,
+                )?;
+                if closest.whitespace_only {
+                    write!(
+                        f,
+                        "\ndiffers only in whitespace; use line_edits lines {}-{} instead",
+                        closest.start_line, closest.end_line,
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "\nadjust `old` to match that text, or use line_edits lines {}-{}",
+                        closest.start_line, closest.end_line,
+                    )?;
+                }
+            }
+            Ok(())
+        } else {
+            write!(
+                f,
+                "edit {} in {:?} matched {} times (need exactly 1, or set replace_all)",
+                self.index, self.path, self.matches,
+            )
+        }
+    }
 }
 
 /// One decoded file, ready for the scratch index. `is_text` marks full-file
@@ -858,14 +948,21 @@ pub(crate) fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFi
             return Err(CommitError::BothWrittenAndDeleted { path: path.clone() });
         }
     }
-    let mut seen_edits = HashSet::new();
+    // A file may carry several exact edits (applied in order); their
+    // per-file CAS blobs must agree, since they all edit one base blob.
+    let mut edit_blobs: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for e in &changes.edits {
         validate_path(&e.path)?;
         validate_blob(&e.path, e.expect_blob.as_deref())?;
-        if !seen_edits.insert(e.path.as_str()) {
-            return Err(CommitError::DuplicateEdit {
-                path: e.path.clone(),
-            });
+        if let Some(blob) = e.expect_blob.as_deref() {
+            if let Some(seen) = edit_blobs.insert(e.path.as_str(), blob) {
+                if seen != blob {
+                    return Err(CommitError::InvalidEdit {
+                        path: e.path.clone(),
+                        reason: "edits to one file must name the same expect_blob",
+                    });
+                }
+            }
         }
         if seen_writes.contains(e.path.as_str()) {
             return Err(CommitError::BothWrittenAndEdited {
@@ -1068,8 +1165,15 @@ pub async fn apply_changes(
     Ok(())
 }
 
-/// Apply exact-match edits against the base commit's blobs. `old` must occur
-/// exactly once unless `replace_all` (then at least once).
+/// Apply exact-match edits against the base commit's blobs. A file may carry
+/// several edits: they apply in request order, each against the text the
+/// previous ones left, so an `old` quoted from the file as read still
+/// matches unless an earlier edit rewrote it. `old` must occur exactly once
+/// unless `replace_all` (then at least once).
+///
+/// Every edit is checked before any is applied, so one bad `old` never hides
+/// another: all failures come back in one [`CommitError::EditMismatches`].
+/// A failed edit leaves its file's text unchanged for the edits after it.
 ///
 /// Edits share the writes' caps: the base blob must fit in
 /// [`MAX_TEXT_BYTES`] (checked with `cat-file -s` before reading, so a huge
@@ -1083,28 +1187,125 @@ async fn apply_edits(
     files: &mut Vec<RawFile>,
     total: &mut usize,
 ) -> Result<(), CommitError> {
-    for e in edits {
-        let Some(parent) = parent else {
-            return Err(CommitError::NotFound {
-                path: e.path.clone(),
-            });
+    if edits.is_empty() {
+        return Ok(());
+    }
+    let Some(parent) = parent else {
+        return Err(CommitError::NotFound {
+            path: edits[0].path.clone(),
+        });
+    };
+    let mut failures = Vec::new();
+    // Path → evolving text, in first-edit order so results are deterministic.
+    let mut texts: Vec<(String, String)> = Vec::new();
+    for (index, e) in edits.iter().enumerate() {
+        let slot = match texts.iter().position(|(path, _)| *path == e.path) {
+            Some(slot) => slot,
+            None => {
+                let (content, _) = read_text_blob(git_dir, parent, &e.path).await?;
+                texts.push((e.path.clone(), content));
+                texts.len() - 1
+            }
         };
-        let (content, _) = read_text_blob(git_dir, parent, &e.path).await?;
+        let content = &texts[slot].1;
         let count = content.matches(&e.old).count();
         if count == 0 || (!e.replace_all && count > 1) {
-            return Err(CommitError::EditMatch {
+            failures.push(EditFailure {
+                index,
                 path: e.path.clone(),
-                count,
+                matches: count,
+                closest: (count == 0)
+                    .then(|| closest_region(content, &e.old))
+                    .flatten(),
             });
+            continue;
         }
-        let replaced = if e.replace_all {
+        let next = if e.replace_all {
             content.replace(&e.old, &e.new)
         } else {
             content.replacen(&e.old, &e.new, 1)
         };
-        push_text_result(&e.path, replaced, files, total)?;
+        texts[slot].1 = next;
+    }
+    if !failures.is_empty() {
+        return Err(CommitError::EditMismatches(EditMismatches(failures)));
+    }
+    for (path, next) in texts {
+        push_text_result(&path, next, files, total)?;
     }
     Ok(())
+}
+
+/// Collapse every whitespace run: two lines that differ only in indentation
+/// or spacing compare equal, so the closest-window search forgives them.
+fn squish(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The window of `content`'s lines that best matches `old`: the window with
+/// the most whitespace-normalised lines in common (multiset overlap, first
+/// window wins ties). `None` when either side has no lines. The window is
+/// `old`'s line count wide (or the whole file when shorter) and shows at
+/// most [`MAX_CLOSEST_LINES`] lines.
+fn closest_region(content: &str, old: &str) -> Option<ClosestRegion> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.is_empty() {
+        return None;
+    }
+    let file_lines: Vec<&str> = content.lines().collect();
+    if file_lines.is_empty() {
+        return None;
+    }
+    let old_norm: Vec<String> = old_lines.iter().map(|l| squish(l)).collect();
+    let file_norm: Vec<String> = file_lines.iter().map(|l| squish(l)).collect();
+    let width = old_norm.len().min(file_norm.len());
+    let mut need: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in &old_norm {
+        *need.entry(line.as_str()).or_default() += 1;
+    }
+    let overlap = |have: &std::collections::HashMap<&str, usize>| -> usize {
+        need.iter()
+            .map(|(line, n)| (*n).min(have.get(line).copied().unwrap_or(0)))
+            .sum()
+    };
+    let mut have: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in &file_norm[..width] {
+        *have.entry(line.as_str()).or_default() += 1;
+    }
+    let mut best = 0usize;
+    let mut best_score = overlap(&have);
+    for start in 1..=(file_norm.len() - width) {
+        let out = file_norm[start - 1].as_str();
+        if let Some(left) = have.get_mut(out) {
+            *left -= 1;
+            if *left == 0 {
+                have.remove(out);
+            }
+        }
+        let pushed = file_norm[start + width - 1].as_str();
+        *have.entry(pushed).or_default() += 1;
+        let score = overlap(&have);
+        if score > best_score {
+            best_score = score;
+            best = start;
+        }
+    }
+    let end = best + width;
+    let shown = end.min(best + MAX_CLOSEST_LINES);
+    let text: Vec<String> = file_lines[best..shown]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{}│ {line}", best + i + 1))
+        .collect();
+    let whitespace_only = width == old_norm.len()
+        && file_norm[best..end] == old_norm[..]
+        && file_lines[best..end] != old_lines[..];
+    Some(ClosestRegion {
+        start_line: (best + 1) as u64,
+        end_line: shown as u64,
+        text: text.join("\n"),
+        whitespace_only,
+    })
 }
 
 /// Check one produced text file against the caps and account its bytes, like
@@ -2702,6 +2903,67 @@ mod tests {
         assert_eq!(parent.trim(), h2);
     }
 
+    /// Several exact edits to one file apply in request order (what agents
+    /// send: ChatGPT's 2- and 9-edit commits were refused before). Each sees
+    /// the text the earlier ones left, and one failure reports its index
+    /// while the file stays untouched.
+    #[tokio::test]
+    async fn several_edits_to_one_file_apply_in_order() {
+        let (_dir, cfg, store, sync) = setup("multi").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write(
+            "page.tsx",
+            "<h1>Title</h1>\n<p>Body</p>\n<footer>Foot</footer>\n",
+        ));
+        commit(&store, &cfg, &sync, "multi", seed).await.unwrap();
+        let bare = manifest::mirror_path(&cfg, "multi");
+        let edit = |old: &str, new: &str| Edit {
+            path: "page.tsx".to_string(),
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all: false,
+            expect_blob: None,
+        };
+
+        let mut three = req("three");
+        three
+            .changes
+            .edits
+            .push(edit("<h1>Title</h1>", "<h1>Family</h1>"));
+        three
+            .changes
+            .edits
+            .push(edit("<p>Body</p>", "<p>Photos</p>"));
+        // Chains onto the first edit's result.
+        three
+            .changes
+            .edits
+            .push(edit("<h1>Family</h1>", "<h1>Familygram</h1>"));
+        let head = commit(&store, &cfg, &sync, "multi", three).await.unwrap();
+        assert_eq!(
+            show(&bare, &head, "page.tsx").await,
+            "<h1>Familygram</h1>\n<p>Photos</p>\n<footer>Foot</footer>\n"
+        );
+
+        let mut bad = req("bad");
+        bad.changes.edits.push(edit("<p>Photos</p>", "<p>Feed</p>"));
+        bad.changes
+            .edits
+            .push(edit("<p>Photos</p>", "<p>Again</p>"));
+        match commit(&store, &cfg, &sync, "multi", bad).await {
+            Err(CommitError::EditMismatches(list)) => {
+                assert_eq!(list.0.len(), 1);
+                assert_eq!(list.0[0].index, 1, "the second edit no longer matches");
+                assert_eq!(list.0[0].matches, 0);
+            }
+            other => panic!("a stale second edit must fail, got {other:?}"),
+        }
+        assert_eq!(
+            show(&bare, &head, "page.tsx").await,
+            "<h1>Familygram</h1>\n<p>Photos</p>\n<footer>Foot</footer>\n"
+        );
+    }
+
     #[tokio::test]
     async fn edits_match_exactly_once_by_default() {
         let (_dir, cfg, store, sync) = setup("edits").await;
@@ -2712,7 +2974,7 @@ mod tests {
         let head = commit(&store, &cfg, &sync, "edits", seed).await.unwrap();
         let bare = manifest::mirror_path(&cfg, "edits");
 
-        // Zero matches: error names the path and the count.
+        // Zero matches: the error names the edit index, path and count.
         let mut zero = req("zero");
         zero.changes.edits.push(Edit {
             path: "page.tsx".to_string(),
@@ -2722,9 +2984,11 @@ mod tests {
             expect_blob: None,
         });
         match commit(&store, &cfg, &sync, "edits", zero).await {
-            Err(CommitError::EditMatch { path, count }) => {
-                assert_eq!(path, "page.tsx");
-                assert_eq!(count, 0);
+            Err(CommitError::EditMismatches(list)) => {
+                assert_eq!(list.0.len(), 1);
+                assert_eq!(list.0[0].index, 0);
+                assert_eq!(list.0[0].path, "page.tsx");
+                assert_eq!(list.0[0].matches, 0);
             }
             other => panic!("zero matches must fail, got {other:?}"),
         }
@@ -2739,9 +3003,12 @@ mod tests {
             expect_blob: None,
         });
         match commit(&store, &cfg, &sync, "edits", two).await {
-            Err(CommitError::EditMatch { path, count }) => {
-                assert_eq!(path, "page.tsx");
-                assert_eq!(count, 2);
+            Err(CommitError::EditMismatches(list)) => {
+                assert_eq!(list.0.len(), 1);
+                assert_eq!(list.0[0].index, 0);
+                assert_eq!(list.0[0].path, "page.tsx");
+                assert_eq!(list.0[0].matches, 2);
+                assert!(list.0[0].closest.is_none());
             }
             other => panic!("two matches must fail, got {other:?}"),
         }
@@ -2777,6 +3044,86 @@ mod tests {
             "<h1>z</h1>\n<p>w</p>\n<h1>z</h1>\n"
         );
         assert_eq!(head.len(), 40);
+    }
+    #[tokio::test]
+    async fn edit_mismatches_report_every_failure_with_hints() {
+        let (_dir, cfg, store, sync) = setup("mismatch").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write(
+            "app.ts",
+            "const alpha = 1;\nconst beta = 2;\nconst gamma = 3;\nconst delta = 4;\n",
+        ));
+        seed.changes
+            .writes
+            .push(write("other.ts", "export const x = 1;\n"));
+        seed.changes.writes.push(write("third.ts", "a;\nb;\n"));
+        commit(&store, &cfg, &sync, "mismatch", seed).await.unwrap();
+        let edit = |path: &str, old: &str| Edit {
+            path: path.to_string(),
+            old: old.to_string(),
+            new: "n".to_string(),
+            replace_all: false,
+            expect_blob: None,
+        };
+
+        // A near miss points at the best-matching window.
+        let mut near = req("near");
+        near.changes.edits.push(edit(
+            "app.ts",
+            "const alpha = 1;\nconst beta = 9;\nconst gamma = 3;",
+        ));
+        match commit(&store, &cfg, &sync, "mismatch", near).await {
+            Err(CommitError::EditMismatches(list)) => {
+                assert_eq!(list.0.len(), 1);
+                let closest = list.0[0].closest.as_ref().expect("near miss has a window");
+                assert_eq!((closest.start_line, closest.end_line), (1, 3));
+                assert!(closest.text.contains("const beta = 2;"), "{}", closest.text);
+                assert!(!closest.whitespace_only);
+                let msg = list.to_string();
+                assert!(msg.contains("closest lines 1-3"), "{msg}");
+                assert!(msg.contains("line_edits lines 1-3"), "{msg}");
+            }
+            other => panic!("near miss must fail, got {other:?}"),
+        }
+
+        // A whitespace-only difference says so and suggests line_edits.
+        let mut ws = req("ws");
+        ws.changes
+            .edits
+            .push(edit("other.ts", "  export const x = 1;"));
+        match commit(&store, &cfg, &sync, "mismatch", ws).await {
+            Err(CommitError::EditMismatches(list)) => {
+                let closest = list.0[0].closest.as_ref().expect("window shown");
+                assert!(closest.whitespace_only);
+                let msg = list.to_string();
+                assert!(msg.contains("differs only in whitespace"), "{msg}");
+                assert!(msg.contains("line_edits lines 1-1"), "{msg}");
+            }
+            other => panic!("whitespace miss must fail, got {other:?}"),
+        }
+
+        // Several failing edits are all reported, in request order.
+        let mut many = req("many");
+        many.changes.edits.push(edit("app.ts", "nope one"));
+        many.changes
+            .edits
+            .push(edit("other.ts", "const x = 1;\nconst x = 1;"));
+        many.changes.edits.push(edit("third.ts", ";"));
+        match commit(&store, &cfg, &sync, "mismatch", many).await {
+            Err(CommitError::EditMismatches(list)) => {
+                assert_eq!(list.0.len(), 3, "{list:?}");
+                assert_eq!(list.0[0].index, 0);
+                assert_eq!(list.0[0].matches, 0);
+                assert!(list.0[0].closest.is_some());
+                assert_eq!(list.0[1].index, 1);
+                assert_eq!(list.0[1].matches, 0);
+                assert_eq!(list.0[2].index, 2);
+                assert_eq!(list.0[2].path, "third.ts");
+                assert_eq!(list.0[2].matches, 2);
+                assert!(list.0[2].closest.is_none());
+            }
+            other => panic!("all failures must be reported, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3260,27 +3607,6 @@ mod tests {
         match commit(&store, &cfg, &sync, "overlap", both).await {
             Err(CommitError::BothWrittenAndEdited { path }) => assert_eq!(path, "g.txt"),
             other => panic!("a write and an edit on one path must fail, got {other:?}"),
-        }
-
-        // The same path edited twice.
-        let mut dedup = req("dedup");
-        dedup.changes.edits.push(Edit {
-            path: "h.txt".to_string(),
-            old: "x".to_string(),
-            new: "y".to_string(),
-            replace_all: false,
-            expect_blob: None,
-        });
-        dedup.changes.edits.push(Edit {
-            path: "h.txt".to_string(),
-            old: "y".to_string(),
-            new: "z".to_string(),
-            replace_all: false,
-            expect_blob: None,
-        });
-        match commit(&store, &cfg, &sync, "overlap", dedup).await {
-            Err(CommitError::DuplicateEdit { path }) => assert_eq!(path, "h.txt"),
-            other => panic!("duplicate edits must fail, got {other:?}"),
         }
 
         // A move whose target is written in the same commit.

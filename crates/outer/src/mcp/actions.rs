@@ -247,12 +247,28 @@ fn summary_for(tool: &str, args: &Value) -> Option<String> {
             s
         }
         "read_files" => {
+            // Lenient shapes (`paths`, `path`, `file`, string entries)
+            // count like the canonical `files` array.
             let files = args.get("files").and_then(Value::as_array);
-            let n = files.map_or(0, Vec::len);
+            let n = files.map_or_else(
+                || {
+                    if args.get("paths").is_some() {
+                        args.get("paths")
+                            .and_then(Value::as_array)
+                            .map_or(1, Vec::len)
+                    } else if args.get("path").or(args.get("file")).is_some() {
+                        1
+                    } else {
+                        0
+                    }
+                },
+                Vec::len,
+            );
             let mut s = format!("read_files {n} file(s)");
             if let Some(fs) = files {
                 for f in fs.iter().take(2) {
-                    if let Some(p) = f.get("path").and_then(Value::as_str) {
+                    let p = f.as_str().or_else(|| f.get("path").and_then(Value::as_str));
+                    if let Some(p) = p {
                         s.push_str(&format!(" {p}"));
                     }
                 }

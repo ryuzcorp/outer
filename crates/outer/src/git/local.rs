@@ -79,14 +79,18 @@ pub struct FileStat {
     pub binary: bool,
 }
 
-/// A commit with its file list and unified patch.
+/// A commit with its per-file stats and unified patch.
 #[derive(Debug, Clone)]
 pub struct ShowResult {
     pub commit: LogEntry,
-    pub files: Vec<String>,
+    /// Every changed file (status with +/- counts), in `git diff` order.
+    /// Never cut: callers on an output budget lead with these.
+    pub stats: Vec<FileStat>,
     /// Unified patch, cut at [`MAX_PATCH_BYTES`] with `truncated` set.
     pub patch: String,
     pub truncated: bool,
+    /// True for a root commit (no parent): the patch shows the whole tree.
+    pub root: bool,
 }
 
 /// Reject worktree escapes and git internals before a path reaches git, with
@@ -754,8 +758,15 @@ pub async fn log(
 
 /// `sha`'s metadata, changed files and unified patch (capped at
 /// [`MAX_PATCH_BYTES`]).
-pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
+///
+/// `paths` narrows the patch to those files (repo-relative, validated like
+/// reads). The per-file stats always name every changed file and are never
+/// cut: callers on an output budget lead with them and cut the patch instead.
+pub async fn show(bare: &Path, sha: &str, paths: &[String]) -> anyhow::Result<ShowResult> {
     validate_sha(sha)?;
+    for path in paths {
+        validate_read_path(path)?;
+    }
     let resolved = run_git(
         &[
             &git_dir(bare),
@@ -798,35 +809,23 @@ pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
         at: parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
         message: parts.next().unwrap_or("").trim().to_string(),
     };
-    let files_run = run_capped(
-        &[
-            &gd,
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "-r",
-            "--root",
-            &sha,
-        ],
-        MAX_GIT_OUTPUT_BYTES,
-    )
-    .await?;
-    if files_run.failed() {
-        anyhow::bail!("git diff-tree failed\n{}", files_run.stderr);
+    // The stat list always names every changed file, even when `paths`
+    // narrows the patch: it is never cut.
+    let stats = stats_against_parent(bare, &sha).await?;
+    let mut patch_args = vec![
+        gd.clone(),
+        "show".to_string(),
+        "--format=".to_string(),
+        "--no-ext-diff".to_string(),
+        "--unified=3".to_string(),
+        sha.clone(),
+    ];
+    if !paths.is_empty() {
+        patch_args.push("--".to_string());
+        patch_args.extend(paths.iter().cloned());
     }
-    let files: Vec<String> = String::from_utf8_lossy(&files_run.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect();
     let patch_run = run_capped(
-        &[
-            &gd,
-            "show",
-            "--format=",
-            "--no-ext-diff",
-            "--unified=3",
-            &sha,
-        ],
+        &patch_args.iter().map(String::as_str).collect::<Vec<_>>(),
         MAX_GIT_OUTPUT_BYTES,
     )
     .await?;
@@ -835,11 +834,19 @@ pub async fn show(bare: &Path, sha: &str) -> anyhow::Result<ShowResult> {
     }
     let patch = String::from_utf8_lossy(&patch_run.stdout).into_owned();
     let (patch, cut) = truncate_utf8(&patch, MAX_PATCH_BYTES);
+    let root = run_git(
+        &[&gd, "rev-parse", "--verify", &format!("{sha}^")],
+        &[],
+        GIT_TIMEOUT,
+    )
+    .await
+    .is_err();
     Ok(ShowResult {
         commit,
-        files,
+        stats,
         patch,
         truncated: patch_run.truncated || cut,
+        root,
     })
 }
 /// The first parent of `sha`, or `None` for a root commit. Errors on an
@@ -1178,15 +1185,23 @@ mod tests {
         assert_eq!(head.as_deref(), Some(sha.as_str()));
         assert_eq!(entries.len(), 1);
         assert_eq!(next, 1);
-        let shown = show(&bare, &sha).await.unwrap();
+        let shown = show(&bare, &sha, &[]).await.unwrap();
         assert_eq!(shown.commit.sha, sha);
         assert_eq!(shown.commit.author_name, "ana");
         assert_eq!(shown.commit.author_email, "id@example.com");
         assert!(shown.commit.at > 0);
         assert_eq!(shown.commit.message, "first");
-        assert_eq!(shown.files.len(), 2);
+        assert!(shown.root, "the seed commit has no parent");
+        assert_eq!(shown.stats.len(), 2);
         assert!(shown.patch.contains("Groceries"));
         assert!(!shown.truncated);
+        let one = show(&bare, &sha, &["pages/index.tsx".to_string()])
+            .await
+            .unwrap();
+        // The stats still name every file; only the patch narrows.
+        assert_eq!(one.stats.len(), 2);
+        assert!(one.patch.contains("pages/index.tsx"));
+        assert!(!one.patch.contains("lib/moderate.ts"));
     }
 
     #[tokio::test]
@@ -1232,8 +1247,8 @@ mod tests {
             "only whole lines before the cap count as hits"
         );
         // The same flood through `show`: the streamed patch is cut too.
-        let shown = show(&bare, &flood_sha).await.unwrap();
-        assert_eq!(shown.files.len(), 12);
+        let shown = show(&bare, &flood_sha, &[]).await.unwrap();
+        assert_eq!(shown.stats.len(), 12);
         assert!(shown.truncated);
         assert!(shown.patch.len() <= MAX_PATCH_BYTES);
     }

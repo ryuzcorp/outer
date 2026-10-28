@@ -526,10 +526,14 @@ async fn create_commit_read_history_roundtrip() {
     )
     .await;
     let shown = result(&shown);
-    assert!(shown["structuredContent"]["patch"]
+    assert!(shown["content"][1]["text"]
         .as_str()
         .unwrap()
         .contains("Vegetables"));
+    assert!(
+        shown["structuredContent"].get("patch").is_none(),
+        "patch is text-only"
+    );
 
     let (_, get) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
     assert_eq!(result(&get)["structuredContent"]["status"], "running");
@@ -8324,4 +8328,318 @@ async fn examples_without_files_is_small_and_text_only() {
     for entry in structured["files"].as_array().unwrap() {
         assert!(entry.get("text").is_none(), "no contents in structured");
     }
+}
+
+/// Weak `read_files` shapes normalise to the canonical input; a genuinely
+/// wrong shape fails with a tool-named `-32602` carrying the arg shape.
+#[tokio::test]
+async fn read_files_lenient_shapes() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // Bare path strings in `files`.
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": ["pages/index.tsx"]}),
+    )
+    .await;
+    let read = result(&read);
+    assert!(read.get("isError").is_none(), "{read}");
+    assert_eq!(
+        read["structuredContent"]["files"][0]["path"],
+        "pages/index.tsx"
+    );
+
+    // A `paths` alias for `files`.
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "paths": ["pages/index.tsx"]}),
+    )
+    .await;
+    assert!(result(&read).get("isError").is_none(), "{read:?}");
+
+    // A single `path` with a line range.
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "path": "pages/index.tsx",
+               "start_line": 1, "end_line": 1}),
+    )
+    .await;
+    let read = result(&read);
+    assert_eq!(
+        read["structuredContent"]["files"][0]["text"],
+        "1│ <h1>Groceries</h1>"
+    );
+
+    // A single `file`.
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "file": "pages/index.tsx"}),
+    )
+    .await;
+    assert!(result(&read).get("isError").is_none(), "{read:?}");
+
+    // A genuinely wrong shape names the tool, field and expected shape, and
+    // carries the rejected shape (types only) in `data`.
+    let (_, bad) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": 42}),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602);
+    let message = bad["error"]["message"].as_str().unwrap();
+    assert!(message.contains("read_files"), "{message}");
+    assert!(message.contains("`files`"), "{message}");
+    assert!(message.contains("got a number"), "{message}");
+    assert_eq!(bad["error"]["data"]["tool"], "read_files");
+    assert_eq!(
+        bad["error"]["data"]["shape"],
+        json!({"app": "string", "files": "number"})
+    );
+}
+
+/// `search_code` takes a bare string for `paths` (and a `glob` alias).
+#[tokio::test]
+async fn search_code_paths_string() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "Groceries", "paths": "pages/*.tsx"}),
+    )
+    .await;
+    let found = result(&found);
+    assert!(found.get("isError").is_none(), "{found}");
+    let files = found["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "pages/index.tsx");
+
+    let (_, found) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "Groceries", "glob": "*.tsx"}),
+    )
+    .await;
+    assert!(result(&found).get("isError").is_none(), "{found:?}");
+
+    let (_, bad) = call(
+        &state,
+        Some(&token),
+        "search_code",
+        json!({"app": "groceries", "query": "Groceries", "paths": 42}),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602);
+    let message = bad["error"]["message"].as_str().unwrap();
+    assert!(message.contains("search_code"), "{message}");
+    assert!(message.contains("`paths`"), "{message}");
+}
+
+/// `show_commit` budgets the patch at 20 KB behind an uncut stat list, flags
+/// the root commit, and filters to `path`/`paths` on request.
+#[tokio::test]
+async fn show_commit_budget_stats_and_filter() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    // The oldest commit is the root: no parent, so the patch is the tree.
+    let (_, history) = call(&state, Some(&token), "history", json!({"app": "groceries"})).await;
+    let commits = result(&history)["structuredContent"]["commits"].clone();
+    let root = commits.as_array().unwrap().last().unwrap()["sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, shown) = call(
+        &state,
+        Some(&token),
+        "show_commit",
+        json!({"app": "groceries", "sha": root}),
+    )
+    .await;
+    let shown = result(&shown);
+    assert_eq!(shown["structuredContent"]["root"], true);
+    assert!(
+        shown["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Root commit:"),
+        "{shown}"
+    );
+
+    // A 30 KB file: the patch is cut at 20 KB, the stats are not.
+    let big = "line\n".repeat(6000);
+    let (_, committed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Big file",
+               "writes": [{"path": "big.txt", "content": big},
+                          {"path": "note.txt", "content": "small\n"}]}),
+    )
+    .await;
+    let sha = result(&committed)["structuredContent"]["commit"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, shown) = call(
+        &state,
+        Some(&token),
+        "show_commit",
+        json!({"app": "groceries", "sha": sha}),
+    )
+    .await;
+    let shown = result(&shown);
+    let structured = &shown["structuredContent"];
+    assert_eq!(structured["truncated"], true);
+    assert!(
+        shown["content"][1]["text"].as_str().unwrap().len() <= 21 * 1024,
+        "patch is budgeted"
+    );
+    let files = structured["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    let big_stat = files.iter().find(|f| f["path"] == "big.txt").unwrap();
+    assert_eq!(big_stat["status"], "A");
+    assert_eq!(big_stat["added"], 6000);
+    assert_eq!(big_stat["removed"], 0);
+    let summary = shown["content"][0]["text"].as_str().unwrap();
+    assert!(summary.contains("A big.txt +6000/-0"), "{summary}");
+    assert!(
+        summary.contains(
+            "Patch cut at 20 KB. To see files, call open_app for the tree, or read_files {paths} for contents."
+        ),
+        "{summary}"
+    );
+
+    // `path` narrows the patch but keeps the full stat list.
+    let (_, shown) = call(
+        &state,
+        Some(&token),
+        "show_commit",
+        json!({"app": "groceries", "sha": sha, "path": "note.txt"}),
+    )
+    .await;
+    let shown = result(&shown);
+    let structured = &shown["structuredContent"];
+    assert_eq!(structured["files"].as_array().unwrap().len(), 2);
+    let patch = shown["content"][1]["text"].as_str().unwrap();
+    assert!(patch.contains("+++ b/note.txt"), "{patch}");
+    assert!(!patch.contains("big.txt"), "{patch}");
+}
+
+/// Failing exact edits are all reported in one error — by `commit` and by
+/// `stage`, which share the edit path — with the match count and the
+/// closest window for zero matches.
+#[tokio::test]
+async fn commit_edit_mismatch_reports_all_failures() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    commit_writes(
+        &state,
+        &token,
+        "groceries",
+        vec![
+            ("app.ts", "const a = 1;\nconst b = 2;\nconst c = 3;\n"),
+            ("other.ts", "x;\ny;\n"),
+        ],
+    )
+    .await;
+
+    let (_, failed) = call(
+        &state,
+        Some(&token),
+        "commit",
+        json!({"app": "groceries", "message": "Bad edits",
+               "edits": [{"path": "app.ts", "old": "const a = 1;\nconst b = 9;\nconst c = 3;", "new": "x"},
+                         {"path": "other.ts", "old": ";", "new": "!"}]}),
+    )
+    .await;
+    let err = is_error(&failed);
+    assert_eq!(err["error"], "invalid_argument");
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains("edit 0"), "{message}");
+    assert!(message.contains("app.ts"), "{message}");
+    assert!(message.contains("edit 1"), "{message}");
+    assert!(message.contains("other.ts"), "{message}");
+    assert!(message.contains("matched 2 times"), "{message}");
+    assert!(message.contains("closest lines 1-3"), "{message}");
+    let edits = err["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 2);
+    assert_eq!(edits[0]["index"], 0);
+    assert_eq!(edits[0]["path"], "app.ts");
+    assert_eq!(edits[0]["matches"], 0);
+    assert_eq!(edits[0]["closest"]["start_line"], 1);
+    assert_eq!(edits[0]["closest"]["end_line"], 3);
+    assert!(
+        edits[0]["closest"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("const b = 2;"),
+        "{}",
+        edits[0]["closest"]["text"]
+    );
+    assert_eq!(edits[1]["index"], 1);
+    assert_eq!(edits[1]["matches"], 2);
+    assert!(
+        edits[1].get("closest").is_none(),
+        "duplicates carry no window"
+    );
+
+    // `stage` shares the path: the same shape comes back.
+    let (_, staged) = call(
+        &state,
+        Some(&token),
+        "stage",
+        json!({"app": "groceries",
+               "edits": [{"path": "app.ts", "old": "const b = 9;", "new": "x"}]}),
+    )
+    .await;
+    let err = is_error(&staged);
+    assert_eq!(err["error"], "invalid_argument");
+    assert_eq!(err["edits"].as_array().unwrap().len(), 1);
+    assert!(
+        err["message"].as_str().unwrap().contains("closest lines"),
+        "{err}"
+    );
+}
+
+/// Every `-32602` names the tool and carries the rejected shape in `data`.
+#[tokio::test]
+async fn invalid_params_name_tool_and_shape() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+
+    let (_, shape) = call(&state, Some(&token), "commit", json!({})).await;
+    assert_eq!(shape["error"]["code"], -32602);
+    let message = shape["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("commit:"), "{message}");
+    assert_eq!(shape["error"]["data"]["tool"], "commit");
+
+    let (_, shape) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": ["x.ts"], "sha": 7}),
+    )
+    .await;
+    assert_eq!(shape["error"]["code"], -32602);
+    assert_eq!(shape["error"]["data"]["shape"]["sha"], "number");
 }

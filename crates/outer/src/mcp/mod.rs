@@ -859,7 +859,97 @@ async fn handle_call(
     );
     match outcome {
         Ok(result) => rpc_result(id, result),
-        Err(tools::CallError::Rpc(code, message)) => rpc_error(Some(id), code, message),
+        Err(tools::CallError::Rpc(code, message)) => {
+            if code == -32602 {
+                // Argument-shape failures name the tool, the field and the
+                // expected shape, and log the rejected shape (types and keys
+                // only, never values) so the next failure tells us what the
+                // client sent.
+                let shape = arg_shape(args.as_ref());
+                tracing::info!(tool = name, shape = %shape, "rejected tool arguments");
+                let detail = message.strip_prefix("invalid params: ").unwrap_or(&message);
+                let message = detail
+                    .strip_prefix(&format!("{name}: "))
+                    .map(|rest| format!("{name}: {rest}"))
+                    .unwrap_or_else(|| format!("{name}: invalid params: {detail}"));
+                rpc_error_data(
+                    Some(id),
+                    code,
+                    message,
+                    json!({"tool": name, "shape": shape}),
+                )
+            } else {
+                rpc_error(Some(id), code, message)
+            }
+        }
         Err(tools::CallError::Tool(err)) => rpc_result(id, err.into_result()),
+    }
+}
+
+/// The `data` of a `-32602` error plus [`arg_shape`].
+fn rpc_error_data(
+    id: Option<Value>,
+    code: i64,
+    message: impl Into<String>,
+    data: Value,
+) -> Response {
+    let id = id.unwrap_or(Value::Null);
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message.into(), "data": data},
+        })),
+    )
+        .into_response()
+}
+
+/// The rejected argument's shape: JSON types and keys only, never values
+/// (bounded: at most 5 array elements, 4 levels deep).
+fn arg_shape(args: Option<&Value>) -> Value {
+    match args {
+        None | Some(Value::Null) => Value::Null,
+        Some(value) => shape_of(value, 0),
+    }
+}
+
+fn shape_of(value: &Value, depth: usize) -> Value {
+    if depth > 4 {
+        return json!(shape_name(value));
+    }
+    match value {
+        Value::Null => json!("null"),
+        Value::Bool(_) => json!("boolean"),
+        Value::Number(_) => json!("number"),
+        Value::String(_) => json!("string"),
+        Value::Array(items) => {
+            let mut shapes: Vec<Value> = items
+                .iter()
+                .take(5)
+                .map(|item| shape_of(item, depth + 1))
+                .collect();
+            if items.len() > 5 {
+                shapes.push(json!("..."));
+            }
+            Value::Array(shapes)
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), shape_of(item, depth + 1)))
+                .collect(),
+        ),
+    }
+}
+
+/// The bare type name for a value past the shape depth cap.
+fn shape_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
