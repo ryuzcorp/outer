@@ -38,7 +38,7 @@ pub async fn set_access(input: SetAccessInput, ctx: &Ctx<'_>) -> Result<Value, T
     // The Pro gate lives in the shared domain function, so the console
     // endpoint gating on the same function refuses identically.
     let plan = super::plan_of(&ctx.state.pool, &app.owner_id).await?;
-    crate::access::set_access(
+    let (mode, changed) = crate::access::set_access(
         &ctx.state.pool,
         &app.id,
         mode,
@@ -47,6 +47,18 @@ pub async fn set_access(input: SetAccessInput, ctx: &Ctx<'_>) -> Result<Value, T
     )
     .await
     .map_err(|err| access_tool_error(&app.slug, err, &ctx.state.billing, &app.owner_id))?;
+    // A real change evicts anything cached before the lock (or unlock):
+    // the live host, the preview host and every active custom domain.
+    if changed {
+        crate::access::spawn_gate_purge(
+            &ctx.state.purges,
+            ctx.state.delete_cfg.cache_purge.clone(),
+            ctx.state.pool.clone(),
+            ctx.state.delete_cfg.apps_domain.clone(),
+            app.id.clone(),
+            app.slug.clone(),
+        );
+    }
     let summary = match mode {
         AccessMode::Pin => format!(
             "{} now asks visitors for a PIN. Share it with your family; changing it signs everyone out.",

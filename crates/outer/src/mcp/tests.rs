@@ -3505,7 +3505,7 @@ async fn set_access_is_pro_gated_and_never_echoes_the_secret() {
     let hash = hash.expect("pin stores a hash");
     assert!(hash.starts_with("$argon2id$"), "{hash}");
     assert!(!hash.contains("1234"));
-    assert_eq!(version, 2, "open and pin each bump the version");
+    assert_eq!(version, 1, "open is a no-op; only pin bumps the version");
 
     // `get_app` shows the mode, never the hash.
     let (_, got) = call(&state, Some(&ana), "get_app", json!({"app": "groceries"})).await;

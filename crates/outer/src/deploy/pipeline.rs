@@ -398,7 +398,7 @@ pub struct Deployer {
 pub struct PurgeTasks(Arc<Mutex<tokio::task::JoinSet<()>>>);
 
 impl PurgeTasks {
-    fn spawn(&self, purge: impl std::future::Future<Output = ()> + Send + 'static) {
+    pub(crate) fn spawn(&self, purge: impl std::future::Future<Output = ()> + Send + 'static) {
         let mut set = self.0.lock().expect("purge set poisoned");
         // Reap finished purges so a long-running `serve` doesn't accumulate them.
         while set.try_join_next().is_some() {}

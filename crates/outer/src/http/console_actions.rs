@@ -289,7 +289,7 @@ async fn set_app_access(
     secret: Option<&str>,
 ) -> Result<serde_json::Value, ToolError> {
     let plan = plan_of(&mcp.pool, &app.owner_id).await?;
-    crate::access::set_access(&mcp.pool, &app.id, mode, secret, &plan)
+    let (mode, changed) = crate::access::set_access(&mcp.pool, &app.id, mode, secret, &plan)
         .await
         .map_err(|err| {
             crate::mcp::tools::access::access_tool_error(
@@ -299,6 +299,18 @@ async fn set_app_access(
                 &app.owner_id,
             )
         })?;
+    // Same purge as the MCP tool: a real change evicts anything cached
+    // before the lock (or unlock) on every host serving the app.
+    if changed {
+        crate::access::spawn_gate_purge(
+            &mcp.purges,
+            mcp.delete_cfg.cache_purge.clone(),
+            mcp.pool.clone(),
+            mcp.delete_cfg.apps_domain.clone(),
+            app.id.clone(),
+            app.slug.clone(),
+        );
+    }
     Ok(json!({"access": mode.as_str()}))
 }
 

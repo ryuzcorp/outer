@@ -745,6 +745,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(&config),
         },
+        purges: purges.clone(),
         egress: egress.clone(),
         secrets_key,
         unsub_key: config.outer_secret.as_bytes().to_vec(),
