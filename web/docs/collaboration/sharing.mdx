@@ -7,7 +7,13 @@ Ask your agent to share your app and it returns the URL, a one-line share text, 
 
 New apps are unlisted: anyone with the link can open them, but search engines stay out. Public apps are listed and indexable, and public visibility is a Pro feature. Only the owner can change visibility in Console → Settings.
 
-If you downgrade, public apps return to unlisted.
+If you downgrade, public apps return to unlisted. An app access gate stays on until you turn it off.
+
+## Lock your app with a PIN or password
+
+On Pro, the owner can put a visitor gate on the app in Console → Settings → Visitor access (or ask your agent to call `set_access`): a 4-8 digit PIN or a password (8-128 characters). The gate locks every address that serves the app — its page, preview links, and any custom domain — and every page, including assets. Visitors see an unlock form; after one correct entry they stay unlocked on that address for 30 days. Changing the secret signs everyone out.
+
+Opening the app again is always free. If you downgrade, a gate you already set stays enforced — turn it off in Settings, but you can't set a new one until you resubscribe.
 
 Free apps show a small outer.now badge in the bottom-right corner of its pages. Pro removes it.
 

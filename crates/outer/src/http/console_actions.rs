@@ -29,6 +29,7 @@ use crate::mcp::McpState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/console/apps/{slug}/visibility", post(api_visibility))
+        .route("/api/console/apps/{slug}/access", post(api_access))
         .route("/api/console/apps/{slug}/always-on", post(api_always_on))
         .route("/api/console/apps/{slug}/rename", post(api_rename))
         .route("/api/console/apps/{slug}/delete", post(api_delete))
@@ -239,6 +240,66 @@ async fn set_app_visibility(
     let host = format!("{}.{}", app.slug, mcp.delete_cfg.apps_domain);
     crate::cloudflare::purge_host_cache(mcp.delete_cfg.cache_purge.as_ref(), &host).await;
     Ok(json!({"visibility": visibility.as_str()}))
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessBody {
+    mode: String,
+    secret: Option<String>,
+}
+
+/// `POST /api/console/apps/:slug/access {mode, secret?}`: the MCP
+/// `set_access` path — open, pin (4-8 digits) or password (8-128 chars).
+/// PIN/password need Pro; opening never does. The audit summary names the
+/// mode only, never the secret.
+async fn api_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Json(body): Json<AccessBody>,
+) -> Response {
+    let mcp = &state.mcp;
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
+        Ok(pair) => pair,
+        Err(res) => return *res,
+    };
+    let mode = match body.mode.as_str() {
+        "open" => crate::access::AccessMode::Open,
+        "pin" => crate::access::AccessMode::Pin,
+        "password" => crate::access::AccessMode::Password,
+        other => {
+            return tool_response(&ToolError::invalid_argument(format!(
+                "mode must be open, pin or password, got {other:?}"
+            )))
+            .into_response();
+        }
+    };
+    // The summary never carries the secret: the action log must not hold
+    // credentials.
+    let summary = format!("set_access {}", mode.as_str());
+    let result = set_app_access(mcp, &app, mode, body.secret.as_deref()).await;
+    audited(mcp, &account, &app, admin, "set_access", &summary, result).await
+}
+
+/// The domain call, shared by the access endpoint's three modes.
+async fn set_app_access(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    mode: crate::access::AccessMode,
+    secret: Option<&str>,
+) -> Result<serde_json::Value, ToolError> {
+    let plan = plan_of(&mcp.pool, &app.owner_id).await?;
+    crate::access::set_access(&mcp.pool, &app.id, mode, secret, &plan)
+        .await
+        .map_err(|err| {
+            crate::mcp::tools::access::access_tool_error(
+                &app.slug,
+                err,
+                &mcp.billing,
+                &app.owner_id,
+            )
+        })?;
+    Ok(json!({"access": mode.as_str()}))
 }
 
 #[derive(Debug, Deserialize)]

@@ -188,6 +188,19 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `app` | string | yes | The app slug. |
 | `on` | boolean | yes | true keeps the fleet awake (Pro only); false lets it sleep on idle. |
 
+## `set_access`
+
+- **Access:** signed in
+- **Description:** Put a visitor gate on your app {app, mode, secret?}: open (default, everyone walks in), pin (4-8 digits) or password (8-128 chars). PIN and password are a Pro feature; opening is always allowed. The gate locks every host and path until the visitor unlocks; changing the secret signs everyone out. Never returns the secret. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+| `mode` | string | yes | open (default, everyone walks in), pin (4-8 digits) or password (8-128 chars, no control characters). |
+| `secret` | string | no | Required for pin/password, refused for open. Never echoed back. |
+
 ## `share_app`
 
 - **Access:** signed in

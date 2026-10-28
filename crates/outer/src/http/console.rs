@@ -27,6 +27,8 @@
 //!   `set_visibility` path, including the shared Pro gate.
 //! - `POST /api/console/apps/:slug/always-on {on}`: the MCP `set_always_on`
 //!   path (Pro keep-warm), including the shared Pro gate.
+//! - `POST /api/console/apps/:slug/access {mode, secret?}`: the MCP
+//!   `set_access` path (Pro visitor gate), including the shared Pro gate.
 //! - `POST /api/console/apps/:slug/delete {confirm}`: the MCP `delete_app`
 //!   path; `confirm` must equal the slug.
 //! - `PUT /api/console/apps/:slug/secrets/:name {value}` and
@@ -793,6 +795,7 @@ async fn api_apps(State(state): State<super::AppState>, headers: HeaderMap) -> R
                 crate::collaborators::Role::Collaborator => "collaborator",
             },
             "visibility": app.visibility.as_str(),
+            "access": app.access_mode.as_str(),
             "always_on": app.always_on,
             "status": status,
             "last_request_at": app.last_request_at,
@@ -938,6 +941,7 @@ async fn api_app(
             crate::collaborators::Role::Collaborator => "collaborator",
         },
         "visibility": app.visibility.as_str(),
+        "access": app.access_mode.as_str(),
         "always_on": app.always_on,
         "status": status,
         "last_request_at": app.last_request_at,
@@ -3428,6 +3432,101 @@ mod tests {
         assert!(rows.iter().any(|(_, outcome, _)| outcome == "ok"));
         assert!(rows.iter().any(|(_, outcome, code)| outcome == "error"
             && *code == Some("payment_required".to_string())));
+    }
+
+    #[tokio::test]
+    async fn console_access_pro_gate() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        let session = login(&pool, "ana@example.com").await;
+        let path = "/api/console/apps/groceries/access";
+
+        // Free owner: `pin` is refused with the MCP code and a user
+        // message pointing to Pro.
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                path,
+                &session,
+                serde_json::json!({"mode": "pin", "secret": "1234"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let body: serde_json::Value = body.parse().unwrap();
+        assert_eq!(body["error"], "payment_required");
+        assert!(
+            body["user_message"].as_str().unwrap().contains("Pro"),
+            "{body}"
+        );
+
+        // `open` is always allowed, on any plan.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &session, serde_json::json!({"mode": "open"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.parse::<serde_json::Value>().unwrap()["access"], "open");
+
+        // Pro owner: `pin` flips the row, storing a hash, never the secret.
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE id = 'acct-ana@example.com'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, body) = send(
+            &app,
+            post_json(
+                path,
+                &session,
+                serde_json::json!({"mode": "pin", "secret": "1234"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.parse::<serde_json::Value>().unwrap()["access"], "pin");
+        let (mode, hash): (String, Option<String>) =
+            sqlx::query_as("SELECT access_mode, access_hash FROM app WHERE slug = 'groceries'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "pin");
+        let hash = hash.expect("pin stores a hash");
+        assert!(hash.starts_with("$argon2id$"), "{hash}");
+
+        // Bad shapes are refused as invalid_argument.
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                path,
+                &session,
+                serde_json::json!({"mode": "pin", "secret": "12"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Every attempt audited under the MCP tool name, and no summary
+        // ever carries the secret.
+        let rows = action_rows(&pool).await;
+        assert!(
+            rows.iter().all(|(tool, _, _)| tool == "set_access"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|(_, outcome, _)| outcome == "ok"));
+        assert!(rows.iter().any(|(_, outcome, code)| outcome == "error"
+            && *code == Some("payment_required".to_string())));
+        let summaries: Vec<String> =
+            sqlx::query_scalar("SELECT summary FROM agent_action WHERE tool = 'set_access'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(!summaries.is_empty());
+        assert!(
+            summaries.iter().all(|s| !s.contains("1234")),
+            "audit never holds the secret: {summaries:?}"
+        );
     }
 
     #[tokio::test]

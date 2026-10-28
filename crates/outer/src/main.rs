@@ -868,7 +868,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             metrics.clone(),
         )
         .with_look_tokens(look_tokens)
-        .with_crawl_hooks(crawl_hooks),
+        .with_crawl_hooks(crawl_hooks)
+        .with_access_key(outer::access::AccessKey::derive(&config.outer_secret)),
         config.domain.clone(),
     );
     tracing::info!(

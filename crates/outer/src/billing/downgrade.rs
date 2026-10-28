@@ -11,8 +11,11 @@
 //! and forces every public app back to `unlisted` through the shared
 //! `set_visibility` plus the same app-host edge purge the MCP tool and the
 //! console do — the stored visibility must not stay `public` on a Free
-//! account. Re-upgrading cancels a pending purge (the stamps clear) but
-//! restarts nothing: stopped apps stay stopped until the owner wakes one.
+//! account. The visitor gate (`access_mode`) is deliberately untouched:
+//! removing it would expose a private app, so a gated app stays gated and
+//! the owner can only turn it off, never set a new one. Re-upgrading
+//! cancels a pending purge (the stamps clear) but restarts nothing: stopped
+//! apps stay stopped until the owner wakes one.
 
 use sqlx::SqlitePool;
 

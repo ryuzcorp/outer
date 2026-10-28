@@ -2250,6 +2250,7 @@ export function SettingsView({
         </div>
       </section>
       {app.role === "owner" && <VisibilityCard app={app} plan={plan} onRefresh={onRefresh} />}
+      {app.role === "owner" && <VisitorAccessCard app={app} plan={plan} onRefresh={onRefresh} />}
       {app.role === "owner" && <KeepWarmCard app={app} plan={plan} onRefresh={onRefresh} />}
       {app.role === "owner" && (
         <DomainsCard
@@ -2366,6 +2367,196 @@ function VisibilityCard({
             isPro ? null : "Pro",
           )}
         </div>
+        {error() && (
+          <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
+            <span class="min-w-0 break-words">{error()}</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// Settings → Visitor access card: the app's PIN/password gate (owner-only).
+// Open serves everyone; PIN (4-8 digits) and password (8-128 chars) lock
+// every host and path behind the unlock form. PIN/password need Pro;
+// opening never does. The secret input never renders the stored value.
+function VisitorAccessCard({
+  app,
+  plan,
+  onRefresh,
+}: {
+  app: AppDetail;
+  plan: string;
+  onRefresh: () => void;
+}) {
+  const picked = atom<"open" | "pin" | "password">(
+    app.access === "pin" || app.access === "password" ? app.access : "open",
+  );
+  const secret = atom("");
+  const pending = atom<boolean | null>(null);
+  const error = atom<string | null>(null);
+  const isPro = plan === "pro";
+  const needsSecret = picked() === "pin" || picked() === "password";
+
+  async function save(): Promise<void> {
+    if (pending() !== null) {
+      return;
+    }
+    const mode = picked();
+    if (mode === "pin" && !/^\d{4,8}$/.test(secret())) {
+      error.set("The PIN must be 4-8 digits.");
+      return;
+    }
+    if (mode === "password" && (secret().length < 8 || secret().length > 128)) {
+      error.set("The password must be 8-128 characters.");
+      return;
+    }
+    pending.set(true);
+    error.set(null);
+    try {
+      await settingsActions.setAccess.run({
+        slug: app.slug,
+        mode,
+        secret: mode === "open" ? undefined : secret(),
+      });
+      secret.set("");
+      onRefresh();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      pending.set(null);
+    }
+  }
+
+  function option(
+    value: "open" | "pin" | "password",
+    title: string,
+    explainer: string,
+    disabled: boolean,
+    badge: string | null,
+  ) {
+    return (
+      <label
+        class={`flex min-w-0 cursor-pointer items-start gap-3 rounded-box border border-base-300 p-3${disabled ? " opacity-60" : ""}`}
+      >
+        <input
+          type="radio"
+          name={`access-${app.slug}`}
+          class="radio mt-0.5 shrink-0"
+          checked={picked() === value}
+          disabled={disabled || pending() !== null}
+          onchange={() => {
+            picked.set(value);
+            error.set(null);
+          }}
+        />
+        <span class="min-w-0 flex-1">
+          <span class="flex min-w-0 flex-wrap items-center gap-2">
+            <strong class="min-w-0 truncate">{title}</strong>
+            {app.access === value && (
+              <span class="badge badge-soft badge-success badge-sm shrink-0" title="The gate in force">
+                Current
+              </span>
+            )}
+            {badge && (
+              <span class="badge badge-soft badge-info badge-sm shrink-0" title={badge}>
+                {badge}
+              </span>
+            )}
+          </span>
+          <span class="mt-0.5 block min-w-0 break-words text-[13px] opacity-60">
+            {explainer}
+          </span>
+        </span>
+      </label>
+    );
+  }
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Visitor access">
+      <div class="card-body min-w-0">
+        <h2 class="card-title min-w-0 truncate" title="Visitor access">
+          Visitor access
+          {!isPro && (
+            <span class="badge badge-soft badge-info badge-sm shrink-0" title="A PIN or password gate is a Pro feature">
+              Pro
+            </span>
+          )}
+          {pending() && <span class="loading loading-spinner loading-xs shrink-0" aria-label="Saving" />}
+        </h2>
+        <div class="flex min-w-0 flex-col gap-2" role="radiogroup" aria-label="Visitor access">
+          {option(
+            "open",
+            "Open",
+            "Everyone walks in. Always free, even to remove a gate left by a downgrade.",
+            false,
+            null,
+          )}
+          {option(
+            "pin",
+            "PIN",
+            "Visitors type a 4-8 digit PIN to enter. Changing it signs everyone out.",
+            !isPro,
+            isPro ? null : "Pro",
+          )}
+          {option(
+            "password",
+            "Password",
+            "Visitors type a password (8-128 characters) to enter. Changing it signs everyone out.",
+            !isPro,
+            isPro ? null : "Pro",
+          )}
+        </div>
+        {needsSecret &&
+          (isPro ? (
+            <div class="mt-2 flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end">
+              <label class="form-control min-w-0 flex-1" for={`access-secret-${app.slug}`}>
+                <span class="label-text min-w-0 break-words">
+                  {picked() === "pin" ? "New PIN (4-8 digits)" : "New password (8-128 characters)"}
+                </span>
+                <input
+                  id={`access-secret-${app.slug}`}
+                  class="input input-bordered input-sm w-full min-w-0"
+                  type={picked() === "pin" ? "text" : "password"}
+                  inputmode={picked() === "pin" ? "numeric" : undefined}
+                  autocomplete={picked() === "pin" ? "one-time-code" : "new-password"}
+                  value={secret()}
+                  disabled={pending() !== null}
+                  oninput={(e: Event) => {
+                    secret.set((e.target as HTMLInputElement).value);
+                  }}
+                />
+              </label>
+              <button
+                type="button"
+                class="btn btn-neutral btn-sm min-w-0 shrink-0"
+                disabled={pending() !== null || secret().length === 0}
+                title={picked() === app.access ? "Change the secret" : "Lock the app"}
+                onclick={() => void save()}
+              >
+                {pending() ? "Saving…" : "Save"}
+              </button>
+            </div>
+          ) : (
+            <p class="m-0 mt-2 min-w-0 break-words text-[13px] opacity-60">
+              A PIN or password gate needs Outer Pro. Upgrade in billing, then
+              set it here (or ask your agent to call `set_access`).
+            </p>
+          ))}
+        {!needsSecret && picked() !== app.access && (
+          <div class="mt-2 min-w-0">
+            <button
+              type="button"
+              class="btn btn-neutral btn-sm min-w-0 shrink-0"
+              disabled={pending() !== null}
+              title="Remove the gate"
+              onclick={() => void save()}
+            >
+              {pending() ? "Saving…" : "Save"}
+            </button>
+          </div>
+        )}
         {error() && (
           <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
             <span class="min-w-0 break-words">{error()}</span>

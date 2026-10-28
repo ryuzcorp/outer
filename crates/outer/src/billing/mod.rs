@@ -418,7 +418,7 @@ impl PendingEffects {
             // change stands, like the collaborator invite.
             let upgrade = billing.upgrade_url(account_id, now_secs);
             let text = format!(
-                "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (20 apps, 1,000 changes a day): {upgrade}\n\nAfter 7 days your account returns to Free: every app but your two oldest stops, and Pro features pause until you resubscribe. Your code and data stay."
+                "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (20 apps, 1,000 changes a day): {upgrade}\n\nAfter 7 days your account returns to Free: every app but your two oldest stops, and Pro features pause until you resubscribe. An app access gate stays on until you turn it off. Your code and data stay."
             );
             if let Err(err) = sender
                 .send_text(email, "Outer Pro payment failed — 7 days to update", &text)
@@ -1088,7 +1088,7 @@ pub async fn run_grace_sweep(
             downgraded += 1;
             let upgrade = billing.upgrade_url(&user.id, now_secs);
             let text = format!(
-                "Your Outer Pro grace period ended and your account is back on Free: every app but your two oldest stopped, and Pro features paused. Your code and data are kept. Resubscribe anytime: {upgrade}"
+                "Your Outer Pro grace period ended and your account is back on Free: every app but your two oldest stopped, and Pro features paused. An app access gate stays on until you turn it off. Your code and data are kept. Resubscribe anytime: {upgrade}"
             );
             if let Err(err) = sender
                 .send_text(&user.email, "Outer Pro ended — you're on Free", &text)

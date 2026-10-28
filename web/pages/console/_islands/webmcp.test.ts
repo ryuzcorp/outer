@@ -375,6 +375,7 @@ describe("console bridge", () => {
       url: "https://groceries.outer.now",
       role: "owner",
       visibility: "unlisted",
+      access: "open",
       always_on: false,
       status: "running",
       last_request_at: null,

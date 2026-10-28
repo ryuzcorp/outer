@@ -53,6 +53,16 @@ export interface SetAlwaysOnOutput {
   always_on: boolean;
 }
 
+export interface SetAccessInput {
+  slug: string;
+  mode: "open" | "pin" | "password";
+  secret?: string;
+}
+
+export interface SetAccessOutput {
+  access: string;
+}
+
 export interface RenameAppInput {
   slug: string;
   newSlug: string;
@@ -125,6 +135,33 @@ const setAlwaysOn: ConsoleAction<SetAlwaysOnInput, SetAlwaysOnOutput> = {
   },
 };
 
+const setAccess: ConsoleAction<SetAccessInput, SetAccessOutput> = {
+  name: "set_access",
+  title: "Set visitor access",
+  description:
+    "Put a visitor gate on the app: open (default, everyone walks in), pin (4-8 digits) or password (8-128 chars). PIN and password are a Pro feature: Free owners are refused with payment_required. Changing the secret signs everyone out. Returns {access}.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      slug: { type: "string" },
+      mode: { type: "string", enum: ["open", "pin", "password"] },
+      secret: { type: "string" },
+    },
+    required: ["slug", "mode"],
+  },
+  readOnly: false,
+  consequential: false,
+  untrusted: false,
+  run(input, _ctx, signal) {
+    return request<SetAccessOutput>(
+      "POST",
+      `/api/console/apps/${encodeURIComponent(input.slug)}/access`,
+      { mode: input.mode, secret: input.secret },
+      signal,
+    );
+  },
+};
+
 const renameApp: ConsoleAction<RenameAppInput, RenameAppOutput> = {
   name: "rename_app",
   title: "Rename app",
@@ -191,8 +228,9 @@ const deleteApp: ConsoleAction<DeleteAppInput, DeleteAppOutput> = {
 export const actions: ConsoleAction<unknown, unknown>[] = [
   setVisibility as ConsoleAction<unknown, unknown>,
   setAlwaysOn as ConsoleAction<unknown, unknown>,
+  setAccess as ConsoleAction<unknown, unknown>,
   renameApp as ConsoleAction<unknown, unknown>,
   deleteApp as ConsoleAction<unknown, unknown>,
 ];
 
-export const settingsActions = { setVisibility, setAlwaysOn, renameApp, deleteApp };
+export const settingsActions = { setVisibility, setAlwaysOn, setAccess, renameApp, deleteApp };
