@@ -505,11 +505,23 @@ pub fn build_delete_keys(
         .to_string())
 }
 
-/// One exec for every table's row count:
-/// `SELECT 'name' AS t, COUNT(*) AS n FROM "name" UNION ALL …`.
+/// Most `UNION ALL` terms one `celld d1 execute` takes. Prod celld 0.6.2
+/// refuses 6+ terms (`D1_EXEC_ERROR: too many terms in compound SELECT`;
+/// without a trailing semicolon it misleadingly says "incomplete
+/// statement"), so counts for more tables run as several execs. Found live:
+/// the D1 tables view 502'd for an app the moment it grew a 6th visible
+/// table. Keep this at or under the observed boundary.
+pub const MAX_UNION_TERMS: usize = 5;
+
+/// One compound `SELECT 'name' AS t, COUNT(*) AS n FROM "name" UNION ALL …`
+/// per chunk: callers must send chunks, never the whole table list.
 pub fn build_table_counts(tables: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for name in tables {
+        assert!(
+            parts.len() < MAX_UNION_TERMS,
+            "build_table_counts takes at most {MAX_UNION_TERMS} tables; chunk first"
+        );
         parts.push(format!(
             "SELECT {} AS t, COUNT(*) AS n FROM {}",
             string_literal(name),
@@ -517,6 +529,15 @@ pub fn build_table_counts(tables: &[String]) -> String {
         ));
     }
     parts.join(" UNION ALL ")
+}
+
+/// The counts queries for `tables`, chunked so no exec exceeds
+/// [`MAX_UNION_TERMS`] terms.
+pub fn table_count_queries(tables: &[String]) -> Vec<String> {
+    tables
+        .chunks(MAX_UNION_TERMS)
+        .map(build_table_counts)
+        .collect()
 }
 
 /// Tag column stamping every row of a batched exec so `split_batched` can
@@ -967,7 +988,8 @@ pub(crate) async fn database_bindings(store: &Store, slug: &str) -> anyhow::Resu
         .collect())
 }
 
-/// Tables plus row counts, in one `SELECT … UNION ALL …` exec.
+/// Tables plus row counts, chunked into several `SELECT … UNION ALL …`
+/// execs when there are more tables than [`MAX_UNION_TERMS`].
 pub async fn list_tables(
     ctx: &D1Ctx,
     app: &crate::apps::App,
@@ -1002,16 +1024,8 @@ pub async fn list_tables(
     }
     names.sort();
     let mut counts: BTreeMap<String, i64> = BTreeMap::new();
-    if !names.is_empty() {
-        let out = d1_exec(
-            ctx,
-            &app.slug,
-            &identity,
-            &build_table_counts(&names),
-            true,
-            project.path(),
-        )
-        .await?;
+    for query in table_count_queries(&names) {
+        let out = d1_exec(ctx, &app.slug, &identity, &query, true, project.path()).await?;
         for row in parse_json_rows(&out) {
             if let (Some(name), Some(n)) = (json_str(&row, "t"), json_i64(&row, "n")) {
                 counts.insert(name.to_string(), n);
@@ -2069,6 +2083,31 @@ mod tests {
             "SELECT 'users' AS t, COUNT(*) AS n FROM \"users\" UNION ALL \
              SELECT 'orgs\"x' AS t, COUNT(*) AS n FROM \"orgs\"\"x\""
         );
+    }
+
+    #[test]
+    fn table_counts_chunk_at_the_celld_union_limit() {
+        let tables = |n: usize| (0..n).map(|i| format!("t{i:02}")).collect::<Vec<_>>();
+        // At the boundary: one exec.
+        assert_eq!(table_count_queries(&tables(0)).len(), 0);
+        assert_eq!(table_count_queries(&tables(1)).len(), 1);
+        assert_eq!(table_count_queries(&tables(MAX_UNION_TERMS)).len(), 1);
+        // Past it: one more exec, and no exec exceeds the limit.
+        let queries = table_count_queries(&tables(MAX_UNION_TERMS + 2));
+        assert_eq!(queries.len(), 2);
+        for query in &queries {
+            let terms = query.matches("UNION ALL").count() + 1;
+            assert!(terms <= MAX_UNION_TERMS, "{query}");
+        }
+        // Every table is counted exactly once, in order.
+        let all = queries.join(" UNION ALL ");
+        for i in 0..MAX_UNION_TERMS + 2 {
+            let name = format!("t{i:02}");
+            assert!(
+                all.matches(&format!("FROM \"{name}\"")).count() == 1,
+                "{all}"
+            );
+        }
     }
 
     // --- database allowlist ----------------------------------------------
