@@ -519,7 +519,7 @@ export const RowEditor = ({
           <h3
             id={titleId}
             tabindex="-1"
-            class="m-0 text-lg font-bold outline-none"
+            class="m-0 text-lg font-semibold outline-none"
           >
             {title}
             <span class="font-normal opacity-60"> · {schema.table}</span>
