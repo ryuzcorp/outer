@@ -8,6 +8,16 @@ export default defineConfig({
   // Logo mark beside the wordmark (Blume inlines web/public/logo.svg; the
   // same file ships as /favicon.svg for the favicon).
   logo: { image: "/logo.svg", text: "Outer" },
+  // Typography: Geist everywhere, self-hosted (Blume downloads the files
+  // at build time and serves them locally — no Google Fonts requests at
+  // runtime). Same two families as the console (see pages/console/console.css).
+  theme: {
+    fonts: {
+      display: "geist",
+      body: "geist",
+      mono: "geist-mono",
+    },
+  },
   // Ilha islands in the console pages (`pages/console/`): Astro renders
   // them server-side and hydrates them in the browser (`client:load`).
   // The islands use the automatic JSX runtime (`jsxImportSource: ilha`,

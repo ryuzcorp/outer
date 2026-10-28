@@ -54,7 +54,7 @@ export function NewFolderButton({
       {open() ? (
         <div class="modal modal-open" role="dialog" aria-modal="true" aria-label="Create folder">
           <div class="modal-box min-w-0">
-            <h3 class="m-0 text-base font-bold">New folder</h3>
+            <h3 class="m-0 text-base font-semibold">New folder</h3>
             <label class="flex flex-col gap-1 py-3 text-sm" for="r2-new-folder">
               Folder name
               <input

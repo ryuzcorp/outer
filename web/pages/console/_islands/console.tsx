@@ -1065,7 +1065,7 @@ export function Console() {
                   aria-hidden="true"
                 />
                 <span class="avatar avatar-placeholder" aria-hidden="true">
-                  <span class="flex h-11 w-11 items-center justify-center text-xl font-bold">
+                  <span class="flex h-11 w-11 items-center justify-center text-lg font-semibold">
                     {monogram(a.slug)}
                   </span>
                 </span>
@@ -1090,7 +1090,7 @@ export function Console() {
                   aria-hidden="true"
                 />
                 <span class="avatar avatar-placeholder" aria-hidden="true">
-                  <span class="flex h-11 w-11 items-center justify-center text-xl font-bold">
+                  <span class="flex h-11 w-11 items-center justify-center text-lg font-semibold">
                     {monogram(active.slug)}
                   </span>
                 </span>
@@ -1163,7 +1163,7 @@ export function Console() {
               onclick={() => patchUi({ accountOpen: !ui().accountOpen })}
             >
               <span class="avatar avatar-placeholder">
-                <span class="bg-base-300 flex h-11 w-11 items-center justify-center rounded-[14px] text-xl font-bold">
+                <span class="bg-base-300 flex h-11 w-11 items-center justify-center rounded-[14px] text-lg font-semibold">
                   <span aria-hidden="true">
                     {(email() || "?").slice(0, 1).toUpperCase()}
                   </span>
@@ -1468,7 +1468,7 @@ export function Console() {
             <aside class="side max-md:min-h-dvh min-w-0" aria-label="App navigation">
               <div class="side-head">
                 <div class="side-id">
-                  <p class="m-0 min-w-0 truncate text-[15px] font-semibold" title={active.slug}>
+                  <p class="m-0 min-w-0 truncate text-base font-semibold" title={active.slug}>
                     {active.slug}
                   </p>
                   <p class="m-0 min-w-0 truncate text-xs opacity-60" title={active.url}>
@@ -1610,7 +1610,7 @@ export function Console() {
             <aside class="side max-md:min-h-dvh min-w-0" aria-label="Account navigation">
               <div class="side-head">
                 <div class="side-id">
-                  <p class="m-0 min-w-0 truncate text-[15px] font-semibold" title="Account">
+                  <p class="m-0 min-w-0 truncate text-base font-semibold" title="Account">
                     Account
                   </p>
                   <p class="m-0 min-w-0 truncate text-xs opacity-60" title={email()}>
@@ -1645,7 +1645,7 @@ export function Console() {
               </ul>
               <div class="side-foot">
                 <div class="divider my-2" aria-hidden="true" />
-                <p class="m-0 min-w-0 truncate font-mono text-xs opacity-60" title={email()}>
+                <p class="m-0 min-w-0 truncate text-xs opacity-60" title={email()}>
                   {email()}
                 </p>
               </div>

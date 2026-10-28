@@ -388,7 +388,7 @@ export function ErrorsView({
                                 <span class="loading loading-spinner loading-sm" aria-label="Loading issue detail" />
                               ) : (
                                 <div class="flex min-w-0 flex-col gap-2 py-1">
-                                  <p class="m-0 min-w-0 break-words font-mono text-sm" title={detail()?.issue.message}>
+                                  <p class="m-0 min-w-0 break-words text-sm" title={detail()?.issue.message}>
                                     {detail()?.issue.message}
                                   </p>
                                   {detail()?.issue.frame && (

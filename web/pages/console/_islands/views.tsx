@@ -232,7 +232,7 @@ function StatCard({
         {icon}
         <span class="min-w-0 flex-1 truncate" title={label}>{label}</span>
       </div>
-      <div class="stat-value min-w-0 truncate text-3xl font-medium" title={pill ? `${value} ${pill}` : value}>
+      <div class="stat-value min-w-0 truncate text-lg font-semibold" title={pill ? `${value} ${pill}` : value}>
         {value}
         {pill != null && pill !== "" && (
           <span class="badge badge-soft badge-sm ml-2 shrink-0 align-middle" title={pillTitle}>{pill}</span>
@@ -608,7 +608,7 @@ export function OverviewView({
                       <span class={`badge badge-soft ${outcomeBadge(a.outcome)} shrink-0`} title={a.outcome}>
                         {a.outcome}
                       </span>
-                      <span class="min-w-0 flex-1 truncate font-mono text-xs" title={a.summary}>
+                      <span class="min-w-0 flex-1 truncate text-xs" title={a.summary}>
                         {a.summary || a.tool}
                       </span>
                       <span class="shrink-0 whitespace-nowrap text-xs opacity-60" title={when(a.at)}>
@@ -640,7 +640,7 @@ export function OverviewView({
                 .slice(0, 3)
                 .map((i) => (
                   <li key={i.fingerprint} class="list-row min-w-0 text-[13px]">
-                    <span class="min-w-0 flex-1 truncate font-mono text-xs" title={i.message}>
+                    <span class="min-w-0 flex-1 truncate text-xs" title={i.message}>
                       {i.message}
                     </span>
                     <span class="shrink-0 whitespace-nowrap text-xs opacity-60">
@@ -902,7 +902,7 @@ export function ActionsView({
                   </td>
                   <td class="truncate" title={a.by}>{a.by}</td>
                   <td class="truncate font-mono" title={a.tool}>{a.tool}</td>
-                  <td class="truncate font-mono" title={a.summary}>
+                  <td class="truncate" title={a.summary}>
                     {a.summary}
                   </td>
                   <td class="min-w-0">
@@ -1836,7 +1836,7 @@ export function DomainsCard({
         {domain && (
           <div class="mt-3 flex min-w-0 flex-col gap-3">
             <div class="flex min-w-0 flex-wrap items-center gap-2">
-              <span class="min-w-0 flex-1 truncate font-mono text-[15px]" title={domain.hostname}>
+              <span class="min-w-0 flex-1 truncate font-mono text-base" title={domain.hostname}>
                 {domain.hostname}
               </span>
               <span class={`badge badge-soft shrink-0 ${domainBadge(domain.status)}`} title={domain.ssl_status ? `certificate: ${domain.ssl_status}` : domain.status}>
@@ -2099,7 +2099,7 @@ export function CollaboratorsCard({
                 {entries.map((entry) => (
                   <tr key={entry.email}>
                     <td class="min-w-0">
-                      <span class="block min-w-0 truncate font-mono" title={entry.email}>
+                      <span class="block min-w-0 truncate" title={entry.email}>
                         {entry.email}
                       </span>
                     </td>
@@ -3403,7 +3403,7 @@ function WaitlistCard({
               <tbody>
                 {entries.map((entry) => (
                   <tr key={entry.email}>
-                    <td class="min-w-0 truncate font-mono" title={entry.email}>
+                    <td class="min-w-0 truncate" title={entry.email}>
                       {entry.email}
                     </td>
                     <td class="whitespace-nowrap">{entry.attempts}</td>

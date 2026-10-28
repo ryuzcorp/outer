@@ -156,7 +156,7 @@ export function ConfirmModal({
   return (
     <div class="modal modal-open" role="dialog" aria-modal="true" aria-label={title}>
       <div class="modal-box min-w-0">
-        <h3 class="m-0 text-base font-bold">{title}</h3>
+        <h3 class="m-0 text-base font-semibold">{title}</h3>
         <p class="m-0 py-3 text-sm opacity-80">{consequence}</p>
         {error === undefined || error === "" ? null : (
           <div class="alert alert-error alert-soft mb-3 text-sm" role="alert">
