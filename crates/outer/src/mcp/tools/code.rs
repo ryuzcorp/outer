@@ -1267,7 +1267,8 @@ pub async fn show_commit(input: ShowCommitInput, ctx: &Ctx<'_>) -> Result<Value,
             "message": shown.commit.message,
         },
         "files": files,
-        "patch": patch,
+        // The patch rides in the text block only (like `read_files`):
+        // duplicating it here doubled every response.
         "truncated": truncated,
         "root": shown.root,
     });

@@ -162,8 +162,6 @@ pub enum CommitError {
     BothWrittenAndDeleted { path: String },
     #[error("{path} is written more than once in one commit")]
     DuplicateWrite { path: String },
-    #[error("{path} is edited more than once in one commit")]
-    DuplicateEdit { path: String },
     #[error("{path} is both written and edited in one commit")]
     BothWrittenAndEdited { path: String },
     #[error("blob conflict in {path}: expected blob {expected}, current {current}; re-read the file and retry with the fresh blob")]
@@ -950,14 +948,21 @@ pub(crate) fn validate_request(req: &CommitRequest) -> Result<(String, Vec<RawFi
             return Err(CommitError::BothWrittenAndDeleted { path: path.clone() });
         }
     }
-    let mut seen_edits = HashSet::new();
+    // A file may carry several exact edits (applied in order); their
+    // per-file CAS blobs must agree, since they all edit one base blob.
+    let mut edit_blobs: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for e in &changes.edits {
         validate_path(&e.path)?;
         validate_blob(&e.path, e.expect_blob.as_deref())?;
-        if !seen_edits.insert(e.path.as_str()) {
-            return Err(CommitError::DuplicateEdit {
-                path: e.path.clone(),
-            });
+        if let Some(blob) = e.expect_blob.as_deref() {
+            if let Some(seen) = edit_blobs.insert(e.path.as_str(), blob) {
+                if seen != blob {
+                    return Err(CommitError::InvalidEdit {
+                        path: e.path.clone(),
+                        reason: "edits to one file must name the same expect_blob",
+                    });
+                }
+            }
         }
         if seen_writes.contains(e.path.as_str()) {
             return Err(CommitError::BothWrittenAndEdited {
@@ -1160,11 +1165,15 @@ pub async fn apply_changes(
     Ok(())
 }
 
-/// Apply exact-match edits against the base commit's blobs. `old` must occur
-/// exactly once unless `replace_all` (then at least once).
+/// Apply exact-match edits against the base commit's blobs. A file may carry
+/// several edits: they apply in request order, each against the text the
+/// previous ones left, so an `old` quoted from the file as read still
+/// matches unless an earlier edit rewrote it. `old` must occur exactly once
+/// unless `replace_all` (then at least once).
 ///
 /// Every edit is checked before any is applied, so one bad `old` never hides
 /// another: all failures come back in one [`CommitError::EditMismatches`].
+/// A failed edit leaves its file's text unchanged for the edits after it.
 ///
 /// Edits share the writes' caps: the base blob must fit in
 /// [`MAX_TEXT_BYTES`] (checked with `cat-file -s` before reading, so a huge
@@ -1187,9 +1196,18 @@ async fn apply_edits(
         });
     };
     let mut failures = Vec::new();
-    let mut replaced: Vec<(&Edit, String)> = Vec::with_capacity(edits.len());
+    // Path → evolving text, in first-edit order so results are deterministic.
+    let mut texts: Vec<(String, String)> = Vec::new();
     for (index, e) in edits.iter().enumerate() {
-        let (content, _) = read_text_blob(git_dir, parent, &e.path).await?;
+        let slot = match texts.iter().position(|(path, _)| *path == e.path) {
+            Some(slot) => slot,
+            None => {
+                let (content, _) = read_text_blob(git_dir, parent, &e.path).await?;
+                texts.push((e.path.clone(), content));
+                texts.len() - 1
+            }
+        };
+        let content = &texts[slot].1;
         let count = content.matches(&e.old).count();
         if count == 0 || (!e.replace_all && count > 1) {
             failures.push(EditFailure {
@@ -1197,7 +1215,7 @@ async fn apply_edits(
                 path: e.path.clone(),
                 matches: count,
                 closest: (count == 0)
-                    .then(|| closest_region(&content, &e.old))
+                    .then(|| closest_region(content, &e.old))
                     .flatten(),
             });
             continue;
@@ -1207,13 +1225,13 @@ async fn apply_edits(
         } else {
             content.replacen(&e.old, &e.new, 1)
         };
-        replaced.push((e, next));
+        texts[slot].1 = next;
     }
     if !failures.is_empty() {
         return Err(CommitError::EditMismatches(EditMismatches(failures)));
     }
-    for (e, next) in replaced {
-        push_text_result(&e.path, next, files, total)?;
+    for (path, next) in texts {
+        push_text_result(&path, next, files, total)?;
     }
     Ok(())
 }
@@ -2885,6 +2903,67 @@ mod tests {
         assert_eq!(parent.trim(), h2);
     }
 
+    /// Several exact edits to one file apply in request order (what agents
+    /// send: ChatGPT's 2- and 9-edit commits were refused before). Each sees
+    /// the text the earlier ones left, and one failure reports its index
+    /// while the file stays untouched.
+    #[tokio::test]
+    async fn several_edits_to_one_file_apply_in_order() {
+        let (_dir, cfg, store, sync) = setup("multi").await;
+        let mut seed = req("seed");
+        seed.changes.writes.push(write(
+            "page.tsx",
+            "<h1>Title</h1>\n<p>Body</p>\n<footer>Foot</footer>\n",
+        ));
+        commit(&store, &cfg, &sync, "multi", seed).await.unwrap();
+        let bare = manifest::mirror_path(&cfg, "multi");
+        let edit = |old: &str, new: &str| Edit {
+            path: "page.tsx".to_string(),
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all: false,
+            expect_blob: None,
+        };
+
+        let mut three = req("three");
+        three
+            .changes
+            .edits
+            .push(edit("<h1>Title</h1>", "<h1>Family</h1>"));
+        three
+            .changes
+            .edits
+            .push(edit("<p>Body</p>", "<p>Photos</p>"));
+        // Chains onto the first edit's result.
+        three
+            .changes
+            .edits
+            .push(edit("<h1>Family</h1>", "<h1>Familygram</h1>"));
+        let head = commit(&store, &cfg, &sync, "multi", three).await.unwrap();
+        assert_eq!(
+            show(&bare, &head, "page.tsx").await,
+            "<h1>Familygram</h1>\n<p>Photos</p>\n<footer>Foot</footer>\n"
+        );
+
+        let mut bad = req("bad");
+        bad.changes.edits.push(edit("<p>Photos</p>", "<p>Feed</p>"));
+        bad.changes
+            .edits
+            .push(edit("<p>Photos</p>", "<p>Again</p>"));
+        match commit(&store, &cfg, &sync, "multi", bad).await {
+            Err(CommitError::EditMismatches(list)) => {
+                assert_eq!(list.0.len(), 1);
+                assert_eq!(list.0[0].index, 1, "the second edit no longer matches");
+                assert_eq!(list.0[0].matches, 0);
+            }
+            other => panic!("a stale second edit must fail, got {other:?}"),
+        }
+        assert_eq!(
+            show(&bare, &head, "page.tsx").await,
+            "<h1>Familygram</h1>\n<p>Photos</p>\n<footer>Foot</footer>\n"
+        );
+    }
+
     #[tokio::test]
     async fn edits_match_exactly_once_by_default() {
         let (_dir, cfg, store, sync) = setup("edits").await;
@@ -3528,27 +3607,6 @@ mod tests {
         match commit(&store, &cfg, &sync, "overlap", both).await {
             Err(CommitError::BothWrittenAndEdited { path }) => assert_eq!(path, "g.txt"),
             other => panic!("a write and an edit on one path must fail, got {other:?}"),
-        }
-
-        // The same path edited twice.
-        let mut dedup = req("dedup");
-        dedup.changes.edits.push(Edit {
-            path: "h.txt".to_string(),
-            old: "x".to_string(),
-            new: "y".to_string(),
-            replace_all: false,
-            expect_blob: None,
-        });
-        dedup.changes.edits.push(Edit {
-            path: "h.txt".to_string(),
-            old: "y".to_string(),
-            new: "z".to_string(),
-            replace_all: false,
-            expect_blob: None,
-        });
-        match commit(&store, &cfg, &sync, "overlap", dedup).await {
-            Err(CommitError::DuplicateEdit { path }) => assert_eq!(path, "h.txt"),
-            other => panic!("duplicate edits must fail, got {other:?}"),
         }
 
         // A move whose target is written in the same commit.

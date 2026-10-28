@@ -526,10 +526,14 @@ async fn create_commit_read_history_roundtrip() {
     )
     .await;
     let shown = result(&shown);
-    assert!(shown["structuredContent"]["patch"]
+    assert!(shown["content"][1]["text"]
         .as_str()
         .unwrap()
         .contains("Vegetables"));
+    assert!(
+        shown["structuredContent"].get("patch").is_none(),
+        "patch is text-only"
+    );
 
     let (_, get) = call(&state, Some(&token), "get_app", json!({"app": "groceries"})).await;
     assert_eq!(result(&get)["structuredContent"]["status"], "running");
@@ -8505,7 +8509,7 @@ async fn show_commit_budget_stats_and_filter() {
     let structured = &shown["structuredContent"];
     assert_eq!(structured["truncated"], true);
     assert!(
-        structured["patch"].as_str().unwrap().len() <= 20 * 1024,
+        shown["content"][1]["text"].as_str().unwrap().len() <= 21 * 1024,
         "patch is budgeted"
     );
     let files = structured["files"].as_array().unwrap();
@@ -8534,8 +8538,9 @@ async fn show_commit_budget_stats_and_filter() {
     let shown = result(&shown);
     let structured = &shown["structuredContent"];
     assert_eq!(structured["files"].as_array().unwrap().len(), 2);
-    assert!(structured["patch"].as_str().unwrap().contains("note.txt"));
-    assert!(!structured["patch"].as_str().unwrap().contains("big.txt"));
+    let patch = shown["content"][1]["text"].as_str().unwrap();
+    assert!(patch.contains("+++ b/note.txt"), "{patch}");
+    assert!(!patch.contains("big.txt"), "{patch}");
 }
 
 /// Failing exact edits are all reported in one error — by `commit` and by
