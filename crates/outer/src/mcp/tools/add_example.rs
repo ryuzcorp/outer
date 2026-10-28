@@ -49,7 +49,7 @@ pub async fn add_example(input: AddExampleInput, ctx: &Ctx<'_>) -> Result<Value,
     let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     let planned = async {
         let bare = super::code::mirror_for(ctx, &app.slug).await?;
-        let tree = head_tree(&bare, &inputs).await?;
+        let (head, tree) = head_tree(&bare, &inputs).await?;
         // The app's template is what the tree shows: the app starter owns
         // `pages/_nav.ts`, the website starter has no nav file.
         let app_template = if tree.contains_key("pages/_nav.ts") {
@@ -58,11 +58,12 @@ pub async fn add_example(input: AddExampleInput, ctx: &Ctx<'_>) -> Result<Value,
             "website"
         };
         crate::examples::apply::plan_apply(&tree, app_template, &inputs, &[input.name.as_str()])
+            .map(|plan| (head, plan))
             .map_err(|refusal| ToolError::invalid_argument(refusal.to_string()))
     }
     .await;
-    let plan = match planned {
-        Ok(plan) => plan,
+    let (head, plan) = match planned {
+        Ok(planned) => planned,
         Err(err) => {
             if let Err(refund) = refund_change(&ctx.state.pool, &app.owner_id).await {
                 tracing::warn!("add_example refund failed: {refund:#}");
@@ -72,7 +73,10 @@ pub async fn add_example(input: AddExampleInput, ctx: &Ctx<'_>) -> Result<Value,
     };
     let request = git::CommitRequest {
         message: format!("add_example: {}", plan.added.join(", ")),
-        base: None,
+        // Full-file writes planned from `head`: a commit that landed since
+        // would be silently overwritten, so the CAS refuses with `conflict`
+        // (current sha included) and the agent re-runs add_example.
+        base: Some(head),
         changes: git::CommitChanges {
             writes: plan
                 .writes
@@ -163,13 +167,26 @@ fn add_summary(
     }
 }
 
-/// The head tree as the apply engine sees it: every non-migration file the
-/// closure touches (with text), plus the `db/migrations/` names (numbers
-/// only) and the two edited files.
+/// The head sha and the tree as the apply engine sees it at that sha: every
+/// non-migration file the closure touches (with text), plus the
+/// `db/migrations/` names (numbers only) and the two edited files. Every
+/// read pins the sha the listing resolved, so the plan and the commit's CAS
+/// base are the same commit.
 async fn head_tree(
     bare: &std::path::Path,
     inputs: &[crate::examples::apply::ExampleInput],
-) -> Result<BTreeMap<String, String>, ToolError> {
+) -> Result<(String, BTreeMap<String, String>), ToolError> {
+    // Migration numbers only: renumbered writes never collide with them.
+    let (head, migrations, _) =
+        crate::git::local::list_files(bare, None, Some("db/migrations"), usize::MAX)
+            .await
+            .map_err(|err| {
+                if err.to_string().contains("no commits") {
+                    ToolError::not_found("app has no commits yet")
+                } else {
+                    internal(err)
+                }
+            })?;
     let mut need: BTreeSet<&str> = BTreeSet::new();
     for input in inputs {
         for (path, _) in &input.files {
@@ -180,7 +197,7 @@ async fn head_tree(
     need.insert("void.config.ts");
     let mut tree = BTreeMap::new();
     for path in need {
-        match crate::git::local::read_blob(bare, None, path).await {
+        match crate::git::local::read_blob(bare, Some(&head), path).await {
             Ok((_, bytes)) => match String::from_utf8(bytes) {
                 Ok(text) => {
                     tree.insert(path.to_string(), text);
@@ -198,19 +215,8 @@ async fn head_tree(
             }
         }
     }
-    // Migration numbers only: renumbered writes never collide with them.
-    let (_, migrations, _) =
-        crate::git::local::list_files(bare, None, Some("db/migrations"), usize::MAX)
-            .await
-            .map_err(|err| {
-                if err.to_string().contains("no commits") {
-                    ToolError::not_found("app has no commits yet")
-                } else {
-                    internal(err)
-                }
-            })?;
     for entry in migrations {
         tree.entry(entry.path).or_insert_with(String::new);
     }
-    Ok(tree)
+    Ok((head, tree))
 }
