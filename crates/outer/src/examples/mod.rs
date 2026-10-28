@@ -1,4 +1,5 @@
-//! Copy-paste patterns served over the public `examples` MCP tool.
+//! Copy-paste patterns served over the public `examples` MCP tool, and
+//! applied by `add_example` / `create_app {examples}`.
 //!
 //! The patterns live in `examples/` in the `outer-templates` repo, vendored
 //! into the store as a git bundle at the pinned sha (see [`crate::templates`]).
@@ -6,6 +7,7 @@
 //! Outer's data dir, once per sha, and serve from there. A pinned sha with no
 //! `examples/` yields an empty list. A bad example is skipped with a warn and
 //! never fails the whole list.
+pub mod apply;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +32,6 @@ pub struct Summary {
     pub title: String,
     pub summary: String,
     pub template: String,
-    pub dependencies: BTreeMap<String, String>,
     pub files: Vec<FileRef>,
 }
 
@@ -41,14 +42,25 @@ pub struct ExampleFile {
     pub text: String,
 }
 
-/// One full example: the README plus every file's text.
+/// One full example: the README plus every file's text, plus the apply
+/// metadata `add_example` plans from (`requires`, `nav`, `bindings`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavEntry {
+    pub href: String,
+    pub label: String,
+    pub icon: String,
+}
+
+/// One full example: the README, every file's text, and the apply metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Example {
     pub name: String,
     pub title: String,
     pub summary: String,
     pub template: String,
-    pub dependencies: BTreeMap<String, String>,
+    pub requires: Vec<String>,
+    pub nav: Vec<NavEntry>,
+    pub bindings: BTreeMap<String, Vec<BTreeMap<String, String>>>,
     pub readme: String,
     pub files: Vec<ExampleFile>,
 }
@@ -68,15 +80,29 @@ pub fn is_valid_name(name: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
-/// The `example.json` contract: name, title, summary, template, plus optional
-/// dependencies. Unknown fields are ignored.
+/// The `example.json` contract: title, summary, template, plus optional
+/// `requires`, `nav` and `bindings`. `dependencies` is not supported and
+/// rejects the example; unknown fields are ignored.
+#[derive(Debug, Deserialize)]
+struct NavJson {
+    href: String,
+    label: String,
+    icon: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ExampleJson {
     title: String,
     summary: String,
     template: String,
     #[serde(default)]
-    dependencies: BTreeMap<String, String>,
+    requires: Vec<String>,
+    #[serde(default)]
+    nav: Vec<NavJson>,
+    #[serde(default)]
+    bindings: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    #[serde(default)]
+    dependencies: Option<serde_json::Value>,
 }
 
 /// Largest single file an example may carry (contract: 64 KiB).
@@ -134,7 +160,6 @@ impl Example {
             title: self.title.clone(),
             summary: self.summary.clone(),
             template: self.template.clone(),
-            dependencies: self.dependencies.clone(),
             files: self
                 .files
                 .iter()
@@ -142,6 +167,30 @@ impl Example {
                     path: file.path.clone(),
                     lines: file.text.lines().count(),
                 })
+                .collect(),
+        }
+    }
+
+    /// The apply engine's view of this example.
+    pub fn apply_input(&self) -> apply::ExampleInput {
+        apply::ExampleInput {
+            name: self.name.clone(),
+            template: self.template.clone(),
+            requires: self.requires.clone(),
+            nav: self
+                .nav
+                .iter()
+                .map(|item| apply::NavItem {
+                    href: item.href.clone(),
+                    label: item.label.clone(),
+                    icon: item.icon.clone(),
+                })
+                .collect(),
+            bindings: self.bindings.clone(),
+            files: self
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.text.clone()))
                 .collect(),
         }
     }
@@ -350,6 +399,38 @@ fn load_example(dir: &Path, name: &str) -> Option<Example> {
     if crate::templates::Template::from_id(&meta.template).is_none() {
         return reject(&format!("bad template {:?}", meta.template));
     }
+    if meta.dependencies.is_some() {
+        return reject("example.json \"dependencies\" is not supported (examples ship files only; add_example never touches package.json)");
+    }
+    for dep in &meta.requires {
+        if !is_valid_name(dep) {
+            return reject(&format!("bad requires entry {dep:?}"));
+        }
+    }
+    let mut nav = Vec::with_capacity(meta.nav.len());
+    for item in meta.nav {
+        if item.href.is_empty() || !item.href.starts_with('/') {
+            return reject(&format!("bad nav href {:?}", item.href));
+        }
+        if item.label.is_empty() {
+            return reject(&format!("bad nav label for {:?}", item.href));
+        }
+        if !apply::is_valid_icon(&item.icon) {
+            return reject(&format!("bad nav icon {:?}", item.icon));
+        }
+        nav.push(NavEntry {
+            href: item.href,
+            label: item.label,
+            icon: item.icon,
+        });
+    }
+    for key in meta.bindings.keys() {
+        if key != "d1_databases" && key != "r2_buckets" {
+            return reject(&format!(
+                "bad bindings key {key:?}: want d1_databases or r2_buckets"
+            ));
+        }
+    }
     let readme = match std::fs::read_to_string(dir.join("README.md")) {
         Ok(readme) => readme,
         Err(_) => return reject("missing README.md"),
@@ -381,7 +462,9 @@ fn load_example(dir: &Path, name: &str) -> Option<Example> {
         title: meta.title,
         summary: meta.summary,
         template: meta.template,
-        dependencies: meta.dependencies,
+        requires: meta.requires,
+        nav,
+        bindings: meta.bindings,
         readme,
         files: out,
     })
@@ -496,7 +579,6 @@ mod tests {
             "title": title,
             "summary": summary,
             "template": template,
-            "dependencies": {"left-pad": "^1.3.0"},
         })
         .to_string()
     }
@@ -561,10 +643,6 @@ mod tests {
         assert_eq!(all[1].title, "List form");
         assert_eq!(all[1].summary, "A D1-backed list with add and complete.");
         assert_eq!(all[1].template, "app");
-        assert_eq!(
-            all[1].dependencies.get("left-pad").map(String::as_str),
-            Some("^1.3.0")
-        );
         let paths: Vec<_> = all[1].files.iter().map(|file| file.path.as_str()).collect();
         assert_eq!(paths, ["pages/list.server.ts", "pages/list.tsx"]);
         assert!(all[1].files.iter().all(|file| file.lines > 0));
@@ -586,6 +664,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["blog"]
         );
+    }
+
+    #[tokio::test]
+    async fn an_example_carrying_dependencies_is_skipped() {
+        let store = Store::memory();
+        let json = serde_json::json!({
+            "name": "need",
+            "title": "Need",
+            "summary": "Wants a package.",
+            "template": "app",
+            "dependencies": {"some-pkg": "^1.0.0"},
+        })
+        .to_string();
+        fixture(
+            &store,
+            &[(
+                "need",
+                &[
+                    ("example.json", json.as_str()),
+                    ("README.md", "# Need\n"),
+                    ("pages/need.ts", "export const need = 1;\n"),
+                ],
+            )],
+            &[],
+        )
+        .await;
+        let state = tool_state(store).await;
+        let dir = &state.delete_cfg.data_dir;
+        assert!(list(&state.store, dir, None).await.unwrap().is_empty());
+        assert!(get(&state.store, dir, "need").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -621,6 +729,7 @@ mod tests {
             ExamplesInput {
                 name: Some("nope".to_string()),
                 template: None,
+                files: None,
             },
             &ctx,
         )
@@ -654,6 +763,7 @@ mod tests {
                 ExamplesInput {
                     name: Some(bad.clone()),
                     template: None,
+                    files: None,
                 },
                 &ctx,
             )
@@ -666,6 +776,7 @@ mod tests {
             ExamplesInput {
                 name: Some("list-form".to_string()),
                 template: None,
+                files: None,
             },
             &ctx,
         )
@@ -736,6 +847,7 @@ mod tests {
             ExamplesInput {
                 name: Some("big".to_string()),
                 template: None,
+                files: Some(true),
             },
             &ctx,
         )
@@ -751,6 +863,50 @@ mod tests {
             "{text}"
         );
         assert!(text.starts_with("# Big\n"), "{text}");
+        // Contents travel in the text block only, never duplicated.
+        assert!(
+            !text.contains("\"text\""),
+            "no JSON envelope in the text block"
+        );
+        for entry in structured["files"].as_array().unwrap() {
+            assert!(entry.get("text").is_none(), "no contents in structured");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_files_lists_without_contents() {
+        let state = two_example_state().await;
+        let ctx = Ctx {
+            state: &state,
+            principal: None,
+            client_ip: None,
+        };
+        let value = examples_tool(
+            ExamplesInput {
+                name: Some("list-form".to_string()),
+                template: None,
+                files: None,
+            },
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = value["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() < 6 * 1024, "stays small: {}", text.len());
+        assert!(text.contains("pages/list.tsx"), "{text}");
+        assert!(
+            !text.contains("export default function List"),
+            "no file contents: {text}"
+        );
+        assert!(text.contains("add_example"), "{text}");
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["name"], "list-form");
+        assert_eq!(structured["requires"].as_array().unwrap().len(), 0);
+        assert_eq!(structured["files"].as_array().unwrap().len(), 2);
+        assert!(structured.get("readme").is_some());
+        for entry in structured["files"].as_array().unwrap() {
+            assert!(entry.get("text").is_none(), "no contents in structured");
+        }
     }
 
     #[tokio::test]

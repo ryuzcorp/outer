@@ -1,0 +1,9 @@
+{
+  "name": "signup",
+  "title": "Signup",
+  "summary": "Fixture newsletter-style example.",
+  "template": "website",
+  "bindings": {
+    "d1_databases": [{ "binding": "DB", "database_name": "site-db", "migrations_dir": "db/migrations" }]
+  }
+}

@@ -1,0 +1,3 @@
+# clash
+
+Golden-fixture example.

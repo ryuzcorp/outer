@@ -1,0 +1,6 @@
+{
+  "name": "extra",
+  "title": "Extra",
+  "summary": "Fixture renumber example.",
+  "template": "app"
+}

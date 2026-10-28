@@ -1,0 +1,1 @@
+refusing to apply nav: pages/_nav.ts has no // outer:nav-icons marker (the nav was restructured). Add the nav lines by hand — see the example README "Without add_example"

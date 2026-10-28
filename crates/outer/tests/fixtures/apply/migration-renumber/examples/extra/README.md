@@ -1,0 +1,3 @@
+# extra
+
+Golden-fixture example.

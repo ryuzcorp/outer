@@ -1,0 +1,8 @@
+{
+  "name": "beta",
+  "title": "Beta",
+  "summary": "Second fixture example.",
+  "template": "app",
+  "requires": ["alpha"],
+  "nav": [{ "href": "/beta", "label": "Beta", "icon": "Camera" }]
+}

@@ -6,6 +6,7 @@
 //! and surface as JSON-RPC `-32602`, never as `isError`.
 
 pub(crate) mod account;
+pub(crate) mod add_example;
 pub(crate) mod apps;
 pub(crate) mod backups;
 pub(crate) mod billing;
@@ -1242,6 +1243,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "examples" => examples::examples(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "add_example" => add_example::add_example(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         _ => Err(CallError::Rpc(-32602, format!("unknown tool {tool:?}"))),
