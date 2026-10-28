@@ -474,6 +474,10 @@ pub struct McpState {
     /// The installed per-app egress policy: app create/delete refreshes it
     /// so the new uid set is covered at once.
     pub egress: crate::fleet::egress::EgressFirewall,
+    /// Detached edge purges (the deploy pipeline's mechanism): the access
+    /// gate change path enqueues host purges here so a slow Cloudflare never
+    /// holds up the `set_access` response.
+    pub purges: crate::deploy::pipeline::PurgeTasks,
 }
 impl McpState {
     /// `https://<slug>.outer.now`, or the localhost equivalent in dev.
@@ -593,6 +597,7 @@ impl McpState {
                 cache_purge: None,
             },
             egress: crate::fleet::egress::EgressFirewall::disabled(),
+            purges: crate::deploy::pipeline::PurgeTasks::default(),
         }
     }
 

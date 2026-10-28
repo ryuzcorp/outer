@@ -745,6 +745,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(&config),
         },
+        purges: purges.clone(),
         egress: egress.clone(),
         secrets_key,
         unsub_key: config.outer_secret.as_bytes().to_vec(),
@@ -868,7 +869,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             metrics.clone(),
         )
         .with_look_tokens(look_tokens)
-        .with_crawl_hooks(crawl_hooks),
+        .with_crawl_hooks(crawl_hooks)
+        .with_access_key(outer::access::AccessKey::derive(&config.outer_secret)),
         config.domain.clone(),
     );
     tracing::info!(

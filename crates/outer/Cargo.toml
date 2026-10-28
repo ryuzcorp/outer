@@ -9,6 +9,7 @@ repository = "https://github.com/ryuzcorp/outer"
 publish = false
 
 [dependencies]
+argon2 = { version = "0.5", features = ["std", "password-hash"] }
 aes-gcm = "0.10"
 anyhow = "1"
 axum = "0.8"

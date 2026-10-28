@@ -3,6 +3,7 @@
 //! The library holds the platform's modules; `src/main.rs` is the `outer`
 //! binary that boots them.
 
+pub mod access;
 pub mod accounts;
 pub mod alerts;
 pub mod apps;

@@ -5,11 +5,12 @@
 use serde_json::Value;
 
 use crate::mcp::tools::{
-    account, add_example as add_example_inputs, apps as app_inputs, backups as backup_inputs,
-    code as code_inputs, collaborators as collab_inputs, data as data_inputs,
-    domains as domain_inputs, drafts as draft_inputs, examples as examples_inputs,
-    export as export_inputs, look as look_inputs, open_app as open_app_inputs,
-    preview as preview_inputs, runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
+    access as access_inputs, account, add_example as add_example_inputs, apps as app_inputs,
+    backups as backup_inputs, code as code_inputs, collaborators as collab_inputs,
+    data as data_inputs, domains as domain_inputs, drafts as draft_inputs,
+    examples as examples_inputs, export as export_inputs, look as look_inputs,
+    open_app as open_app_inputs, preview as preview_inputs, runtime as runtime_inputs,
+    secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -97,7 +98,7 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
         | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
         | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" | "stage"
-        | "check" | "ship" | "add_example" => Hints::WRITE,
+        | "check" | "ship" | "add_example" | "set_access" => Hints::WRITE,
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -254,6 +255,11 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<app_inputs::SetAlwaysOnInput>(
             "set_always_on",
             "Keep a Pro app warm {app, on}: on skips the idle sleep and restarts the fleet after restarts (up to the host cap); off lets it sleep on idle. On is a Pro feature; turning it off is always allowed.",
+            Account, false,
+        ),
+        tool::<access_inputs::SetAccessInput>(
+            "set_access",
+            "Put a visitor gate on your app {app, mode, secret?}: open (default, everyone walks in), pin (4-8 digits) or password (8-128 chars). PIN and password are a Pro feature; opening is always allowed. The gate locks every host and path until the visitor unlocks; changing the secret signs everyone out. Never returns the secret. Owner only.",
             Account, false,
         ),
         tool::<app_inputs::ShareAppInput>(
@@ -497,7 +503,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 61);
+        assert_eq!(tools.len(), 62);
     }
 }
 

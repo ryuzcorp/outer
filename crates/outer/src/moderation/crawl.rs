@@ -1143,6 +1143,38 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// The crawl transport is loopback-direct (`http://127.0.0.1:{fleet
+    /// port}`), never through the proxy: a gated app's fleet answers the
+    /// crawl with no cookie, so moderation is never blind to private apps.
+    #[tokio::test]
+    async fn loopback_fetch_reaches_the_fleet_with_no_cookie() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let body = "<html><body>private page</body></html>";
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let fetch = LoopbackFetch::new(port, std::time::Duration::from_secs(5)).unwrap();
+        let page = fetch.fetch("/").await.unwrap();
+        assert_eq!(page.status, 200);
+        assert_eq!(page.content_type, "text/html");
+        assert!(page.body.windows(12).any(|w| w == b"private page"));
+    }
+
     struct MapFetch {
         pages: HashMap<String, FetchedPage>,
     }

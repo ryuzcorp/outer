@@ -305,7 +305,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 61);
+    assert_eq!(anon.len(), 62);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
     assert!(anon.contains(&"add_example".to_string()));
@@ -323,7 +323,8 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 59);
+    assert_eq!(authed.len(), 60);
+    assert!(authed.contains(&"set_access".to_string()));
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
     assert!(authed.contains(&"upgrade".to_string()));
@@ -3431,6 +3432,141 @@ async fn set_always_on_is_pro_gated() {
         .await
         .unwrap();
     assert_eq!(flag, 1);
+}
+
+/// `pin`/`password` are Pro, gated in the shared domain function: a Free
+/// owner is refused with `payment_required`, `open` is always allowed, and
+/// Pro sets the gate. The result never echoes the secret; `get_app` shows
+/// the mode but never the hash.
+#[tokio::test]
+async fn set_access_is_pro_gated_and_never_echoes_the_secret() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+
+    let (_, refused) = call(
+        &state,
+        Some(&ana),
+        "set_access",
+        json!({"app": "groceries", "mode": "pin", "secret": "1234"}),
+    )
+    .await;
+    let err = is_error(&refused);
+    assert_eq!(err["error"], "payment_required");
+    assert!(
+        err["user_message"].as_str().unwrap().contains("Pro"),
+        "{err}"
+    );
+
+    // `open` is always allowed, on any plan.
+    let (_, open) = call(
+        &state,
+        Some(&ana),
+        "set_access",
+        json!({"app": "groceries", "mode": "open"}),
+    )
+    .await;
+    assert_eq!(result(&open)["structuredContent"]["mode"], "open");
+
+    // Shapes are refused before any row changes.
+    for args in [
+        json!({"app": "groceries", "mode": "pin", "secret": "123"}),
+        json!({"app": "groceries", "mode": "pin"}),
+        json!({"app": "groceries", "mode": "password", "secret": "short"}),
+        json!({"app": "groceries", "mode": "open", "secret": "1234"}),
+        json!({"app": "groceries", "mode": "fingerprint"}),
+    ] {
+        let (_, bad) = call(&state, Some(&ana), "set_access", args).await;
+        assert_eq!(is_error(&bad)["error"], "invalid_argument");
+    }
+
+    set_plan(&state, "ana@example.com", "pro").await;
+    let (_, pin) = call(
+        &state,
+        Some(&ana),
+        "set_access",
+        json!({"app": "groceries", "mode": "pin", "secret": "1234"}),
+    )
+    .await;
+    let summary = result(&pin)["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        summary,
+        "groceries now asks visitors for a PIN. Share it with your family; changing it signs everyone out."
+    );
+    assert!(!summary.contains("1234"), "the secret is never echoed");
+    assert_eq!(result(&pin)["structuredContent"]["mode"], "pin");
+    let (mode, hash, version): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT access_mode, access_hash, access_version FROM app WHERE slug = 'groceries'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(mode, "pin");
+    let hash = hash.expect("pin stores a hash");
+    assert!(hash.starts_with("$argon2id$"), "{hash}");
+    assert!(!hash.contains("1234"));
+    assert_eq!(version, 1, "open is a no-op; only pin bumps the version");
+
+    // `get_app` shows the mode, never the hash.
+    let (_, got) = call(&state, Some(&ana), "get_app", json!({"app": "groceries"})).await;
+    let app = &result(&got)["structuredContent"];
+    assert_eq!(app["access"], "pin");
+    assert!(app.get("access_hash").is_none(), "{app}");
+
+    // A stranger's slug answers `not_found`, like every other app tool.
+    let bob = api_key_for(&state, "bob@example.com").await;
+    let (_, missing) = call(
+        &state,
+        Some(&bob),
+        "set_access",
+        json!({"app": "groceries", "mode": "open"}),
+    )
+    .await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
+}
+
+/// A downgrade keeps the gate enforced (removing it would expose a private
+/// app): the row stays gated, the owner can open it but cannot set a new
+/// secret until they resubscribe.
+#[tokio::test]
+async fn downgrade_keeps_the_gate_enforced() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+    set_plan(&state, "ana@example.com", "pro").await;
+    let (_, pin) = call(
+        &state,
+        Some(&ana),
+        "set_access",
+        json!({"app": "groceries", "mode": "password", "secret": "correct horse!"}),
+    )
+    .await;
+    assert_eq!(result(&pin)["structuredContent"]["mode"], "password");
+
+    set_plan(&state, "ana@example.com", "free").await;
+    let mode: String = sqlx::query_scalar("SELECT access_mode FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(mode, "password", "downgrade leaves the gate on");
+    // A new secret is refused on Free...
+    let (_, refused) = call(
+        &state,
+        Some(&ana),
+        "set_access",
+        json!({"app": "groceries", "mode": "pin", "secret": "9999"}),
+    )
+    .await;
+    assert_eq!(is_error(&refused)["error"], "payment_required");
+    // ...but opening is always allowed.
+    let (_, open) = call(
+        &state,
+        Some(&ana),
+        "set_access",
+        json!({"app": "groceries", "mode": "open"}),
+    )
+    .await;
+    assert_eq!(result(&open)["structuredContent"]["mode"], "open");
 }
 
 /// New Pro apps default to keep-warm; Free apps start cold.

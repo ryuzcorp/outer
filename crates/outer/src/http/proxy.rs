@@ -58,6 +58,15 @@ pub struct ProxyState {
     /// that only assert the queued row: the report still records, and the
     /// crawl sweep picks the app up within minutes.
     pub crawl_hooks: Option<CrawlHooks>,
+    /// Unlock-cookie HMAC key for the access gate (`OUTER_SECRET`-derived,
+    /// wired by the integration owner). `None` in tests that never lock an
+    /// app: a gated app fails closed without it.
+    pub access_key: Option<crate::access::AccessKey>,
+    /// Process-wide Argon2 verify budget (8 permits): `unlock_submit` takes
+    /// one before hashing and fails fast with 429 when none is free, so a
+    /// burst of unlocks never stacks blocking-pool threads. From state, never
+    /// global, so tests scope their own budget.
+    pub verify_permits: Arc<tokio::sync::Semaphore>,
 }
 impl ProxyState {
     /// Build the per-state upstream client and the per-state touch-throttle
@@ -84,7 +93,17 @@ impl ProxyState {
             metrics,
             look_tokens: LookTokens::new(),
             crawl_hooks: None,
+            access_key: None,
+            verify_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         }
+    }
+
+    /// Wire the access-gate cookie key (the integration owner derives it
+    /// from `OUTER_SECRET` once; tests that lock an app pass
+    /// [`crate::access::AccessKey::test_key`]).
+    pub fn with_access_key(mut self, key: crate::access::AccessKey) -> Self {
+        self.access_key = Some(key);
+        self
     }
 
     /// Wire the after-live moderation hooks (the integration owner calls this
@@ -299,13 +318,26 @@ fn response_bytes(res: &hyper::Response<hyper::body::Incoming>) -> u64 {
 /// end-to-end headers, streaming body. Hop-by-hop headers go both ways,
 /// including any the upstream nominates through `Connection`;
 /// on a 101 the upgrade pair stays so the handshake completes.
-fn from_upstream(res: hyper::Response<hyper::body::Incoming>, is_unlisted: bool) -> Response {
+///
+/// A gated app's responses never cache on the edge: the upstream
+/// `Cache-Control` is replaced with `private, no-store` (Cloudflare caches
+/// static extensions by default regardless of app headers, so the origin
+/// must refuse caching itself) and `Cookie` joins `Vary`, merged with any
+/// upstream `Vary` the app sent. `ETag`/`Last-Modified` stay: validators are
+/// harmless once nothing stores the response. An open app keeps every
+/// upstream header untouched.
+fn from_upstream(
+    res: hyper::Response<hyper::body::Incoming>,
+    is_unlisted: bool,
+    gated: bool,
+) -> Response {
     let keep_upgrade = res.status() == StatusCode::SWITCHING_PROTOCOLS;
     let (mut parts, body) = res.into_parts();
     // Collected before the drain: every name this response's `Connection`
     // nominates goes with the fixed hop-by-hop list.
     let nominated = connection_tokens(&parts.headers);
     let mut out = Response::builder().status(parts.status);
+    let mut vary: Vec<String> = Vec::new();
     let mut last_name: Option<HeaderName> = None;
     for (name, value) in parts.headers.drain() {
         if let Some(name) = name {
@@ -318,10 +350,25 @@ fn from_upstream(res: hyper::Response<hyper::body::Incoming>, is_unlisted: bool)
         {
             continue;
         }
+        if gated && (name == axum::http::header::CACHE_CONTROL || name == axum::http::header::VARY)
+        {
+            if name == axum::http::header::VARY {
+                if let Ok(text) = value.to_str() {
+                    vary.push(text.to_string());
+                }
+            }
+            continue;
+        }
         out = out.header(name, value);
     }
     if is_unlisted {
         out = out.header("x-robots-tag", "noindex, nofollow");
+    }
+    if gated {
+        vary.push("Cookie".to_string());
+        out = out
+            .header("cache-control", "private, no-store")
+            .header("vary", vary.join(", "));
     }
     out.body(Body::new(body)).unwrap()
 }
@@ -433,14 +480,18 @@ fn csp_policy_blocks_inline(policy: &str) -> bool {
 /// Copy end-to-end response headers onto a rebuilt look response: the same
 /// hop-by-hop filtering as [`from_upstream`] (look responses never upgrade,
 /// so no 101 pair is kept). `content-length` must already be removed by the
-/// caller when the body changes; oversize streams set their own.
+/// caller when the body changes; oversize streams set their own. A gated
+/// app's look render carries the same `private, no-store` + `Vary: Cookie`
+/// as every other gated response.
 fn copy_response_headers(
     out: http::response::Builder,
     headers: &mut HeaderMap,
     is_unlisted: bool,
+    gated: bool,
 ) -> http::response::Builder {
     let nominated = connection_tokens(headers);
     let mut rebuilt = out;
+    let mut vary: Vec<String> = Vec::new();
     let mut last_name: Option<HeaderName> = None;
     for (name, value) in headers.drain() {
         if let Some(name) = name {
@@ -450,22 +501,43 @@ fn copy_response_headers(
         if is_hop_by_hop(name.as_str()) || nominated.iter().any(|t| t == name.as_str()) {
             continue;
         }
+        if gated && (name == axum::http::header::CACHE_CONTROL || name == axum::http::header::VARY)
+        {
+            if name == axum::http::header::VARY {
+                if let Ok(text) = value.to_str() {
+                    vary.push(text.to_string());
+                }
+            }
+            continue;
+        }
         rebuilt = rebuilt.header(name, value);
     }
     if is_unlisted {
         rebuilt = rebuilt.header("x-robots-tag", "noindex, nofollow");
+    }
+    if gated {
+        vary.push("Cookie".to_string());
+        rebuilt = rebuilt
+            .header("cache-control", "private, no-store")
+            .header("vary", vary.join(", "));
     }
     rebuilt
 }
 
 /// Rebuild a buffered look response: same end-to-end headers, fresh
 /// `Content-Length` for the new body.
-fn rebuild_look_body(mut parts: http::response::Parts, is_unlisted: bool, body: &[u8]) -> Response {
+fn rebuild_look_body(
+    mut parts: http::response::Parts,
+    is_unlisted: bool,
+    gated: bool,
+    body: &[u8],
+) -> Response {
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     let out = copy_response_headers(
         Response::builder().status(parts.status),
         &mut parts.headers,
         is_unlisted,
+        gated,
     );
     out.header("content-length", body.len())
         .body(Body::from(body.to_vec()))
@@ -507,6 +579,7 @@ fn chain_suffix(body: Body, suffix: Vec<u8>) -> Body {
 async fn badge_response(
     upstream: hyper::Response<hyper::body::Incoming>,
     is_unlisted: bool,
+    gated: bool,
     badge: &[u8],
     head: bool,
 ) -> Response {
@@ -537,7 +610,7 @@ async fn badge_response(
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED | StatusCode::PARTIAL_CONTENT
         );
     if !is_html || encoded || bodyless {
-        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted);
+        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted, gated);
     }
     // A declared length grows by exactly the badge: the framing stays exact
     // and keep-alive survives. Undeclared lengths chunk, as before.
@@ -554,12 +627,19 @@ async fn badge_response(
     parts.headers.remove(axum::http::header::LAST_MODIFIED);
     parts.headers.insert(
         axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("private, no-cache"),
+        // A gated page must never sit in the edge cache: `no-store` wins
+        // over the badge's usual `no-cache`.
+        axum::http::HeaderValue::from_static(if gated {
+            "private, no-store"
+        } else {
+            "private, no-cache"
+        }),
     );
     let mut out = copy_response_headers(
         Response::builder().status(parts.status),
         &mut parts.headers,
         is_unlisted,
+        gated,
     );
     if let Some(len) = declared {
         out = out.header("content-length", len + badge.len());
@@ -611,6 +691,7 @@ async fn read_look_body(
 async fn look_response(
     upstream: hyper::Response<hyper::body::Incoming>,
     is_unlisted: bool,
+    gated: bool,
     badge: Option<&[u8]>,
 ) -> Response {
     let (mut parts, body) = upstream.into_parts();
@@ -634,7 +715,7 @@ async fn look_response(
             !encoding.is_empty() && !encoding.trim().eq_ignore_ascii_case("identity")
         });
     if !is_html || encoded {
-        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted);
+        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted, gated);
     }
     // Everything below rewrites the page for one browser render. The edge
     // must never store it: Cloudflare's cache key ignores the look header,
@@ -658,6 +739,7 @@ async fn look_response(
             Response::builder().status(parts.status),
             &mut parts.headers,
             is_unlisted,
+            gated,
         );
         let streamed = prepend_look_stream(LOOK_SKIP_OVERSIZE.to_vec(), body.boxed());
         let streamed = match badge {
@@ -675,13 +757,13 @@ async fn look_response(
                 if let Some(suffix) = badge {
                     marked.extend_from_slice(suffix);
                 }
-                rebuild_look_body(parts, is_unlisted, &marked)
+                rebuild_look_body(parts, is_unlisted, gated, &marked)
             } else {
                 let mut page = inject_look_snippet(&buf);
                 if let Some(suffix) = badge {
                     page.extend_from_slice(suffix);
                 }
-                rebuild_look_body(parts, is_unlisted, &page)
+                rebuild_look_body(parts, is_unlisted, gated, &page)
             }
         }
         Ok((buf, Some(rest))) => {
@@ -691,6 +773,7 @@ async fn look_response(
                 Response::builder().status(parts.status),
                 &mut parts.headers,
                 is_unlisted,
+                gated,
             );
             let mut prefix = LOOK_SKIP_OVERSIZE.to_vec();
             prefix.extend_from_slice(&buf);
@@ -752,6 +835,9 @@ async fn outer_page(state: &ProxyState, app: &apps::App, suffix: &str, req: Requ
     match (req.method().as_str(), suffix) {
         ("GET", "report") => report_form_page(),
         ("POST", "report") => report_submit(state, app, req).await,
+        // The access gate's own unlock form: reachable on a locked app, so
+        // it answers here with the other proxy-owned pages, before the gate.
+        ("POST", "unlock") => unlock_submit(state, app, req).await,
         ("GET", "held") => held_page(),
         ("GET", "suspended") => suspended_page(),
         ("GET", "paused") => paused_page(app.paused_reason.as_deref()),
@@ -913,6 +999,223 @@ async fn report_submit(state: &ProxyState, app: &apps::App, req: Request) -> Res
         "<p>A human reviews every report. If the app is harmful, it will be \
          held or suspended soon.</p>",
     )
+}
+
+/// The gate's plain answer for non-navigation locked requests (assets, API
+/// calls, anything without a navigation `Accept`): 401 text, `no-store` so
+/// nothing caches the refusal, `noindex` so it never gets indexed.
+fn locked_plain() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("cache-control", "no-store")
+        .header("x-robots-tag", "noindex, nofollow")
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from("This app is private."))
+        .unwrap()
+}
+
+/// The gate's HTML answer for locked navigations (GET/HEAD with a navigation
+/// `Accept`): 401 with the Outer-served lock page — the app's name, "This
+/// app is private", one secret input and Unlock. Same-origin, no external
+/// assets, strict CSP (the page carries no styles or scripts).
+fn locked_page(app: &apps::App, next: &str, error: Option<&str>) -> Response {
+    let page = crate::access::render_lock_page(
+        app.name.as_deref().unwrap_or(&app.slug),
+        app.access_mode,
+        next,
+        error,
+    );
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("cache-control", "no-store")
+        .header("x-robots-tag", "noindex, nofollow")
+        .header(
+            "content-security-policy",
+            "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        )
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(page))
+        .unwrap()
+}
+
+/// Whether `req` is a locked-app navigation: GET/HEAD with a navigation
+/// `Accept`, the shape that gets the HTML lock page instead of the plain
+/// 401.
+fn wants_lock_page(req: &Request) -> bool {
+    matches!(req.method().as_str(), "GET" | "HEAD")
+        && crate::http::badge::accepts_html(req.headers())
+}
+
+/// The request's unlock cookie, if it holds a live one for this app on this
+/// host: the right app, the current version, the request's host, unexpired,
+/// valid MAC. Anything else — missing, moved from another app or host, stale
+/// after a secret change, expired, forged — is locked. Recognition shares
+/// [`crate::access::is_access_pair`] with the forward strip, so every
+/// spelling the gate accepts is stripped before the app sees it.
+fn has_access_cookie(state: &ProxyState, headers: &HeaderMap, app: &apps::App, host: &str) -> bool {
+    let Some(key) = state.access_key.as_ref() else {
+        // Fail closed: a gated app without a wired key never unlocks.
+        return false;
+    };
+    let now = apps::now_ms();
+    crate::access::access_cookie_values(headers).any(|value| {
+        crate::access::verify_cookie(key, value, &app.id, app.access_version, now, host)
+    })
+}
+
+/// `POST /.outer/unlock` (form-encoded): check the same-origin proof, then
+/// the failure budgets, verify the secret off the async runtime under the
+/// process-wide permit cap, and on success set the unlock cookie and 303
+/// back to `next` (a validated same-host relative path, never an open
+/// redirect). Failures re-render the lock page with 401 ("Wrong PIN" /
+/// "Wrong password") and count against the budgets; spent budgets answer
+/// 429 with a plain wait time and never check the hash.
+async fn unlock_submit(state: &ProxyState, app: &apps::App, req: Request) -> Response {
+    // Same-origin proof: `Sec-Fetch-Site: same-origin`, or — when the
+    // browser omits it — an `Origin` equal to the request's own scheme and
+    // host. Browsers always send `Origin` on form POSTs, so a missing or
+    // foreign value is a cross-site auto-POST driving the victim's browser:
+    // refuse before it spends the budget, writes a ledger row or mints a
+    // cookie. Curl (no headers at all) is refused too: the unlock form the
+    // page serves always posts same-origin.
+    let fetch_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok());
+    let raw_host = request_host(&req).unwrap_or_default();
+    let scheme = if state.origin_locked { "https" } else { "http" };
+    let origin_ok = req
+        .headers()
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| {
+            origin
+                .trim()
+                .eq_ignore_ascii_case(&format!("{scheme}://{raw_host}"))
+        });
+    if fetch_site != Some("same-origin") && !origin_ok {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("cache-control", "no-store")
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from("same-origin requests only"))
+            .unwrap();
+    }
+    let Some(key) = state.access_key.clone() else {
+        return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+    };
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    let client = client_ip(req.headers(), state.origin_locked, peer);
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("cache-control", "no-store")
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from("unlock too large"))
+                .unwrap();
+        }
+    };
+    let fields = crawl::parse_form(&bytes);
+    let secret = fields.get("secret").map(String::as_str).unwrap_or("");
+    let next = fields
+        .get("next")
+        .map(|raw| crate::access::sanitize_next(raw))
+        .unwrap_or("/");
+    let now = apps::now_ms();
+    match crate::access::check_attempt(
+        &state.pool,
+        client.as_deref(),
+        &app.id,
+        app.access_mode,
+        now,
+    )
+    .await
+    {
+        Err(err) => {
+            tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "unlock ledger lookup failed");
+            return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+        Ok(Err(retry_after)) => {
+            return limited_response(retry_after);
+        }
+        Ok(Ok(())) => {}
+    }
+    // An open app has nothing to unlock (the gate lifted mid-form): go back.
+    let Some(expected) = app.access_hash.as_deref() else {
+        return redirect_next(next);
+    };
+    // One Argon2 verify at a time per permit, burst-wide: fail fast with
+    // 429 when the cap is spent rather than queueing blocking-pool work.
+    // The refusal records nothing: no failure happened.
+    let Ok(_permit) = state.verify_permits.try_acquire() else {
+        return limited_response(1);
+    };
+    if crate::access::verify_secret(expected, secret).await {
+        // The cookie binds the request host (port already stripped), so the
+        // live, preview and custom-domain scopes stay separate.
+        let host = strip_port(&raw_host);
+        let value = crate::access::mint_cookie(&key, &app.id, app.access_version, now, host);
+        let location = axum::http::HeaderValue::from_str(next)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("/"));
+        Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header("location", location)
+            .header(
+                "set-cookie",
+                format!(
+                    "{}={value}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+                    crate::access::COOKIE_NAME,
+                    crate::access::COOKIE_TTL_MS / 1000,
+                ),
+            )
+            .header("cache-control", "no-store")
+            .body(Body::empty())
+            .unwrap()
+    } else {
+        if let Err(err) =
+            crate::access::record_failure(&state.pool, client.as_deref(), &app.id, now).await
+        {
+            tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "unlock ledger record failed");
+        }
+        locked_page(app, next, Some("wrong"))
+    }
+}
+
+/// The spent-budget answer: 429 with `Retry-After` seconds for clients and
+/// the wait in whole minutes for humans ("Too many tries. Try again in N
+/// minutes."), `no-store` so the edge never caches the refusal.
+fn limited_response(retry_after: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("retry-after", retry_after.to_string())
+        .header("cache-control", "no-store")
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(format!(
+            "Too many tries. Try again in {} minutes.",
+            crate::access::retry_minutes(retry_after)
+        )))
+        .unwrap()
+}
+
+/// Back to the validated same-host path, after an unlock (or when the gate
+/// lifted mid-form). The 303 keeps the browser on GET. The `Location`
+/// builds fallibly: `sanitize_next` already rejects control bytes, and a
+/// bad value falls back to `/` instead of panicking the connection.
+fn redirect_next(next: &str) -> Response {
+    let location = axum::http::HeaderValue::from_str(next)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("/"));
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header("location", location)
+        .header("cache-control", "no-store")
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// The held interstitial (spec §15.2): 503 while the app is being reviewed.
@@ -1095,7 +1398,13 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         );
     }
     let is_unlisted = app.visibility == apps::Visibility::Unlisted;
-    if req.method() == axum::http::Method::GET && req.uri().path() == "/robots.txt" && is_unlisted {
+    // A gated app answers the disallowing robots.txt whatever its
+    // visibility, and crawlers carry no cookie: serve it before the gate.
+    let gated = app.access_mode != crate::access::AccessMode::Open;
+    if req.method() == axum::http::Method::GET
+        && req.uri().path() == "/robots.txt"
+        && (is_unlisted || gated)
+    {
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain")
@@ -1103,6 +1412,49 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             .body(Body::from("User-agent: *\nDisallow: /\n"))
             .unwrap();
     }
+    // The fleet health gate answers synthetically on every app host, gated
+    // or open, without waking or proxying: the path used to fall through to
+    // the fleet, leaking app content and waking the fleet for anonymous
+    // requests. Internal health checks go direct to loopback, like the
+    // platform `/health` route (`ok`).
+    if req.uri().path() == "/.well-known/celld/health" {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("cache-control", "no-store")
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from("ok"))
+            .unwrap();
+    }
+    // Console capture claims its single-use token up front: a live token
+    // for this host unlocks the render below AND skips the gate, so
+    // `look_at_app` screenshots see the unlocked app. The header never
+    // reaches upstream either way (stripped in the forward loop).
+    let look_armed = req
+        .headers()
+        .get(LOOK_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| state.look_tokens.claim(bare, token));
+    // Pro access gate: every host that serves the app (live, preview and
+    // custom domains), every method and path, assets included. Outer's own
+    // traffic skips it: the `/.outer/*` pages above (report, held/suspended
+    // and unlock), the synthetic health gate above, a live look-token
+    // render, and the robots answer above. Locked requests never wake the
+    // fleet: the gate answers before `ensure_awake`. The cookie binds the
+    // request host, so live, preview and custom-domain scopes stay separate.
+    if gated && !look_armed && !has_access_cookie(&state, req.headers(), &app, bare) {
+        if wants_lock_page(&req) {
+            let raw = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
+            let next = crate::access::sanitize_next(raw);
+            return locked_page(&app, next, None);
+        }
+        return locked_plain();
+    }
+    // A gated response is never indexed either, whatever the visibility.
+    let noindex = is_unlisted || gated;
     if is_preview {
         if let Err(err) = state.fleets.ensure_awake_preview(&state.pool, &app).await {
             tracing::warn!(slug = %app.slug, error = %err, "preview wake failed");
@@ -1194,18 +1546,15 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // Collected up front: every name this request's `Connection` nominates
     // is hop-by-hop for this hop, alongside the fixed list.
     let nominated = connection_tokens(&parts.headers);
-    // Console capture: consume a live token for this host, if present. The
-    // header never reaches upstream either way; a live token additionally
-    // asks for an identity body so the recorder can be injected below.
-    let look_armed = parts
-        .headers
-        .get(LOOK_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|token| state.look_tokens.claim(bare, token));
-    // The badge needs plain HTML too, but only when the client would take
-    // HTML at all: API and asset fetches keep their encoding and pass
-    // through untouched below.
+    // Claimed up front (before the access gate): a live token additionally
+    // asks for an identity body so the recorder can be injected below. The
+    // header never reaches upstream either way (skipped in the loop).
     let badge_identity = badge.is_some() && badge::accepts_html(&parts.headers);
+    // The gate cookie is Outer's, never the app's: drop that pair and keep
+    // every other cookie. The shared [`crate::access::forwarded_cookie`]
+    // recognizes exactly the spellings the gate accepts, so a cookie that
+    // unlocks is always stripped before the app sees it.
+    let fwd_cookie: Option<String> = crate::access::forwarded_cookie(&parts.headers);
     for (name, value) in parts.headers.iter() {
         if *name == axum::http::header::HOST {
             continue;
@@ -1220,6 +1569,11 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         }
         // The console-capture token is ours: never forward it, valid or not.
         if name.as_str() == LOOK_HEADER {
+            continue;
+        }
+        // The gate cookie is re-added below without its pair (see
+        // `fwd_cookie`); skip every client `Cookie` header here.
+        if *name == axum::http::header::COOKIE {
             continue;
         }
         // With a live token the recorder needs plain HTML below, as does
@@ -1264,6 +1618,10 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     if look_armed || badge_identity {
         outbound = outbound.header(axum::http::header::ACCEPT_ENCODING, "identity");
     }
+    // The visitor's other cookies, without the gate pair (see `fwd_cookie`).
+    if let Some(cookie) = fwd_cookie {
+        outbound = outbound.header(axum::http::header::COOKIE, cookie);
+    }
     let outbound = match outbound.body(body) {
         Ok(req) => req,
         Err(_) => return text(StatusCode::BAD_GATEWAY, "app unavailable"),
@@ -1300,7 +1658,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
                 upstream_start.elapsed().as_millis() as u64,
                 0,
             );
-            return from_upstream(upstream, is_unlisted);
+            return from_upstream(upstream, noindex, gated);
         }
     }
     if look_armed {
@@ -1310,7 +1668,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         let status = upstream.status();
         let bytes_out = response_bytes(&upstream);
         let latency_ms = upstream_start.elapsed().as_millis() as u64;
-        let response = look_response(upstream, is_unlisted, badge.as_deref()).await;
+        let response = look_response(upstream, noindex, gated, badge.as_deref()).await;
         meter(status.as_u16(), latency_ms, bytes_out);
         return response;
     }
@@ -1320,14 +1678,14 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         let status = upstream.status();
         let bytes_out = response_bytes(&upstream);
         let latency_ms = upstream_start.elapsed().as_millis() as u64;
-        let response = badge_response(upstream, is_unlisted, &snippet, is_head).await;
+        let response = badge_response(upstream, noindex, gated, &snippet, is_head).await;
         meter(status.as_u16(), latency_ms, bytes_out);
         return response;
     }
     let status = upstream.status();
     let bytes_out = response_bytes(&upstream);
     let latency_ms = upstream_start.elapsed().as_millis() as u64;
-    let response = from_upstream(upstream, is_unlisted);
+    let response = from_upstream(upstream, noindex, gated);
     meter(status.as_u16(), latency_ms, bytes_out);
     response
 }
@@ -1453,6 +1811,34 @@ mod tests {
                         .status(StatusCode::OK)
                         .header("content-type", "text/css")
                         .body(Body::from("body{color:red}"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                // A cacheable asset AND page: the upstream claims a long
+                // public max-age (plus an ETag and an upstream `Vary`), so
+                // the gate tests can pin the no-store override downstream.
+                "/cacheable",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/css")
+                        .header("cache-control", "public, max-age=3600")
+                        .header("etag", "\"css-v1\"")
+                        .header("vary", "Accept-Encoding")
+                        .body(Body::from("body{color:red}"))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/cacheable-html",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("cache-control", "public, max-age=3600")
+                        .header("etag", "\"html-v1\"")
+                        .body(Body::from("<html><head></head><body>hi</body></html>"))
                         .unwrap()
                 }),
             )
@@ -1892,6 +2278,802 @@ mod tests {
             .unwrap();
         let (_, headers, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
         assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+    }
+
+    /// A proxy state with the test access key wired, for the gate tests.
+    fn gate_state(pool: sqlx::SqlitePool, dir: &std::path::Path) -> ProxyState {
+        ProxyState::new(
+            pool,
+            manager(dir),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        )
+        .with_access_key(crate::access::AccessKey::test_key())
+    }
+
+    /// Lock `id` behind `mode` with `secret`.
+    async fn lock_app(pool: &sqlx::SqlitePool, id: &str, mode: &str, secret: &str) {
+        let hash = crate::access::hash_secret(secret).await.unwrap();
+        sqlx::query(
+            "UPDATE app SET access_mode = ?1, access_hash = ?2, access_version = 1 WHERE id = ?3",
+        )
+        .bind(mode)
+        .bind(hash)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A visitor request from one fixed client IP (so the per-IP failure
+    /// budget trips deterministically).
+    fn visitor(mut req: Request) -> Request {
+        req.extensions_mut()
+            .insert(ConnectInfo("9.9.9.9:1234".parse::<SocketAddr>().unwrap()));
+        req
+    }
+
+    fn html_nav(host: &str, path: &str, cookie: Option<&str>) -> Request {
+        let mut req = Request::builder()
+            .uri(path)
+            .header("host", host)
+            .header("accept", "text/html,application/xhtml+xml");
+        if let Some(cookie) = cookie {
+            req = req.header("cookie", cookie);
+        }
+        visitor(req.body(Body::empty()).unwrap())
+    }
+
+    fn unlock_post(host: &str, body: &str) -> Request {
+        // The unlock form posts same-origin: browsers attach `Origin`, which
+        // the handler requires when `Sec-Fetch-Site` is absent.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/.outer/unlock")
+            .header("host", host)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", format!("http://{host}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        visitor(req)
+    }
+
+    /// A locked HTML navigation gets the Outer-served 401 page — "This app
+    /// is private", one secret input and Unlock — with `no-store`,
+    /// `noindex` and a strict CSP, before any wake or forward.
+    #[tokio::test]
+    async fn locked_html_get_serves_the_lock_page() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let before = fleet.hits.load(Ordering::SeqCst);
+        let (status, headers, body) = body_text(
+            router(state)
+                .oneshot(html_nav("shop.outer.test", "/items", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("This app is private"), "{body}");
+        assert!(body.contains("action=\"/.outer/unlock\""), "{body}");
+        assert!(
+            body.contains("inputmode=\"numeric\""),
+            "PIN input mode: {body}"
+        );
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+        assert!(
+            headers
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|csp| csp.contains("default-src 'none'")),
+            "strict CSP: {headers:?}"
+        );
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            before,
+            "locked requests never wake or forward"
+        );
+    }
+
+    /// A locked non-navigation (assets, API) gets the plain 401 text.
+    #[tokio::test]
+    async fn locked_asset_get_is_plain_401() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "password", "correct horse!").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let req = visitor(
+            Request::builder()
+                .uri("/asset.css")
+                .header("host", "shop.outer.test")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "This app is private.");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+    }
+
+    /// Outer's own pages stay reachable on a locked app: the report form
+    /// and the disallowing robots answer (even for a public app), both
+    /// `no-store` and never forwarded.
+    #[tokio::test]
+    async fn outer_pages_and_robots_stay_reachable_on_locked_app() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let before = fleet.hits.load(Ordering::SeqCst);
+        let req = Request::builder()
+            .uri("/.outer/report")
+            .header("host", "shop.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Report this app"), "{body}");
+        let req = Request::builder()
+            .uri("/robots.txt")
+            .header("host", "shop.outer.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "User-agent: *\nDisallow: /\n");
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), before);
+    }
+
+    /// The unlock round trip: a correct PIN sets the cookie and 303s to
+    /// `next`; the next request forwards WITHOUT the gate cookie and with
+    /// every other cookie intact.
+    #[tokio::test]
+    async fn unlock_sets_cookie_and_forwards_without_it() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let req = unlock_post("shop.outer.test", "secret=1234&next=/items?page=2");
+        let (status, headers, _) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers.get("location").unwrap(), "/items?page=2");
+        let set_cookie = headers
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .expect("unlock sets the cookie")
+            .to_string();
+        assert!(
+            set_cookie.starts_with("__Host-outer-access="),
+            "{set_cookie}"
+        );
+        assert!(set_cookie.contains("; Secure"), "{set_cookie}");
+        assert!(set_cookie.contains("; HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("; SameSite=Lax"), "{set_cookie}");
+        assert!(set_cookie.contains("; Path=/"), "{set_cookie}");
+        let value = set_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("__Host-outer-access=")
+            .unwrap();
+        // The visitor's other cookies ride along; the gate pair must not
+        // reach the app.
+        let req = html_nav(
+            "shop.outer.test",
+            "/echo",
+            Some(&format!(
+                "session=abc; __Host-outer-access={value}; theme=dark"
+            )),
+        );
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got = echo(&body);
+        assert_eq!(got["headers"]["cookie"], "session=abc; theme=dark");
+    }
+
+    /// A wrong PIN re-renders with 401 ("Wrong PIN") and records the
+    /// failure; the 6th failure in the window gets 429 naming the wait in
+    /// minutes, `no-store`, and never checks the hash (even the right PIN
+    /// is refused).
+    #[tokio::test]
+    async fn wrong_secret_counts_and_trips_the_ip_budget() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        for _ in 0..5 {
+            let req = unlock_post("shop.outer.test", "secret=0000&next=/");
+            let (status, _, body) =
+                body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert!(body.contains("Wrong PIN"), "{body}");
+        }
+        // The 6th attempt — even with the RIGHT secret — is limited: the
+        // gate never checked the hash.
+        let req = unlock_post("shop.outer.test", "secret=1234&next=/");
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key("retry-after"), "{headers:?}");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert!(
+            body.starts_with("Too many tries. Try again in "),
+            "the limit reads plainly: {body}"
+        );
+        assert!(body.ends_with(" minutes."), "{body}");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE action = 'access_fail'",
+        )
+        .fetch_one(&fix.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 10,
+            "five failures on two budgets, nothing recorded past the limit"
+        );
+    }
+
+    /// A secret change (bumped version) signs old cookies out, a cookie
+    /// minted for one app is rejected on another, and a cookie minted for
+    /// one host is rejected on another (live vs preview scope).
+    #[tokio::test]
+    async fn stale_and_foreign_cookies_stay_locked() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        let fleet2 = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        insert_app(
+            &fix.pool,
+            "app-other",
+            "other",
+            fleet2.addr.port(),
+            "public",
+        )
+        .await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        lock_app(&fix.pool, "app-other", "pin", "1234").await;
+        let key = crate::access::AccessKey::test_key();
+        let now = crate::apps::now_ms();
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        // Mint for the pre-change version, then rotate the secret.
+        let stale = crate::access::mint_cookie(&key, "app-shop", 1, now, "shop.outer.test");
+        crate::access::set_access(
+            &fix.pool,
+            "app-shop",
+            crate::access::AccessMode::Pin,
+            Some("9999"),
+            "pro",
+        )
+        .await
+        .unwrap();
+        let (status, _, _) = body_text(
+            router(state.clone())
+                .oneshot(html_nav(
+                    "shop.outer.test",
+                    "/",
+                    Some(&format!("__Host-outer-access={stale}")),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "bumped version rejects the old cookie"
+        );
+        // Fresh cookie for the new version passes.
+        let fresh = crate::access::mint_cookie(&key, "app-shop", 2, now, "shop.outer.test");
+        let (status, _, _) = body_text(
+            router(state.clone())
+                .oneshot(html_nav(
+                    "shop.outer.test",
+                    "/",
+                    Some(&format!("__Host-outer-access={fresh}")),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // A cookie for another app is rejected there.
+        let foreign = crate::access::mint_cookie(&key, "app-shop", 2, now, "other.outer.test");
+        let (status, _, _) = body_text(
+            router(state.clone())
+                .oneshot(html_nav(
+                    "other.outer.test",
+                    "/",
+                    Some(&format!("__Host-outer-access={foreign}")),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "app-scoped cookie");
+        // A live-host cookie is rejected on the preview host: same app, but
+        // the cookie scope is the request host. The row carries preview
+        // state so the preview host routes, plus a successful preview deploy
+        // so the preview-ready gate passes; the access gate 401s before any
+        // wake.
+        sqlx::query(
+            "UPDATE app SET preview_sha = 'b', preview_updated_at = ?1, \
+             preview_port = 1, preview_internal_port = 1 WHERE id = 'app-shop'",
+        )
+        .bind(crate::apps::now_ms())
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO deploy (id, app_id, sha, kind, status, created_at, finished_at) \
+             VALUES ('dep-preview', 'app-shop', 'b', 'preview', 'success', 0, 1)",
+        )
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        let before = fleet.hits.load(Ordering::SeqCst) + fleet2.hits.load(Ordering::SeqCst);
+        let (status, _, body) = body_text(
+            router(state)
+                .oneshot(html_nav(
+                    "shop--preview.outer.test",
+                    "/",
+                    Some(&format!("__Host-outer-access={fresh}")),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "host-scoped cookie: {body}"
+        );
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst) + fleet2.hits.load(Ordering::SeqCst),
+            before,
+            "a rejected cookie never wakes a fleet"
+        );
+    }
+
+    /// `next` is a same-host relative path only: absolute URLs,
+    /// protocol-relative hosts, backslash escapes, and any control or
+    /// non-visible-ASCII byte fall back to `/` — without panicking the
+    /// `Location` header build.
+    #[tokio::test]
+    async fn unlock_next_never_leaves_the_host() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        for evil in [
+            "next=https%3A%2F%2Fevil.example",
+            "next=%2F%2Fevil.example",
+            "next=%2F%5Cevil",
+            // CR/LF in the form value: `sanitize_next` falls back instead of
+            // panicking `Builder::header`.
+            "next=%2Fa%0D%0AB%3A+1",
+            "next=%2Fa%7F",
+        ] {
+            let req = unlock_post("shop.outer.test", &format!("secret=1234&{evil}"));
+            let (status, headers, _) =
+                body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{evil}");
+            assert_eq!(headers.get("location").unwrap(), "/", "{evil}");
+        }
+    }
+
+    /// Bypasses that must keep working: a live look-token render sees the
+    /// app with no cookie; a client-forged look token or "internal" header
+    /// never bypasses the gate.
+    #[tokio::test]
+    async fn look_bypass_but_forged_headers_do_not() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let tokens = crate::look_tokens::LookTokens::new();
+        let token = tokens.mint("shop.outer.test");
+        let state = gate_state(fix.pool.clone(), fix._dir.path()).with_look_tokens(tokens);
+        // Live look token: unlocked render, no cookie.
+        let req = look_html_request(Some(&token));
+        let (status, _, _) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        // A forged look token or "internal" header buys nothing.
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "shop.outer.test")
+            .header("x-outer-look", "forged")
+            .header("x-internal-bypass", "1")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "This app is private.");
+    }
+
+    /// The fleet health gate answers synthetically on gated AND open app
+    /// hosts — `ok`, `no-store` — without waking or proxying: the path used
+    /// to forward to the app, leaking whatever it serves and waking the
+    /// fleet for anonymous requests.
+    #[tokio::test]
+    async fn health_gate_is_synthetic_and_never_wakes() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        let fleet_open = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        insert_app(
+            &fix.pool,
+            "app-open",
+            "open",
+            fleet_open.addr.port(),
+            "public",
+        )
+        .await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        for host in ["shop.outer.test", "open.outer.test"] {
+            let before = fleet.hits.load(Ordering::SeqCst);
+            let req = visitor(
+                Request::builder()
+                    .uri("/.well-known/celld/health")
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+            let (status, headers, body) =
+                body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "host {host}");
+            assert_eq!(body, "ok", "host {host}");
+            assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+            assert_eq!(
+                fleet.hits.load(Ordering::SeqCst),
+                before,
+                "the health gate never reaches the fleet: {host}"
+            );
+        }
+        // An asleep app (nothing listening) stays asleep: the synthetic
+        // answer never touches the fleet manager.
+        let dead_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        insert_app(&fix.pool, "app-dead", "dead", dead_port, "public").await;
+        lock_app(&fix.pool, "app-dead", "pin", "1234").await;
+        let req = visitor(
+            Request::builder()
+                .uri("/.well-known/celld/health")
+                .header("host", "dead.outer.test")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok", "no wake, no forward, no 503");
+    }
+
+    /// A cross-site unlock POST is refused before it can spend the
+    /// visitor's failure budget.
+    #[tokio::test]
+    async fn cross_site_unlock_is_refused_without_recording() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/.outer/unlock")
+            .header("host", "shop.outer.test")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::from("secret=0000&next=/"))
+            .unwrap();
+        let (status, _, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE action = 'access_fail'",
+        )
+        .fetch_one(&fix.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "refused cross-site posts record nothing");
+    }
+
+    /// Unlocks need a same-origin proof: `Sec-Fetch-Site: same-origin`, or
+    /// `Origin` equal to the request's own scheme+host. A missing or foreign
+    /// proof is refused (403, no ledger row, no `Set-Cookie`), so a
+    /// cross-site auto-POST cannot unlock a victim's browser.
+    #[tokio::test]
+    async fn unlock_needs_a_same_origin_proof() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        // No proof headers at all: refused.
+        let bare = Request::builder()
+            .method("POST")
+            .uri("/.outer/unlock")
+            .header("host", "shop.outer.test")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("secret=1234&next=/"))
+            .unwrap();
+        let (status, headers, _) =
+            body_text(router(state.clone()).oneshot(visitor(bare)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert!(headers.get("set-cookie").is_none());
+        // A foreign `Origin`: refused.
+        let foreign = Request::builder()
+            .method("POST")
+            .uri("/.outer/unlock")
+            .header("host", "shop.outer.test")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", "https://evil.example")
+            .body(Body::from("secret=1234&next=/"))
+            .unwrap();
+        let (status, _, _) = body_text(
+            router(state.clone())
+                .oneshot(visitor(foreign))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // The request's own `Origin`: unlocks.
+        let req = unlock_post("shop.outer.test", "secret=1234&next=/");
+        let (status, _, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE action = 'access_fail'",
+        )
+        .fetch_one(&fix.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "refused proofs record nothing");
+    }
+
+    /// An unlocked navigation to a gated app carries `noindex`, whatever
+    /// the visibility.
+    #[tokio::test]
+    async fn gated_proxied_page_carries_noindex() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let key = crate::access::AccessKey::test_key();
+        let cookie = crate::access::mint_cookie(
+            &key,
+            "app-shop",
+            1,
+            crate::apps::now_ms(),
+            "shop.outer.test",
+        );
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        // `/look-html` is upstream HTML, so the proxied response is a page.
+        let req = html_nav(
+            "shop.outer.test",
+            "/look-html",
+            Some(&format!("__Host-outer-access={cookie}")),
+        );
+        let (status, headers, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+    }
+
+    /// A gated app's proxied responses never cache: the upstream
+    /// `Cache-Control: public, max-age=3600` becomes `private, no-store`
+    /// and `Cookie` joins `Vary` (asset, page and look render alike), while
+    /// `ETag` stays for validators. An open app keeps the upstream headers
+    /// untouched.
+    #[tokio::test]
+    async fn gated_proxied_responses_carry_no_store_and_vary() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        let fleet_open = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        insert_app(
+            &fix.pool,
+            "app-open",
+            "open",
+            fleet_open.addr.port(),
+            "public",
+        )
+        .await;
+        let key = crate::access::AccessKey::test_key();
+        let cookie = crate::access::mint_cookie(
+            &key,
+            "app-shop",
+            1,
+            crate::apps::now_ms(),
+            "shop.outer.test",
+        );
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        // Asset on the gated app.
+        let req = html_nav(
+            "shop.outer.test",
+            "/cacheable",
+            Some(&format!("__Host-outer-access={cookie}")),
+        );
+        let (status, headers, _) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("cache-control").unwrap(), "private, no-store");
+        let vary = headers.get("vary").and_then(|v| v.to_str().ok()).unwrap();
+        assert!(
+            vary.contains("Accept-Encoding"),
+            "upstream Vary kept: {vary}"
+        );
+        assert!(vary.contains("Cookie"), "gate Vary added: {vary}");
+        assert_eq!(
+            headers.get("etag").unwrap(),
+            "\"css-v1\"",
+            "validators stay"
+        );
+        // HTML page on the gated app.
+        let req = html_nav(
+            "shop.outer.test",
+            "/cacheable-html",
+            Some(&format!("__Host-outer-access={cookie}")),
+        );
+        let (status, headers, _) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("cache-control").unwrap(), "private, no-store");
+        assert!(
+            headers
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("Cookie")),
+            "{headers:?}"
+        );
+        // Look render on the gated app: the look path rebuilds headers, and
+        // the same no-store override applies.
+        let tokens = crate::look_tokens::LookTokens::new();
+        let token = tokens.mint("shop.outer.test");
+        let look_state = gate_state(fix.pool.clone(), fix._dir.path()).with_look_tokens(tokens);
+        let mut req = Request::builder()
+            .uri("/cacheable-html")
+            .header("host", "shop.outer.test")
+            .header("accept", "text/html,application/xhtml+xml")
+            .header(LOOK_HEADER, token)
+            .header("cookie", format!("__Host-outer-access={cookie}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("9.9.9.9:1234".parse::<SocketAddr>().unwrap()));
+        let (status, headers, body) =
+            body_text(router(look_state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("cache-control").unwrap(), "private, no-store");
+        assert!(
+            body.contains("__outer_look"),
+            "the recorder was injected: {body}"
+        );
+        // Open app: the upstream headers pass through untouched.
+        let req = html_nav("open.outer.test", "/cacheable", None);
+        let (status, headers, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("cache-control").unwrap(),
+            "public, max-age=3600"
+        );
+        assert_eq!(headers.get("vary").unwrap(), "Accept-Encoding");
+    }
+
+    /// A gate cookie with whitespace before the `=` unlocks AND is stripped:
+    /// one shared recognition serves the gate check and the forward path.
+    #[tokio::test]
+    async fn spaced_gate_cookie_unlocks_but_never_reaches_the_app() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let key = crate::access::AccessKey::test_key();
+        let cookie = crate::access::mint_cookie(
+            &key,
+            "app-shop",
+            1,
+            crate::apps::now_ms(),
+            "shop.outer.test",
+        );
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let req = html_nav(
+            "shop.outer.test",
+            "/echo",
+            Some(&format!(
+                "session=abc; __Host-outer-access ={cookie}; theme=dark"
+            )),
+        );
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "the spaced spelling unlocks");
+        let got = echo(&body);
+        assert_eq!(got["headers"]["cookie"], "session=abc; theme=dark");
+    }
+
+    /// The per-app PIN budget is 30 failures per 24 h: the 31st attempt —
+    /// even with the RIGHT secret — gets 429 without ever calling the
+    /// verifier. Distinct client IPs spread the failures past the tighter
+    /// per-IP budget.
+    #[tokio::test]
+    async fn thirty_first_pin_failure_is_limited_without_verifying() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        for n in 0..30 {
+            // Six IPs, five failures each: under the per-IP budget of 5.
+            let peer: SocketAddr = format!("10.9.0.{}:1234", n / 5 + 1).parse().unwrap();
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/.outer/unlock")
+                .header("host", "shop.outer.test")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "http://shop.outer.test")
+                .body(Body::from("secret=0000&next=/"))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let (status, _, _) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "failure {n}");
+        }
+        // The 31st attempt carries the RIGHT secret: a verify would 303, so
+        // 429 proves the budget refused before the hash.
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/.outer/unlock")
+            .header("host", "shop.outer.test")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", "http://shop.outer.test")
+            .body(Body::from("secret=1234&next=/"))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo("10.9.0.9:1234".parse::<SocketAddr>().unwrap()));
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert!(body.starts_with("Too many tries. Try again in "), "{body}");
+    }
+
+    /// The Argon2 permit cap refuses fast: with no permit free the unlock
+    /// answers 429 without calling the verifier (the right secret still
+    /// refuses) rather than queueing blocking-pool work.
+    #[tokio::test]
+    async fn exhausted_verify_permits_fail_fast() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let permits = state.verify_permits.clone();
+        let _held = permits.acquire_many(8).await.unwrap();
+        let req = unlock_post("shop.outer.test", "secret=1234&next=/");
+        let (status, headers, _) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE action = 'access_fail'",
+        )
+        .fetch_one(&fix.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "a refused attempt records no failure");
     }
 
     #[tokio::test]

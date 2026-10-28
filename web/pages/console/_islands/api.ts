@@ -76,6 +76,8 @@ export interface ConsoleApp {
   /** True when this detail was served through the admin override. */
   admin?: boolean;
   visibility: string;
+  /** Visitor gate: open, pin or password. Never the hash. */
+  access: string;
   /** Pro keep-warm flag; stored for every plan, ignored on Free. */
   always_on: boolean;
   status: string;

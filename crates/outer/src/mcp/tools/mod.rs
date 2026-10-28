@@ -5,6 +5,7 @@
 //! that becomes `isError`). Argument-shape failures are the caller's bug
 //! and surface as JSON-RPC `-32602`, never as `isError`.
 
+pub(crate) mod access;
 pub(crate) mod account;
 pub(crate) mod add_example;
 pub(crate) mod apps;
@@ -1117,6 +1118,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "set_always_on" => apps::set_always_on(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "set_access" => access::set_access(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "share_app" => apps::share_app(parse_args(args)?, ctx)

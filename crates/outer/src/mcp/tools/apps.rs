@@ -442,6 +442,8 @@ pub async fn app_summary(ctx: &Ctx<'_>, app: &App, role: Role) -> Result<Value, 
             Role::Collaborator => "collaborator",
         },
         "visibility": app.visibility.as_str(),
+        // The visitor gate: open, pin or password. Never the hash.
+        "access": app.access_mode.as_str(),
         // Pro keep-warm flag (feature #6); Free owners see it stored but
         // ignored until they upgrade.
         "always_on": app.always_on,

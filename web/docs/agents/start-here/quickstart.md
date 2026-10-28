@@ -32,6 +32,14 @@ Change code with `commit {app, message, line_edits}` using line-anchored edits (
 
 Call `share_app {app}` for the URL, share text, and QR code. Check [Look](/agents/testing/look) output and [Logs](/agents/testing/logs) after server changes. Undo with `rollback` (never counts as a code change). Delete with `delete_app {app, confirm}` where confirm repeats the slug; the name is free to claim again immediately.
 
+## Private apps
+
+If the user wants the app private, call `set_access {app, mode}`: `pin`
+(4-8 digits) or `password` (8-128 characters) locks every host and path
+behind an unlock form; `open` removes the gate. Pro only — opening is always
+allowed. Passkeys (`add_example passkeys`) are for per-person accounts;
+the gate is one shared secret for all visitors.
+
 ## Rules that bite newcomers
 
 | Rule | Detail |

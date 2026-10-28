@@ -225,6 +225,14 @@ pub struct App {
     /// is Pro (up to the host cap) and the warm-up restarts it when stopped.
     /// Stored for every plan; ignored on Free.
     pub always_on: bool,
+    /// Visitor gate (Pro): `open` serves everyone, `pin`/`password` need the
+    /// unlock cookie. Stored for every plan; ignored only when `open`.
+    pub access_mode: crate::access::AccessMode,
+    /// Argon2id hash of the PIN/password (`None` when open). Never leaves
+    /// the server: tools and console show the mode, never this.
+    pub access_hash: Option<String>,
+    /// Bumps on every gate change, so a new secret signs old cookies out.
+    pub access_version: i64,
     /// The active preview deploy (Pro feature #7), if any: the commit on
     /// the `preview` git ref, served at `<slug>--preview.<apps_domain>`
     /// from a fresh data namespace. All four are set or cleared together.
@@ -286,7 +294,8 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visibility, \
     moderation_state, paused_reason, \
     asleep_since, last_request_at, last_deploy_sha, last_activity_at, expired_at, \
-    downgraded_stopped_at, created_at, always_on, preview_sha, preview_updated_at, \
+    downgraded_stopped_at, created_at, always_on, access_mode, access_hash, access_version, \
+    preview_sha, preview_updated_at, \
     preview_port, preview_internal_port";
 
 #[derive(Debug, sqlx::FromRow)]
@@ -309,6 +318,9 @@ struct AppRow {
     downgraded_stopped_at: Option<i64>,
     created_at: i64,
     always_on: i64,
+    access_mode: String,
+    access_hash: Option<String>,
+    access_version: i64,
     preview_sha: Option<String>,
     preview_updated_at: Option<i64>,
     preview_port: Option<i64>,
@@ -338,6 +350,9 @@ impl AppRow {
             last_activity_at: self.last_activity_at,
             expired_at: self.expired_at,
             downgraded_stopped_at: self.downgraded_stopped_at,
+            access_mode: crate::access::AccessMode::parse(&self.access_mode)?,
+            access_hash: self.access_hash,
+            access_version: self.access_version,
             created_at: self.created_at,
             always_on: self.always_on != 0,
             preview_sha: self.preview_sha,
@@ -564,6 +579,10 @@ async fn create_inner(
         expired_at: None,
         downgraded_stopped_at: None,
         created_at: now,
+        // New apps start open; the owner gates them with `set_access`.
+        access_mode: crate::access::AccessMode::Open,
+        access_hash: None,
+        access_version: 0,
         // New rows start cold; the MCP `create_app` path flips Pro apps
         // on right after (the plan lives with the caller, not here).
         always_on: false,
