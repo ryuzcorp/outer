@@ -476,6 +476,8 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
+| `path` | string | no | One file's patch (same as `paths` with one entry). |
+| `paths` | array of string | no | Only these files' patch (repo-relative). The stat list still names every changed file. |
 | `sha` | string | yes | The commit sha to show. |
 
 ## `rollback`

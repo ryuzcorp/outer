@@ -425,23 +425,13 @@ pub(crate) async fn diff_for(
         Ok(bare) => bare,
         Err(res) => return *res,
     };
-    let shown = match local::show(&bare, &raw).await {
+    let shown = match local::show(&bare, &raw, &[]).await {
         Ok(shown) => shown,
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("unknown commit") {
                 return nostore_json(StatusCode::NOT_FOUND, "not_found", "no such version");
             }
-            return nostore_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unavailable",
-                "could not load the diff right now",
-            );
-        }
-    };
-    let stats = match local::show_stats(&bare, &shown.commit.sha).await {
-        Ok(stats) => stats,
-        Err(_) => {
             return nostore_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "unavailable",
@@ -461,7 +451,7 @@ pub(crate) async fn diff_for(
             "message": shown.commit.message,
         },
         "parent": parent,
-        "files": stats.iter().map(stat_json).collect::<Vec<_>>(),
+        "files": shown.stats.iter().map(stat_json).collect::<Vec<_>>(),
         "patch": shown.patch,
         "truncated": shown.truncated,
     }))

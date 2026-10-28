@@ -157,6 +157,28 @@ impl ToolError {
             )
             .with_extra("path", json!(path))
             .with_extra("blob", json!(current)),
+            E::EditMismatches(list) => {
+                let edits: Vec<Value> = list
+                    .0
+                    .iter()
+                    .map(|failure| {
+                        let mut entry = json!({
+                            "index": failure.index,
+                            "path": failure.path,
+                            "matches": failure.matches,
+                        });
+                        if let Some(closest) = &failure.closest {
+                            entry["closest"] = json!({
+                                "start_line": closest.start_line,
+                                "end_line": closest.end_line,
+                                "text": closest.text,
+                            });
+                        }
+                        entry
+                    })
+                    .collect();
+                Self::invalid_argument(list.to_string()).with_extra("edits", json!(edits))
+            }
             E::Internal(e) => {
                 tracing::warn!("commit internal: {e:#}");
                 Self::internal("the commit failed on our side; try again in a minute")
