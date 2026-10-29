@@ -6,9 +6,10 @@
 #
 # Points OUTER_IMAGE at OUTER_PREVIOUS_IMAGE in /srv/outer/release.env
 # (recording the abandoned image as OUTER_ROLLED_BACK_FROM, and leaving no
-# rollback target behind), runs `docker compose up -d`, and waits for the same signal as release.sh
-# (container running + outer's "listening on" log line — mTLS admits no
-# unauthenticated HTTP probe).
+# rollback target behind), then hands that image out with the same
+# zero-downtime flow as a release (deploy/handoff.sh): the replacement
+# container just runs the previous image, so the rollback itself drops no
+# connection and kills no in-flight deploy.
 #
 # No secrets in args or logs (only image tags travel in release.env).
 
@@ -27,9 +28,11 @@ cd /srv/outer
 # Sourced, NOT exported: an exported OUTER_IMAGE would override
 # --env-file below and compose would keep the current image.
 # shellcheck disable=SC1091
-. /srv/outer/release.env
-# One-way: a retry after a failed rollout re-applies the same target instead
-# of flipping back. Going forward again is a fresh release.sh.
+source /srv/outer/release.env
+# shellcheck disable=SC1091
+source /srv/outer/handoff.sh
+# One-way: a retry after a failed rollout re-applies the same target
+# instead of flipping back. Going forward again is a fresh release.sh.
 if [[ -n "${OUTER_PREVIOUS_IMAGE:-}" ]]; then
     target="$OUTER_PREVIOUS_IMAGE"
     tmp="$(mktemp)"
@@ -54,28 +57,7 @@ echo "remote: rolling back to $target"
 # drop it here; a build that has the firewall reinstalls it at boot.
 nft delete table inet outer 2>/dev/null || true
 
-docker compose --env-file /srv/outer/release.env \
-    -f /srv/outer/compose.yaml up -d
-
-cid="$(docker compose --env-file /srv/outer/release.env \
-    -f /srv/outer/compose.yaml ps -q outer)"
-[[ -n "$cid" ]] || {
-    echo "remote: no outer container after up" >&2
-    exit 1
-}
-deadline=$((SECONDS + 60))
-while true; do
-    # The image check catches a compose that kept the old container.
-    if [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$cid")" == "true $target" ]] \
-        && docker logs "$cid" 2>&1 | grep -q 'listening on'; then
-        break
-    fi
-    if [[ $SECONDS -ge $deadline ]]; then
-        echo "remote: outer did not come back; last log lines:" >&2
-        docker logs --tail 50 "$cid" >&2 || true
-        exit 1
-    fi
-    sleep 2
-done
-echo "remote: rolled back to $target ($cid)"
+trap 'handoff_clear; docker rm -f outer-next >/dev/null 2>&1 || true' EXIT
+handoff_to "$target"
+trap - EXIT
 EOF

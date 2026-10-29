@@ -730,6 +730,8 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
     // the maintenance drain finishes them), so an error always means the
     // rename never happened — while a committed rename counts even when
     // its redeploy fails or is blocked.
+    // A handoff refuses before the claim, so a retry costs no quota.
+    super::check_no_drain(ctx.state)?;
     let claim =
         super::claim_change(&ctx.state.pool, &ctx.state.billing, &caller.account_id).await?;
     // The rename redeploys a running app, so the redeploy's plan admission

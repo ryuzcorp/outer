@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 #
-# Outer release: build the image from the current HEAD and roll it out.
+# Outer release: build the image from the current HEAD and roll it out with
+# no downtime (deploy/handoff.sh).
 #
 #   deploy/release.sh <ssh-target>
 #
 # Refuses a dirty tree. Prefers podman, falls back to docker. Streams the
 # image with save|load (no registry), uploads compose.yaml + the firewall
-# files to /srv/outer, records OUTER_IMAGE (keeping the previous tag as
-# OUTER_PREVIOUS_IMAGE), runs `docker compose up -d`, then health-checks.
+# files + handoff.sh to /srv/outer, then hands the new image out: the
+# newcomer shares 443 via SO_REUSEPORT while the old container drains
+# (refuses new deploys, exits once in-flight ones finish), and the compose
+# service is recreated last onto the same image. At no point is 443 without
+# a listener, and no in-flight deploy dies with its process.
 #
 # Health check from the box: outer serves TLS with required client
 # certificates (mTLS), so no unauthenticated probe can pass the handshake —
 # not even `curl --resolve ... https://outer.now/health` from here. The check
-# is therefore: the container is running and outer logged its "listening on"
-# line. Rollback: deploy/rollback.sh <ssh-target>.
+# is therefore: the container is running on the new image and outer logged
+# its "listening on" line. Rollback: deploy/rollback.sh <ssh-target> (same
+# handoff, previous image).
+#
+# Migrations are append-only within a release line: the newcomer runs them
+# at boot while the old container is still serving, so a release's
+# migrations must be additive (nullable columns, new tables). A destructive
+# migration needs an announced maintenance release, not this script.
 #
 # No secrets in args or logs (only image tags travel in release.env).
 
@@ -29,7 +39,7 @@ cd "$ROOT"
 }
 SHA="$(git rev-parse --short HEAD)"
 [[ "$SHA" =~ ^[0-9a-f]+$ ]] || {
-    echo "release.sh: unexpected sha: $SHA" >&2
+    echo "release.sh: unexpected short SHA: $SHA" >&2
     exit 1
 }
 
@@ -41,7 +51,7 @@ SHA="$(git rev-parse --short HEAD)"
 MIGRATIONS="crates/outer/migrations"
 APPLIED="$(ssh "$TARGET" "sqlite3 -separator ' ' /srv/outer/data/outer.sqlite \
     'SELECT version, lower(hex(checksum)) FROM _sqlx_migrations ORDER BY version'" 2>/dev/null)" || {
-    echo "release.sh: could not read applied migrations from $TARGET (sqlite3 on the host?)" >&2
+    echo "release.sh: cannot read prod migrations from $TARGET (is outer up?)" >&2
     exit 1
 }
 while read -r version checksum; do
@@ -73,7 +83,7 @@ else
 fi
 
 ssh "$TARGET" mkdir -p /srv/outer
-scp deploy/compose.yaml deploy/firewall.sh deploy/firewall.service \
+scp deploy/compose.yaml deploy/handoff.sh deploy/firewall.sh deploy/firewall.service \
     deploy/firewall-refresh.service deploy/firewall-refresh.timer \
     "$TARGET:/srv/outer/"
 
@@ -102,26 +112,6 @@ for f in /srv/outer/tls/origin.pem /srv/outer/tls/origin.key /srv/outer/tls/orig
     }
 done
 
-# Record the new image, keeping the previous tag for rollback.
-touch /srv/outer/release.env
-chmod 600 /srv/outer/release.env
-prev="$(grep -E '^OUTER_IMAGE=' /srv/outer/release.env | tail -n 1 | cut -d= -f2- || true)"
-prev_rollback="$(grep -E '^OUTER_PREVIOUS_IMAGE=' /srv/outer/release.env | tail -n 1 | cut -d= -f2- || true)"
-tmp="$(mktemp)"
-grep -v -E '^(OUTER_IMAGE|OUTER_PREVIOUS_IMAGE|OUTER_ROLLED_BACK_FROM)=' \
-    /srv/outer/release.env >"$tmp" || true
-{
-    cat "$tmp"
-    echo "OUTER_IMAGE=outer:$SHA"
-    if [[ -n "$prev" && "$prev" != "outer:$SHA" ]]; then
-        echo "OUTER_PREVIOUS_IMAGE=$prev"
-    elif [[ -n "$prev_rollback" ]]; then
-        # Re-releasing the running image keeps the existing rollback target.
-        echo "OUTER_PREVIOUS_IMAGE=$prev_rollback"
-    fi
-} > /srv/outer/release.env
-rm -f "$tmp"
-
 # outer runs on the host network: the ingress filter must be in place before
 # it starts (a first install may predate it). firewall.sh exits nonzero on
 # failure, which stops the rollout here.
@@ -129,38 +119,13 @@ if ! nft list table inet outer_fw >/dev/null 2>&1; then
     /srv/outer/firewall.sh
 fi
 
-docker compose --env-file /srv/outer/release.env \
-    -f /srv/outer/compose.yaml up -d
-
-
-# Wait for the rollout: container running + outer's boot line. mTLS means no
-# HTTP probe is possible without a client key, so the log line is the signal.
-cid="$(docker compose --env-file /srv/outer/release.env \
-    -f /srv/outer/compose.yaml ps -q outer)"
-[[ -n "$cid" ]] || {
-    echo "remote: no outer container after up" >&2
-    exit 1
-}
-deadline=$((SECONDS + 60))
-while true; do
-    # The image check catches a compose that kept the old container.
-    if [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$cid")" == "true outer:$SHA" ]] \
-        && docker logs "$cid" 2>&1 | grep -q 'listening on'; then
-        break
-    fi
-    if [[ $SECONDS -ge $deadline ]]; then
-        echo "remote: outer did not come up; last log lines:" >&2
-        docker logs --tail 50 "$cid" >&2 || true
-        exit 1
-    fi
-    sleep 2
-done
-echo "remote: outer:$SHA up ($cid)"
-
-# Keep the last 3 outer images, prune older (in-use images fail, ignored).
-docker images --format '{{.CreatedAt}} {{.Repository}}:{{.Tag}}' \
-    | grep ' outer:' | sort -r | awk '{print $NF}' | tail -n +4 \
-    | xargs -r docker rmi >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+source /srv/outer/handoff.sh
+# Whatever fails below, the heartbeat must not outlive the release and the
+# flag must not stay fresh: both would refuse deploys for no reason.
+trap 'handoff_clear; docker rm -f outer-next >/dev/null 2>&1 || true' EXIT
+handoff_to "outer:$SHA"
+trap - EXIT
 EOF
 
 echo "released $IMAGE to $TARGET"

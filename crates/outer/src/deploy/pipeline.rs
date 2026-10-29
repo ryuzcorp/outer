@@ -40,6 +40,8 @@ use crate::fleet::cgroups;
 use crate::fleet::manager::FleetStorage;
 use crate::fleet::sandbox::{self, Sandbox};
 use crate::git::manifest::{self, GitConfig};
+use crate::handoff;
+pub use crate::handoff::DrainRefused;
 use crate::moderation::gate;
 use crate::moderation::jev::JevClient;
 use crate::store::Store;
@@ -388,6 +390,10 @@ pub struct Deployer {
     /// operator CLI) sets the boot-installed handle; the deploy entries
     /// refuse builds while a required policy is missing.
     egress: std::sync::RwLock<crate::fleet::egress::EgressFirewall>,
+    /// Set on SIGTERM (drain in-flight deploys, refuse new ones) and read
+    /// alongside the handoff flag file, so a release handoff refuses new
+    /// deploys on both the old and the new process.
+    draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Edge purges still in flight. Each runs detached so `deploy` never waits
@@ -649,6 +655,7 @@ impl Deployer {
             app_locks: Mutex::new(HashMap::new()),
             purges: PurgeTasks::default(),
             egress: std::sync::RwLock::new(crate::fleet::egress::EgressFirewall::disabled()),
+            draining: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -674,6 +681,27 @@ impl Deployer {
         self.purges.clone()
     }
 
+    /// Mark this process draining: new deploys refuse with [`DrainRefused`]
+    /// while in-flight ones run to a terminal row. The shutdown path sets
+    /// this on SIGTERM; the handoff flag file covers the newcomer.
+    pub fn set_draining(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True while this process drains (SIGTERM) or a release handoff is
+    /// open (flag file): no new deploy may start here.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
+            || handoff::is_active(&self.settings.data_dir)
+    }
+
+    /// The drain flag for the shutdown path: setting it refuses new deploys
+    /// while the process finishes in-flight ones before exiting.
+    pub fn drain_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.draining.clone()
+    }
+
     /// Deploy `sha` of `app`: row `queued` → `building` → `reviewing` →
     /// `deploying` → `success`|`failed`|`blocked`. A blocked deploy writes
     /// `status = 'blocked'` with findings JSON, leaves `last_deploy_sha`
@@ -689,6 +717,9 @@ impl Deployer {
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
+        if self.is_draining() {
+            return Err(DrainRefused.into());
+        }
         // Fail closed: no build runs as the app uid while the required
         // policy is missing.
         self.egress()
@@ -712,6 +743,9 @@ impl Deployer {
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
+        if self.is_draining() {
+            return Err(DrainRefused.into());
+        }
         // Fail closed: no build runs as the app uid while the required
         // policy is missing.
         self.egress()
@@ -3851,6 +3885,61 @@ mod tests {
                 format!("grocery.{}", deployer.settings.apps_domain),
                 "shop.example.com".to_string(),
             ]
+        );
+    }
+
+    /// A release handoff or SIGTERM drain refuses new deploys retryably
+    /// before any row is written; a fresh deployer passes the same gate.
+    #[tokio::test]
+    async fn draining_refuses_new_deploys_without_a_row() {
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10001);
+        let git = crate::git::manifest::GitConfig::new(data.path().join("git"), None);
+        let sha = "a".repeat(40);
+        assert!(
+            !deployer.is_draining(),
+            "a fresh deployer with no flag file drains nothing"
+        );
+        deployer.set_draining();
+        assert!(deployer.is_draining(), "SIGTERM marks the drain");
+        let err = deployer
+            .deploy(&pool, &Store::memory(), &git, &app, &sha)
+            .await
+            .expect_err("a draining deployer refuses");
+        assert!(
+            err.is::<DrainRefused>(),
+            "the refusal is typed for a retryable mapping: {err:?}"
+        );
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM deploy")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused deploy writes no row");
+    }
+
+    /// The handoff flag file alone drains the deployer: the newcomer
+    /// refuses new deploys while the old process finishes its in-flight
+    /// ones, with no signal involved.
+    #[tokio::test]
+    async fn handoff_flag_file_drains_the_deployer() {
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        std::fs::write(data.path().join(crate::handoff::FLAG), since_epoch).unwrap();
+        assert!(
+            deployer.is_draining(),
+            "a fresh flag file refuses new deploys"
+        );
+        std::fs::remove_file(data.path().join(crate::handoff::FLAG)).unwrap();
+        assert!(
+            !deployer.is_draining(),
+            "a cleared handoff lets deploys through again"
         );
     }
 

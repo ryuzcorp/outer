@@ -6,7 +6,7 @@
 //! The `app` and `templates` commands run app operations against the same
 //! database and bucket; `serve` picks their results up (it reads app rows per
 //! request, and fleets adopt new deploys on reload or their own poll).
-
+//!
 use std::future::Future;
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -583,26 +583,42 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("restored platform state from the bucket snapshot");
     }
     let pool = db::open(&config.db_path()).await?;
-    let interrupted = outer::deploy::fail_interrupted(&pool).await?;
-    if interrupted > 0 {
+    // A release handoff shares this SQLite file with the still-serving old
+    // process: its in-flight deploy rows are live work, not crash leftovers.
+    // Skip the restart bookkeeping (and the secret-injection scrub, which
+    // would race the old process's running deploys) until the handoff
+    // clears; the next handoff-free boot closes whatever is left behind.
+    if outer::handoff::is_active(&config.data_dir) {
         tracing::warn!(
-            interrupted,
-            "closed deploy rows a restart cut off (marked failed)"
+            "handoff flag is active: skipping interrupted-deploy bookkeeping, \
+             refusing new deploys and delaying background writers until it clears"
         );
-    }
-    // A crash mid-upload leaves injected plaintext in the worktree: put the
-    // stashed pre-inject bytes back and delete the sidecars (next boot
-    // retries whatever still fails the symlink check).
-    let scrubbed = outer::deploy::scrub_interrupted_injections(&config.data_dir)?;
-    if scrubbed > 0 {
-        tracing::warn!(
-            scrubbed,
-            "restored deploy configs a restart cut off mid secret-injection"
-        );
+    } else {
+        let interrupted = outer::deploy::fail_interrupted(&pool).await?;
+        if interrupted > 0 {
+            tracing::warn!(
+                interrupted,
+                "closed deploy rows a restart cut off (marked failed)"
+            );
+        }
+        // A crash mid-upload leaves injected plaintext in the worktree: put the
+        // stashed pre-inject bytes back and delete the sidecars (next boot
+        // retries whatever still fails the symlink check).
+        let scrubbed = outer::deploy::scrub_interrupted_injections(&config.data_dir)?;
+        if scrubbed > 0 {
+            tracing::warn!(
+                scrubbed,
+                "restored deploy configs a restart cut off mid secret-injection"
+            );
+        }
     }
     // Bind before claiming the bucket: a second instance that can't listen
-    // must not take ownership away from the one that's serving.
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    // must not take ownership away from the one that's serving. The bind is
+    // SO_REUSEPORT, so during a release handoff the newcomer shares 443 with
+    // the old container and the kernel splits new connections; the claim
+    // below then moves the snapshot-owner fence to the newcomer, and the old
+    // process stands down on its next tick.
+    let listener = outer::handoff::bind_reuseport(config.listen)?;
     // Read the TLS triple right after binding (still before the bucket
     // claim): an unreadable cert must fail the boot, never the claim.
     let tls_files = match (&config.tls_cert, &config.tls_key, &config.origin_pull_ca) {
@@ -671,20 +687,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     let git = git_config(&config);
     let git_sync = outer::git::GitSync::default();
-    outer::cron::spawn_cron_task(
-        pool.clone(),
-        fleets.clone(),
-        outer::cron::TICK_EVERY,
-        outer::cron::WAKE_LEAD,
-    );
-    // Daily D1 backups (wave 3, feature #4): dump each active app's
-    // databases to `outer/backups/{slug}/` and prune past retention.
-    outer::d1_backup::spawn_backup_task(
-        pool.clone(),
-        store.clone(),
-        fleets.clone(),
-        outer::d1_backup::TICK_EVERY,
-    );
 
     let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
     // One client for the pipeline gate and the slug/name check alike: both
@@ -763,74 +765,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             config.outer_secret.as_bytes().to_vec(),
         )?,
     };
-    // Past-due grace (spec §14.2): day-5 reminders and the downgrade at
-    // day 7, plus the downgrade-retention pass (day-23 warnings, day-30
-    // purges). A missed tick only delays mail and the downgrade; the next
-    // tick catches up.
-    let retention = outer::billing::RetentionDeps {
-        store: store.clone(),
-        git: git.clone(),
-        sync: git_sync.clone(),
-        fleets: fleets.clone(),
-        deploys: mcp.deploys.clone(),
-        rollback_locks: mcp.rollback_locks.clone(),
-        delete_cfg: mcp.delete_cfg.clone(),
-    };
-    outer::billing::spawn_grace_sweep(
-        mcp.billing.clone(),
-        pool.clone(),
-        mcp.auth.config.email.clone(),
-        mcp.egress.clone(),
-        retention.clone(),
-    );
-    // Sleep, preview-expiry, keep-warm, log flush and prefix-cleanup ticks
-    // (every minute) with the daily maintenance block: retention prunes
-    // plus the inactivity sweep (spec §7.8: reminders, expiry, restores,
-    // purges). Spawned after the MCP state so the daily block owns the
-    // delete handles and the mail handles.
-    fleets.spawn_sleep_sweep(
-        pool.clone(),
-        store.clone(),
-        git.clone(),
-        git_sync.clone(),
-        Duration::from_secs(60.min(rt.sleep_after_secs.max(1))),
-        outer::inactivity::SweepDeps {
-            sender: mcp.auth.config.email.clone(),
-            issuer: mcp.auth.config.issuer.clone(),
-            unsub_key: mcp.unsub_key.clone(),
-            retention: retention.clone(),
-            windows: outer::inactivity::Windows::new(rt.inactive_days, rt.inactive_grace_days),
-        },
-    );
-    // Email alerts (wave 3, feature #2): error spikes are evaluated from
-    // `error_issue` every five minutes; deploy failures and quota
-    // thresholds notify inline at their trigger sites.
-    outer::alerts::spawn_sweep(
-        pool.clone(),
-        mcp.auth.config.email.clone(),
-        mcp.auth.config.issuer.clone(),
-        mcp.unsub_key.clone(),
-        std::time::Duration::from_secs(300),
-    );
-    // Request metrics (spec §13): owned by the proxy state, flushed to
-    // SQLite every few seconds by the sweep below (and once more on
-    // shutdown), pruned per plan by the same sweep.
-    let metrics = outer::observe::metrics::MetricsAgg::new();
-    let metrics_sweep = outer::observe::metrics::spawn_sweep(pool.clone(), metrics.clone());
-    // Plan limits (spec §3, owner-set 2026-10-26): hourly request rollup +
-    // soft-cap email and storage freeze. A missed tick only delays mail and
-    // flags; the rollup watermark never double-counts.
-    outer::limits::spawn_limits_sweep(outer::limits::LimitsSweep {
-        pool: pool.clone(),
-        store: store.clone(),
-        sender: mcp.auth.config.email.clone(),
-        issuer: mcp.auth.config.issuer.clone(),
-        unsub_key: mcp.unsub_key.clone(),
-        billing: mcp.billing.clone(),
-    });
     // After-live moderation (spec §15.2): the proxy's report path and the
     // periodic sweep share the Jev client, the crawl config and the effect
-    // deps (mailbox, fleet handle, edge purge).
+    // deps (mailbox, fleet handle, edge purge). The sweep itself starts in
+    // the waiter below; the hooks serve requests from boot.
     let crawl_effects = outer::moderation::crawl::EffectDeps {
         sender: mcp.auth.config.email.clone(),
         apps_domain: rt.apps_domain.clone(),
@@ -842,12 +780,157 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         cfg: config.crawl.clone(),
         effects: crawl_effects.clone(),
     };
-    outer::moderation::crawl::spawn_sweep(outer::moderation::crawl::SweepDeps {
-        pool: pool.clone(),
-        cfg: config.crawl.clone(),
-        jev: mcp.jev.clone(),
-        effects: crawl_effects,
-    });
+    // Background writers wait out a release handoff: while the flag file is
+    // fresh the old process still owns its fleets and runs its own sweeps,
+    // so the newcomer must not wake, mail, prune or back up twice. Request
+    // serving, metrics and the snapshot sync run from boot; this waiter only
+    // delays the writers. Returns at once when no handoff is open.
+    {
+        let data_dir = config.data_dir.clone();
+        let sweep_data_dir = data_dir.clone();
+        let sweep_pool = pool.clone();
+        let sweep_store = store.clone();
+        let sweep_fleets = fleets.clone();
+        let sweep_git = git.clone();
+        let sweep_sync = git_sync.clone();
+        let sweep_billing = mcp.billing.clone();
+        let sweep_email = mcp.auth.config.email.clone();
+        let sweep_issuer = mcp.auth.config.issuer.clone();
+        let sweep_unsub = mcp.unsub_key.clone();
+        let sweep_egress = mcp.egress.clone();
+        let sweep_deploys = mcp.deploys.clone();
+        let sweep_locks = mcp.rollback_locks.clone();
+        let sweep_delete = mcp.delete_cfg.clone();
+        let sweep_jev = mcp.jev.clone();
+        let sweep_crawl = config.crawl.clone();
+        let sweep_effects = crawl_effects.clone();
+        let sleep_every = Duration::from_secs(60.min(rt.sleep_after_secs.max(1)));
+        let sweep_windows =
+            outer::inactivity::Windows::new(rt.inactive_days, rt.inactive_grace_days);
+        tokio::spawn(async move {
+            match outer::handoff::wait_until_clear(&data_dir).await {
+                // The old process exited before the flag cleared: any
+                // non-terminal deploy row is a kill leftover (the normal
+                // SIGTERM drain leaves none), so close it here instead of
+                // at boot, when the old process still owned those rows.
+                outer::handoff::HandoffEnd::Cleared => {
+                    match outer::deploy::fail_interrupted(&sweep_pool).await {
+                        Ok(0) => {}
+                        Ok(closed) => tracing::warn!(
+                            closed,
+                            "closed deploy rows the handoff cut off (marked failed)"
+                        ),
+                        Err(err) => tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "handoff catch-up bookkeeping failed"
+                        ),
+                    }
+                    if let Err(err) = outer::deploy::scrub_interrupted_injections(&sweep_data_dir) {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "handoff catch-up scrub failed"
+                        );
+                    }
+                }
+                outer::handoff::HandoffEnd::Stale => {
+                    tracing::warn!(
+                        "handoff flag went stale (crashed release?): sweeps start, \
+                         but check for a stray old container before releasing again"
+                    );
+                }
+            }
+            outer::cron::spawn_cron_task(
+                sweep_pool.clone(),
+                sweep_fleets.clone(),
+                outer::cron::TICK_EVERY,
+                outer::cron::WAKE_LEAD,
+            );
+            // Daily D1 backups (wave 3, feature #4): dump each active app's
+            // databases to `outer/backups/{slug}/` and prune past retention.
+            outer::d1_backup::spawn_backup_task(
+                sweep_pool.clone(),
+                sweep_store.clone(),
+                sweep_fleets.clone(),
+                outer::d1_backup::TICK_EVERY,
+            );
+            // Past-due grace (spec §14.2): day-5 reminders and the downgrade
+            // at day 7, plus the downgrade-retention pass (day-23 warnings,
+            // day-30 purges). A missed tick only delays mail and the
+            // downgrade; the next tick catches up.
+            let retention = outer::billing::RetentionDeps {
+                store: sweep_store.clone(),
+                git: sweep_git.clone(),
+                sync: sweep_sync.clone(),
+                fleets: sweep_fleets.clone(),
+                deploys: sweep_deploys.clone(),
+                rollback_locks: sweep_locks.clone(),
+                delete_cfg: sweep_delete.clone(),
+            };
+            outer::billing::spawn_grace_sweep(
+                sweep_billing.clone(),
+                sweep_pool.clone(),
+                sweep_email.clone(),
+                sweep_egress.clone(),
+                retention.clone(),
+            );
+            // Sleep, preview-expiry, keep-warm, log flush and prefix-cleanup
+            // ticks (every minute) with the daily maintenance block:
+            // retention prunes plus the inactivity sweep (spec §7.8:
+            // reminders, expiry, restores, purges).
+            sweep_fleets.spawn_sleep_sweep(
+                sweep_pool.clone(),
+                sweep_store.clone(),
+                sweep_git.clone(),
+                sweep_sync.clone(),
+                sleep_every,
+                outer::inactivity::SweepDeps {
+                    sender: sweep_email.clone(),
+                    issuer: sweep_issuer.clone(),
+                    unsub_key: sweep_unsub.clone(),
+                    retention: retention.clone(),
+                    windows: sweep_windows,
+                },
+            );
+            // Email alerts (wave 3, feature #2): error spikes are evaluated
+            // from `error_issue` every five minutes; deploy failures and
+            // quota thresholds notify inline at their trigger sites.
+            outer::alerts::spawn_sweep(
+                sweep_pool.clone(),
+                sweep_email.clone(),
+                sweep_issuer.clone(),
+                sweep_unsub.clone(),
+                std::time::Duration::from_secs(300),
+            );
+            // Plan limits (spec §3, owner-set 2026-10-26): hourly request
+            // rollup + soft-cap email and storage freeze. A missed tick only
+            // delays mail and flags; the rollup watermark never double-counts.
+            outer::limits::spawn_limits_sweep(outer::limits::LimitsSweep {
+                pool: sweep_pool.clone(),
+                store: sweep_store.clone(),
+                sender: sweep_email.clone(),
+                issuer: sweep_issuer.clone(),
+                unsub_key: sweep_unsub.clone(),
+                billing: sweep_billing.clone(),
+            });
+            outer::moderation::crawl::spawn_sweep(outer::moderation::crawl::SweepDeps {
+                pool: sweep_pool.clone(),
+                cfg: sweep_crawl.clone(),
+                jev: sweep_jev.clone(),
+                effects: sweep_effects,
+            });
+        });
+    }
+    // Request metrics (spec §13): owned by the proxy state, flushed to
+    // SQLite every few seconds by the sweep below (and once more on
+    // shutdown), pruned per plan by the same sweep. Runs from boot, handoff
+    // or not: recording is a local SQLite write, never a double-acting
+    // external effect.
+    let metrics = outer::observe::metrics::MetricsAgg::new();
+    let metrics_sweep = outer::observe::metrics::spawn_sweep(pool.clone(), metrics.clone());
+    // The drain flag refuses new deploys from here on: the shutdown path
+    // sets it on the first signal and waits out the in-flight ones before
+    // stopping fleets, so a release handoff never kills an agent deploy.
+    let drain = mcp.deploys.drain_handle();
     let app = http::app(
         http::AppState {
             pool: pool.clone(),
@@ -886,13 +969,15 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         // handshake drops just that connection and never stops serving.
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(rustls_config));
-        let std_listener = listener.into_std()?;
+        let std_listener = listener;
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
+        let shutdown_pool = pool.clone();
+        let shutdown_drain = drain.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
-            // Bounded drain: stop_all and the final snapshot run after
-            // serve returns, all inside compose's 35 s stop_grace_period.
+            drain_and_wait(shutdown_pool, shutdown_drain).await;
+            // Bounded HTTP drain: stop_all and the final snapshot run after
+            // serve returns, all inside compose's 15 min stop_grace_period.
             shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
         });
         axum_server::tls_rustls::from_tcp_rustls(std_listener, rustls_config)?
@@ -900,11 +985,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
+        let shutdown_pool = pool.clone();
         axum::serve(
-            listener,
+            tokio::net::TcpListener::from_std(listener)?,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(drain_and_wait(shutdown_pool, drain))
         .await?;
     }
 
@@ -946,4 +1032,13 @@ async fn shutdown_signal() {
         () = ctrl_c => {}
         () = terminate => {}
     }
+}
+
+/// First shutdown signal (Ctrl-C/SIGTERM): the lib gate refuses new deploys
+/// and waits for in-flight ones to finish, so a release handoff — or any
+/// stop — never kills an agent deploy mid-flight. The second signal exits
+/// at once; the next boot's `fail_interrupted` closes whatever is left.
+async fn drain_and_wait(pool: sqlx::SqlitePool, drain: Option<Arc<std::sync::atomic::AtomicBool>>) {
+    shutdown_signal().await;
+    outer::handoff::drain_and_wait(&pool, drain, shutdown_signal()).await;
 }
