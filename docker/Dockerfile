@@ -8,7 +8,7 @@
 #
 # outer terminates TLS itself (rustls) on OUTER_LISTEN: the Cloudflare
 # Origin CA certificate plus Authenticated Origin Pulls (mTLS).
-ARG CELLD_VERSION=0.6.2
+ARG CELLD_VERSION=0.6.3
 ARG ESBUILD_VERSION=0.28.2
 # Pinned formatter for agent commits. Keep in step with the template's
 # `oxfmt` devDependency, `.github/workflows/ci.yml`, and the extension list
