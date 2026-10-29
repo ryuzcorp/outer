@@ -293,6 +293,20 @@ pub async fn claim_change(
     Ok(Claim { used, limit })
 }
 
+/// Release handoff or SIGTERM drain: refuse before any quota is claimed or
+/// any deploy row is written, retryably. Callers check this before
+/// [`claim_change`]; the [`run_deploy`] gate backstops paths that reach a
+/// deploy another way (seed deploys, promotes, rollbacks, console retries).
+pub fn check_no_drain(state: &McpState) -> Result<(), ToolError> {
+    if state.deploys.is_draining() {
+        return Err(ToolError::rate_limited(
+            "outer is handing off to a new release; retry shortly",
+            crate::handoff::DRAIN_RETRY_AFTER_S,
+        ));
+    }
+    Ok(())
+}
+
 /// Give back a claimed change when the commit never happened (bad base,
 /// moved head, storage failure). One guarded decrement; a missing or empty
 /// row stays empty.
@@ -861,6 +875,17 @@ async fn run_deploy_inner(
     // claims already count their change/rollback; a created app or commit
     // already exists when this refuses, and the error names the reset).
     check_build_quota(&state.pool, &state.billing, &app.owner_id).await?;
+    // Release handoff or SIGTERM drain: the last backstop before a deploy
+    // row is written or a build is spawned, retryably. Callers that claim
+    // quota check [`check_no_drain`] first, so this usually fires for
+    // claim-free paths (seed deploys, promotes, rollbacks, console retries).
+    // Covers MCP and console alike: both funnel through here.
+    if state.deploys.is_draining() {
+        return Err(ToolError::rate_limited(
+            "outer is handing off to a new release; retry shortly",
+            crate::handoff::DRAIN_RETRY_AFTER_S,
+        ));
+    }
     check_storage_writable(&state.pool, &state.billing, app).await?;
     let deploys = state.deploys.clone();
     let pool = state.pool.clone();
@@ -980,6 +1005,12 @@ async fn run_deploy_inner(
             &outcome,
             kind.is_preview(),
         )),
+        Ok(Ok((_, Err(e)))) if e.is::<crate::deploy::DrainRefused>() => {
+            Err(ToolError::rate_limited(
+                "outer is handing off to a new release; retry shortly",
+                crate::handoff::DRAIN_RETRY_AFTER_S,
+            ))
+        }
         Ok(Ok((_, Err(e)))) => Err(internal(e)),
         Ok(Err(e)) => Err(internal(anyhow::Error::new(e))),
         Err(_) => Ok(json!({

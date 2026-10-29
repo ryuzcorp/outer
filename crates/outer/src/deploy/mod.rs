@@ -12,5 +12,5 @@ pub mod pipeline;
 pub use check::{CheckOutput, CheckStep};
 pub use pipeline::{
     fail_interrupted, prune_old, scrub_interrupted_injections, DeployKind, DeployOutcome,
-    DeploySettings, Deployer, PurgeTasks, Step,
+    DeploySettings, Deployer, DrainRefused, PurgeTasks, Step,
 };

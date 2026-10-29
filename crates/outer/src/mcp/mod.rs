@@ -186,6 +186,29 @@ impl Deploys {
             DeploysInner::Fake(fake) => fake.deploy_preview(pool, app, sha).await,
         }
     }
+
+    /// True while this process drains (SIGTERM) or a release handoff is
+    /// open: [`run_deploy`] refuses new deploys retryably up front. The
+    /// test fake never drains.
+    ///
+    /// [`run_deploy`]: crate::mcp::tools::run_deploy
+    pub fn is_draining(&self) -> bool {
+        match &*self.inner {
+            DeploysInner::Live(deployer) => deployer.is_draining(),
+            #[cfg(test)]
+            DeploysInner::Fake(_) => false,
+        }
+    }
+
+    /// The live pipeline's drain flag for the shutdown path (`None` for the
+    /// test fake, which never drains).
+    pub fn drain_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        match &*self.inner {
+            DeploysInner::Live(deployer) => Some(deployer.drain_handle()),
+            #[cfg(test)]
+            DeploysInner::Fake(_) => None,
+        }
+    }
 }
 /// What the fake deploy answers with.
 #[cfg(test)]

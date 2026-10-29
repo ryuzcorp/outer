@@ -21,6 +21,7 @@ pub mod deploy;
 pub mod examples;
 pub mod fleet;
 pub mod git;
+pub mod handoff;
 pub mod http;
 pub mod inactivity;
 pub mod limits;

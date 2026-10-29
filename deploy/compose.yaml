@@ -19,10 +19,13 @@ services:
     image: ${OUTER_IMAGE:?set OUTER_IMAGE in /srv/outer/release.env (deploy/release.sh writes it)}
     restart: unless-stopped
     network_mode: host
-    # Above outer's stop budget: fleets stop concurrently (each at most ~20 s:
-    # StopGrace::NORMAL is 15 s SIGTERM + 5 s SIGKILL), then outer writes the
-    # final state snapshot before exiting.
-    stop_grace_period: 35s
+    # Above outer's stop budget: on SIGTERM outer refuses new deploys and
+    # waits out the in-flight ones (a release handoff drains this way), and
+    # only then stops fleets concurrently (each at most ~20 s: StopGrace is
+    # 15 s SIGTERM + 5 s SIGKILL) and writes the final state snapshot. Stops
+    # with no in-flight deploys exit at once; the grace period is a cap, not
+    # a delay. `docker stop -t` on the command line overrides this per stop.
+    stop_grace_period: 15m
     # Tenant isolation: dropping to the app/fleet uids, owning worktrees, the
     # nft egress policy (needs NET_ADMIN), and per-fleet cgroup leaves.
     # The cgroup leaves need a writable cgroupfs mount: CAP_SYS_ADMIN lets

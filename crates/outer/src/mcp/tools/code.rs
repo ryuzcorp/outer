@@ -959,6 +959,8 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     // commit counts against the owner's daily changes.
     check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await?;
+    // A handoff refuses before the claim, so a retry costs no quota.
+    super::check_no_drain(ctx.state)?;
     let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     let outcome = match git::commit::commit_with_outcome(
         &ctx.state.store,
@@ -1056,6 +1058,8 @@ async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, T
     }
     check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await?;
+    // A handoff refuses before the claim, so a retry costs no quota.
+    super::check_no_drain(ctx.state)?;
     let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
     let outcome = match git::commit::commit_preview(
         &ctx.state.store,
@@ -1368,6 +1372,8 @@ pub async fn rollback_to(
     // The daily budget is claimed after the cheap checks and before the git
     // work: a refused or redundant rollback costs nothing, and a rollback
     // whose commit never happens gives the claim back.
+    // A handoff refuses before the budget claim, so a retry costs nothing.
+    super::check_no_drain(state)?;
     super::claim_rollback(&state.pool, &app.id).await?;
     // A refused build spends nothing: the rollback budget is refunded, so a
     // capped account can still roll back after midnight.
