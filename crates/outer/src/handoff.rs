@@ -53,6 +53,10 @@ pub fn bind_reuseport(listen: std::net::SocketAddr) -> anyhow::Result<std::net::
     socket
         .bind(&listen.into())
         .with_context(|| format!("bind {listen}"))?;
+    // Tokio (both `axum::serve` and axum-server's `from_tcp`) takes this
+    // socket over and requires non-blocking mode; a blocking listener is a
+    // boot error there, not a slowdown.
+    socket.set_nonblocking(true)?;
     socket.listen(1024)?;
     Ok(socket.into())
 }
@@ -281,6 +285,10 @@ mod tests {
     #[test]
     fn reuseport_binds_twice_and_serves() {
         let first = bind_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(
+            socket2::SockRef::from(&first).nonblocking().unwrap(),
+            "Tokio takes this socket over and requires non-blocking mode"
+        );
         let port = first.local_addr().unwrap().port();
         let second = bind_reuseport(std::net::SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
         assert_eq!(

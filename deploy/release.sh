@@ -121,9 +121,9 @@ fi
 
 # shellcheck disable=SC1091
 source /srv/outer/handoff.sh
-# Whatever fails below, the heartbeat must not outlive the release and the
-# flag must not stay fresh: both would refuse deploys for no reason.
-trap 'handoff_clear; docker rm -f outer-next >/dev/null 2>&1 || true' EXIT
+# Whatever fails below, the heartbeat must not outlive the release: abort
+# clears the flag and removes outer-next only while a compose outer serves.
+trap 'handoff_abort' EXIT
 handoff_to "outer:$SHA"
 trap - EXIT
 EOF

@@ -57,7 +57,7 @@ echo "remote: rolling back to $target"
 # drop it here; a build that has the firewall reinstalls it at boot.
 nft delete table inet outer 2>/dev/null || true
 
-trap 'handoff_clear; docker rm -f outer-next >/dev/null 2>&1 || true' EXIT
+trap 'handoff_abort' EXIT
 handoff_to "$target"
 trap - EXIT
 EOF

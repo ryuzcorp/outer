@@ -13,31 +13,36 @@
 #
 # Coordination is the handoff flag file (/srv/outer/data/handoff): the
 # release script writes the heartbeat epoch into it every minute while the
-# handoff is open. outer refuses new deploys (retryable, 60 s backoff) and
-# delays its background writers while the flag is fresh; a flag older than
-# 180 s reads as inactive, so a crashed release heals itself. Recovery from
-# a crashed release is `rm /srv/outer/data/handoff` plus `docker rm -f
-# outer-next`, then a fresh release.
+# handoff is open, and holds it until outer-next is stopped. outer refuses
+# new deploys (retryable, 60 s backoff) and delays its background writers
+# while the flag is fresh; a flag older than 180 s reads as inactive, so a
+# crashed release heals itself. Recovery from a crashed release is
+# `rm /srv/outer/data/handoff` plus `docker rm -f outer-next`, then a fresh
+# release.
 #
 # shellcheck disable=SC2034
 
 HANDOFF_FILE=/srv/outer/data/handoff
 HEARTBEAT_PID=""
 
-# Write one heartbeat epoch into the flag file.
+# Write one heartbeat epoch into the flag file, atomically: readers must
+# never see a truncated file (an empty read deletes the flag and unblocks
+# the newcomer mid-handoff).
 handoff_flag() {
-    date +%s >"$HANDOFF_FILE"
+    date +%s >"$HANDOFF_FILE.tmp" && mv -f "$HANDOFF_FILE.tmp" "$HANDOFF_FILE"
 }
 
-# Open the handoff and keep the heartbeat fresh in the background.
+# Open the handoff and keep the heartbeat fresh in the background. The
+# subshell's stdio is detached so a lingering sleep never holds the ssh
+# channel open after the script exits.
 handoff_heartbeat_start() {
     handoff_flag
     (
         while true; do
             sleep 60
-            date +%s >"$HANDOFF_FILE"
+            handoff_flag
         done
-    ) &
+    ) >/dev/null 2>&1 </dev/null &
     HEARTBEAT_PID=$!
 }
 
@@ -54,6 +59,22 @@ handoff_heartbeat_stop() {
 handoff_clear() {
     handoff_heartbeat_stop
     rm -f "$HANDOFF_FILE"
+}
+
+# Abort a failed handoff: clear the flag, and remove outer-next only while
+# a compose-managed outer still serves. Past the old container's removal
+# outer-next may be the only listener on 443, so it stays up and the
+# operator recovers with a fresh release.
+handoff_abort() {
+    handoff_clear
+    local old
+    old="$(docker compose --env-file /srv/outer/release.env \
+        -f /srv/outer/compose.yaml ps -q outer 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$old" ]] && docker logs "$old" 2>&1 | grep -q 'listening on'; then
+        docker rm -f outer-next >/dev/null 2>&1 || true
+    else
+        echo "remote: handoff aborted with no healthy compose outer; outer-next is left running — recover with a fresh release" >&2
+    fi
 }
 
 # wait_for_listening <container> <image>: the container is running on
@@ -148,28 +169,74 @@ handoff_to() {
         -v /srv/outer/data:/data \
         -v /srv/outer/tls:/tls:ro \
         "$image" serve >/dev/null
-    wait_for_listening outer-next "$image" || return 1
-    # Drain the old container: SIGTERM refuses new deploys and the process
-    # exits once in-flight ones finish. -t 900 bounds a wedged deploy with
-    # SIGKILL; the newcomer's handoff catch-up closes whatever is left.
     old="$(docker compose --env-file /srv/outer/release.env \
         -f /srv/outer/compose.yaml ps -q outer)"
     [[ -n "$old" ]] || {
         echo "remote: no outer container to drain" >&2
+        handoff_abort
         return 1
     }
-    docker stop -t 900 "$old"
-    docker rm "$old"
+    if ! wait_for_listening outer-next "$image"; then
+        # First-handoff fallback: an old container that predates SO_REUSEPORT
+        # cannot share 443, so the newcomer bind fails with EADDRINUSE.
+        # Stop/start once (seconds of blackout; the idle wait above keeps
+        # in-flight deploys off the old build) — every later handoff
+        # overlaps.
+        if docker logs outer-next 2>&1 | grep -qi "address already in use" \
+            && [[ "$(docker inspect -f '{{.State.Running}}' "$old")" == "true" ]]; then
+            echo "remote: old container predates SO_REUSEPORT; one-time stop/start fallback" >&2
+            docker stop -t 60 "$old"
+            docker rm "$old"
+            docker start outer-next >/dev/null
+            wait_for_listening outer-next "$image" || {
+                handoff_abort
+                return 1
+            }
+            old=""
+        else
+            handoff_abort
+            return 1
+        fi
+    fi
+    # Drain the old container: SIGTERM refuses new deploys and the process
+    # exits once in-flight ones finish. -t 900 bounds a wedged deploy with
+    # SIGKILL; the newcomer's handoff catch-up closes whatever is left.
+    # (Skipped on the fallback path above: the old container is already
+    # gone.)
+    if [[ -n "$old" ]]; then
+        docker stop -t 900 "$old" || {
+            handoff_abort
+            return 1
+        }
+        docker rm "$old" || {
+            handoff_abort
+            return 1
+        }
+    fi
     record_image "$image"
-    handoff_clear
     # Recreate the compose service onto the same image: it overlaps the
     # newcomer via SO_REUSEPORT (same-version, no schema skew), then the
-    # newcomer drains and goes away. Steady state stays compose-managed.
+    # newcomer drains and goes away. The flag stays up throughout, so the
+    # recreated service skips boot bookkeeping and waits out its writers
+    # until outer-next is gone. Steady state stays compose-managed.
     docker compose --env-file /srv/outer/release.env \
-        -f /srv/outer/compose.yaml up -d
-    wait_for_listening outer-outer-1 "$image" || return 1
-    docker stop -t 300 outer-next
-    docker rm outer-next
+        -f /srv/outer/compose.yaml up -d || {
+        handoff_abort
+        return 1
+    }
+    wait_for_listening outer-outer-1 "$image" || {
+        handoff_abort
+        return 1
+    }
+    docker stop -t 300 outer-next || {
+        handoff_abort
+        return 1
+    }
+    docker rm outer-next || {
+        handoff_abort
+        return 1
+    }
+    handoff_clear
     # Keep the last 3 outer images, prune older (in-use images fail, ignored).
     docker images --format '{{.CreatedAt}} {{.Repository}}:{{.Tag}}' \
         | grep ' outer:' | sort -r | awk '{print $NF}' | tail -n +4 \
