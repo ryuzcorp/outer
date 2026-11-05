@@ -1520,7 +1520,11 @@ impl Deployer {
 
     /// The `celld deploy <root> ... --json` upload; returns (output, version).
     /// Bucket credentials come from the per-prefix cache when fresh (minted
-    /// on a miss), so the step env never carries the parent keys.
+    /// on a miss), so the step env never carries the parent keys. The fork
+    /// confines project reads to the config's directory (a `dist/` deploy
+    /// root can no longer pull a root-level Dockerfile or hoisted
+    /// packages), so the upload names the checkout with `--read-root` and
+    /// deploys keep building exactly what upstream celld accepted.
     async fn celld_deploy(
         &self,
         app: &App,
@@ -1556,6 +1560,10 @@ impl Deployer {
         if let Some(esbuild) = &self.settings.esbuild_bin {
             env.push(("CELLD_ESBUILD".to_string(), esbuild.clone()));
         }
+        // The fork admits build inputs from beyond the config's directory
+        // only through `--read-root`: name the checkout, so a `dist/`
+        // deploy root still builds against hoisted packages and a
+        // root-level Dockerfile exactly as upstream celld did.
         let args = vec![
             "deploy".to_string(),
             deploy_root.root.to_string_lossy().into_owned(),
@@ -1566,6 +1574,8 @@ impl Deployer {
             "--region".to_string(),
             region,
             "--json".to_string(),
+            "--read-root".to_string(),
+            self.work_dir(&app.slug).to_string_lossy().into_owned(),
         ];
         let out = self
             .run_sandboxed_step(
@@ -4444,6 +4454,47 @@ exit 0
                 }
             })
             .collect()
+    }
+
+    /// The `celld deploy` upload names the checkout with `--read-root`:
+    /// the fork confines project reads to the config's directory, so a
+    /// `dist/` deploy root needs the checkout admitted for build inputs
+    /// (hoisted packages, a root-level Dockerfile) that upstream celld
+    /// resolved without a flag.
+    #[tokio::test]
+    async fn deploy_names_the_checkout_as_celld_read_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = GitConfig::new(dir.path().join("git"), None);
+        let store = Store::memory();
+        let sync = GitSync::default();
+        manifest::init_repo(&store, &cfg, &sync, "grocery")
+            .await
+            .unwrap();
+        let sha = commit_tree(&cfg, &store, &sync, "grocery", vec![]).await;
+
+        let (_ddir, pool) = test_pool().await;
+        let app = test_app(10124);
+        insert_test_app(&pool, &app).await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_fake_celld(state.path());
+        let data = tempfile::tempdir().unwrap();
+        let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
+        let outcome = deployer
+            .deploy(&pool, &store, &cfg, &app, &sha)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
+        let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
+        let work = data.path().join("work").join(&app.slug);
+        // The full final argument is the checkout: a longer value (such as
+        // the dist dir under it) must not satisfy this.
+        let rooted = calls
+            .lines()
+            .any(|line| line.ends_with(&format!("--read-root {}", work.display())));
+        assert!(
+            rooted,
+            "the upload names the checkout as read root: {calls}"
+        );
     }
 
     async fn insert_test_app(pool: &SqlitePool, app: &App) {
