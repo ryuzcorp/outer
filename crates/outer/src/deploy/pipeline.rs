@@ -4486,8 +4486,13 @@ exit 0
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
         let work = data.path().join("work").join(&app.slug);
+        // The full final argument is the checkout: a longer value (such as
+        // the dist dir under it) must not satisfy this.
+        let rooted = calls
+            .lines()
+            .any(|line| line.ends_with(&format!("--read-root {}", work.display())));
         assert!(
-            calls.contains(&format!("--read-root {}", work.display())),
+            rooted,
             "the upload names the checkout as read root: {calls}"
         );
     }

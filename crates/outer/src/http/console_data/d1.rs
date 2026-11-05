@@ -932,7 +932,13 @@ fn first_lines(stderr: &str, n: usize) -> String {
     let joined = tail.join(" ");
     const MAX: usize = 500;
     if joined.len() > MAX {
-        format!("{}…", &joined[..MAX])
+        // Byte 500 can land inside a multibyte character: cut at the
+        // boundary at or before it, or formatting an error panics.
+        let mut end = MAX;
+        while !joined.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &joined[..end])
     } else if joined.is_empty() {
         "celld exited non-zero with no output".to_string()
     } else {
@@ -979,6 +985,14 @@ fn json_i64(row: &serde_json::Map<String, serde_json::Value>, key: &str) -> Opti
 
 fn json_str<'a>(row: &'a serde_json::Map<String, serde_json::Value>, key: &str) -> Option<&'a str> {
     row.get(key).and_then(|v| v.as_str())
+}
+
+/// True for the rows `PRAGMA table_list` reports as tables: ordinary
+/// tables and virtual ones (FTS5, vec0 — the export replays them whole).
+/// Shadows, views and internals never reach an export allowlist or a drop
+/// set through this predicate.
+pub(crate) fn is_table_kind(kind: Option<&str>) -> bool {
+    matches!(kind, Some("table" | "virtual"))
 }
 
 /// One cell as the UI sees it: NULL → null, numbers stringified exactly,
@@ -1083,7 +1097,7 @@ pub async fn list_tables(
     .await?;
     let mut names: Vec<String> = Vec::new();
     for row in parse_json_rows(&out) {
-        if json_str(&row, "type") != Some("table") {
+        if !is_table_kind(json_str(&row, "type")) {
             continue;
         }
         let Some(name) = json_str(&row, "name") else {
@@ -2100,6 +2114,17 @@ mod tests {
         assert_eq!(cell_value(&json!(false)), Some("0".to_string()));
         // Blobs arrive as byte arrays and render as x'hex'.
         assert_eq!(cell_value(&json!([222, 173])), Some("x'dead'".to_string()));
+    }
+
+    #[test]
+    fn first_lines_truncates_on_a_char_boundary() {
+        // Byte 500 lands inside the two-byte é: cutting there would panic,
+        // so the cut moves back to the boundary.
+        let long = format!("{}{}é{}", "x", "y".repeat(498), "z".repeat(10));
+        let out = first_lines(&long, 5);
+        assert!(out.ends_with('…'), "{out}");
+        assert!(out.starts_with(&format!("x{}", "y".repeat(498))), "{out}");
+        assert!(!out.contains('é'), "{out}");
     }
 
     #[test]

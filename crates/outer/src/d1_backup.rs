@@ -243,29 +243,21 @@ async fn exec_one(
 ) -> Result<String, D1Error> {
     d1::d1_exec(ctx, slug, identity, sql, true, project).await
 }
-/// Dump one binding to SQL text: one `celld d1 export` over the visible
-/// tables, plus the visible views (a filtered export leaves views out —
-/// they belong to no table). The `--table` allowlist keeps celld's
-/// `d1_migrations` bookkeeping and the runtime's internal tables out of the
-/// dump, so restore never sees them; the chosen tables' indexes, triggers
-/// and AUTOINCREMENT counters ride along. The export is one snapshot even
-/// while the database takes writes — a daily sweep cost, not an
-/// interactive one.
-pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<String, D1Error> {
-    let (identity, project) = d1::ready_backup(ctx, app, binding).await?;
-    // The same set the D1 panel shows and the restore drops: bookkeeping
-    // and internals never reach the export's argv.
-    let out = exec_one(
-        ctx,
-        &app.slug,
-        &identity,
-        project.path(),
-        "PRAGMA table_list",
-    )
-    .await?;
+/// Visible table names, sorted: the `--table` allowlist for the export.
+/// Ordinary tables and virtual ones (FTS5, vec0) both travel — the export
+/// replays a virtual table whole while skipping its shadows internally.
+/// Bookkeeping and internals never reach the allowlist (nor the restore).
+async fn visible_table_names(
+    ctx: &D1Ctx,
+    slug: &str,
+    identity: &str,
+    project: &std::path::Path,
+) -> Result<Vec<String>, D1Error> {
+    // The same set the D1 panel shows and the restore drops.
+    let out = exec_one(ctx, slug, identity, project, "PRAGMA table_list").await?;
     let mut tables = Vec::new();
     for row in d1::parse_json_rows(&out) {
-        if row.get("type").and_then(|v| v.as_str()) != Some("table") {
+        if !d1::is_table_kind(row.get("type").and_then(|v| v.as_str())) {
             continue;
         }
         let Some(name) = row.get("name").and_then(|v| v.as_str()) else {
@@ -277,34 +269,92 @@ pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<Stri
         tables.push(name.to_string());
     }
     tables.sort();
-    let mut stmts = Vec::new();
-    // No visible tables means nothing to export — and an unfiltered export
-    // would sweep bookkeeping in — so the dump below holds views only.
-    if !tables.is_empty() {
-        let body = d1::d1_export(ctx, &app.slug, &identity, &tables, project.path()).await?;
-        stmts.extend(split_sql(&body));
-    }
-    // Views belong to no table, so the filtered export leaves them out: one
-    // sqlite_master read appends them in catalog order.
+    Ok(tables)
+}
+
+/// Visible view definitions with their own triggers, in catalog order: a
+/// filtered export carries neither (neither belongs to a table), while an
+/// INSTEAD OF trigger dies with its view on restore unless replayed.
+async fn visible_view_stmts(
+    ctx: &D1Ctx,
+    slug: &str,
+    identity: &str,
+    project: &std::path::Path,
+) -> Result<Vec<String>, D1Error> {
     let views_out = exec_one(
         ctx,
-        &app.slug,
-        &identity,
-        project.path(),
-        "SELECT name, sql FROM sqlite_master WHERE type = 'view' \
-         AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        slug,
+        identity,
+        project,
+        "SELECT name, sql, type, tbl_name FROM sqlite_master \
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+         AND (type = 'view' OR type = 'trigger') ORDER BY rowid",
     )
     .await?;
+    let mut stmts = Vec::new();
+    let mut views: Vec<String> = Vec::new();
+    // Catalog order puts each view before its own triggers (a trigger
+    // cannot be created before its view), so one pass suffices. Table
+    // triggers never match: their tables ride the export already, and
+    // replaying them twice would fail the restore.
     for row in d1::parse_json_rows(&views_out) {
+        let kind = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let owner = row.get("tbl_name").and_then(|v| v.as_str()).unwrap_or("");
         let Some(sql) = row.get("sql").and_then(|v| v.as_str()) else {
             continue;
         };
-        if !d1::visible_table(name) {
-            continue;
+        if kind == "view" {
+            if !d1::visible_table(name) {
+                continue;
+            }
+            views.push(name.to_string());
+            stmts.push(sql.to_string());
+        } else if kind == "trigger" && views.iter().any(|v| v.as_str() == owner) {
+            stmts.push(sql.to_string());
         }
-        stmts.push(sql.to_string());
     }
+    Ok(stmts)
+}
+
+/// Dump one binding to SQL text: one `celld d1 export` over the visible
+/// tables, plus the visible views and their triggers (a filtered export
+/// leaves both out — neither belongs to a table). The `--table` allowlist
+/// keeps celld's `d1_migrations` bookkeeping and the runtime's internal
+/// tables out of the dump, so restore never sees them; the chosen tables'
+/// indexes, triggers and AUTOINCREMENT counters ride along. The export is
+/// one snapshot even while the database takes writes — a daily sweep cost,
+/// not an interactive one.
+pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<String, D1Error> {
+    let (identity, project) = d1::ready_backup(ctx, app, binding).await?;
+    // Table list, export and views are separate calls; a migration landing
+    // between them would store a view without its table (or miss either).
+    // Re-list after the views read: on drift retry the whole sequence, so a
+    // stored dump always describes one schema. Three attempts, then the
+    // sweep tries again next hour.
+    let mut attempt = 0;
+    let stmts = loop {
+        attempt += 1;
+        let tables = visible_table_names(ctx, &app.slug, &identity, project.path()).await?;
+        let mut stmts = Vec::new();
+        // No visible tables means nothing to export — and an unfiltered
+        // export would sweep bookkeeping in — so the dump below holds views
+        // only.
+        if !tables.is_empty() {
+            let body = d1::d1_export(ctx, &app.slug, &identity, &tables, project.path()).await?;
+            stmts.extend(split_sql(&body));
+        }
+        stmts.extend(visible_view_stmts(ctx, &app.slug, &identity, project.path()).await?);
+        let relist = visible_table_names(ctx, &app.slug, &identity, project.path()).await?;
+        if relist == tables {
+            break stmts;
+        }
+        if attempt >= 3 {
+            return Err(D1Error::Unavailable(anyhow::anyhow!(
+                "database {binding:?} schema changed during backup; retry"
+            )));
+        }
+    };
     // A single statement bigger than D1's statement limit can never be
     // restored (the replay batch would fail at the celld limit after the
     // tables were already dropped), so the backup fails here and stores
@@ -515,6 +565,11 @@ pub async fn restore_database(
     let mut drops = Vec::new();
     for row in d1::parse_json_rows(&views_out) {
         if let Some(name) = row.get("name").and_then(|v| v.as_str()) {
+            // The dump omits hidden views, so the restore must not drop
+            // them either: dropping one its dump lacks would lose it.
+            if !d1::visible_table(name) {
+                continue;
+            }
             drops.push(format!("DROP VIEW IF EXISTS {}", d1::quote_ident(name)));
         }
     }
@@ -542,9 +597,19 @@ pub async fn restore_database(
     let mut batch_bytes = 0usize;
     let mut statements_applied = 0usize;
     let mut bytes_applied = 0usize;
+    // Every replay batch defers foreign keys like the drop batch does:
+    // the dump arrives in creation order, not dependency order, so a child
+    // row may land before its parent row. Deferring at each batch's start
+    // covers every statement in it, the same way the drops rely on.
+    let replay = |batch: &[String]| {
+        format!(
+            "PRAGMA defer_foreign_keys = ON;\n{}",
+            batch.join("\n;\n") + "\n;"
+        )
+    };
     for stmt in statements {
         if !batch.is_empty() && batch_bytes + stmt.len() + 3 > RESTORE_BATCH_BYTES {
-            let sql = batch.join("\n;\n") + "\n;";
+            let sql = replay(&batch);
             exec_one(ctx, &app.slug, &identity, project.path(), &sql).await?;
             statements_applied += batch.len();
             bytes_applied += sql.len();
@@ -555,7 +620,7 @@ pub async fn restore_database(
         batch.push(stmt);
     }
     if !batch.is_empty() {
-        let sql = batch.join("\n;\n") + "\n;";
+        let sql = replay(&batch);
         exec_one(ctx, &app.slug, &identity, project.path(), &sql).await?;
         statements_applied += batch.len();
         bytes_applied += sql.len();
@@ -900,7 +965,7 @@ if [ "$1" = "d1" ] && [ "$2" = "export" ]; then
   # table) and no bookkeeping or internals. Logged whole for argv
   # assertions; the dump streams on stdout.
   printf '%s\n' "$*" >> "{log}"
-  printf '%s\n' 'CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT, "avatar" BLOB);' 'INSERT INTO "users" ("id", "name", "avatar") VALUES (1, '"'"'ada'"'"', NULL), (2, '"'"'o'"'"''"'"'brien; -- x'"'"', x'"'"'dead'"'"');' 'CREATE TABLE "orders" ("id" INTEGER PRIMARY KEY, "user_id" INTEGER REFERENCES "users" ("id"));' 'INSERT INTO "orders" ("id", "user_id") VALUES (7, 1);' 'DELETE FROM "sqlite_sequence" WHERE "name" = '"'"'users'"'"';' 'INSERT INTO "sqlite_sequence" ("name", "seq") VALUES ('"'"'users'"'"', 2), ('"'"'orders'"'"', 7);' 'CREATE INDEX "idx_orders_user" ON "orders" ("user_id");' 'CREATE TRIGGER "trg_users" AFTER INSERT ON "users" BEGIN UPDATE "users" SET "name" = CASE WHEN NEW."id" > 0 THEN '"'"'touched'"'"' ELSE '"'"'kept'"'"' END WHERE "id" = NEW."id"; END;'
+  printf '%s\n' 'CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT, "avatar" BLOB);' 'INSERT INTO "users" ("id", "name", "avatar") VALUES (1, '"'"'ada'"'"', NULL), (2, '"'"'o'"'"''"'"'brien; -- x'"'"', x'"'"'dead'"'"');' 'CREATE TABLE "orders" ("id" INTEGER PRIMARY KEY, "user_id" INTEGER REFERENCES "users" ("id"));' 'INSERT INTO "orders" ("id", "user_id") VALUES (7, 1);' 'CREATE VIRTUAL TABLE "docs" USING fts5("title");' 'INSERT INTO "docs" ("title") VALUES ('"'"'hello'"'"');' 'DELETE FROM "sqlite_sequence" WHERE "name" = '"'"'users'"'"';' 'INSERT INTO "sqlite_sequence" ("name", "seq") VALUES ('"'"'users'"'"', 2), ('"'"'orders'"'"', 7);' 'CREATE INDEX "idx_orders_user" ON "orders" ("user_id");' 'CREATE TRIGGER "trg_users" AFTER INSERT ON "users" BEGIN UPDATE "users" SET "name" = CASE WHEN NEW."id" > 0 THEN '"'"'touched'"'"' ELSE '"'"'kept'"'"' END WHERE "id" = NEW."id"; END;'
   exit 0
 fi
 command_of() {{
@@ -916,11 +981,11 @@ case "$sql" in
   "SELECT name FROM sqlite_master WHERE type = 'view'"*)
     printf '%s\n' '{{"name":"big"}}'
     ;;
-  "SELECT name, sql FROM sqlite_master WHERE type = 'view'"*)
-    printf '%s\n' '{{"name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\""}}'
+  "SELECT name, sql, type, tbl_name FROM sqlite_master"*)
+    printf '%s\n' '{{"name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\"","type":"view","tbl_name":"big"}}' '{{"name":"trg_big","sql":"CREATE TRIGGER \"trg_big\" INSTEAD OF INSERT ON \"big\" BEGIN SELECT 1; END","type":"trigger","tbl_name":"big"}}' '{{"name":"trg_orders","sql":"CREATE TRIGGER \"trg_orders\" AFTER INSERT ON \"orders\" BEGIN SELECT 1; END","type":"trigger","tbl_name":"orders"}}'
     ;;
   "PRAGMA table_list")
-    printf '%s\n' '{{"type":"table","name":"users"}}' '{{"type":"table","name":"orders"}}' '{{"type":"table","name":"_hidden"}}' '{{"type":"table","name":"d1_migrations"}}' '{{"type":"table","name":"sqlite_sequence"}}' '{{"type":"table","name":"_litestream_seq"}}'
+    printf '%s\n' '{{"type":"table","name":"users"}}' '{{"type":"table","name":"orders"}}' '{{"type":"virtual","name":"docs"}}' '{{"type":"shadow","name":"docs_data"}}' '{{"type":"table","name":"_hidden"}}' '{{"type":"table","name":"d1_migrations"}}' '{{"type":"table","name":"sqlite_sequence"}}' '{{"type":"table","name":"_litestream_seq"}}'
     ;;
   *"COUNT(*) AS n"*)
     printf '%s\n' '{{"t":"users","n":2}}' '{{"t":"orders","n":1}}'
@@ -1045,6 +1110,16 @@ exit 0
         assert!(users_at < orders_at, "tables stay in creation order");
         assert!(dump.contains("CREATE INDEX \"idx_orders_user\""));
         assert!(dump.contains("CREATE VIEW \"big\" AS SELECT * FROM \"users\""));
+        // The view's own trigger rides along; a table trigger never does
+        // (its table already carries it through the export).
+        assert!(
+            dump.contains("CREATE TRIGGER \"trg_big\" INSTEAD OF"),
+            "{dump}"
+        );
+        assert!(!dump.contains("trg_orders"), "{dump}");
+        // Virtual tables dump whole; their shadows never reach the export.
+        assert!(dump.contains("CREATE VIRTUAL TABLE \"docs\""), "{dump}");
+        assert!(!dump.contains("docs_data"), "shadows stay out");
         // AUTOINCREMENT continuity rides the sequence counters, which the
         // old manual dump never carried.
         assert!(dump.contains("sqlite_sequence"), "{dump}");
@@ -1081,10 +1156,97 @@ exit 0
         assert!(export.contains("d1 export app-db"), "{export}");
         assert!(export.contains("--table users"), "{export}");
         assert!(export.contains("--table orders"), "{export}");
+        assert!(
+            export.contains("--table docs"),
+            "virtual tables travel: {export}"
+        );
+        assert!(!export.contains("--table docs_data"), "{export}");
         assert!(!export.contains("--table d1_migrations"), "{export}");
         assert!(!export.contains("--table _hidden"), "{export}");
         assert!(!export.contains("--table sqlite_sequence"), "{export}");
         assert!(!export.contains("--table _litestream"), "{export}");
+        // One list for the allowlist, one after the views read to confirm
+        // no migration landed mid-dump.
+        let lists = calls
+            .lines()
+            .filter(|line| line.contains("PRAGMA table_list"))
+            .count();
+        assert_eq!(lists, 2, "{calls}");
+    }
+
+    /// A fake `celld` whose table list never settles: every listing
+    /// alternates, so the drift check retries and then gives up.
+    fn install_drifting_celld(state: &std::path::Path) -> std::path::PathBuf {
+        let script = state.join("fake-celld-drift");
+        let tmp = script.with_extension("tmp");
+        let log = state.join("calls.log").to_string_lossy().into_owned();
+        let counter = state.join("drift-n").to_string_lossy().into_owned();
+        std::fs::write(
+            &tmp,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "d1" ] && [ "$2" = "export" ]; then
+  printf '%s\n' export-call >> "{log}"
+  printf '%s\n' 'CREATE TABLE "users" ("id" INTEGER PRIMARY KEY);'
+  exit 0
+fi
+command_of() {{
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--command" ]; then printf '%s' "$a"; return 0; fi
+    prev="$a"
+  done
+}}
+sql=$(command_of "$@")
+case "$sql" in
+  "PRAGMA table_list")
+    n=$(cat "{counter}" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "{counter}"
+    if [ $((n % 2)) -eq 0 ]; then
+      printf '%s\n' '{{"type":"table","name":"users"}}'
+    else
+      printf '%s\n' '{{"type":"table","name":"users"}}' '{{"type":"table","name":"orders"}}'
+    fi
+    ;;
+  "SELECT name, sql, type, tbl_name FROM sqlite_master"*)
+    ;;
+  *) echo "unexpected command: $sql" >&2; exit 1;;
+esac
+exit 0
+"#,
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::rename(&tmp, &script).unwrap();
+        script
+    }
+
+    #[tokio::test]
+    async fn dump_retries_a_schema_that_changes_mid_dump() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        let script = install_drifting_celld(state.path());
+        let store = Store::memory();
+        let now = crate::apps::now_ms();
+        seed_backup_app(&pool, &store, now).await;
+        let ctx = backup_ctx(&pool, &state, &script, store);
+        let app = crate::apps::get_by_slug(&pool, "acme")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = dump_database(&ctx, &app, "DB").await.unwrap_err();
+        assert!(matches!(err, D1Error::Unavailable(_)), "{err:?}");
+        // Three full attempts, then the sweep tries again next hour: no
+        // partial dump is stored.
+        let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
+        let exports = calls.lines().filter(|line| *line == "export-call").count();
+        assert_eq!(exports, 3, "{calls}");
     }
 
     #[tokio::test]
@@ -1110,7 +1272,7 @@ exit 0
                 .unwrap();
 
         assert_ne!(fresh.id, first.id);
-        assert_eq!(report.tables_dropped, 2);
+        assert_eq!(report.tables_dropped, 3);
         assert!(report.statements_applied > 0, "{report:?}");
         assert!(!report.fresh_backup_id.is_empty());
         let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
@@ -1132,6 +1294,13 @@ exit 0
         // The trigger replays whole, body semicolon and CASE included.
         assert!(calls.contains("CREATE TRIGGER \"trg_users\""));
         assert!(calls.contains("ELSE 'kept' END"));
+        // The view's own trigger and the sequence counters replay too:
+        // writes keep working after restore and AUTOINCREMENT continues.
+        assert!(
+            calls.contains("CREATE TRIGGER \"trg_big\" INSTEAD OF"),
+            "{calls}"
+        );
+        assert!(calls.contains("sqlite_sequence"), "{calls}");
         // Fresh backup + restore target coexist: nothing pruned within retention.
         assert_eq!(backups_for(&pool, &app.id).await.unwrap().len(), 2);
     }
@@ -1164,7 +1333,7 @@ case "$sql" in
   "PRAGMA table_list")
     printf '%s\n' '{{"type":"table","name":"big"}}'
     ;;
-  "SELECT name, sql FROM sqlite_master WHERE type = 'view'"*)
+  "SELECT name, sql, type, tbl_name FROM sqlite_master"*)
     ;;
   *) echo "unexpected command: $sql" >&2; exit 1;;
 esac
