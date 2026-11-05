@@ -8,16 +8,18 @@
 //! newest 3 dumps per binding, Pro the newest 30 (spec §3, owner-set
 //! 2026-10-26).
 //!
-//! celld 0.6.2 has no `d1 export` command: only `d1 execute` and
-//! `d1 migrations apply` run SQL from the CLI
-//! (<https://celld.dev/docs/services/d1>), so the dump is produced the
-//! portable way — the schema out of `sqlite_master`, then paged
-//! `SELECT * … LIMIT … OFFSET …` rows through `celld d1 execute --json`,
-//! rendered to `CREATE` plus multi-row `INSERT` statements. Every generated
+//! `celld d1 export` dumps the live database as SQL — schema beside data,
+//! read under one transaction on the owning node, so the dump is a single
+//! snapshot even while the database takes writes. The dump names exactly
+//! the visible tables (`--table`, repeatable): celld's `d1_migrations`
+//! bookkeeping and the runtime's internal tables stay out, the chosen
+//! tables' indexes, triggers and AUTOINCREMENT counters ride along, and the
+//! visible views (which belong to no table, so a filtered export leaves
+//! them out) are appended by one `sqlite_master` read. Every stored
 //! statement stays under the 100,000-byte D1 statement limit
-//! (<https://celld.dev/docs/services/d1>) with headroom, and the dump holds
-//! no `BEGIN`/`COMMIT` (application SQL may not use them): each restore
-//! batch runs inside celld's own transaction instead.
+//! (<https://celld.dev/docs/services/d1>), and the dump holds no
+//! `BEGIN`/`COMMIT` (application SQL may not use them): each restore batch
+//! runs inside celld's own transaction instead.
 //!
 //! Restore replays a dump into the same database (drop the user tables,
 //! replay in batches) after taking a fresh backup first, so a bad restore
@@ -25,7 +27,6 @@
 //! written by `migrations apply` — is neither dumped nor dropped, so a
 //! restore never confuses a later apply.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -83,14 +84,6 @@ pub const BACKUP_EVERY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// How often the sweep looks for due apps.
 pub const TICK_EVERY: Duration = Duration::from_secs(3600);
-
-/// Rows per dump page: small enough that no page nears the 32 MiB binding
-/// result cap, large enough that a daily dump is a handful of execs.
-pub const ROW_PAGE: i64 = 500;
-
-/// Generated statements stay under the 100,000-byte D1 statement limit with
-/// headroom for celld's own wrapping.
-pub const MAX_STATEMENT_BYTES: usize = 90_000;
 
 /// The hard D1 statement limit
 /// (<https://celld.dev/docs/services/d1>): a single row bigger than this
@@ -250,278 +243,97 @@ async fn exec_one(
 ) -> Result<String, D1Error> {
     d1::d1_exec(ctx, slug, identity, sql, true, project).await
 }
-/// One `sqlite_master` row with a body: tables, indexes, triggers, views.
-/// Auto-indexes carry NULL `sql` and never reach here.
-struct SchemaObject {
-    kind: String,
-    name: String,
-    sql: String,
-}
-
-/// Dump one binding to SQL text. Runs `1 + tables × 2 + pages` small execs
-/// (schema, then per table one `PRAGMA foreign_key_list` and one
-/// `PRAGMA table_info`, then the row pages), each bounded by
-/// [`ROW_PAGE`] — a daily sweep cost, not an interactive one.
+/// Dump one binding to SQL text: one `celld d1 export` over the visible
+/// tables, plus the visible views (a filtered export leaves views out —
+/// they belong to no table). The `--table` allowlist keeps celld's
+/// `d1_migrations` bookkeeping and the runtime's internal tables out of the
+/// dump, so restore never sees them; the chosen tables' indexes, triggers
+/// and AUTOINCREMENT counters ride along. The export is one snapshot even
+/// while the database takes writes — a daily sweep cost, not an
+/// interactive one.
 pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<String, D1Error> {
     let (identity, project) = d1::ready_backup(ctx, app, binding).await?;
-
+    // The same set the D1 panel shows and the restore drops: bookkeeping
+    // and internals never reach the export's argv.
     let out = exec_one(
         ctx,
         &app.slug,
         &identity,
         project.path(),
-        "SELECT type, name, tbl_name, sql FROM sqlite_master \
-         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        "PRAGMA table_list",
     )
     .await?;
-    let mut objects = Vec::new();
+    let mut tables = Vec::new();
     for row in d1::parse_json_rows(&out) {
-        let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let table = row.get("tbl_name").and_then(|v| v.as_str()).unwrap_or("");
-        // Only the app's own tables, the same set the D1 panel shows and the
-        // restore drops: celld's migration bookkeeping must survive for a
-        // later `migrations apply`, and the runtime's internal tables
-        // (`_litestream_*` and friends) refuse reads outright.
-        if !d1::visible_table(name) || !d1::visible_table(table) {
+        if row.get("type").and_then(|v| v.as_str()) != Some("table") {
             continue;
         }
-        let (Some(kind), Some(sql)) = (
-            row.get("type").and_then(|v| v.as_str()),
-            row.get("sql").and_then(|v| v.as_str()),
-        ) else {
+        let Some(name) = row.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
-        objects.push(SchemaObject {
-            kind: kind.to_string(),
-            name: name.to_string(),
-            sql: sql.to_string(),
-        });
-    }
-    let tables: Vec<&SchemaObject> = objects.iter().filter(|o| o.kind == "table").collect();
-
-    // Foreign-key edges for dependency order, one PRAGMA per table.
-    let mut deps: HashMap<&str, Vec<String>> = HashMap::new();
-    for table in &tables {
-        let sql = format!("PRAGMA foreign_key_list({})", d1::quote_ident(&table.name));
-        let mut refs = Vec::new();
-        for row in
-            d1::parse_json_rows(&exec_one(ctx, &app.slug, &identity, project.path(), &sql).await?)
-        {
-            if let Some(target) = row.get("table").and_then(|v| v.as_str()) {
-                refs.push(target.to_string());
-            }
+        if !d1::visible_table(name) {
+            continue;
         }
-        deps.insert(table.name.as_str(), refs);
+        tables.push(name.to_string());
     }
-    let ordered = topo_order(&tables, &deps);
-
-    // Column types for value rendering, one PRAGMA per table.
-    let mut columns: HashMap<&str, Vec<(String, String)>> = HashMap::new();
-    for table in &tables {
-        let sql = format!("PRAGMA table_info({})", d1::quote_ident(&table.name));
-        let mut cols: Vec<(i64, String, String)> = Vec::new();
-        for row in
-            d1::parse_json_rows(&exec_one(ctx, &app.slug, &identity, project.path(), &sql).await?)
-        {
-            let cid = row.get("cid").and_then(|v| v.as_i64()).unwrap_or(0);
-            let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let decltype = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            cols.push((cid, name.to_string(), decltype.to_string()));
+    tables.sort();
+    let mut stmts = Vec::new();
+    // No visible tables means nothing to export — and an unfiltered export
+    // would sweep bookkeeping in — so the dump below holds views only.
+    if !tables.is_empty() {
+        let body = d1::d1_export(ctx, &app.slug, &identity, &tables, project.path()).await?;
+        stmts.extend(split_sql(&body));
+    }
+    // Views belong to no table, so the filtered export leaves them out: one
+    // sqlite_master read appends them in catalog order.
+    let views_out = exec_one(
+        ctx,
+        &app.slug,
+        &identity,
+        project.path(),
+        "SELECT name, sql FROM sqlite_master WHERE type = 'view' \
+         AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+    )
+    .await?;
+    for row in d1::parse_json_rows(&views_out) {
+        let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(sql) = row.get("sql").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !d1::visible_table(name) {
+            continue;
         }
-        cols.sort_by_key(|(cid, _, _)| *cid);
-        columns.insert(
-            table.name.as_str(),
-            cols.into_iter()
-                .map(|(_, name, decltype)| (name, decltype))
-                .collect(),
-        );
+        stmts.push(sql.to_string());
     }
-
+    // A single statement bigger than D1's statement limit can never be
+    // restored (the replay batch would fail at the celld limit after the
+    // tables were already dropped), so the backup fails here and stores
+    // nothing.
+    if let Some(big) = stmts.iter().find(|s| s.len() > D1_STATEMENT_LIMIT) {
+        return Err(D1Error::TooLarge(format!(
+            "a dumped statement is too large to restore ({} bytes)",
+            big.len()
+        )));
+    }
     let mut dump = format!(
         "-- Outer D1 backup: database {binding:?}\n\
          -- Restore with Console → D1 → Backups, or the restore_backup MCP tool.\n"
     );
-    // Statements are separated by `;` on its own line, not by a bare `;`: a
-    // DDL line ending in a `--` comment would otherwise eat the terminator
-    // (the `;` lands on the comment's line), merging two statements into one
-    // syntax error at restore time.
-    let push = |dump: &mut String, stmt: &str| {
+    for stmt in &stmts {
         dump.push_str(stmt);
+        // Statements are separated by `;` on its own line, not by a bare
+        // `;`: a DDL line ending in a `--` comment would otherwise eat the
+        // terminator (the `;` lands on the comment's line), merging two
+        // statements into one syntax error at restore time.
         dump.push_str("\n;\n");
-    };
-    for table in &ordered {
-        push(&mut dump, &table.sql);
     }
-    // Indexes, triggers and views after the tables they belong to, in
-    // catalog order.
-    for obj in objects
-        .iter()
-        .filter(|o| o.kind == "index" || o.kind == "trigger" || o.kind == "view")
-    {
-        push(&mut dump, &obj.sql);
-    }
-    let mut bytes = dump.len();
-
-    for table in &ordered {
-        let Some(cols) = columns.get(table.name.as_str()) else {
-            continue;
-        };
-        if cols.is_empty() {
-            continue;
-        }
-        let prefix = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            d1::quote_ident(&table.name),
-            cols.iter()
-                .map(|(name, _)| d1::quote_ident(name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let mut offset = 0i64;
-        loop {
-            let sql = format!(
-                "SELECT * FROM {} LIMIT {ROW_PAGE} OFFSET {offset}",
-                d1::quote_ident(&table.name)
-            );
-            let rows = d1::parse_json_rows(
-                &exec_one(ctx, &app.slug, &identity, project.path(), &sql).await?,
-            );
-            let page_len = rows.len();
-            for stmt in pack_inserts(&prefix, cols, &rows) {
-                // A single row bigger than D1's statement limit can never be
-                // restored (the replay batch would fail at the celld limit
-                // after the tables were already dropped), so the backup
-                // fails here and stores nothing.
-                if stmt.len() > D1_STATEMENT_LIMIT {
-                    return Err(D1Error::TooLarge(format!(
-                        "a row in table {:?} is too large to restore ({} bytes)",
-                        table.name,
-                        stmt.len()
-                    )));
-                }
-                bytes += stmt.len() + 2;
-                if bytes > MAX_DUMP_BYTES {
-                    return Err(D1Error::TooLarge(format!(
-                        "database {binding:?} exceeds the {} MiB dump cap",
-                        MAX_DUMP_BYTES / (1024 * 1024)
-                    )));
-                }
-                push(&mut dump, &stmt);
-            }
-            if page_len < ROW_PAGE as usize {
-                break;
-            }
-            offset += ROW_PAGE;
-        }
+    if dump.len() > MAX_DUMP_BYTES {
+        return Err(D1Error::TooLarge(format!(
+            "database {binding:?} exceeds the {} MiB dump cap",
+            MAX_DUMP_BYTES / (1024 * 1024)
+        )));
     }
     Ok(dump)
-}
-
-/// Order tables so referenced tables are created first. Repeatedly emits the
-/// first catalog table whose prerequisites (references staying inside the
-/// dumped set) are all emitted — O(n²), but D1 apps have tens of tables at
-/// most, and the scan order keeps the output deterministic. A reference
-/// cycle — or a reference to a table outside the dump — can never stall the
-/// scan: when no table is emittable, the first leftover goes next in catalog
-/// order, so the dump never loses a table.
-fn topo_order<'a>(
-    tables: &[&'a SchemaObject],
-    deps: &HashMap<&str, Vec<String>>,
-) -> Vec<&'a SchemaObject> {
-    let in_set: std::collections::HashSet<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-    let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(tables.len());
-    while out.len() < tables.len() {
-        let mut progressed = false;
-        for table in tables {
-            if emitted.contains(table.name.as_str()) {
-                continue;
-            }
-            let blocked = deps
-                .get(table.name.as_str())
-                .map(|refs| {
-                    refs.iter().any(|r| {
-                        r != &table.name
-                            && in_set.contains(r.as_str())
-                            && !emitted.contains(r.as_str())
-                    })
-                })
-                .unwrap_or(false);
-            if !blocked {
-                emitted.insert(table.name.as_str());
-                out.push(*table);
-                progressed = true;
-            }
-        }
-        if !progressed {
-            // A cycle: emit the first leftover in catalog order. Its CREATE
-            // may name a table created later in the file, which SQLite
-            // accepts — the reference resolves by the time data lands.
-            let leftover = tables
-                .iter()
-                .find(|t| !emitted.contains(t.name.as_str()))
-                .expect("topo: leftover exists while out is short");
-            emitted.insert(leftover.name.as_str());
-            out.push(*leftover);
-        }
-    }
-    out
-}
-
-/// True for a `x'hex'` blob literal on a BLOB-affinity column: it passes
-/// through unquoted, since [`d1::literal`] would quote-escape it into a
-/// text value. `cell_value` only ever produces NULL or `x'hex'` for such
-/// columns (a text-looking `x'…'` in a TEXT column still quotes normally).
-/// An empty decltype also has BLOB affinity in SQLite.
-fn is_blob_literal(decltype: &str, rendered: &str) -> bool {
-    let blob_affinity = decltype.is_empty() || decltype.to_uppercase().contains("BLOB");
-    blob_affinity
-        && rendered.len() >= 4
-        && rendered.starts_with("x'")
-        && rendered.ends_with('\'')
-        && rendered[2..rendered.len() - 1]
-            .chars()
-            .all(|c| c.is_ascii_hexdigit())
-}
-
-/// Pack one page's rows into multi-row `INSERT` statements of at most
-/// [`MAX_STATEMENT_BYTES`] bytes. One row per statement worst case (a single
-/// row bigger than [`D1_STATEMENT_LIMIT`] is left whole for `dump_database`
-/// to reject at backup time instead of silently truncating here).
-fn pack_inserts(
-    prefix: &str,
-    cols: &[(String, String)],
-    rows: &[serde_json::Map<String, serde_json::Value>],
-) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let mut current = String::new();
-    for row in rows {
-        let values: Vec<String> = cols
-            .iter()
-            .map(|(name, decltype)| {
-                let rendered = row.get(name).map(d1::cell_value).unwrap_or(None);
-                match rendered {
-                    Some(value) if is_blob_literal(decltype, &value) => value,
-                    other => d1::literal(decltype, other.as_deref()),
-                }
-            })
-            .collect();
-        let tuple = format!("({})", values.join(", "));
-        if !current.is_empty()
-            && prefix.len() + current.len() + 2 + tuple.len() > MAX_STATEMENT_BYTES
-        {
-            stmts.push(format!("{prefix}{current}"));
-            current.clear();
-        }
-        if !current.is_empty() {
-            current.push_str(", ");
-        }
-        current.push_str(&tuple);
-    }
-    if !current.is_empty() {
-        stmts.push(format!("{prefix}{current}"));
-    }
-    stmts
 }
 
 /// Split dump SQL back into statements, without their trailing `;`.
@@ -990,14 +802,6 @@ pub fn spawn_backup_task(pool: SqlitePool, store: Store, fleets: FleetManager, e
 mod tests {
     use super::*;
 
-    fn schema_object(kind: &str, name: &str, sql: &str) -> SchemaObject {
-        SchemaObject {
-            kind: kind.to_string(),
-            name: name.to_string(),
-            sql: sql.to_string(),
-        }
-    }
-
     #[test]
     fn backup_keys_sort_by_time_under_one_slug() {
         let early = backup_key("acme", 1000, "DB");
@@ -1027,69 +831,6 @@ mod tests {
         assert_eq!(backups_keep("free"), 3);
         assert_eq!(backups_keep("pro"), 30);
         assert_eq!(backups_keep("anything-else"), FREE_BACKUPS_KEEP);
-    }
-
-    #[test]
-    fn topo_order_puts_parents_first() {
-        let users = schema_object(
-            "table",
-            "users",
-            "CREATE TABLE users (id INTEGER PRIMARY KEY)",
-        );
-        let orders = schema_object(
-            "table",
-            "orders",
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))",
-        );
-        let items = schema_object(
-            "table",
-            "items",
-            "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER REFERENCES orders(id))",
-        );
-        let tables = vec![&items, &orders, &users];
-        let mut deps = HashMap::new();
-        deps.insert("orders", vec!["users".to_string()]);
-        deps.insert("items", vec!["orders".to_string()]);
-        let ordered = topo_order(&tables, &deps);
-        let names: Vec<&str> = ordered.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["users", "orders", "items"]);
-    }
-
-    #[test]
-    fn topo_order_survives_a_reference_cycle() {
-        let a = schema_object(
-            "table",
-            "a",
-            "CREATE TABLE a (id INTEGER PRIMARY KEY, b_id INTEGER REFERENCES b(id))",
-        );
-        let b = schema_object(
-            "table",
-            "b",
-            "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES a(id))",
-        );
-        let tables = vec![&a, &b];
-        let mut deps = HashMap::new();
-        deps.insert("a", vec!["b".to_string()]);
-        deps.insert("b", vec!["a".to_string()]);
-        let ordered = topo_order(&tables, &deps);
-        assert_eq!(ordered.len(), 2);
-        // Catalog order for the cycle: no table lost, no hang.
-        assert_eq!(ordered[0].name, "a");
-        assert_eq!(ordered[1].name, "b");
-    }
-
-    #[test]
-    fn topo_order_ignores_references_outside_the_dump() {
-        let users = schema_object(
-            "table",
-            "users",
-            "CREATE TABLE users (id INTEGER PRIMARY KEY)",
-        );
-        let tables = vec![&users];
-        let mut deps = HashMap::new();
-        deps.insert("users", vec!["d1_migrations".to_string()]);
-        let ordered = topo_order(&tables, &deps);
-        assert_eq!(ordered.len(), 1);
     }
 
     #[test]
@@ -1135,39 +876,16 @@ mod tests {
         assert!(stmts[0].contains("\"we;ird\""));
     }
 
-    #[test]
-    fn pack_inserts_stays_under_the_statement_cap() {
-        let prefix = "INSERT INTO \"t\" (\"note\") VALUES ";
-        let cols = vec![("note".to_string(), "TEXT".to_string())];
-        let big = "x".repeat(1000);
-        let rows: Vec<serde_json::Map<String, serde_json::Value>> = (0..200)
-            .map(|i| {
-                let mut row = serde_json::Map::new();
-                row.insert(
-                    "note".to_string(),
-                    serde_json::Value::String(format!("{big}-{i}")),
-                );
-                row
-            })
-            .collect();
-        let stmts = pack_inserts(prefix, &cols, &rows);
-        assert!(stmts.len() > 1);
-        for stmt in &stmts {
-            assert!(stmt.len() <= MAX_STATEMENT_BYTES, "{}", stmt.len());
-        }
-        let tuples: usize = stmts.iter().map(|s| s.matches("), (").count() + 1).sum();
-        assert_eq!(tuples, 200);
-    }
-
     // --- fake celld ------------------------------------------------------
 
     use crate::auth::test_support::test_pool;
     use crate::fleet::manager::FleetStorage;
 
     /// A fake `celld` answering the backup engine's exact queries: the
-    /// schema read, per-table PRAGMAs, row pages, the restore's table/view
-    /// reads, and (by logging + `exit 0`) every drop/replay batch. The state
-    /// dir is baked into the script, so parallel tests never share it.
+    /// `d1 export` dump over the allowlisted tables, the dump's and the
+    /// restore's view reads, the restore's table/count reads, and (by
+    /// logging + `exit 0`) every drop/replay batch. The state dir is baked
+    /// into the script, so parallel tests never share it.
     fn install_fake_celld(state: &std::path::Path) -> std::path::PathBuf {
         let script = state.join("fake-celld");
         let tmp = script.with_extension("tmp");
@@ -1176,6 +894,15 @@ mod tests {
             &tmp,
             format!(
                 r#"#!/bin/sh
+if [ "$1" = "d1" ] && [ "$2" = "export" ]; then
+  # A filtered export: exactly the allowlisted tables (their indexes and
+  # triggers follow), the sequence counters, no views (they belong to no
+  # table) and no bookkeeping or internals. Logged whole for argv
+  # assertions; the dump streams on stdout.
+  printf '%s\n' "$*" >> "{log}"
+  printf '%s\n' 'CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT, "avatar" BLOB);' 'INSERT INTO "users" ("id", "name", "avatar") VALUES (1, '"'"'ada'"'"', NULL), (2, '"'"'o'"'"''"'"'brien; -- x'"'"', x'"'"'dead'"'"');' 'CREATE TABLE "orders" ("id" INTEGER PRIMARY KEY, "user_id" INTEGER REFERENCES "users" ("id"));' 'INSERT INTO "orders" ("id", "user_id") VALUES (7, 1);' 'DELETE FROM "sqlite_sequence" WHERE "name" = '"'"'users'"'"';' 'INSERT INTO "sqlite_sequence" ("name", "seq") VALUES ('"'"'users'"'"', 2), ('"'"'orders'"'"', 7);' 'CREATE INDEX "idx_orders_user" ON "orders" ("user_id");' 'CREATE TRIGGER "trg_users" AFTER INSERT ON "users" BEGIN UPDATE "users" SET "name" = CASE WHEN NEW."id" > 0 THEN '"'"'touched'"'"' ELSE '"'"'kept'"'"' END WHERE "id" = NEW."id"; END;'
+  exit 0
+fi
 command_of() {{
   prev=""
   for a in "$@"; do
@@ -1186,36 +913,14 @@ command_of() {{
 sql=$(command_of "$@")
 printf '%s\n' "$sql" >> "{log}"
 case "$sql" in
-  *_litestream_*)
-    # Real celld refuses any read of the runtime's internal tables.
-    echo "Error: D1_EXEC_ERROR: access to _litestream_seq.id is prohibited" >&2
-    exit 1
-    ;;
-  "SELECT type, name, tbl_name, sql"*)
-    printf '%s\n' '{{"type":"table","name":"users","tbl_name":"users","sql":"CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT, \"avatar\" BLOB)"}}' '{{"type":"table","name":"orders","tbl_name":"orders","sql":"CREATE TABLE \"orders\" (\"id\" INTEGER PRIMARY KEY, \"user_id\" INTEGER REFERENCES \"users\" (\"id\"))"}}' '{{"type":"table","name":"d1_migrations","tbl_name":"d1_migrations","sql":"CREATE TABLE d1_migrations (id TEXT)"}}' '{{"type":"table","name":"_litestream_seq","tbl_name":"_litestream_seq","sql":"CREATE TABLE _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER)"}}' '{{"type":"index","name":"idx_orders_user","tbl_name":"orders","sql":"CREATE INDEX \"idx_orders_user\" ON \"orders\" (\"user_id\")"}}' '{{"type":"trigger","name":"trg_users","tbl_name":"users","sql":"CREATE TRIGGER \"trg_users\" AFTER INSERT ON \"users\" BEGIN UPDATE \"users\" SET \"name\" = CASE WHEN NEW.\"id\" > 0 THEN '"'"'touched'"'"' ELSE '"'"'kept'"'"' END WHERE \"id\" = NEW.\"id\"; END"}}' '{{"type":"view","name":"big","tbl_name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\""}}'
-    ;;
-  'PRAGMA foreign_key_list("orders")')
-    printf '%s\n' '{{"table":"users","from":"user_id","to":"id"}}'
-    ;;
-  'PRAGMA foreign_key_list("users")')
-    ;;
-  'PRAGMA table_info("users")')
-    printf '%s\n' '{{"cid":0,"name":"id","type":"INTEGER"}}' '{{"cid":1,"name":"name","type":"TEXT"}}' '{{"cid":2,"name":"avatar","type":"BLOB"}}'
-    ;;
-  'PRAGMA table_info("orders")')
-    printf '%s\n' '{{"cid":0,"name":"id","type":"INTEGER"}}' '{{"cid":1,"name":"user_id","type":"INTEGER"}}'
-    ;;
-  'SELECT * FROM "users"'*)
-    printf '%s\n' '{{"id":1,"name":"ada"}}' '{{"id":2,"name":"o'"'"'brien; -- x","avatar":[222,173]}}'
-    ;;
-  'SELECT * FROM "orders"'*)
-    printf '%s\n' '{{"id":7,"user_id":1}}'
-    ;;
   "SELECT name FROM sqlite_master WHERE type = 'view'"*)
     printf '%s\n' '{{"name":"big"}}'
     ;;
+  "SELECT name, sql FROM sqlite_master WHERE type = 'view'"*)
+    printf '%s\n' '{{"name":"big","sql":"CREATE VIEW \"big\" AS SELECT * FROM \"users\""}}'
+    ;;
   "PRAGMA table_list")
-    printf '%s\n' '{{"type":"table","name":"users"}}' '{{"type":"table","name":"orders"}}' '{{"type":"table","name":"_hidden"}}'
+    printf '%s\n' '{{"type":"table","name":"users"}}' '{{"type":"table","name":"orders"}}' '{{"type":"table","name":"_hidden"}}' '{{"type":"table","name":"d1_migrations"}}' '{{"type":"table","name":"sqlite_sequence"}}' '{{"type":"table","name":"_litestream_seq"}}'
     ;;
   *"COUNT(*) AS n"*)
     printf '%s\n' '{{"t":"users","n":2}}' '{{"t":"orders","n":1}}'
@@ -1315,8 +1020,12 @@ exit 0
             .unwrap();
     }
 
+    /// The `d1 export` dump carries the visible tables (their indexes and
+    /// triggers follow, counters included), appends the visible views the
+    /// filtered export leaves out, and names exactly the visible tables on
+    /// the export's argv — bookkeeping and internals stay out.
     #[tokio::test]
-    async fn dump_orders_parents_first_and_renders_values() {
+    async fn dump_exports_allowlisted_tables_and_appends_views() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
         let script = install_fake_celld(state.path());
@@ -1333,10 +1042,15 @@ exit 0
 
         let users_at = dump.find("CREATE TABLE \"users\"").expect("users DDL");
         let orders_at = dump.find("CREATE TABLE \"orders\"").expect("orders DDL");
-        assert!(users_at < orders_at, "parents are created first");
+        assert!(users_at < orders_at, "tables stay in creation order");
         assert!(dump.contains("CREATE INDEX \"idx_orders_user\""));
-        assert!(dump.contains("CREATE VIEW \"big\""));
+        assert!(dump.contains("CREATE VIEW \"big\" AS SELECT * FROM \"users\""));
+        // AUTOINCREMENT continuity rides the sequence counters, which the
+        // old manual dump never carried.
+        assert!(dump.contains("sqlite_sequence"), "{dump}");
         assert!(!dump.contains("d1_migrations"), "bookkeeping stays out");
+        assert!(!dump.contains("_hidden"), "hidden tables stay out");
+        assert!(!dump.contains("_litestream"), "internals stay out");
         // The trigger body holds `;`-terminated statements: the dump keeps it
         // whole, and the splitter must too (a fragment each side of the
         // body's `;` would replay as a syntax error).
@@ -1359,6 +1073,18 @@ exit 0
             "{dump}"
         );
         assert!(dump.contains("INSERT INTO \"orders\" (\"id\", \"user_id\") VALUES (7, 1)"));
+
+        let calls = std::fs::read_to_string(state.path().join("calls.log")).unwrap();
+        let Some(export) = calls.lines().find(|line| line.starts_with("d1 export")) else {
+            panic!("one export call: {calls}");
+        };
+        assert!(export.contains("d1 export app-db"), "{export}");
+        assert!(export.contains("--table users"), "{export}");
+        assert!(export.contains("--table orders"), "{export}");
+        assert!(!export.contains("--table d1_migrations"), "{export}");
+        assert!(!export.contains("--table _hidden"), "{export}");
+        assert!(!export.contains("--table sqlite_sequence"), "{export}");
+        assert!(!export.contains("--table _litestream"), "{export}");
     }
 
     #[tokio::test]
@@ -1410,8 +1136,8 @@ exit 0
         assert_eq!(backups_for(&pool, &app.id).await.unwrap().len(), 2);
     }
 
-    /// A fake `celld` serving one table with one row bigger than the D1
-    /// statement limit: the dump must refuse it at backup time.
+    /// A fake `celld` whose export carries one statement bigger than the
+    /// D1 statement limit: the dump must refuse it at backup time.
     fn install_huge_row_celld(state: &std::path::Path) -> std::path::PathBuf {
         let script = state.join("fake-celld-huge");
         let tmp = script.with_extension("tmp");
@@ -1420,6 +1146,11 @@ exit 0
             &tmp,
             format!(
                 r#"#!/bin/sh
+if [ "$1" = "d1" ] && [ "$2" = "export" ]; then
+  printf '%s\n' "$*" >> "{log}"
+  printf 'CREATE TABLE "big" ("c" TEXT);\nINSERT INTO "big" ("c") VALUES ('"'"'%s'"'"');\n' "$(head -c 120000 /dev/zero | tr '\0' 'x')"
+  exit 0
+fi
 command_of() {{
   prev=""
   for a in "$@"; do
@@ -1430,16 +1161,10 @@ command_of() {{
 sql=$(command_of "$@")
 printf '%s\n' "$sql" >> "{log}"
 case "$sql" in
-  "SELECT type, name, tbl_name, sql"*)
-    printf '%s\n' '{{"type":"table","name":"big","tbl_name":"big","sql":"CREATE TABLE \"big\" (\"c\" TEXT)"}}'
+  "PRAGMA table_list")
+    printf '%s\n' '{{"type":"table","name":"big"}}'
     ;;
-  'PRAGMA foreign_key_list("big")')
-    ;;
-  'PRAGMA table_info("big")')
-    printf '%s\n' '{{"cid":0,"name":"c","type":"TEXT"}}'
-    ;;
-  'SELECT * FROM "big"'*)
-    printf '{{"c":"%s"}}\n' "$(head -c 120000 /dev/zero | tr '\0' 'x')"
+  "SELECT name, sql FROM sqlite_master WHERE type = 'view'"*)
     ;;
   *) echo "unexpected command: $sql" >&2; exit 1;;
 esac

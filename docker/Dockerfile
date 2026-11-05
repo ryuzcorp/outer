@@ -8,14 +8,24 @@
 #
 # outer terminates TLS itself (rustls) on OUTER_LISTEN: the Cloudflare
 # Origin CA certificate plus Authenticated Origin Pulls (mTLS).
-ARG CELLD_VERSION=0.6.3
+# celld comes from the ryuzcorp/celld fork: upstream denoland/celld at
+# 0.6.3 plus the fork's patches (Void framework compatibility, sandbox
+# containers/exec, D1/R2 fixes, deploy project-read confinement with
+# `--read-root`), published as `<version>-ryuzcorp.<level>` with SLSA
+# provenance attestations. The two ARG lines below are the single source
+# of the pin: a bump changes these values (the tag, then the digest from
+# the fork's publish summary). Upstream celld ships only security fixes
+# from 0.6.x on, so the fork carries the patches.
+ARG CELLD_VERSION=0.6.3-ryuzcorp.8
+ARG CELLD_DIGEST=sha256:0aa1b90feb327ce751f660d87c9f92b654694f7e5f7fa543c184e61ef9a7d303
+ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
 ARG ESBUILD_VERSION=0.28.2
 # Pinned formatter for agent commits. Keep in step with the template's
 # `oxfmt` devDependency, `.github/workflows/ci.yml`, and the extension list
 # in `crates/outer/src/git/format.rs`.
 ARG OXFMT_VERSION=0.74.0
 
-FROM ghcr.io/denoland/celld:${CELLD_VERSION} AS celld
+FROM ${CELLD_IMAGE} AS celld
 
 # --- web site (Blume) -----------------------------------------------------------
 # The platform host serves this static build for humans and agents; the MCP

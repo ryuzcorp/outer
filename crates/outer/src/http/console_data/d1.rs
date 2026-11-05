@@ -853,6 +853,78 @@ pub(crate) async fn d1_exec(
         .map_err(|e| D1Error::Celld(format!("celld printed non-UTF-8 output: {e}")))
 }
 
+/// A dump is not a diagnostic ping: the export streams up to its 32 MiB
+/// cap through the fleet, so it gets the migration-sized deadline.
+pub const D1_EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One `celld d1 export` against the app's fleet: a consistent SQL dump of
+/// exactly `tables` on stdout as text (no `--json`), read under one
+/// transaction on the owning node — a single snapshot even while the
+/// database takes writes. Their indexes and triggers follow each table
+/// and the chosen counters replay scoped per counter; views belong to no
+/// table, so a filtered export leaves them out and the caller dumps those
+/// separately. `tables` empty means every table, so callers pass an
+/// explicit allowlist and never an empty list. `--table` takes its value
+/// unconditionally, so even a hostile table name can never parse as an
+/// option. Same scoped-grant env as [`d1_exec`].
+pub(crate) async fn d1_export(
+    ctx: &D1Ctx,
+    slug: &str,
+    identity: &str,
+    tables: &[String],
+    project: &FsPath,
+) -> Result<String, D1Error> {
+    let prefix = FleetStorage::fleet_prefix(slug);
+    let creds = ctx
+        .storage
+        .credentials
+        .for_prefix(&prefix)
+        .await
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("minting scoped credentials: {e:#}")))?;
+    let bucket = ctx.storage.bucket_url(slug);
+    let mut cmd = tokio::process::Command::new(&ctx.celld_bin);
+    cmd.arg("d1").arg("export").arg(identity);
+    for table in tables {
+        cmd.arg("--table").arg(table);
+    }
+    cmd.arg("--bucket")
+        .arg(&bucket)
+        .arg("--endpoint")
+        .arg(&ctx.storage.endpoint)
+        .arg("--region")
+        .arg(&ctx.storage.region)
+        .current_dir(project)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("AWS_ACCESS_KEY_ID", creds.access_key_id)
+        .env("AWS_SECRET_ACCESS_KEY", creds.secret_access_key)
+        .env("AWS_REGION", &ctx.storage.region)
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("S3_ENDPOINT", &ctx.storage.endpoint)
+        // `spawn` inherits stdio by default: pipe both explicitly, or
+        // `wait_with_output` returns empty output while the child writes to
+        // the server's own stdout.
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(token) = &creds.session_token {
+        cmd.env("AWS_SESSION_TOKEN", token);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("spawning celld: {e:#}")))?;
+    let out = tokio::time::timeout(D1_EXPORT_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| D1Error::Timeout)?
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("waiting for celld: {e:#}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(D1Error::Celld(first_lines(&stderr, 5)));
+    }
+    String::from_utf8(out.stdout)
+        .map_err(|e| D1Error::Celld(format!("celld printed non-UTF-8 output: {e}")))
+}
+
 /// Last `n` non-empty lines of celld stderr, bounded for the log line.
 fn first_lines(stderr: &str, n: usize) -> String {
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
