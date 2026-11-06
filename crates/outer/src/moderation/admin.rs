@@ -21,6 +21,12 @@
 //! (2) the attempt signal counts deploy attempts, not commits: `usage_day`
 //! aggregates per user-day and cannot be attributed to one app, while
 //! `deploy` is the durable per-app record.
+//!
+//! `shared_week1` reads the first seven days of `visitor_day`, which
+//! [`crate::observe::metrics::prune`] keeps past retention for exactly this
+//! reason. Apps created before that exemption existed (2026-11-06) may have
+//! lost the rows under the Free 24 h retention and then read as not shared;
+//! Pro apps kept 30 days, so theirs are complete.
 
 use serde::Serialize;
 use sqlx::SqlitePool;
