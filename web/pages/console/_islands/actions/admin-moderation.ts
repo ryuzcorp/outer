@@ -26,6 +26,12 @@ export interface ModerationQueue {
   items: ModerationQueueItem[];
 }
 
+export interface Rate {
+  met: number;
+  of: number;
+  pct: number;
+}
+
 export interface AdminStats {
   accounts_total: number;
   accounts_by_plan: { plan: string; accounts: number }[];
@@ -41,6 +47,15 @@ export interface AdminStats {
   deploy_failure_rate_7d: number;
   deploy_p50_ms_7d: number | null;
   deploy_p95_ms_7d: number | null;
+  beta: {
+    first_session: Rate;
+    shared_week1: Rate;
+    return_week2: Rate;
+    launch_price: Rate;
+    build_failures_7d: number;
+    build_failure_rate_7d: number;
+    attempts_before_first_success: number | null;
+  };
 }
 
 export interface ReviewInput {
