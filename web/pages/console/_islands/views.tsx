@@ -1166,7 +1166,7 @@ export function DeploysView({
                   <div class="flex min-w-0 gap-3">
                     <span class="w-[90px] shrink-0 opacity-60">URL</span>
                     <span class="flex min-w-0 items-center gap-2">
-                      <a class="link min-w-0 flex-1 truncate" href={app.url} title={app.url}>
+                      <a class="link min-w-0 flex-1 break-all" href={app.url} title={app.url}>
                         {app.url}
                       </a>
                       <CopyButton value={app.url} label="Copy app URL" />
@@ -2240,7 +2240,7 @@ export function SettingsView({
             </div>
             {app.deletes_at != null && (
               <div class="flex min-w-0 gap-3 text-[13px]">
-                <dt class="w-[90px] shrink-0 opacity-60">Deleted</dt>
+                <dt class="w-[90px] shrink-0 opacity-60">Deletes</dt>
                 <dd class="m-0 min-w-0 flex-1 truncate" title={when(app.deletes_at)}>
                   {timeAgo(app.deletes_at)}
                 </dd>
