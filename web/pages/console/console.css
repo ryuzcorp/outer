@@ -514,13 +514,26 @@ a.rail-tile:hover {
   }
 
   .drawer {
+    /* The shell's second row is a definite height (`minmax(0, 1fr)`), so
+       the drawer and its content must claim it explicitly. Left at `auto`
+       they grow to their content height and `.console`'s `overflow: hidden`
+       clips the rest: the main panel never scrolls on a phone. */
+    height: 100%;
     min-height: 0;
+  }
+
+  .drawer-content {
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .main {
     height: 100%;
     min-height: 0;
     padding: 16px 12px 32px;
+    /* The drawer's own scroll must not chain to the page underneath. */
+    overscroll-behavior: contain;
   }
 
   .console-boot {
