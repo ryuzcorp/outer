@@ -3488,6 +3488,37 @@ function ModerationStatsCard({
           <StatCell label="Deploy p50 / 7d" value={secs(s.deploy_p50_ms_7d)} />
           <StatCell label="Deploy p95 / 7d" value={secs(s.deploy_p95_ms_7d)} />
         </div>
+        {s.beta && (
+          <>
+            <h3 class="m-0 min-w-0 truncate pt-1 text-sm font-semibold">Validation (spec §1.3)</h3>
+            <div class="grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+              {(
+                [
+                  ["First session", s.beta.first_session],
+                  ["Shared in week 1", s.beta.shared_week1],
+                  ["Returned in week 2", s.beta.return_week2],
+                  ["Launch price", s.beta.launch_price],
+                ] as const
+              ).map(([label, r]) => (
+                <StatCell
+                  label={label}
+                  value={r.of === 0 ? "—" : `${r.pct.toFixed(1)}% (${r.met}/${r.of})`}
+                  title={
+                    r.of === 0
+                      ? "no account or app has completed this window yet"
+                      : `${r.met} of ${r.of}`
+                  }
+                />
+              ))}
+            </div>
+            <p
+              class="m-0 min-w-0 text-xs opacity-60"
+              title="Deploys in the last 7 days that failed at worktree, install or build; the median count of deploy attempts per app before its first success."
+            >
+              {`Build failures / 7d: ${s.beta.build_failures_7d} (${(s.beta.build_failure_rate_7d * 100).toFixed(1)}%) · median attempts before first success: ${s.beta.attempts_before_first_success ?? "—"}`}
+            </p>
+          </>
+        )}
         {plans && (
           <p class="m-0 min-w-0 truncate text-xs opacity-60" title={plans}>
             {plans}

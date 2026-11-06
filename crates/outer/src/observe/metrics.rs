@@ -55,9 +55,11 @@
 //!   unlisted `robots.txt` override — and the celld health gate path are
 //!   never counted.
 //! - **Retention:** [`prune`] deletes `metric_minute`, `path_hour` and
-//!   `visitor_day` rows older than 7 d for Free apps and 30 d for Pro,
+//!   `visitor_day` rows older than 24 h for Free apps and 30 d for Pro,
 //!   joining `app.owner_id` to `account.plan` (`visitor_day` compares the
-//!   UTC-day key against the retention cutoff's day).
+//!   UTC-day key against the retention cutoff's day). The exception is an
+//!   app's first week of `visitor_day` rows, which is kept forever: the
+//!   spec §1.3 sharing signal is computed from it long after the app exists.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
@@ -710,7 +712,7 @@ pub struct FlushStats {
     pub visitor_days: usize,
 }
 
-/// Delete per-plan expired rows: older than 7 d for Free apps and 30 d for
+/// Delete per-plan expired rows: older than 24 h for Free apps and 30 d for
 /// Pro (spec §3). The plan lives on the account that owns the app. Returns
 /// `(metric_minute rows, path_hour rows, visitor_day rows)` deleted.
 pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64, u64)> {
@@ -745,8 +747,15 @@ pub async fn prune(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<(u64, u64, 
     let mut days = 0;
     for (cutoff, plan) in [(day_of(free_cutoff), "free"), (day_of(pro_cutoff), "pro")] {
         days += sqlx::query(
+            // An app's first week survives retention: it is the only durable
+            // record of the spec §1.3 "do people share" signal
+            // (`moderation::admin::stats`), and seven small rows per app cost
+            // nothing. Days before creation (impossible rows) are deleted.
             "DELETE FROM visitor_day WHERE day < ?1 AND app_id IN \
-             (SELECT a.id FROM app a JOIN user c ON c.id = a.owner_id WHERE c.plan = ?2)",
+             (SELECT a.id FROM app a JOIN user c ON c.id = a.owner_id WHERE c.plan = ?2) \
+             AND NOT EXISTS (SELECT 1 FROM app a WHERE a.id = visitor_day.app_id \
+                 AND visitor_day.day >= a.created_at / 86400000 \
+                 AND visitor_day.day < a.created_at / 86400000 + 7)",
         )
         .bind(cutoff)
         .bind(plan)
@@ -1366,6 +1375,53 @@ mod tests {
             ["free-app", "pro-app", "pro-app"],
             "visitor_day keeps the same rows per plan"
         );
+    }
+
+    /// The spec §1.3 sharing signal reads an app's first seven days long
+    /// after retention would have deleted them.
+    #[tokio::test]
+    async fn prune_keeps_an_apps_first_week_of_visitors() {
+        let (pool, _dir) = pool().await;
+        let now_ms = crate::apps::now_ms();
+        let created = now_ms - 20 * 86_400_000;
+        sqlx::query(
+            "INSERT INTO user (id, email, plan, lastActiveAt, createdAt, updatedAt) \
+             VALUES ('acct-week', 'week@example.com', 'free', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, visibility, last_activity_at, created_at) \
+             VALUES ('week-app', 'week', 'acct-week', 260001, 280001, 290001, 'public', 0, ?1)",
+        )
+        .bind(created)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let d0 = day_of(created);
+        for day in [d0, d0 + 3, d0 + 6, d0 + 10, d0 + 15] {
+            sqlx::query(
+                "INSERT INTO visitor_day (app_id, day, visitors) VALUES ('week-app', ?1, 1)",
+            )
+            .bind(day)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let (_, _, days) = prune(&pool, now_ms).await.unwrap();
+        assert_eq!(
+            days, 2,
+            "the two days after the first week and past the Free 24 h retention go"
+        );
+        let left: Vec<i64> = sqlx::query_as("SELECT day FROM visitor_day ORDER BY day")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(day,)| day)
+            .collect();
+        assert_eq!(left, [d0, d0 + 3, d0 + 6], "the first week survives");
     }
 
     #[tokio::test]
