@@ -19,8 +19,9 @@
 //!
 //! Only the Worker bundle maps: workerd reports the entry bare
 //! (`worker.js`, the fork's `index.js` module name), so only frames naming
-//! a bare file are attempted. Python `File ...` frames and `node:`
-//! internals never reach a map.
+//! exactly those files are attempted. Python `File ...` frames, `node:`
+//! internals, and unknown bare names never reach a map: the token lookup is
+//! positional, so anything else would map to a wrong position.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,13 +43,16 @@ pub const MAX_MAP_BYTES: u64 = 8 * 1024 * 1024;
 /// older than this still render — with their raw, unsymbolicated stacks.
 pub const KEEP_DEPLOY_SHAS: usize = 10;
 
-/// A frame file with no path and no scheme is the Worker bundle itself:
-/// workerd reports the entry (`worker.js`, the fork's `index.js` module
-/// name) bare, never an app path. Like Noite, every other frame maps
-/// regardless — a lookup miss renders raw, so a wrong guess costs one map
-/// probe, never a wrong position.
+/// The Worker bundle's report names: upstream celld serves the entry as
+/// `worker.js`, the fork as its `index.js` module name — workerd prints the
+/// entry bare in both cases, never an app path. Only these two names map:
+/// the token lookup is purely positional (greatest-lower-bound), so any
+/// other bare frame (`node:events:1:1`, a stray `events:1:1`) would map to
+/// an unrelated app position instead of missing. Unknown names render raw.
+const BUNDLE_FILES: &[&str] = &["worker.js", "index.js"];
+
 fn is_bundle_file(file: &str) -> bool {
-    !file.is_empty() && !file.contains('/') && !file.contains('\\') && !file.contains("://")
+    BUNDLE_FILES.contains(&file)
 }
 
 /// What `maps/<slug>/<sha>/manifest.json` records: the Worker bundle's map,
@@ -72,10 +76,15 @@ pub fn is_key_sha(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Newest-first successful deploy shas for one app, for the read-time join
-/// of a frame timestamp to its deploy's maps.
+/// Newest-first deploy shas for one app, for the read-time join of a frame
+/// timestamp to its deploy's maps: every successful deploy, plus the live
+/// one when it is not successful. An upload-first deploy whose migrate step
+/// fails still serves the new version (`last_deploy_sha` moves exactly as
+/// on success while the row stays `failed`), so excluding it would map the
+/// live version's frames against the previous deploy's map — wrong
+/// positions, not just raw ones.
 pub async fn deploy_shas(pool: &SqlitePool, app_id: &str) -> Vec<(String, i64)> {
-    sqlx::query_as::<_, (String, i64)>(
+    let mut shas: Vec<(String, i64)> = sqlx::query_as::<_, (String, i64)>(
         "SELECT sha, created_at FROM deploy WHERE app_id = ?1 AND status = 'success' \
          ORDER BY created_at DESC, sha DESC LIMIT ?2",
     )
@@ -83,7 +92,24 @@ pub async fn deploy_shas(pool: &SqlitePool, app_id: &str) -> Vec<(String, i64)> 
     .bind((KEEP_DEPLOY_SHAS + 1) as i64)
     .fetch_all(pool)
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    let live: Option<(String, i64)> = sqlx::query_as(
+        "SELECT d.sha, d.created_at FROM deploy d JOIN app a ON a.id = d.app_id \
+         WHERE d.app_id = ?1 AND d.sha = a.last_deploy_sha AND d.status != 'success' \
+         ORDER BY d.created_at DESC LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some((sha, created_at)) = live {
+        if !shas.iter().any(|(s, _)| s == &sha) {
+            shas.push((sha, created_at));
+            shas.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        }
+    }
+    shas
 }
 
 /// The newest successful deploy at or before `ts_secs` (unix seconds, the
@@ -96,21 +122,90 @@ pub fn sha_for_ts(shas: &[(String, i64)], ts_secs: i64) -> Option<&str> {
         .map(|(sha, _)| sha.as_str())
 }
 
+/// What the deploy's temp map path held when the upload finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapRead {
+    /// Nothing there: celld had nothing to map (asset-only or Python
+    /// projects, and entries without a sibling map — celld warns and writes
+    /// nothing), or the file vanished. Not an error: there is simply no map.
+    Absent,
+    /// A map, but over [`MAX_MAP_BYTES`]: refused before parsing, so a
+    /// corrupt or hostile map cannot blow the read path's memory.
+    OverCap,
+    /// Map bytes to validate and store.
+    Found(Vec<u8>),
+}
+
+/// Read one temp map the deploy step passed `--sourcemap`: the worktree
+/// belongs to the app uid, which can replace the path while celld runs, so
+/// the open refuses symlinks (`O_NOFOLLOW`), refuses non-regular files
+/// (FIFOs would block the deploy; directories, sockets and devices are not
+/// maps), and reads at most [`MAX_MAP_BYTES`] + 1 (over-cap surfaces as
+/// [`MapRead::OverCap` instead of truncating into a corrupt map). The
+/// validation and the open cannot be pried apart by a path swap: a single
+/// `O_NOFOLLOW` open plus an `fstat` file-type check, no name re-lookup.
+pub async fn read_map_file(path: &Path) -> MapRead {
+    use std::os::unix::fs::OpenOptionsExt;
+    let open = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path);
+    let file = match open {
+        Ok(file) => file,
+        Err(_) => return MapRead::Absent,
+    };
+    // `fstat`, not a name re-lookup: what was opened is what is checked, so
+    // a path swap between the check and the read cannot smuggle a FIFO or
+    // a symlink past. `O_NOFOLLOW` already refused symlinks at open.
+    let is_regular = match file.metadata() {
+        Ok(meta) => meta.file_type().is_file(),
+        Err(_) => return MapRead::Absent,
+    };
+    if !is_regular {
+        return MapRead::Absent;
+    }
+    let mut buf = Vec::new();
+    // `O_NONBLOCK` on a regular file reads normally; on a FIFO it errors
+    // instead of blocking the deploy, which lands here as absent. One byte
+    // past the cap distinguishes over-cap from exactly-at-cap without ever
+    // holding more.
+    use tokio::io::AsyncReadExt as _;
+    let capped = match tokio::fs::File::from_std(file)
+        .take(MAX_MAP_BYTES + 1)
+        .read_to_end(&mut buf)
+        .await
+    {
+        Ok(n) => n as u64,
+        Err(_) => return MapRead::Absent,
+    };
+    if buf.is_empty() {
+        return MapRead::Absent;
+    }
+    if capped > MAX_MAP_BYTES {
+        return MapRead::OverCap;
+    }
+    MapRead::Found(buf)
+}
+
 /// Store one deploy's Worker map: validates the sha and the size, writes
 /// `worker.js.map` plus the manifest, then prunes sha dirs outside `keep`.
-/// Missing bytes (asset-only or Python projects, and entries without a
-/// sibling map — celld warns and writes nothing) are not an error: there is
-/// simply no map to store. Never fails the deploy: every IO problem returns
-/// a note for the journal, and the deploy already succeeded.
+/// Never fails the deploy: every refusal returns a note for the journal,
+/// and the deploy already succeeded.
 pub async fn store_worker_map(
     data_dir: &Path,
     slug: &str,
     sha: &str,
-    map_bytes: Option<Vec<u8>>,
+    read: MapRead,
     keep: &[(String, i64)],
 ) -> String {
-    let Some(bytes) = map_bytes else {
-        return "sourcemaps: no worker map (celld had nothing to map)".to_string();
+    let bytes = match read {
+        MapRead::Absent => {
+            return "sourcemaps: no worker map (celld had nothing to map)".to_string();
+        }
+        MapRead::OverCap => {
+            return "sourcemaps: skipped storing the worker map (over the size cap)".to_string();
+        }
+        MapRead::Found(bytes) => bytes,
     };
     if !is_key_sha(sha) {
         return "sourcemaps: skipped storing the worker map (bad deploy sha)".to_string();
@@ -179,11 +274,11 @@ pub fn load_worker_map(data_dir: &Path, slug: &str, sha: &str) -> Option<sourcem
 
 /// One frame location split into file + 0-based line/col:
 /// `worker.js:21:27` → `("worker.js", 20, 26)`. V8 prints 1-based positions.
-/// `None` for anything that is not a mappable Worker frame: only bare
-/// bundle names attempt a lookup, so `node:` internals, `file://` URLs and
-/// paths with a directory never reach the map (a miss would render raw
-/// anyway, but the allowlist keeps tenant-controlled paths out of the map
-/// query).
+/// `None` for anything that is not a mappable Worker frame: only the two
+/// bundle names attempt a lookup, so `node:` internals, `file://` URLs,
+/// paths with a directory, and unknown bare names never reach the map.
+/// The allowlist is load-bearing, not just hygiene: the token lookup is
+/// positional, so anything else would map to a wrong app position.
 pub fn split_worker_location(location: &str) -> Option<(&str, u32, u32)> {
     let (head, col) = location.rsplit_once(':')?;
     let col: u32 = col.parse().ok()?;
@@ -231,13 +326,19 @@ pub fn mapped_frame_line(map: &sourcemap::SourceMap, line: &str) -> Option<Strin
             }
         }
     }
-    // The bare form: `at index.js:L:C` at the line end.
-    let candidate = line.split_whitespace().next_back()?;
+    // The bare form: `at index.js:L:C` at the line end. Trim first: the
+    // candidate is a whitespace-delimited token, so without the trim a
+    // trailing space would fold the whole line into the prefix and append
+    // the mapping after it (duplicating the frame), and the trailing
+    // whitespace is preserved byte-identically after the mapping.
+    let end = line.trim_end().len();
+    let candidate = line[..end].split_whitespace().next_back()?;
     let mapped = mapped_location(map, candidate)?;
     Some(format!(
-        "{}{}",
-        &line[..line.len() - candidate.len()],
-        mapped
+        "{}{}{}",
+        &line[..end - candidate.len()],
+        mapped,
+        &line[end..]
     ))
 }
 
@@ -371,10 +472,14 @@ mod tests {
 
     #[test]
     fn worker_location_rejects_non_bundle_frames() {
-        // `node:` internals, paths, and Python frames never reach a map
-        // lookup.
+        // `node:` internals, paths, unknown bare names, and Python frames
+        // never reach a map lookup: the positional lookup would map them to
+        // a wrong app position instead of missing.
         for location in [
             "node:internal/modules:5:10",
+            "node:events:1:1",
+            "events:1:1",
+            "server.ts:1:1",
             "file:///app/index.js:1:2",
             "src/index.js:1:2",
             "index.js:0:1",
@@ -383,6 +488,19 @@ mod tests {
         ] {
             assert_eq!(split_worker_location(location), None, "{location}");
         }
+    }
+
+    #[test]
+    fn mapped_frame_line_preserves_trailing_whitespace() {
+        let map = test_map();
+        assert_eq!(
+            mapped_frame_line(&map, "    at handler (index.js:1:1)  "),
+            Some("    at handler (src/app.ts:1:1)  ".to_string())
+        );
+        assert_eq!(
+            mapped_frame_line(&map, "    at index.js:1:1\t"),
+            Some("    at src/app.ts:1:1\t".to_string())
+        );
     }
 
     #[test]
@@ -428,8 +546,14 @@ mod tests {
         let stale = app_maps_dir(data.path(), slug).join("cc".repeat(32));
         tokio::fs::create_dir_all(&stale).await.unwrap();
         let keep = vec![(sha_new.clone(), 2), (sha_old.clone(), 1)];
-        let note =
-            store_worker_map(data.path(), slug, &sha_new, Some(test_map_bytes()), &keep).await;
+        let note = store_worker_map(
+            data.path(),
+            slug,
+            &sha_new,
+            MapRead::Found(test_map_bytes()),
+            &keep,
+        )
+        .await;
         assert_eq!(note, "sourcemaps: stored the worker map");
         assert!(load_worker_map(data.path(), slug, &sha_new).is_some());
         assert!(!stale.exists());
@@ -449,11 +573,22 @@ mod tests {
         let keep: Vec<(String, i64)> = vec![];
         // No bytes: celld had nothing to map (asset-only, Python, missing
         // sibling) — storing nothing is the answer, not an error.
-        let note = store_worker_map(data.path(), "s", &"aa".repeat(32), None, &keep).await;
-        assert!(note.contains("nothing to map"), "{note}");
-        // A hostile sha never becomes a path.
         let note =
-            store_worker_map(data.path(), "s", "../../etc", Some(test_map_bytes()), &keep).await;
+            store_worker_map(data.path(), "s", &"aa".repeat(32), MapRead::Absent, &keep).await;
+        assert!(note.contains("nothing to map"), "{note}");
+        // Over-cap surfaces as its own refusal, not a truncated map.
+        let note =
+            store_worker_map(data.path(), "s", &"aa".repeat(32), MapRead::OverCap, &keep).await;
+        assert!(note.contains("size cap"), "{note}");
+        // A hostile sha never becomes a path.
+        let note = store_worker_map(
+            data.path(),
+            "s",
+            "../../etc",
+            MapRead::Found(test_map_bytes()),
+            &keep,
+        )
+        .await;
         assert!(note.contains("bad deploy sha"), "{note}");
         assert!(!data.path().join(MAPS_DIR).join("etc").exists());
         // Oversize and broken maps refuse before touching disk.
@@ -461,7 +596,7 @@ mod tests {
             data.path(),
             "s",
             &"aa".repeat(32),
-            Some(vec![0u8; MAX_MAP_BYTES as usize + 1]),
+            MapRead::Found(vec![0u8; MAX_MAP_BYTES as usize + 1]),
             &keep,
         )
         .await;
@@ -470,11 +605,52 @@ mod tests {
             data.path(),
             "s",
             &"aa".repeat(32),
-            Some(b"not a map".to_vec()),
+            MapRead::Found(b"not a map".to_vec()),
             &keep,
         )
         .await;
         assert!(note.contains("not a v3"), "{note}");
+        assert!(!data.path().join(MAPS_DIR).join("s").exists());
+    }
+
+    #[tokio::test]
+    async fn read_map_file_rejects_the_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing is absent, not an error.
+        assert_eq!(
+            read_map_file(&dir.path().join("nope.map")).await,
+            MapRead::Absent
+        );
+        // A symlink to a good map is still refused: the app uid must not
+        // redirect the read.
+        let target = dir.path().join("real.map");
+        std::fs::write(&target, test_map_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.map");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert_eq!(read_map_file(&link).await, MapRead::Absent);
+        }
+        // Directories are not maps.
+        assert_eq!(read_map_file(dir.path()).await, MapRead::Absent);
+        // Empty files are absent, not corrupt.
+        let empty = dir.path().join("empty.map");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(read_map_file(&empty).await, MapRead::Absent);
+        // Over the cap reads as over-cap, never truncated.
+        let big = dir.path().join("big.map");
+        std::fs::write(&big, vec![0u8; MAX_MAP_BYTES as usize + 1]).unwrap();
+        assert_eq!(read_map_file(&big).await, MapRead::OverCap);
+        // Exactly at the cap still reads whole: the cap bounds the read,
+        // and the store's own size check decides what to keep.
+        let edge = dir.path().join("edge.map");
+        std::fs::write(&edge, vec![0u8; MAX_MAP_BYTES as usize]).unwrap();
+        assert!(matches!(read_map_file(&edge).await, MapRead::Found(_)));
+        // And the plain case round-trips.
+        assert_eq!(
+            read_map_file(&target).await,
+            MapRead::Found(test_map_bytes())
+        );
     }
 
     #[test]
@@ -531,6 +707,25 @@ mod tests {
             vec![("cc".repeat(32), 3_000_000), ("aa".repeat(32), 1_000_000),]
         );
         assert!(deploy_shas(&pool, "no-such-app").await.is_empty());
+        // A failed deploy still serves its version when the migrate step ran
+        // after the upload: with `last_deploy_sha` on it, its map joins, or
+        // the live version's frames would map against the previous deploy.
+        sqlx::query(
+            "INSERT INTO deploy (id, app_id, sha, kind, status, created_at) \
+             VALUES ('d-live-failed', 'app1', 'ee', 'main', 'failed', 4000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE app SET last_deploy_sha = 'ee' WHERE id = 'app1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let shas = deploy_shas(&pool, "app1").await;
+        assert_eq!(
+            shas.into_iter().map(|(s, _)| s).collect::<Vec<_>>(),
+            vec!["ee".to_string(), "cc".repeat(32), "aa".repeat(32)]
+        );
     }
 
     #[test]

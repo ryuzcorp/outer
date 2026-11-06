@@ -308,6 +308,10 @@ pub struct RunningFleet {
     pub logs: SharedLogRing,
     child: tokio::process::Child,
     pgid: u32,
+    /// The fleet's operator token, if it runs guarded. Sent as
+    /// `Authorization: Bearer` on `/reload`; `None` is the old open
+    /// listener. Never logged (see the `Debug` impl, which redacts it).
+    operator_token: Option<String>,
 }
 
 /// Cap on one stored log line: a hostile fleet printing a newline-less flood
@@ -509,6 +513,7 @@ pub async fn start(
         logs,
         child,
         pgid,
+        operator_token: spec.operator_token.clone(),
     })
 }
 
@@ -518,13 +523,19 @@ impl RunningFleet {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Reload a live fleet without a restart.
+    /// Reload a live fleet without a restart. Guarded fleets require the
+    /// operator token; older fleets listening open ignore the header, so
+    /// the token goes on every reload and mixed states stay working.
     pub async fn reload(&self) -> anyhow::Result<()> {
         let url = format!("http://127.0.0.1:{}/reload", self.internal_port);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
-        client.post(&url).send().await?.error_for_status()?;
+        let mut req = client.post(&url);
+        if let Some(token) = &self.operator_token {
+            req = req.bearer_auth(token);
+        }
+        req.send().await?.error_for_status()?;
         Ok(())
     }
 

@@ -819,10 +819,6 @@ pub(crate) async fn d1_exec(
     if json {
         cmd.arg("--json");
     }
-    // The internal D1 listener requires the fleet's operator token once
-    // the fleet sets it; harmless against older fleets listening open.
-    let (token_key, token_val) = crate::secrets::operator_token_env(&ctx.secrets_key, slug);
-    cmd.env(token_key, token_val);
     cmd.arg("--bucket")
         .arg(&bucket)
         .arg("--endpoint")
@@ -846,6 +842,11 @@ pub(crate) async fn d1_exec(
     if let Some(token) = &creds.session_token {
         cmd.env("AWS_SESSION_TOKEN", token);
     }
+    // After `env_clear` above, which would have wiped it: the internal D1
+    // listener requires the fleet's operator token once the fleet sets it;
+    // harmless against older fleets listening open.
+    let (token_key, token_val) = crate::secrets::operator_token_env(&ctx.secrets_key, slug);
+    cmd.env(token_key, token_val);
     let child = cmd
         .spawn()
         .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("spawning celld: {e:#}")))?;
@@ -895,9 +896,8 @@ pub(crate) async fn d1_export(
     for table in tables {
         cmd.arg("--table").arg(table);
     }
-    // Same operator-token deal as `d1_exec`: required once fleets set it.
-    let (token_key, token_val) = crate::secrets::operator_token_env(&ctx.secrets_key, slug);
-    cmd.env(token_key, token_val);
+    // Same operator-token deal as `d1_exec`: after `env_clear` below,
+    // which would wipe it here.
     cmd.arg("--bucket")
         .arg(&bucket)
         .arg("--endpoint")
@@ -921,6 +921,10 @@ pub(crate) async fn d1_export(
     if let Some(token) = &creds.session_token {
         cmd.env("AWS_SESSION_TOKEN", token);
     }
+    // After `env_clear` above, which would have wiped it: same
+    // operator-token deal as `d1_exec`.
+    let (token_key, token_val) = crate::secrets::operator_token_env(&ctx.secrets_key, slug);
+    cmd.env(token_key, token_val);
     let child = cmd
         .spawn()
         .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("spawning celld: {e:#}")))?;
@@ -2713,6 +2717,14 @@ exit 0
         assert!(!env.contains("AWS_SESSION_TOKEN"), "{env}");
         assert!(env.contains("S3_ENDPOINT=http://127.0.0.1:1"), "{env}");
         assert!(env.contains("AWS_REGION=test-region"), "{env}");
+        // The fleet's operator token survives `env_clear` (a wiped token
+        // would 401 every D1 call against a token-protected fleet): it must
+        // be the slug-derived value, never user input.
+        let want = format!(
+            "CELLD_OPERATOR_TOKEN={}",
+            crate::secrets::operator_token(&crate::secrets::SecretsKey::test_key(), &app.slug)
+        );
+        assert!(env.contains(&want), "{env}");
         // The command ran from a materialized deploy root holding only the
         // synthesized minimal config — never the secret-bearing manifest.
         let roots = std::fs::read_to_string(state.path().join("root-config.log")).unwrap();

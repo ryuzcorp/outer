@@ -335,7 +335,7 @@ export function LogsView({
                   <span class="log-stream" aria-hidden="true">
                     {entry.stream === "stderr" ? "!" : ">"}
                   </span>
-                  <code class="min-w-0 flex-1">{entry.line}</code>
+                  <code class="min-w-0 flex-1" title={entry.mapped ? entry.line : undefined}>{entry.mapped ?? entry.line}</code>
                   <span class="flex shrink-0 items-start gap-1">
                     {entry.fingerprint && (
                       <button
@@ -347,7 +347,7 @@ export function LogsView({
                         Issue
                       </button>
                     )}
-                    <CopyButton value={entry.line} label="Copy line" />
+                    <CopyButton value={entry.mapped ?? entry.line} label="Copy line" />
                   </span>
                 </li>
               ))}

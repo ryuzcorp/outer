@@ -327,9 +327,9 @@ export function ErrorsView({
                               aria-expanded={isOpen}
                             >
                               <span class="block truncate">{issue.message}</span>
-                              {issue.frame && (
-                                <span class="block truncate opacity-60" title={issue.frame}>
-                                  {issue.frame}
+                              {(issue.mapped_frame ?? issue.frame) && (
+                                <span class="block truncate opacity-60" title={issue.frame ?? ""}>
+                                  {issue.mapped_frame ?? issue.frame}
                                 </span>
                               )}
                             </button>
@@ -391,9 +391,9 @@ export function ErrorsView({
                                   <p class="m-0 min-w-0 break-words text-sm" title={detail()?.issue.message}>
                                     {detail()?.issue.message}
                                   </p>
-                                  {detail()?.issue.frame && (
+                                  {(detail()?.issue.mapped_frame ?? detail()?.issue.frame) && (
                                     <p class="m-0 min-w-0 truncate font-mono text-xs opacity-60" title={detail()?.issue.frame ?? ""}>
-                                      {detail()?.issue.frame}
+                                      {detail()?.issue.mapped_frame ?? detail()?.issue.frame}
                                     </p>
                                   )}
                                   <p class="m-0 min-w-0 text-xs opacity-60">
@@ -408,11 +408,11 @@ export function ErrorsView({
                                   {(detail()?.recent.length ?? 0) > 0 && (
                                     <ol class="log-list">
                                       {(detail()?.recent ?? []).map((line) => (
-                                        <li key={line.seq} class={`log-line is-${line.stream}`}>
+                                        <li key={line.seq} class={`log-line is-${line.stream}`} title={line.mapped ? line.line : undefined}>
                                           <span class="log-stream" aria-hidden="true">
                                             {line.stream === "stderr" ? "!" : ">"}
                                           </span>
-                                          <code>{line.line}</code>
+                                          <code>{line.mapped ?? line.line}</code>
                                         </li>
                                       ))}
                                     </ol>

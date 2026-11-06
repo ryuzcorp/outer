@@ -179,14 +179,22 @@ pub fn check_reserved(name: &str) -> Result<(), String> {
 pub const AUTH_SECRET_NAME: &str = "BETTER_AUTH_SECRET";
 
 /// Ensure the app's auth secret exists, minting 32 random bytes hex when
-/// absent. A user value always wins and is never overwritten; a raced
-/// deploy reuses the winner's row on its own read. Returns whether this
-/// call minted.
+/// absent. A stored value (set via Mouth or by a previous deploy) always
+/// wins and is never overwritten. Otherwise the deploy config's own value
+/// is adopted — an app that already ships the secret in its committed
+/// config keeps its sessions instead of having them invalidated by a fresh
+/// mint — and only a config without the secret mints 32 fresh random bytes
+/// hex. Returns whether this call created the row.
+///
+/// A full secret store fails the deploy instead of deploying without auth:
+/// [`set`] refuses past [`MAX_SECRETS_PER_APP`], and a Worker without the
+/// minted or adopted secret would silently lose sign-in.
 pub async fn ensure_auth_secret(
     pool: &SqlitePool,
     key: &SecretsKey,
     app_id: &str,
     now_ms: i64,
+    config_value: Option<&[u8]>,
 ) -> anyhow::Result<bool> {
     let existing: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT value_enc FROM app_secret WHERE app_id = ?1 AND name = ?2")
@@ -197,14 +205,18 @@ pub async fn ensure_auth_secret(
     if existing.is_some() {
         return Ok(false);
     }
-    let secret: [u8; 32] = rand::random();
-    let blob = encrypt(
-        key,
-        app_id,
-        AUTH_SECRET_NAME,
-        hex::encode(secret).as_bytes(),
-    );
-    set(pool, app_id, AUTH_SECRET_NAME, &blob, now_ms).await?;
+    let plain: Vec<u8> = match config_value {
+        Some(value) if !value.is_empty() => value.to_vec(),
+        _ => hex::encode(rand::random::<[u8; 32]>()).into_bytes(),
+    };
+    let blob = encrypt(key, app_id, AUTH_SECRET_NAME, &plain);
+    let capped = set(pool, app_id, AUTH_SECRET_NAME, &blob, now_ms).await?;
+    if capped {
+        anyhow::bail!(
+            "app already holds {MAX_SECRETS_PER_APP} secrets, so {AUTH_SECRET_NAME} was not stored: \
+             delete an unused secret or set {AUTH_SECRET_NAME} via Mouth and redeploy"
+        );
+    }
     Ok(true)
 }
 
@@ -469,11 +481,15 @@ mod tests {
         let key = SecretsKey::test_key();
 
         assert!(
-            ensure_auth_secret(&pool, &key, "app1", 1).await.unwrap(),
+            ensure_auth_secret(&pool, &key, "app1", 1, None)
+                .await
+                .unwrap(),
             "first deploy mints"
         );
         assert!(
-            !ensure_auth_secret(&pool, &key, "app1", 2).await.unwrap(),
+            !ensure_auth_secret(&pool, &key, "app1", 2, None)
+                .await
+                .unwrap(),
             "second deploy reuses"
         );
         let minted: String =
@@ -488,13 +504,57 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !ensure_auth_secret(&pool, &key, "app1", 4).await.unwrap(),
+            !ensure_auth_secret(&pool, &key, "app1", 4, None)
+                .await
+                .unwrap(),
             "user value is kept"
         );
         let kept: String =
             String::from_utf8(decrypt_all(&pool, "app1", &key).await.unwrap()[0].1.clone())
                 .unwrap();
         assert_eq!(kept, "user-value");
+    }
+
+    #[tokio::test]
+    async fn ensure_auth_secret_adopts_the_config_value() {
+        let (_dir, pool) = pool().await;
+        app(&pool, "app1").await;
+        let key = SecretsKey::test_key();
+
+        // No row, but the committed config already ships the secret:
+        // adopting it keeps existing sessions instead of minting over them.
+        assert!(
+            ensure_auth_secret(&pool, &key, "app1", 1, Some(b"config-shipped"))
+                .await
+                .unwrap(),
+            "config value is adopted"
+        );
+        let kept: String =
+            String::from_utf8(decrypt_all(&pool, "app1", &key).await.unwrap()[0].1.clone())
+                .unwrap();
+        assert_eq!(kept, "config-shipped");
+    }
+
+    #[tokio::test]
+    async fn ensure_auth_secret_fails_closed_on_a_full_store() {
+        let (_dir, pool) = pool().await;
+        app(&pool, "app1").await;
+        let key = SecretsKey::test_key();
+
+        for i in 0..MAX_SECRETS_PER_APP {
+            let name = format!("filler-{i}");
+            let blob = encrypt(&key, "app1", &name, b"x");
+            set(&pool, "app1", &name, &blob, 1).await.unwrap();
+        }
+        // The deploy must fail with an actionable error instead of
+        // deploying a Worker with no auth secret.
+        let err = ensure_auth_secret(&pool, &key, "app1", 2, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already holds"),
+            "actionable cap error, got: {err:#}"
+        );
     }
 
     #[test]

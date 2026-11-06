@@ -420,8 +420,10 @@ impl PurgeTasks {
 
 /// Ask the app's fleet to adopt the new deploy now. A sleeping fleet isn't
 /// listening, which is fine: it adopts the deploy when it wakes, and an
-/// awake fleet would also pick it up on its own pointer poll.
-async fn reload_if_awake(app: &App) -> bool {
+/// awake fleet would also pick it up on its own pointer poll. Guarded fleets
+/// require the operator token; older fleets listening open ignore the
+/// header, so the token goes on every reload.
+async fn reload_if_awake(app: &App, operator_token: &str) -> bool {
     let url = format!("http://127.0.0.1:{}/reload", app.internal_port);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -429,6 +431,7 @@ async fn reload_if_awake(app: &App) -> bool {
     let Ok(client) = client else { return false };
     client
         .post(url)
+        .bearer_auth(operator_token)
         .send()
         .await
         .is_ok_and(|r| r.status().is_success())
@@ -830,7 +833,9 @@ impl Deployer {
                 // Switch an awake fleet first, then purge: purging while
                 // the old version still serves would let the edge re-cache
                 // its files. The purge runs off the critical path.
-                let reloaded = reload_if_awake(app).await;
+                let operator_token =
+                    crate::secrets::operator_token(&self.settings.secrets_key, &app.slug);
+                let reloaded = reload_if_awake(app, &operator_token).await;
                 self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
                 Ok(DeployOutcome {
                     deploy_id,
@@ -901,14 +906,22 @@ impl Deployer {
                         DeployKind::Main => {
                             apps::set_last_deploy(pool, &app.id, sha).await?;
                             cron::sync_app_crons(pool, &app.id, &crons, apps::now_ms()).await?;
-                            let reloaded = reload_if_awake(app).await;
+                            let operator_token = crate::secrets::operator_token(
+                                &self.settings.secrets_key,
+                                &app.slug,
+                            );
+                            let reloaded = reload_if_awake(app, &operator_token).await;
                             self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
                             reloaded
                         }
                         DeployKind::Preview => {
                             let _ =
                                 crate::preview::touch_preview(pool, &app.id, apps::now_ms()).await;
-                            let reloaded = reload_if_awake(app).await;
+                            let operator_token = crate::secrets::operator_token(
+                                &self.settings.secrets_key,
+                                &app.slug,
+                            );
+                            let reloaded = reload_if_awake(app, &operator_token).await;
                             self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
                             reloaded
                         }
@@ -1269,13 +1282,29 @@ impl Deployer {
         let Journal { steps, log } = journal;
         let started = Instant::now();
         // Mint platform secrets before decrypting: every deploy carries a
-        // Better Auth secret (user value wins; Noite provisions the same
-        // name), so auth works with no manual step.
+        // Better Auth secret (stored value wins, then the deploy config's
+        // own value, then a fresh mint; Noite provisions the same name), so
+        // auth works with no manual step. Adopting the config's value keeps
+        // an app that already ships the secret from losing its sessions to
+        // a fresh mint. The parse is best-effort: an unreadable config
+        // mints instead of failing here (config validation below still
+        // fails the deploy for real problems).
+        let config_secret: Option<Vec<u8>> =
+            read_config_file(&deploy_root.config)
+                .ok()
+                .and_then(|parsed| {
+                    parsed
+                        .get("vars")?
+                        .get(crate::secrets::AUTH_SECRET_NAME)?
+                        .as_str()
+                        .map(|s| s.as_bytes().to_vec())
+                });
         crate::secrets::ensure_auth_secret(
             pool,
             &self.settings.secrets_key,
             &app.id,
             crate::apps::now_ms(),
+            config_secret.as_deref(),
         )
         .await
         .map_err(|e| StepEnd::Failed(StepFailed::plain("deploy", &e)))?;
@@ -1294,7 +1323,7 @@ impl Deployer {
             log.push_str(&line);
         }
         match outcome {
-            Ok((out, version, map_bytes)) => {
+            Ok((out, version, map_read)) => {
                 // The current row is still `building`, so the success-only
                 // sha list cannot name it: keep it explicitly, or the prune
                 // would drop the map just stored.
@@ -1304,7 +1333,7 @@ impl Deployer {
                     &self.settings.data_dir,
                     &app.slug,
                     sha,
-                    map_bytes,
+                    map_read,
                     &keep,
                 )
                 .await;
@@ -1562,7 +1591,7 @@ impl Deployer {
     }
 
     /// The `celld deploy <root> ... --json` upload; returns
-    /// (output, version, map bytes). Bucket credentials come from the
+    /// (output, version, map read). Bucket credentials come from the
     /// per-prefix cache when fresh (minted on a miss), so the step env never
     /// carries the parent keys. The fork confines project reads to the
     /// config's directory (a `dist/` deploy root can no longer pull a
@@ -1576,7 +1605,7 @@ impl Deployer {
         app: &App,
         deploy_id: &str,
         deploy_root: &DeployRoot,
-    ) -> anyhow::Result<(String, Option<String>, Option<Vec<u8>>)> {
+    ) -> anyhow::Result<(String, Option<String>, crate::observe::sourcemaps::MapRead)> {
         let prefix = FleetStorage::fleet_prefix(&app.slug);
         let creds = self
             .settings
@@ -1647,8 +1676,10 @@ impl Deployer {
             .await;
         // Read before propagating the outcome, and always remove the temp
         // path: a failed upload stores nothing, and no temp map may linger
-        // into the next deploy's worktree.
-        let map_bytes = tokio::fs::read(&map_path).await.ok();
+        // into the next deploy's worktree. The read refuses symlinks and
+        // non-regular files and caps the bytes (the worktree belongs to the
+        // app uid, which can replace the path while celld runs).
+        let map_read = crate::observe::sourcemaps::read_map_file(&map_path).await;
         let _ = tokio::fs::remove_file(&map_path).await;
         let out = out?;
         let parsed: serde_json::Value = serde_json::from_str(out.trim())
@@ -1657,7 +1688,7 @@ impl Deployer {
             .get("version")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        Ok((out, version, map_bytes))
+        Ok((out, version, map_read))
     }
     /// Decrypt the app's secrets into the deploy-root config `vars`, for this
     /// deploy only. Returns `None` when the app has no (usable) secrets (the
@@ -2057,6 +2088,14 @@ impl Deployer {
         if let Some(token) = &creds.session_token {
             env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
         }
+        // `celld d1` reaches the database through a fleet node, and the
+        // internal listener requires the fleet's token once the fleet sets
+        // it — same slug the fleet runs under (the preview app carries the
+        // preview key), so main and preview migrates alike authenticate.
+        // Harmless against older fleets listening open.
+        let (token_key, token_val) =
+            crate::secrets::operator_token_env(&self.settings.secrets_key, &app.slug);
+        env.push((token_key, token_val));
         let args = vec![
             "d1".to_string(),
             "migrations".to_string(),
