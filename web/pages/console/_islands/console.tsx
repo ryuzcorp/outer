@@ -86,6 +86,16 @@ import {
 } from "./views/account.tsx";
 
 import {
+  emptyRegistry,
+  sameKey,
+  settleFetch,
+  staleMessage,
+  startFetch,
+  type DataKey,
+  type Registry,
+  type ResourceId,
+} from "./state.ts";
+import {
   ACCOUNT_TABS,
   CopyButton,
   DATA_VIEWS,
@@ -266,6 +276,11 @@ export function Console() {
   // A fingerprint picked in Logs ("View issue"): the Errors view consumes
   // it on mount and expands it. Owned here, passed down as props.
   const pendingJump = atom<string | null>(null);
+  // Explicit fetch lifecycle per shell resource (see `state.ts`): the key
+  // each loader last started, and whether it is loading/ready/stale/failed.
+  // Quiet poll failures flip the state to `stale` without touching the
+  // panel, and the shell banners the current view's stale loaders.
+  const fetchReg = atom<Registry>(emptyRegistry());
   const bridge: ConsoleBridge = {
     getEmail: () => email(),
     getRoute: () => route(),
@@ -347,14 +362,38 @@ export function Console() {
     myEpoch: number,
     quiet: boolean,
   ): Promise<void> {
-    const fresh = () => epoch === myEpoch;
-    const put = <T,>(a: { set: (p: Panel<T>) => void }, p: Panel<T>): void => {
-      if (fresh()) {
-        a.set(p);
+    // One key per invocation: a response lands only when slug, view, range
+    // and epoch all still match, so a poll started before a range change or
+    // a late page from another app can never repaint the panel.
+    const key: DataKey = { slug, view, range, epoch: myEpoch };
+    const begin = (id: ResourceId): void => {
+      fetchReg.set(startFetch(fetchReg(), id, key, quiet).registry);
+    };
+    // Write-through only when this invocation is still the resource's
+    // current key. Success always repaints; failure repaints only a loud
+    // (first) load — a quiet failure keeps the last value and only flips
+    // the fetch state to `stale`.
+    const land = (
+      id: ResourceId,
+      ok: boolean,
+      write: () => void,
+      message?: string,
+    ): void => {
+      const reg = fetchReg();
+      const current = reg.keys[id] ?? null;
+      if (current === null || !sameKey(current, key)) {
+        return;
       }
+      if (ok || !quiet) {
+        write();
+      }
+      fetchReg.set(
+        settleFetch(reg, id, key, ok, message ?? "fetch failed", Date.now()),
+      );
     };
     const jobs: Array<Promise<void>> = [];
     if (loadersFor(view).includes("metrics")) {
+      begin("metrics");
       if (!quiet) {
         metrics.set({ kind: "loading" });
       }
@@ -363,23 +402,29 @@ export function Console() {
           `/api/console/apps/${encodeURIComponent(slug)}/metrics?hours=${range}`,
         )
           .then((summary) => {
-            put(metrics, { kind: "ready", value: { hours: range, summary } });
+            land("metrics", true, () =>
+              metrics.set({ kind: "ready", value: { hours: range, summary } }),
+            );
           })
           .catch((err: unknown) => {
-            if (!quiet) {
-              put(metrics, { kind: "error", message: String(err) });
-            }
+            land(
+              "metrics",
+              false,
+              () => metrics.set({ kind: "error", message: String(err) }),
+              String(err),
+            );
           }),
       );
     }
     if (loadersFor(view).includes("actions")) {
+      begin("actions");
       if (!quiet) {
         actions.set({ kind: "loading" });
       }
       jobs.push(
         loadActionsPage(slug, null)
           .then((page) => {
-            if (fresh()) {
+            land("actions", true, () =>
               actions.set({
                 kind: "ready",
                 state: {
@@ -388,18 +433,26 @@ export function Console() {
                   loadingMore: false,
                   moreError: null,
                 },
-              });
-            }
+              }),
+            );
           })
           .catch((err: unknown) => {
-            if (!quiet) {
-              put(actions, { kind: "error", message: String(err) });
-            }
+            land(
+              "actions",
+              false,
+              () => actions.set({ kind: "error", message: String(err) }),
+              String(err),
+            );
           }),
       );
     }
-    if (loadersFor(view).includes("errors") || (quiet && view !== "errors")) {
-      if (!quiet && loadersFor(view).includes("errors")) {
+    // The open-errors badge on Overview needs live counts, so the quiet
+    // poll refreshes errors on the views that show it — and only those.
+    const showErrors = loadersFor(view).includes("errors");
+    const pollErrors = quiet && (view === "errors" || view === "overview");
+    if (showErrors || pollErrors) {
+      begin("errors");
+      if (!quiet && showErrors) {
         errors.set({ kind: "loading" });
       }
       jobs.push(
@@ -407,16 +460,22 @@ export function Console() {
           `/api/console/apps/${encodeURIComponent(slug)}/errors`,
         )
           .then((summary) => {
-            put(errors, { kind: "ready", value: summary });
+            land("errors", true, () =>
+              errors.set({ kind: "ready", value: summary }),
+            );
           })
           .catch((err: unknown) => {
-            if (!quiet && loadersFor(view).includes("errors")) {
-              put(errors, { kind: "error", message: String(err) });
-            }
+            land(
+              "errors",
+              false,
+              () => errors.set({ kind: "error", message: String(err) }),
+              String(err),
+            );
           }),
       );
     }
     if (loadersFor(view).includes("logs")) {
+      begin("logs");
       if (!quiet) {
         logs.set({ kind: "loading" });
       }
@@ -425,16 +484,22 @@ export function Console() {
           `/api/console/apps/${encodeURIComponent(slug)}/logs?limit=100`,
         )
           .then((data) => {
-            put(logs, { kind: "ready", value: data.lines });
+            land("logs", true, () =>
+              logs.set({ kind: "ready", value: data.lines }),
+            );
           })
           .catch((err: unknown) => {
-            if (!quiet) {
-              put(logs, { kind: "error", message: String(err) });
-            }
+            land(
+              "logs",
+              false,
+              () => logs.set({ kind: "error", message: String(err) }),
+              String(err),
+            );
           }),
       );
     }
     if (loadersFor(view).includes("secrets")) {
+      begin("secrets");
       if (!quiet) {
         secrets.set({ kind: "loading" });
       }
@@ -442,16 +507,22 @@ export function Console() {
         secretsActions.listSecrets
           .run({ slug })
           .then((summary) => {
-            put(secrets, { kind: "ready", value: summary });
+            land("secrets", true, () =>
+              secrets.set({ kind: "ready", value: summary }),
+            );
           })
           .catch((err: unknown) => {
-            if (!quiet) {
-              put(secrets, { kind: "error", message: String(err) });
-            }
+            land(
+              "secrets",
+              false,
+              () => secrets.set({ kind: "error", message: String(err) }),
+              String(err),
+            );
           }),
       );
     }
     if (loadersFor(view).includes("collaborators")) {
+      begin("collaborators");
       if (!quiet) {
         collaborators.set({ kind: "loading" });
       }
@@ -460,16 +531,22 @@ export function Console() {
           `/api/console/apps/${encodeURIComponent(slug)}/collaborators`,
         )
           .then((summary) => {
-            put(collaborators, { kind: "ready", value: summary });
+            land("collaborators", true, () =>
+              collaborators.set({ kind: "ready", value: summary }),
+            );
           })
           .catch((err: unknown) => {
-            if (!quiet) {
-              put(collaborators, { kind: "error", message: String(err) });
-            }
+            land(
+              "collaborators",
+              false,
+              () => collaborators.set({ kind: "error", message: String(err) }),
+              String(err),
+            );
           }),
       );
     }
     if (loadersFor(view).includes("domains")) {
+      begin("domains");
       if (!quiet) {
         domains.set({ kind: "loading" });
       }
@@ -477,12 +554,17 @@ export function Console() {
         domainActions.listDomains
           .run({ app: slug })
           .then((summary) => {
-            put(domains, { kind: "ready", value: summary });
+            land("domains", true, () =>
+              domains.set({ kind: "ready", value: summary }),
+            );
           })
           .catch((err: unknown) => {
-            if (!quiet) {
-              put(domains, { kind: "error", message: String(err) });
-            }
+            land(
+              "domains",
+              false,
+              () => domains.set({ kind: "error", message: String(err) }),
+              String(err),
+            );
           }),
       );
     }
@@ -697,6 +779,10 @@ export function Console() {
       return;
     }
     const slug = r.app;
+    // The page belongs to this exact view state: navigations, range
+    // changes and polls start a new actions load whose key replaces any
+    // recorded one, so a late page for another app can never append here.
+    const key: DataKey = { slug, view: r.view, range: r.range, epoch };
     const before = current.state.next;
     actions.set({
       kind: "ready",
@@ -704,6 +790,18 @@ export function Console() {
     });
     loadActionsPage(slug, before)
       .then((page) => {
+        // Drop the page when the shell moved on (other app, view, range,
+        // or epoch): the actions panel now belongs to a different key.
+        const live = route();
+        const liveKey: DataKey = {
+          slug: live.app ?? "",
+          view: live.view,
+          range: live.range,
+          epoch,
+        };
+        if (!sameKey(liveKey, key)) {
+          return;
+        }
         const latest = actions();
         if (latest.kind !== "ready") {
           return;
@@ -719,6 +817,16 @@ export function Console() {
         });
       })
       .catch((err: unknown) => {
+        const live = route();
+        const liveKey: DataKey = {
+          slug: live.app ?? "",
+          view: live.view,
+          range: live.range,
+          epoch,
+        };
+        if (!sameKey(liveKey, key)) {
+          return;
+        }
         const latest = actions();
         if (latest.kind !== "ready") {
           return;
@@ -1279,6 +1387,11 @@ export function Console() {
                   </div>
                 )}
               </div>
+              {staleMessage(fetchReg(), loadersFor(r.view)) !== null && (
+                <div class="alert alert-warning alert-soft" role="status">
+                  <span class="min-w-0">Couldn't refresh — retrying</span>
+                </div>
+              )}
               <div class="tabs tabs-box tabs-sm mb-3 w-full min-w-0 overflow-x-auto md:hidden" role="tablist" aria-label="Views">
                 {VIEWS.filter((v) => v.id !== "d1").map((v) => (
                   <a
@@ -1385,19 +1498,45 @@ export function Console() {
                     onShowChanges={(sha) => navigate({ view: "code", sha, codeTab: "changes" })}
                     onSwitchCodeTab={(codeTab) => navigate({ codeTab }, true)}
                     onRefreshLogs={() => {
-                      const slug = route().app;
+                      const rr = route();
+                      const slug = rr.app;
                       if (!slug) {
                         return;
                       }
+                      const key: DataKey = {
+                        slug,
+                        view: rr.view,
+                        range: rr.range,
+                        epoch,
+                      };
+                      fetchReg.set(
+                        startFetch(fetchReg(), "logs", key, false).registry,
+                      );
                       logs.set({ kind: "loading" });
                       api<{ lines: LogLine[] }>(
                         `/api/console/apps/${encodeURIComponent(slug)}/logs?limit=100`,
                       )
                         .then((data) => {
+                          const reg = fetchReg();
+                          const current = reg.keys.logs ?? null;
+                          if (current === null || !sameKey(current, key)) {
+                            return;
+                          }
                           logs.set({ kind: "ready", value: data.lines });
+                          fetchReg.set(
+                            settleFetch(reg, "logs", key, true, undefined, Date.now()),
+                          );
                         })
                         .catch((err: unknown) => {
+                          const reg = fetchReg();
+                          const current = reg.keys.logs ?? null;
+                          if (current === null || !sameKey(current, key)) {
+                            return;
+                          }
                           logs.set({ kind: "error", message: String(err) });
+                          fetchReg.set(
+                            settleFetch(reg, "logs", key, false, String(err)),
+                          );
                         });
                     }}
                     onJumpToIssue={(fingerprint) => {
