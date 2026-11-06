@@ -477,6 +477,7 @@ mod tests {
                 credential_refresh_after: std::time::Duration::from_secs(60),
                 wake_timeout: std::time::Duration::from_secs(1),
                 wake_concurrency: 1,
+                secrets_key: crate::secrets::SecretsKey::test_key(),
                 always_on_max: 10,
                 preview_max: 20,
             });
@@ -565,6 +566,7 @@ mod tests {
                 credential_refresh_after: std::time::Duration::from_secs(60),
                 wake_timeout: std::time::Duration::from_secs(1),
                 wake_concurrency: 1,
+                secrets_key: crate::secrets::SecretsKey::test_key(),
                 always_on_max: 10,
                 preview_max: 20,
             });

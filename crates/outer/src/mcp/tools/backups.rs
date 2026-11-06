@@ -82,6 +82,7 @@ fn backup_ctx(ctx: &Ctx<'_>) -> D1Ctx {
         storage: ctx.state.fleets.storage().clone(),
         pool: ctx.state.pool.clone(),
         store: ctx.state.store.clone(),
+        secrets_key: ctx.state.secrets_key.clone(),
         wake: Some(ctx.state.fleets.clone()),
     }
 }

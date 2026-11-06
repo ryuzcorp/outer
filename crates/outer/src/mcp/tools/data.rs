@@ -540,6 +540,7 @@ pub async fn db_query(input: DbQueryInput, ctx: &Ctx<'_>) -> Result<Value, ToolE
         storage: ctx.state.fleets.storage().clone(),
         pool: ctx.state.pool.clone(),
         store: ctx.state.store.clone(),
+        secrets_key: ctx.state.secrets_key.clone(),
         wake: Some(ctx.state.fleets.clone()),
     };
     let (identity, project) = crate::http::console_data::d1::ready_backup(&d1ctx, &app, &binding)

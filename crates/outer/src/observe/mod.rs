@@ -4,3 +4,4 @@
 //! recording in the proxy, the flush to SQLite, retention, and reads.
 pub mod logs;
 pub mod metrics;
+pub mod sourcemaps;

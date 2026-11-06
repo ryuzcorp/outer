@@ -614,6 +614,12 @@ pub async fn rename_app_with_hooks(
     .await
     .map_err(internal)?;
     move_local_path(
+        &PathBuf::from(data_dir).join("maps").join(old_slug),
+        &PathBuf::from(data_dir).join("maps").join(new_slug),
+    )
+    .await
+    .map_err(internal)?;
+    move_local_path(
         &PathBuf::from(data_dir).join("fleets").join(old_slug),
         &PathBuf::from(data_dir).join("fleets").join(new_slug),
     )

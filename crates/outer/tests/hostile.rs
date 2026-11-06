@@ -268,6 +268,7 @@ fn hostile_fleet_command_is_loopback_only_and_scoped() {
         access_key_id: "scoped-key".to_string(),
         secret_access_key: "scoped-secret".to_string(),
         session_token: Some("scoped-token".to_string()),
+        operator_token: None,
         cgroup_leaf: PathBuf::from("/sys/fs/cgroup/outer/hostile"),
         cgroups_active: true,
         extra_env: vec![

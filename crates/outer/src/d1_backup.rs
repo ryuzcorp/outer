@@ -800,6 +800,7 @@ pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> an
             storage: fleets.storage().clone(),
             pool: pool.clone(),
             store: store.clone(),
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             wake: Some(fleets.clone()),
         };
         let plan = match owner_plan(pool, &app.owner_id).await {
@@ -1032,6 +1033,7 @@ exit 0
             },
             pool: pool.clone(),
             store,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             wake: None,
         }
     }
@@ -1467,6 +1469,7 @@ exit 0
             credential_refresh_after: Duration::from_secs(86400 * 30),
             wake_timeout: Duration::from_secs(1),
             wake_concurrency: 1,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 0,
             preview_max: 0,
         });

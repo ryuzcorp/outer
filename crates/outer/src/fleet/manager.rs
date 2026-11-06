@@ -45,6 +45,9 @@ pub struct ManagerSettings {
     pub credential_refresh_after: Duration,
     /// How long a wake waits for `/.well-known/celld/health`.
     pub wake_timeout: Duration,
+    /// AES-256-GCM key for app secrets; the manager derives each fleet's
+    /// internal-listener token from it (never stored, never a Worker var).
+    pub secrets_key: crate::secrets::SecretsKey,
     /// How many fleets may start at once.
     pub wake_concurrency: usize,
     /// At most this many Pro always-on fleets stay awake at once (from
@@ -88,6 +91,7 @@ struct Inner {
     data_dir: PathBuf,
     celld_bin: String,
     storage: FleetStorage,
+    secrets_key: crate::secrets::SecretsKey,
     cgroups: Option<PathBuf>,
     memory_max_bytes: u64,
     cpu_max: String,
@@ -168,6 +172,7 @@ impl FleetManager {
             data_dir: settings.data_dir,
             celld_bin: settings.celld_bin,
             storage: settings.storage,
+            secrets_key: settings.secrets_key,
             cgroups: settings.cgroups,
             memory_max_bytes: settings.memory_max_bytes,
             cpu_max: settings.cpu_max,
@@ -313,6 +318,12 @@ impl FleetManager {
             // Checked against `is_reserved_env_name`: RUST_LOG carries no
             // reserved prefix, so `fleet_command` passes it through.
             extra_env: vec![("RUST_LOG".to_string(), "warn,cell_console=info".to_string())],
+            // Derived, never stored: the same slug always yields the same
+            // token, so old and new fleets agree without a migration.
+            operator_token: Some(crate::secrets::operator_token(
+                &self.inner.secrets_key,
+                &app.slug,
+            )),
         };
         let opts = FleetOpts {
             celld_bin: self.inner.celld_bin.clone(),
@@ -1202,6 +1213,7 @@ mod tests {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 10,
             preview_max: 20,
         });
@@ -1282,6 +1294,7 @@ mod tests {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(2),
             wake_concurrency: 4,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 10,
             preview_max: 20,
         });
@@ -1467,6 +1480,7 @@ mod tests {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(60),
             wake_concurrency: 2,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 10,
             preview_max: 20,
         });
@@ -1555,6 +1569,7 @@ mod tests {
                 credential_refresh_after: Duration::from_secs(6 * 86400),
                 wake_timeout,
                 wake_concurrency: 4,
+                secrets_key: crate::secrets::SecretsKey::test_key(),
                 always_on_max,
                 preview_max: 20,
             });

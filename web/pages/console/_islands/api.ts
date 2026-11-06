@@ -116,6 +116,8 @@ export interface LogLine {
   stream: string;
   line: string;
   fingerprint?: string;
+  /** The line with its Worker bundle tail mapped to the original position, when a deploy map resolves it. */
+  mapped?: string;
 }
 
 /**
@@ -144,6 +146,8 @@ export interface ErrorIssue {
   fingerprint: string;
   message: string;
   frame: string | null;
+  /** The frame mapped to the original position, when a deploy map resolves it. */
+  mapped_frame?: string | null;
   count: number;
   first_seen: number;
   last_seen: number;
