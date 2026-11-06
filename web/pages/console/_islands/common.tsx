@@ -229,6 +229,17 @@ export function canOpenApp(
 // Relative times with the absolute time on hover (Noite's convention).
 export function timeAgo(ms: number): string {
   const diff = Date.now() - ms;
+  // Deadlines are the future: `deletes_at` is a deadline, so a negative diff
+  // used to read "just now" and every Free app looked deleted already.
+  if (diff <= -86_400_000) {
+    return `in ${Math.floor(-diff / 86_400_000)}d`;
+  }
+  if (diff <= -3_600_000) {
+    return `in ${Math.floor(-diff / 3_600_000)}h`;
+  }
+  if (diff <= -60_000) {
+    return `in ${Math.floor(-diff / 60_000)}m`;
+  }
   if (diff < 60_000) {
     return "just now";
   }
@@ -267,7 +278,7 @@ export function CopyButton({ value, label, class: klass }: { value: string; labe
   return (
     <button
       type="button"
-      class={klass ?? "btn btn-ghost btn-square btn-xs tooltip shrink-0"}
+      class={klass ?? "btn btn-ghost btn-square btn-sm max-md:min-h-11 max-md:min-w-11 tooltip shrink-0"}
       data-tip={copied() ? "Copied" : label}
       title={copied() ? "Copied" : label}
       aria-label={label}
