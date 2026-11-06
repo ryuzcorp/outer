@@ -2013,6 +2013,7 @@ mod tests {
             credential_refresh_after: Duration::from_secs(6 * 86400),
             wake_timeout: Duration::from_secs(5),
             wake_concurrency: 4,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 10,
             preview_max: 20,
         })
@@ -3360,6 +3361,7 @@ mod tests {
                 credential_refresh_after: Duration::from_secs(6 * 86400),
                 wake_timeout: Duration::from_secs(2),
                 wake_concurrency: 4,
+                secrets_key: crate::secrets::SecretsKey::test_key(),
                 always_on_max: 10,
                 preview_max: 20,
             }),

@@ -33,6 +33,9 @@ pub struct FleetSpec {
     /// (dev machines) only warns.
     pub cgroups_active: bool,
     pub extra_env: Vec<(String, String)>,
+    /// Derived operator token for this slug (`CELLD_OPERATOR_TOKEN`):
+    /// `None` is today's open listener (mixed states stay working).
+    pub operator_token: Option<String>,
 }
 
 impl std::fmt::Debug for FleetSpec {
@@ -54,6 +57,10 @@ impl std::fmt::Debug for FleetSpec {
             )
             .field("cgroup_leaf", &self.cgroup_leaf)
             .field("cgroups_active", &self.cgroups_active)
+            .field(
+                "operator_token",
+                &self.operator_token.as_ref().map(|_| "<redacted>"),
+            )
             .field(
                 "extra_env",
                 &self
@@ -147,6 +154,9 @@ pub fn fleet_command(
             format!("{state_dir}/asset-cache"),
         ),
         ("CELLD_TRUST_FORWARDED_HEADERS".to_string(), "1".to_string()),
+        // Fleets run as host processes under their own uid, not inside
+        // containers: read memory pressure from the process itself.
+        ("CELLD_MEMORY_SCOPE".to_string(), "self".to_string()),
         // Every app is a one-node fleet: there is no fleet capacity to wait
         // for, and celld's default first-readiness gate (120 s cap) holds a
         // cold wake for about a second locally and ~3 s on the VPS.
@@ -154,6 +164,12 @@ pub fn fleet_command(
     ];
     if let Some(token) = &spec.session_token {
         env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
+    }
+    // The derived per-slug token guards the internal listener; the manager
+    // fills it, never user input (`extra_env` reserved names are skipped
+    // below, so this cannot arrive any other way).
+    if let Some(token) = &spec.operator_token {
+        env.push(("CELLD_OPERATOR_TOKEN".to_string(), token.clone()));
     }
     for (key, value) in &spec.extra_env {
         if super::sandbox::is_reserved_env_name(key) {
@@ -572,6 +588,7 @@ mod tests {
                 ("GROCERY".to_string(), "milk".to_string()),
                 ("OUTER_SECRET".to_string(), "nope".to_string()),
             ],
+            operator_token: Some("tok-test".to_string()),
         };
         let opts = FleetOpts {
             celld_bin: "/usr/bin/celld".to_string(),
@@ -613,6 +630,7 @@ mod tests {
             (512u64 * 1024 * 1024).to_string()
         );
         assert_eq!(env["CELLD_TRUST_FORWARDED_HEADERS"], "1");
+        assert_eq!(env["CELLD_MEMORY_SCOPE"], "self");
         assert_eq!(
             env["CELLD_READY_FLEET_GATE_MS"], "0",
             "single-node fleets skip the fleet gate"
@@ -623,6 +641,8 @@ mod tests {
         assert_eq!(env["AWS_REGION"], "auto");
         assert_eq!(env["AWS_EC2_METADATA_DISABLED"], "true");
         assert_eq!(env["GROCERY"], "milk");
+        // The derived token guards the internal listener.
+        assert_eq!(env["CELLD_OPERATOR_TOKEN"], "tok-test");
         // Reserved names never reach a fleet.
         assert!(
             !env.contains_key("OUTER_SECRET"),
@@ -637,6 +657,7 @@ mod tests {
         let shown = format!("{spec:?}");
         assert!(!shown.contains("secret\""), "{shown}");
         assert!(!shown.contains("\"token\""), "{shown}");
+        assert!(!shown.contains("tok-test"), "{shown}");
         assert!(!shown.contains("milk"), "extra_env values: {shown}");
         assert!(shown.contains("GROCERY"), "names stay visible: {shown}");
     }

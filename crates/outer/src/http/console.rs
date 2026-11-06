@@ -1071,7 +1071,7 @@ async fn api_logs(
         Ok(parsed) => parsed,
         Err(res) => return *res,
     };
-    let lines = crate::observe::logs::read_filtered(
+    let mut lines = crate::observe::logs::read_filtered(
         &mcp.pool,
         &mcp.fleets,
         &app.id,
@@ -1081,6 +1081,20 @@ async fn api_logs(
         limit,
     )
     .await;
+    // Symbolicate at the edge: stored lines stay raw (and fingerprints stay
+    // stable); each line maps against its own deploy's maps, and anything
+    // without a map renders raw.
+    let shas = crate::observe::sourcemaps::deploy_shas(&mcp.pool, &app.id).await;
+    let mut sym = crate::observe::sourcemaps::Symbolicator::new(
+        mcp.deploys.deploy_settings().map(|s| s.data_dir.as_path()),
+        &app.slug,
+        &shas,
+    );
+    for line in &mut lines {
+        if let Some(s) = sym.as_mut() {
+            line.mapped = s.mapped_line(line.ts, &line.line);
+        }
+    }
     let next_since = lines.last().map(|l| l.seq);
     let lines: Vec<serde_json::Value> = lines.iter().map(|l| l.to_json()).collect();
     (
@@ -1157,18 +1171,32 @@ async fn api_errors(
                 );
             }
         };
+    // One sha query for the whole list; each issue's frame maps against its
+    // own deploy, and shares the parsed maps with the other issues.
+    let shas = crate::observe::sourcemaps::deploy_shas(&mcp.pool, &app.id).await;
+    let mut sym = crate::observe::sourcemaps::Symbolicator::new(
+        mcp.deploys.deploy_settings().map(|s| s.data_dir.as_path()),
+        &app.slug,
+        &shas,
+    );
     ok_json(json!({
-        "issues": found.iter().map(|issue| json!({
-            "fingerprint": issue.fingerprint,
-            "message": issue.message,
-            "frame": issue.frame,
-            "count": issue.count,
-            "first_seen": issue.first_seen,
-            "last_seen": issue.last_seen,
-            "status": issue.status,
-            "resolved_at": issue.resolved_at,
-            "regressed": crate::observe::logs::is_regressed(issue),
-        })).collect::<Vec<_>>(),
+        "issues": found.iter().map(|issue| {
+            let mapped_frame = sym.as_mut().and_then(|s| {
+                s.mapped_frame(issue.last_seen.saturating_div(1000), issue.frame.as_deref())
+            });
+            json!({
+                "fingerprint": issue.fingerprint,
+                "message": issue.message,
+                "frame": issue.frame,
+                "mapped_frame": mapped_frame,
+                "count": issue.count,
+                "first_seen": issue.first_seen,
+                "last_seen": issue.last_seen,
+                "status": issue.status,
+                "resolved_at": issue.resolved_at,
+                "regressed": crate::observe::logs::is_regressed(issue),
+            })
+        }).collect::<Vec<_>>(),
         "counts": {"open": open, "resolved": resolved, "ignored": ignored},
         "s5xx_last_hour": s5xx,
     }))

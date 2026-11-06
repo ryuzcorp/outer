@@ -172,6 +172,69 @@ pub fn check_reserved(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Better Auth's signing secret. Noite provisions the same name per fleet;
+/// matching it means Void apps behave the same on both platforms. Regular
+/// app secret: users may set it via Mouth, and it injects into Worker vars
+/// like any other secret.
+pub const AUTH_SECRET_NAME: &str = "BETTER_AUTH_SECRET";
+
+/// Ensure the app's auth secret exists, minting 32 random bytes hex when
+/// absent. A user value always wins and is never overwritten; a raced
+/// deploy reuses the winner's row on its own read. Returns whether this
+/// call minted.
+pub async fn ensure_auth_secret(
+    pool: &SqlitePool,
+    key: &SecretsKey,
+    app_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<bool> {
+    let existing: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value_enc FROM app_secret WHERE app_id = ?1 AND name = ?2")
+            .bind(app_id)
+            .bind(AUTH_SECRET_NAME)
+            .fetch_optional(pool)
+            .await?;
+    if existing.is_some() {
+        return Ok(false);
+    }
+    let secret: [u8; 32] = rand::random();
+    let blob = encrypt(
+        key,
+        app_id,
+        AUTH_SECRET_NAME,
+        hex::encode(secret).as_bytes(),
+    );
+    set(pool, app_id, AUTH_SECRET_NAME, &blob, now_ms).await?;
+    Ok(true)
+}
+
+/// The fleet internal-listener token, derived — never stored, never
+/// injected into Worker vars. HKDF over the server key and the slug keeps
+/// it stable per app across restarts and renames rebuild the fleet anyway;
+/// rotation rides `OUTER_SECRET` rotation like every other derived value.
+pub fn operator_token(key: &SecretsKey, slug: &str) -> String {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let mut info = b"outer operator token v1\x00".to_vec();
+    info.extend_from_slice(slug.as_bytes());
+    let hk = Hkdf::<Sha256>::new(None, &key.0);
+    let mut token = [0u8; 32];
+    hk.expand(&info, &mut token)
+        .expect("HKDF-SHA256 expands to 32 bytes");
+    hex::encode(token)
+}
+
+/// The (`CELLD_OPERATOR_TOKEN`, token) pair for a celld invocation or
+/// fleet env. `CELLD_*` names are platform-reserved: users cannot set or
+/// see this, and secret injection skips it, so it never reaches Worker
+/// vars.
+pub fn operator_token_env(key: &SecretsKey, slug: &str) -> (String, String) {
+    (
+        "CELLD_OPERATOR_TOKEN".to_string(),
+        operator_token(key, slug),
+    )
+}
+
 /// One `list_secrets` row: the name and when it was last set. Never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMeta {
@@ -397,6 +460,55 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_auth_secret_mints_once_and_keeps_user_values() {
+        let (_dir, pool) = pool().await;
+        app(&pool, "app1").await;
+        let key = SecretsKey::test_key();
+
+        assert!(
+            ensure_auth_secret(&pool, &key, "app1", 1).await.unwrap(),
+            "first deploy mints"
+        );
+        assert!(
+            !ensure_auth_secret(&pool, &key, "app1", 2).await.unwrap(),
+            "second deploy reuses"
+        );
+        let minted: String =
+            String::from_utf8(decrypt_all(&pool, "app1", &key).await.unwrap()[0].1.clone())
+                .unwrap();
+        assert_eq!(minted.len(), 64, "32 random bytes hex");
+        assert!(minted.chars().all(|c| c.is_ascii_hexdigit()), "{minted}");
+
+        // A user value set through Mouth wins and is never overwritten.
+        let blob = encrypt(&key, "app1", AUTH_SECRET_NAME, b"user-value");
+        set(&pool, "app1", AUTH_SECRET_NAME, &blob, 3)
+            .await
+            .unwrap();
+        assert!(
+            !ensure_auth_secret(&pool, &key, "app1", 4).await.unwrap(),
+            "user value is kept"
+        );
+        let kept: String =
+            String::from_utf8(decrypt_all(&pool, "app1", &key).await.unwrap()[0].1.clone())
+                .unwrap();
+        assert_eq!(kept, "user-value");
+    }
+
+    #[test]
+    fn operator_token_is_stable_per_slug_and_scoped() {
+        let key = SecretsKey::test_key();
+        let (name, token) = operator_token_env(&key, "grocery");
+        assert_eq!(name, "CELLD_OPERATOR_TOKEN");
+        assert_eq!(token, operator_token(&key, "grocery"));
+        assert_eq!(token.len(), 64);
+        assert_ne!(token, operator_token(&key, "other"));
+        assert_ne!(
+            token,
+            operator_token(&SecretsKey::derive("different"), "grocery")
+        );
     }
 
     #[tokio::test]

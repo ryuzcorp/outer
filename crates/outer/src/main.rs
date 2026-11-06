@@ -662,6 +662,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .as_ref()
         .map(|cf| cf.credential_refresh_after)
         .unwrap_or(Duration::from_secs(6 * 86400));
+    let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
     let fleets = FleetManager::new(ManagerSettings {
         data_dir: config.data_dir.clone(),
         celld_bin: rt.celld_bin.clone(),
@@ -675,6 +676,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         wake_concurrency: rt.wake_concurrency,
         always_on_max: rt.always_on_max,
         preview_max: rt.preview_max,
+        secrets_key: secrets_key.clone(),
     });
     fleets.set_egress(egress.clone());
     // A previous process may have died between a rename's commit and its
@@ -688,7 +690,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let git = git_config(&config);
     let git_sync = outer::git::GitSync::default();
 
-    let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
     // One client for the pipeline gate and the slug/name check alike: both
     // fail closed when it is `None` on localhost dev, and pass with a
     // warning there.

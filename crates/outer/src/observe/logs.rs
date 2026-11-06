@@ -680,6 +680,11 @@ pub struct LogLine {
     pub stream: String,
     pub line: String,
     pub fingerprint: Option<String>,
+    /// The line with its Worker bundle tail mapped to the original position
+    /// (see [`super::sourcemaps`]). `None` keeps the raw line: no map, no
+    /// deploy, or no mappable frame. Set at the HTTP edge, never by the
+    /// grouping core, so stored lines stay raw and fingerprints stay stable.
+    pub mapped: Option<String>,
 }
 
 impl LogLine {
@@ -687,6 +692,9 @@ impl LogLine {
         let mut out = json!({"seq": self.seq, "ts": self.ts.saturating_mul(1000), "stream": self.stream, "line": self.line});
         if let Some(fp) = &self.fingerprint {
             out["fingerprint"] = json!(fp);
+        }
+        if let Some(mapped) = &self.mapped {
+            out["mapped"] = json!(mapped);
         }
         out
     }
@@ -846,6 +854,7 @@ pub async fn read_filtered(
             stream,
             line,
             fingerprint,
+            mapped: None,
         })
         .collect()
 }
@@ -946,6 +955,7 @@ pub async fn issue_detail(
                 stream: stream.clone(),
                 line: line.clone(),
                 fingerprint: Some(wanted.to_string()),
+                mapped: None,
             });
         }
     }
@@ -1583,6 +1593,7 @@ mod tests {
             credential_refresh_after: std::time::Duration::from_secs(60),
             wake_timeout: std::time::Duration::from_secs(1),
             wake_concurrency: 1,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 10,
             preview_max: 20,
         });
@@ -1787,6 +1798,7 @@ mod tests {
             credential_refresh_after: std::time::Duration::from_secs(60),
             wake_timeout: std::time::Duration::from_secs(1),
             wake_concurrency: 1,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 10,
             preview_max: 20,
         })

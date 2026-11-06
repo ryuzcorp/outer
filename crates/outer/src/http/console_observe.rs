@@ -114,6 +114,7 @@ async fn api_logs_stream(
             tail.last().map(|l| l.seq).unwrap_or(0)
         }
     };
+    let data_dir = mcp.deploys.deploy_settings().map(|s| s.data_dir.clone());
     let stream = futures::stream::unfold(
         (
             mcp.pool.clone(),
@@ -126,8 +127,21 @@ async fn api_logs_stream(
             filter,
             seed,
             true,
+            data_dir,
         ),
-        move |(pool, fleets, auth, session, admin, app_id, slug, filter, mut cursor, mut first)| async move {
+        move |(
+            pool,
+            fleets,
+            auth,
+            session,
+            admin,
+            app_id,
+            slug,
+            filter,
+            mut cursor,
+            mut first,
+            data_dir,
+        )| async move {
             // Re-verified every tick: a revoked or expired session, or a
             // ban, ends the stream for everyone (reopening signs in
             // again). Admin streams additionally re-check the step-up
@@ -168,7 +182,7 @@ async fn api_logs_stream(
                     .await
                     .ok()??;
                 }
-                let lines = crate::observe::logs::read_filtered(
+                let mut lines = crate::observe::logs::read_filtered(
                     &pool,
                     &fleets,
                     &app_id,
@@ -178,6 +192,19 @@ async fn api_logs_stream(
                     FOLLOW_PAGE,
                 )
                 .await;
+                // Edge symbolication like the plain Logs view: one sha
+                // query per page, each line against its own deploy.
+                let shas = crate::observe::sourcemaps::deploy_shas(&pool, &app_id).await;
+                let mut sym = crate::observe::sourcemaps::Symbolicator::new(
+                    data_dir.as_deref(),
+                    &slug,
+                    &shas,
+                );
+                for line in &mut lines {
+                    if let Some(s) = sym.as_mut() {
+                        line.mapped = s.mapped_line(line.ts, &line.line);
+                    }
+                }
                 if let Some(last) = lines.last() {
                     cursor = last.seq;
                 }
@@ -189,6 +216,7 @@ async fn api_logs_stream(
                     .to_string();
                     let state = (
                         pool, fleets, auth, session, admin, app_id, slug, filter, cursor, first,
+                        data_dir,
                     );
                     return Some((Ok::<Event, Infallible>(Event::default().data(data)), state));
                 }
@@ -226,7 +254,7 @@ async fn api_error_detail(
     if fingerprint.is_empty() || fingerprint.len() > 64 {
         return not_found();
     }
-    let detail = match crate::observe::logs::issue_detail(
+    let mut detail = match crate::observe::logs::issue_detail(
         &mcp.pool,
         &app.id,
         &fingerprint,
@@ -244,11 +272,31 @@ async fn api_error_detail(
             );
         }
     };
+    // Same edge symbolication as the issues list: the frame against its
+    // own deploy, each recent line against its own.
+    let shas = crate::observe::sourcemaps::deploy_shas(&mcp.pool, &app.id).await;
+    let mut sym = crate::observe::sourcemaps::Symbolicator::new(
+        mcp.deploys.deploy_settings().map(|s| s.data_dir.as_path()),
+        &app.slug,
+        &shas,
+    );
+    let mapped_frame = sym.as_mut().and_then(|s| {
+        s.mapped_frame(
+            detail.issue.last_seen.saturating_div(1000),
+            detail.issue.frame.as_deref(),
+        )
+    });
+    for line in &mut detail.recent {
+        if let Some(s) = sym.as_mut() {
+            line.mapped = s.mapped_line(line.ts, &line.line);
+        }
+    }
     ok_json(json!({
         "issue": {
             "fingerprint": detail.issue.fingerprint,
             "message": detail.issue.message,
             "frame": detail.issue.frame,
+            "mapped_frame": mapped_frame,
             "count": detail.issue.count,
             "first_seen": detail.issue.first_seen,
             "last_seen": detail.issue.last_seen,

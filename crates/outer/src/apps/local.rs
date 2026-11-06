@@ -38,6 +38,7 @@ pub(crate) async fn remove_local_state(
     remove_file(&work.join(format!("{slug}.install-hash"))).await?;
     remove_dir(&data_dir.join("cache").join(slug)).await?;
     remove_dir(&data_dir.join("fleets").join(slug)).await?;
+    remove_dir(&data_dir.join("maps").join(slug)).await?;
     let sidecars = data_dir.join("secret-sidecars");
     remove_file(&sidecars.join(format!("{slug}.orig"))).await?;
     remove_file(&sidecars.join(format!("{slug}.target"))).await?;

@@ -612,6 +612,9 @@ pub struct D1Ctx {
     pub storage: FleetStorage,
     pub pool: SqlitePool,
     pub store: Store,
+    /// Derives the fleet's `CELLD_OPERATOR_TOKEN` for every `celld d1`
+    /// invocation (the internal listener requires it once fleets set it).
+    pub secrets_key: crate::secrets::SecretsKey,
     /// Wakes the fleet before `d1 execute` (D1 goes through a running node).
     /// `None` in tests with a fake `celld`, where no fleet can be woken.
     pub wake: Option<FleetManager>,
@@ -624,6 +627,7 @@ impl D1Ctx {
             storage: state.mcp.fleets.storage().clone(),
             pool: state.mcp.pool.clone(),
             store: state.mcp.store.clone(),
+            secrets_key: state.mcp.secrets_key.clone(),
             wake: Some(state.mcp.fleets.clone()),
         }
     }
@@ -815,6 +819,10 @@ pub(crate) async fn d1_exec(
     if json {
         cmd.arg("--json");
     }
+    // The internal D1 listener requires the fleet's operator token once
+    // the fleet sets it; harmless against older fleets listening open.
+    let (token_key, token_val) = crate::secrets::operator_token_env(&ctx.secrets_key, slug);
+    cmd.env(token_key, token_val);
     cmd.arg("--bucket")
         .arg(&bucket)
         .arg("--endpoint")
@@ -866,7 +874,7 @@ pub const D1_EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
 /// separately. `tables` empty means every table, so callers pass an
 /// explicit allowlist and never an empty list. `--table` takes its value
 /// unconditionally, so even a hostile table name can never parse as an
-/// option. Same scoped-grant env as [`d1_exec`].
+/// option. Same env as [`d1_exec`] (scoped grant plus operator token).
 pub(crate) async fn d1_export(
     ctx: &D1Ctx,
     slug: &str,
@@ -887,6 +895,9 @@ pub(crate) async fn d1_export(
     for table in tables {
         cmd.arg("--table").arg(table);
     }
+    // Same operator-token deal as `d1_exec`: required once fleets set it.
+    let (token_key, token_val) = crate::secrets::operator_token_env(&ctx.secrets_key, slug);
+    cmd.env(token_key, token_val);
     cmd.arg("--bucket")
         .arg(&bucket)
         .arg("--endpoint")
@@ -2529,6 +2540,7 @@ exit 0
             storage,
             pool: pool.clone(),
             store,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             wake: None,
         }
     }
@@ -3075,6 +3087,7 @@ exit 0
             credential_refresh_after: Duration::from_secs(86400),
             wake_timeout: Duration::from_secs(1),
             wake_concurrency: 1,
+            secrets_key: crate::secrets::SecretsKey::test_key(),
             always_on_max: 10,
             preview_max: 20,
         });
