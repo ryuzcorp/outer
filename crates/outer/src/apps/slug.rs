@@ -5,15 +5,29 @@
 /// Brand and account-page fragments refused in slugs (spec §7.1). One entry
 /// per line, `#` comments; embedded so the check works with no data dir.
 const BRANDS_TXT: &str = include_str!("../../wordlists/brands.txt");
+/// A section header (`# --- … ---`) in the wordlist.
+const SECTION_MARKER: &str = "# ---";
+/// The section of generic account-page words (`verify`, `account`, `login`):
+/// refused in a slug, never read as an impersonated brand in page text.
+const SLUG_ONLY_SECTION: &str = "account-page words";
 
-/// The parsed wordlist: lowercase entries, comments and blanks dropped.
-/// Entries are matched by [`brand_hit`], never by callers directly.
-static BRANDS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
-    BRANDS_TXT
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect()
+/// The parsed wordlist in file order: `(entry, slug_only)`. Entries are
+/// matched by [`brand_hit`] and [`brand_in_text`], never by callers directly.
+static BRANDS: std::sync::LazyLock<Vec<(&'static str, bool)>> = std::sync::LazyLock::new(|| {
+    let mut slug_only = false;
+    let mut entries = Vec::new();
+    for line in BRANDS_TXT.lines() {
+        let line = line.trim();
+        if line.starts_with(SECTION_MARKER) {
+            slug_only = line.contains(SLUG_ONLY_SECTION);
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        entries.push((line, slug_only));
+    }
+    entries
 });
 
 /// Slugs that would collide with platform routes or invite abuse (spec §7.1).
@@ -60,7 +74,7 @@ pub enum SlugError {
 /// so the rule errs on refusing and the agent picks another slug.
 pub fn brand_hit(slug: &str) -> Option<&'static str> {
     let slug = slug.to_lowercase();
-    BRANDS.iter().copied().find(|entry| {
+    BRANDS.iter().map(|(entry, _)| *entry).find(|entry| {
         slug.split('-').any(|token| token == *entry) || (entry.len() >= 5 && slug.contains(entry))
     })
 }
@@ -71,29 +85,39 @@ pub fn brand_hit(slug: &str) -> Option<&'static str> {
 /// page about pineapples never trips `apple` while `Sign in with PayPal`
 /// does. Short entries (under 4 chars) never match: they collide with
 /// ordinary words.
+///
+/// [`SLUG_ONLY_SECTION`] entries are deliberately NOT consulted: "verify",
+/// "account" and "login" name what every sign-in page does, so reading them
+/// as an impersonated brand suspended every app with a password form (live:
+/// `void-debug` on 2026-11-06, a compatibility probe whose page says
+/// "verify"). Brand impersonation is the signal; generic words are not.
 pub fn brand_in_text(haystack: &str) -> Option<&'static str> {
     let lower = haystack.to_lowercase();
     let bytes = lower.as_bytes();
-    BRANDS.iter().copied().find(|entry| {
-        if entry.len() < 4 {
-            return false;
-        }
-        let mut from = 0;
-        while let Some(pos) = lower[from..].find(entry) {
-            let start = from + pos;
-            let end = start + entry.len();
-            let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
-            let right_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
-            if left_ok && right_ok {
-                return true;
+    BRANDS
+        .iter()
+        .filter(|(_, slug_only)| !slug_only)
+        .map(|(entry, _)| *entry)
+        .find(|entry| {
+            if entry.len() < 4 {
+                return false;
             }
-            from = start + 1;
-            if from >= lower.len() {
-                break;
+            let mut from = 0;
+            while let Some(pos) = lower[from..].find(entry) {
+                let start = from + pos;
+                let end = start + entry.len();
+                let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+                let right_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+                if left_ok && right_ok {
+                    return true;
+                }
+                from = start + 1;
+                if from >= lower.len() {
+                    break;
+                }
             }
-        }
-        false
-    })
+            false
+        })
 }
 
 /// Noite's slug rule plus the spec §7.1 reserved list and brand filter.

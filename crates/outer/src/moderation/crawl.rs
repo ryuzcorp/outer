@@ -1280,6 +1280,46 @@ mod tests {
         assert!(brand_in_text("a pineapple recipe").is_none());
     }
 
+    /// Every app with a sign-in form says "verify" or "account"; those words
+    /// are slug fragments, never an impersonated brand.
+    #[test]
+    fn generic_account_words_are_not_brands_in_text() {
+        for text in [
+            "Verify your email",
+            "Account settings",
+            "Secure login",
+            "Bank of ordinary things",
+            "Password recovery",
+        ] {
+            assert!(brand_in_text(text).is_none(), "{text}");
+        }
+        assert_eq!(brand_in_text("Sign in with PayPal"), Some("paypal"));
+        assert_eq!(brand_in_text("Continue to Stripe"), Some("stripe"));
+    }
+
+    /// The after-live crawl suspended a compatibility probe whose page says
+    /// "verify" next to a password field, with no brand anywhere. A
+    /// credential form on its own is not phishing.
+    #[test]
+    fn credential_form_without_a_brand_passes() {
+        let page = PageReport {
+            path: "/".to_string(),
+            texts: vec!["Verify your account".to_string()],
+            has_credential_field: true,
+            ..PageReport::default()
+        };
+        let scores = [crate::moderation::jev::ChunkScores {
+            profanity: 0.0,
+            minors: 0.0,
+            phishing: 0.1,
+            severity: 0.0,
+            hate: 0.0,
+        }];
+        let (verdict, findings) = decide(&[page], Some(&scores));
+        assert_eq!(verdict, CrawlVerdict::Pass);
+        assert!(findings.is_empty());
+    }
+
     #[test]
     fn bad_hosts_match_exactly_and_on_subdomains() {
         let bad = vec!["evil.example.com".to_string()];
