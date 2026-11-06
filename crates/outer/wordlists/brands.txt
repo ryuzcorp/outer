@@ -55,7 +55,10 @@ roblox
 epicgames
 discord
 telegram
-# Account-page words: the credential-harvesting half of "secure-bank-verify".
+# --- account-page words (slug-only) ---
+# The credential-harvesting half of "secure-bank-verify". Refused in a slug,
+# never read as an impersonated brand in page text (`brand_in_text` skips
+# this section): every sign-in form says "verify", "account" or "login".
 bank
 banking
 verify
@@ -70,7 +73,7 @@ password
 recovery
 crypto
 bitcoin
-# Carriers and agencies, for delivery and seizure scams.
+# --- carriers and agencies ---
 dhl
 fedex
 ups
