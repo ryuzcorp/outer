@@ -593,10 +593,17 @@ pub async fn stats(pool: &SqlitePool, now: i64) -> anyhow::Result<Stats> {
     )
     .fetch_one(pool)
     .await?;
+    // The first success is picked by `(created_at, rowid)`: two deploys can
+    // share a millisecond, and the later one must not count as an attempt
+    // before the first success.
     let attempts: Vec<(i64,)> = sqlx::query_as(
         "WITH first AS (SELECT app_id, MIN(created_at) AS t FROM deploy WHERE status = 'success' \
-         GROUP BY app_id) SELECT (SELECT COUNT(*) FROM deploy d WHERE d.app_id = first.app_id \
-         AND d.created_at <= first.t) FROM first",
+         GROUP BY app_id), \
+         picked AS (SELECT f.app_id, f.t, MIN(d.rowid) AS r FROM first f JOIN deploy d \
+         ON d.app_id = f.app_id AND d.created_at = f.t AND d.status = 'success' GROUP BY f.app_id) \
+         SELECT (SELECT COUNT(*) FROM deploy d WHERE d.app_id = picked.app_id \
+         AND (d.created_at < picked.t OR (d.created_at = picked.t AND d.rowid <= picked.r))) \
+         FROM picked",
     )
     .fetch_all(pool)
     .await?;
@@ -941,6 +948,40 @@ mod tests {
                 pct: 100.0 / 3.0
             }
         );
+    }
+
+    #[tokio::test]
+    async fn attempts_before_first_success_breaks_timestamp_ties_by_rowid() {
+        let pool = test_pool().await;
+        let now = 1_750_000_000_000;
+        seed_user(&pool, "u-1", "one@x.test", now - 20 * DAY_MS, "free", None).await;
+        seed_app(&pool, "a-tie", "tie", "u-1", now - 20 * DAY_MS, 1).await;
+        seed_app(&pool, "a-early", "early", "u-1", now - 20 * DAY_MS, 2).await;
+        // Same millisecond: the success is inserted first, so the failed row
+        // after it is not an attempt made before the first success.
+        seed_deploy(&pool, "d-tie-ok", "a-tie", "success", None, now - DAY_MS).await;
+        seed_deploy(&pool, "d-tie-bad", "a-tie", "failed", None, now - DAY_MS).await;
+        // Same millisecond the other way round: two attempts.
+        seed_deploy(
+            &pool,
+            "d-early-bad",
+            "a-early",
+            "failed",
+            None,
+            now - DAY_MS,
+        )
+        .await;
+        seed_deploy(
+            &pool,
+            "d-early-ok",
+            "a-early",
+            "success",
+            None,
+            now - DAY_MS,
+        )
+        .await;
+        let s = stats(&pool, now).await.unwrap();
+        assert_eq!(s.beta.attempts_before_first_success, Some(1.5));
     }
 
     #[tokio::test]

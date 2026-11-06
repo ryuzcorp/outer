@@ -484,11 +484,20 @@ const ACCEPTED_CONFIG_KEYS: &[&str] = &[
 /// at its boot no deploy can still be running: a row left `queued`,
 /// `building`, `reviewing` or `deploying` would otherwise read as in flight
 /// forever (rollback coalesces onto it, `deploy_status wait` polls it).
-/// Returns how many rows were closed.
+/// The closed row gains a step marker naming the phase it died in, so the
+/// deploy-failed-at-build statistic in [`crate::moderation::admin::stats`]
+/// (which reads the last step) does not silently drop an interrupted build;
+/// `queued` never started and keeps a NULL `steps`, and a row that already
+/// carries steps keeps them.
 pub async fn fail_interrupted(pool: &SqlitePool) -> anyhow::Result<u64> {
     let closed = sqlx::query(
         "UPDATE deploy SET status = 'failed', \
          error = 'interrupted: outer restarted before this deploy finished', \
+         steps = COALESCE(steps, CASE status \
+             WHEN 'building' THEN '[{\"name\":\"build\",\"ms\":0,\"skipped\":false}]' \
+             WHEN 'reviewing' THEN '[{\"name\":\"gate\",\"ms\":0,\"skipped\":false}]' \
+             WHEN 'deploying' THEN '[{\"name\":\"deploy\",\"ms\":0,\"skipped\":false}]' \
+         END), \
          finished_at = ? \
          WHERE status NOT IN ('success', 'failed', 'blocked')",
     )
@@ -7443,6 +7452,17 @@ exit 0
             statuses,
             ["success", "blocked", "failed", "failed", "failed", "failed"]
         );
+        let closed: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, steps FROM deploy WHERE id IN ('d4', 'd5', 'd6')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let steps_of = |id: &str| closed.iter().find(|(row, _)| row == id).unwrap().1.clone();
+        // The phase a restart cut off is recorded, so the failed-at-build
+        // statistic does not lose it; `queued` never ran a step.
+        assert!(steps_of("d5").unwrap().contains("\"build\""));
+        assert!(steps_of("d6").unwrap().contains("\"deploy\""));
+        assert_eq!(steps_of("d4"), None);
         assert_eq!(fail_interrupted(&pool).await.unwrap(), 0, "idempotent");
     }
 
