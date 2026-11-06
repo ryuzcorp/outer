@@ -1,33 +1,83 @@
 ---
 title: Connect your agent
-description: Point your agent at Outer's MCP endpoint — one line per client, OAuth or emailed code.
+description: Point your agent at Outer's MCP endpoint — one command per client, OAuth or emailed code.
 ---
 
 Your agent talks to Outer over MCP at `https://outer.now/mcp` (Streamable HTTP,
-OAuth 2.1). The first account tool call starts sign-in. After that the agent
-retries and keeps going.
+OAuth 2.1). Add the server once; the first account tool call starts sign-in in
+your browser.
 
-## Client setup
+## Add the server
 
-| Client | Setup |
-| --- | --- |
-| Claude Code | `claude mcp add --transport http outer https://outer.now/mcp`, then run `/mcp` in Claude Code, pick `outer` and sign in in the browser that opens |
-| claude.ai, Desktop, mobile | Settings → Connectors → Add custom connector → `https://outer.now/mcp` |
-| Codex CLI, IDE, ChatGPT desktop app | `codex mcp add outer --url https://outer.now/mcp`, then `codex mcp login outer` |
-| Perplexity | Settings → Connectors → add a custom MCP connector with `https://outer.now/mcp` (tested: OAuth sign-in, then `@Outer build me …`) |
-| ChatGPT (chatgpt.com) | Add a custom connector with `https://outer.now/mcp` and sign in (tested) |
-| Gemini | Add a custom MCP server with `https://outer.now/mcp` and sign in (tested) |
-| Anything else | OAuth if supported, else the emailed-code fallback (see [Sign in](/get-started/sign-in)) |
+### Claude Code
+
+```bash
+claude mcp add --transport http outer https://outer.now/mcp
+```
+
+Then run `/mcp` inside Claude Code, pick `outer`, and sign in in the browser
+that opens.
+
+### Codex CLI, IDE, ChatGPT desktop app
+
+```bash
+codex mcp add outer --url https://outer.now/mcp
+```
+
+Then ask your agent for the app. The first tool call opens sign-in, and Codex
+reports "Authentication complete" when it is done — no separate login step.
+If no browser opens, run `codex mcp login outer` and retry the call.
 
 :::note
-Codex may not start OAuth from a mid-session `401`. If sign-in does not start, sign in from a fresh session and
-retry the call.
+Codex may not start OAuth from a mid-session `401`. If sign-in does not start,
+open a fresh session and retry.
 :::
+
+### claude.ai, Claude Desktop, Claude mobile
+
+Settings → Connectors → Add custom connector → `https://outer.now/mcp`, then
+sign in.
+
+### ChatGPT
+
+Add a custom connector with `https://outer.now/mcp` and sign in (tested on
+chatgpt.com and the desktop app).
+
+### Gemini
+
+Add a custom MCP server with `https://outer.now/mcp` and sign in.
+
+### Perplexity
+
+Settings → Connectors → add a custom MCP connector with
+`https://outer.now/mcp`. In a chat, mention the connector by name:
+`@Outer build me …`.
+
+### Anything else
+
+Any MCP client works with OAuth 2.1. Clients without OAuth use the emailed-code
+fallback instead ([Sign in](/get-started/sign-in)).
+
+## Ask for your first app
+
+Paste this, then swap the idea for your own:
+
+```text
+Build a grocery list app for my family on Outer. One page: an input to add
+items, a list with checkboxes, and a filter for bought vs. still needed. No
+login, no sharing yet — just the list. Read the Outer quickstart guide first,
+then create the app and show me the live link.
+```
+
+Claude, Codex, ChatGPT and Gemini call the tools directly. Perplexity needs the
+`@Outer` prefix on its first message. The full walkthrough is in
+[Quickstart](/get-started/quickstart); shaping later prompts, in
+[Prompting your agent](/get-started/prompting).
 
 ## How sign-in works
 
-Claude, Codex, ChatGPT and Perplexity use OAuth. Your client opens
-Outer's sign-in page:
+Claude, Codex, ChatGPT and Perplexity use OAuth. Your client opens Outer's
+sign-in page:
 
 1. Enter your email and the emailed code.
 2. Accept the terms on first sign-in.
@@ -36,14 +86,14 @@ Outer's sign-in page:
 Clients without OAuth use two MCP tools instead. Details in
 [Sign in](/get-started/sign-in).
 
-When a limit or refusal hits, the tool result carries a `user_message`
-written for you. Your agent relays it word for word.
+When a limit or refusal hits, the tool result carries a `user_message` written
+for you. Your agent relays it word for word.
 
 ## What your agent builds
 
-One of two empty shells ([Pick a template](/get-started/templates)): the interactive
-`app` (Ilha and Void: lists, dashboards, anything with accounts), or the
-`website` (Astro content site: landing pages, portfolios, blogs). Name
-which one in your first prompt; the default is `app`.
+One of two empty shells ([Pick a template](/get-started/templates)): the
+interactive `app` (Ilha and Void: lists, dashboards, anything with accounts), or
+the `website` (Astro content site: landing pages, portfolios, blogs). Name which
+one in your first prompt; the default is `app`.
 
 Building it? The agent reads Agents → [Quickstart](/agents/start-here/quickstart).
