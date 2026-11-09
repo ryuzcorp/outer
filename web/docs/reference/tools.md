@@ -164,6 +164,17 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
 
+## `request_review`
+
+- **Access:** signed in
+- **Description:** Re-crawl a held app and lift the hold when it is clean, or put a blocked deploy or suspended app in the admin review queue.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `app` | string | yes | The app slug. |
+
 ## `set_visibility`
 
 - **Access:** signed in

@@ -96,9 +96,9 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "list_collaborators" | "list_domains" | "export_code" | "list_backups" | "diff_draft"
         | "examples" => Hints::READ,
         "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
-        | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error" | "add_domain"
-        | "backup_database" | "promote_preview" | "upgrade" | "manage_billing" | "stage"
-        | "check" | "ship" | "add_example" | "set_access" => Hints::WRITE,
+        | "request_review" | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error"
+        | "add_domain" | "backup_database" | "promote_preview" | "upgrade" | "manage_billing"
+        | "stage" | "check" | "ship" | "add_example" | "set_access" => Hints::WRITE,
         // Emails an invite to an address outside Outer.
         "add_collaborator" => Hints {
             open_world: true,
@@ -245,6 +245,11 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<app_inputs::GetAppInput>(
             "get_app",
             "One app: url, role, visibility, status, its last deploy, and deletes_at when a Free app faces deletion for inactivity (absent on Pro).",
+            Account, false,
+        ),
+        tool::<app_inputs::RequestReviewInput>(
+            "request_review",
+            "Re-crawl a held app and lift the hold when it is clean, or put a blocked deploy or suspended app in the admin review queue.",
             Account, false,
         ),
         tool::<app_inputs::SetVisibilityInput>(
@@ -503,7 +508,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 62);
+        assert_eq!(tools.len(), 63);
     }
 }
 

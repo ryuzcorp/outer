@@ -49,6 +49,9 @@ const MAX_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_CRAWL_TEXT_BYTES: usize = 256 * 1024;
 /// Cap on link targets collected per page (the crawl budget caps the fetch).
 const MAX_LINKS_PER_PAGE: usize = 64;
+/// `request_review` refuses a held app crawled inside this window: the crawl
+/// that held it just ran, and a retry seconds later adds nothing.
+pub const REVIEW_COOLDOWN_MS: i64 = 120_000;
 
 /// One fetched page.
 #[derive(Debug, Clone)]
@@ -686,19 +689,22 @@ pub async fn crawl_app<F: PageFetch>(
     let pages_hash = hash_pages(&pages);
     if let Some((last_hash, last_verdict)) = last_crawl_hash(pool, &app.id).await? {
         if last_hash == pages_hash && matches!(last_verdict.as_str(), "pass" | "queue") {
-            touch_crawl(pool, &app.id, now).await?;
+            let verdict = if last_verdict == "queue" {
+                CrawlVerdict::Queue
+            } else {
+                CrawlVerdict::Pass
+            };
+            // A held app re-crawled with the pages that passed before is
+            // clean: the lift edge runs here too, never only on a fetch.
+            let effects = apply_verdict(pool, app, verdict, &[], now).await?;
             return Ok((
                 CrawlResult {
-                    verdict: if last_verdict == "queue" {
-                        CrawlVerdict::Queue
-                    } else {
-                        CrawlVerdict::Pass
-                    },
+                    verdict,
                     findings: Vec::new(),
                     pages_crawled,
                     skipped_unchanged: true,
                 },
-                CrawlEffects::default(),
+                effects,
             ));
         }
     }
@@ -836,9 +842,18 @@ async fn write_check(
 }
 
 /// Record the verdict's database effects and build the caller's side effects.
-/// State only ever moves *away* from `Ok` here: a suspended app is never
-/// downgraded to held by a later crawl, and emails fire only on the
-/// transition (repeated crawls while held stay silent).
+/// Every edge is one named transition, each CASed on its from-state, so this
+/// is the only place a crawl writes `moderation_state`:
+///
+/// | from → to | verdict | effects |
+/// | --- | --- | --- |
+/// | `ok` → `held` | Hold | purge, owner email |
+/// | `ok` → `suspended` | Suspend | stop, purge, owner email |
+/// | `held` → `ok` | Pass | purge, owner email |
+///
+/// Anything else is a no-op: a suspended app never lifts by crawl (admin
+/// only), a held app stays held on Queue/Hold/Suspend/Error, and emails fire
+/// only on a transition (repeated crawls while held stay silent).
 async fn apply_verdict(
     pool: &SqlitePool,
     app: &App,
@@ -847,10 +862,78 @@ async fn apply_verdict(
     now: i64,
 ) -> anyhow::Result<CrawlEffects> {
     touch_crawl_unless_error(pool, &app.id, verdict, now).await?;
+    let current = current_state(pool, &app.id).await?;
+    match (current, verdict) {
+        (Some(ModerationState::Held), CrawlVerdict::Pass) => hold_lift(pool, app).await,
+        (Some(ModerationState::Ok), CrawlVerdict::Hold)
+        | (Some(ModerationState::Ok), CrawlVerdict::Suspend) => {
+            escalate(pool, app, verdict, findings).await
+        }
+        _ => Ok(CrawlEffects::default()),
+    }
+}
+
+/// The `moderation_state` column as it stands now. The `App` a caller holds
+/// can predate a transition (the post-deploy hook loads it before the
+/// deploy), so every edge reads the row itself.
+async fn current_state(pool: &SqlitePool, app_id: &str) -> anyhow::Result<Option<ModerationState>> {
+    let raw: Option<String> = sqlx::query_scalar("SELECT moderation_state FROM app WHERE id = ?1")
+        .bind(app_id)
+        .fetch_optional(pool)
+        .await?;
+    match raw {
+        Some(raw) => Ok(Some(ModerationState::parse(&raw)?)),
+        None => Ok(None),
+    }
+}
+
+/// The lift edge (`held → ok`): a crawl of the held app came back clean.
+/// The CAS keeps a concurrent admin action authoritative; the edge purge
+/// drops the cached held page, and the owner gets one short mail. Suspended
+/// apps never take this edge (spec §15.2: an admin restores them).
+async fn hold_lift(pool: &SqlitePool, app: &App) -> anyhow::Result<CrawlEffects> {
+    let done = sqlx::query(
+        "UPDATE app SET moderation_state = 'ok' WHERE id = ?1 AND moderation_state = 'held'",
+    )
+    .bind(&app.id)
+    .execute(pool)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Ok(CrawlEffects::default());
+    }
+    let mut effects = CrawlEffects {
+        purge_host: true,
+        ..CrawlEffects::default()
+    };
+    let owner_email: Option<String> = sqlx::query_scalar("SELECT email FROM user WHERE id = ?1")
+        .bind(&app.owner_id)
+        .fetch_optional(pool)
+        .await?;
+    if let Some(email_to) = owner_email {
+        effects.email_to = Some(email_to);
+        effects.email_subject = Some(format!("Outer lifted the hold on {}", app.slug));
+        effects.email_body = Some(format!(
+            "Outer lifted the hold on https://{slug}.outer.now: a crawl of its rendered pages came back clean, so visitors see the app again.\n\
+             \n\
+             Keep the page that was flagged clean and the app stays up.\n",
+            slug = app.slug,
+        ));
+    }
+    Ok(effects)
+}
+
+/// The escalation edges out of `ok`: `ok → held` (Hold) and `ok →
+/// suspended` (Suspend). Both hold the CAS on `ok`, so a suspended app is
+/// never downgraded to held and a held app never turns suspended.
+async fn escalate(
+    pool: &SqlitePool,
+    app: &App,
+    verdict: CrawlVerdict,
+    findings: &[CrawlFinding],
+) -> anyhow::Result<CrawlEffects> {
     let (state, stop) = match verdict {
         CrawlVerdict::Suspend => (ModerationState::Suspended, true),
-        CrawlVerdict::Hold => (ModerationState::Held, false),
-        _ => return Ok(CrawlEffects::default()),
+        _ => (ModerationState::Held, false),
     };
     let done = sqlx::query(
         "UPDATE app SET moderation_state = ?1 WHERE id = ?2 AND moderation_state = 'ok'",
@@ -881,10 +964,10 @@ async fn apply_verdict(
                 "Outer suspended https://{slug}.outer.now because a crawl of its rendered pages flagged {what}.\n\
                  \n\
                  The app is stopped and visitors see a suspended page. Fix the cause (often a login or payment form \
-                 posting somewhere unexpected, or page text the content check flags), then deploy again: a clean \
-                 crawl after the next successful deploy lifts this automatically, or an admin can restore the app.\n\
+                 posting somewhere unexpected, or page text the content check flags). An admin reviews suspended \
+                 apps; call `request_review` to put it in the review queue, or reply to this email.\n\
                  \n\
-                 If you believe this is a mistake, reply to this email.\n",
+                 If you believe this is a mistake, reply to this email with why.\n",
                 slug = app.slug,
                 what = first.map(|f| format!("{} ({})", f.page, f.excerpt)).unwrap_or_else(|| "harmful content".to_string()),
             ),
@@ -895,8 +978,8 @@ async fn apply_verdict(
                 "Outer held https://{slug}.outer.now because a crawl of its rendered pages flagged {what}.\n\
                  \n\
                  Visitors see a \"being reviewed\" page until the hold lifts. Fix the flagged text (often \
-                 visitor-written content stored in the app's database), then deploy again: a clean crawl after \
-                 the next successful deploy lifts this automatically, or an admin can restore the app.\n\
+                 visitor-written content stored in the app's database): a clean crawl after your next \
+                 successful deploy lifts this automatically, or call `request_review` after fixing the data.\n\
                  \n\
                  If you believe this is a mistake, reply to this email.\n",
                 slug = app.slug,
@@ -1009,6 +1092,38 @@ pub async fn apply_effects(deps: &EffectDeps, app: &App, effects: &CrawlEffects)
             tracing::warn!(slug = %app.slug, error = %err.to_string(), "crawl email failed");
         }
     }
+}
+
+/// The post-deploy hook's precondition (spec §15.2): a held app never wakes
+/// for visitors, so its fleet may be asleep when the crawl runs and the
+/// loopback fetch would fail open. Wake it first, then re-read the row so the
+/// crawl sees the current state (the caller's `App` predates the deploy).
+/// `ok` apps keep today's behavior; suspended apps are not woken (a crawl
+/// never lifts a suspension).
+pub async fn prepare_deploy_crawl(
+    pool: &SqlitePool,
+    fleets: &crate::fleet::manager::FleetManager,
+    app: &App,
+) -> App {
+    let current = match crate::apps::get_by_id(pool, &app.id).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return app.clone(),
+        Err(err) => {
+            tracing::warn!(slug = %app.slug, error = %format!("{err:#}"), "post-deploy crawl: app reload failed");
+            return app.clone();
+        }
+    };
+    if current.moderation_state != ModerationState::Held {
+        return current;
+    }
+    if let Err(err) = fleets.ensure_awake(pool, &current).await {
+        tracing::warn!(slug = %current.slug, error = %format!("{err:#}"), "post-deploy crawl: held app failed to wake");
+    }
+    crate::apps::get_by_id(pool, &app.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(current)
 }
 
 /// What performing a crawl's side effects needs: the mailbox, the fleet
@@ -1236,6 +1351,133 @@ mod tests {
 
     async fn load_app(pool: &SqlitePool, id: &str) -> App {
         crate::apps::get_by_id(pool, id).await.unwrap().unwrap()
+    }
+
+    async fn set_state(pool: &SqlitePool, id: &str, state: &str) {
+        sqlx::query("UPDATE app SET moderation_state = ?1 WHERE id = ?2")
+            .bind(state)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A Jev stand-in that answers everything clean.
+    async fn clean_jev() -> (crate::moderation::jev::fake::FakeJev, JevClient) {
+        let server = crate::moderation::jev::fake::FakeJev::start(std::sync::Arc::new(
+            |body: &serde_json::Value| {
+                (
+                    200,
+                    crate::moderation::jev::fake::envelope(
+                        crate::moderation::jev::fake::clear_answers(body),
+                    ),
+                )
+            },
+        ))
+        .await;
+        let mut config = crate::moderation::jev::JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = server.base_url.clone();
+        config.timeout = Duration::from_millis(500);
+        let jev = JevClient::new(config).unwrap();
+        (server, jev)
+    }
+
+    /// A Jev stand-in that flags strong profanity on every chunk.
+    async fn profane_jev() -> (crate::moderation::jev::fake::FakeJev, JevClient) {
+        let server = crate::moderation::jev::fake::FakeJev::start(std::sync::Arc::new(
+            |body: &serde_json::Value| {
+                let mut answers = serde_json::Map::new();
+                if let Some(questions) = body
+                    .pointer("/input/questions")
+                    .and_then(|q| q.as_object())
+                {
+                    for (qid, question) in questions {
+                        let kind = question.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        let is_profanity = question
+                            .get("instructions")
+                            .and_then(|q| q.as_str())
+                            .unwrap_or("")
+                            .contains("profanity");
+                        answers.insert(
+                            qid.clone(),
+                            if kind == "score" {
+                                serde_json::json!({"type": "score", "score": 0.0, "confidence": 0.9})
+                            } else if is_profanity {
+                                serde_json::json!({"type": "noul", "noul": 0.95})
+                            } else {
+                                serde_json::json!({"type": "noul", "noul": 0.01})
+                            },
+                        );
+                    }
+                }
+                (
+                    200,
+                    crate::moderation::jev::fake::envelope(serde_json::json!({
+                        "answers": answers, "usage": {},
+                    })),
+                )
+            },
+        ))
+        .await;
+        let mut config = crate::moderation::jev::JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = server.base_url.clone();
+        config.timeout = Duration::from_millis(500);
+        let jev = JevClient::new(config).unwrap();
+        (server, jev)
+    }
+
+    /// A Jev stand-in that queues (severity 2) instead of holding.
+    async fn queue_jev() -> (crate::moderation::jev::fake::FakeJev, JevClient) {
+        let server = crate::moderation::jev::fake::FakeJev::start(std::sync::Arc::new(
+            |body: &serde_json::Value| {
+                let mut answers = serde_json::Map::new();
+                if let Some(questions) = body
+                    .pointer("/input/questions")
+                    .and_then(|q| q.as_object())
+                {
+                    for (qid, question) in questions {
+                        let kind = question.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        let score = if qid.ends_with("_severity") {
+                            2.0
+                        } else {
+                            0.0
+                        };
+                        answers.insert(
+                            qid.clone(),
+                            if kind == "score" {
+                                serde_json::json!({"type": "score", "score": score, "confidence": 0.9})
+                            } else {
+                                serde_json::json!({"type": "noul", "noul": 0.01})
+                            },
+                        );
+                    }
+                }
+                (
+                    200,
+                    crate::moderation::jev::fake::envelope(serde_json::json!({
+                        "answers": answers, "usage": {},
+                    })),
+                )
+            },
+        ))
+        .await;
+        let mut config = crate::moderation::jev::JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = server.base_url.clone();
+        config.timeout = Duration::from_millis(500);
+        let jev = JevClient::new(config).unwrap();
+        (server, jev)
     }
 
     fn page_url() -> url::Url {
@@ -1497,10 +1739,175 @@ mod tests {
         assert_eq!(result.pages_crawled, 2, "same-origin links are followed");
         assert!(effects.email_to.is_none());
         assert!(!effects.stop_fleet);
+        assert!(!effects.purge_host, "an ok app's pass changes nothing");
         assert_eq!(
             load_app(&pool, "a").await.moderation_state,
             ModerationState::Ok
         );
+    }
+
+    /// The lift edge (spec §15.2): a clean crawl of a held app puts it back
+    /// to `ok`, purges the edge (the held page is cached) and mails the
+    /// owner once.
+    #[tokio::test]
+    async fn held_app_lifts_on_a_clean_crawl() {
+        let (_dir, pool) = test_pool().await;
+        insert_app(&pool, "a", "shop").await;
+        set_state(&pool, "a", "held").await;
+        let (_server, jev) = clean_jev().await;
+        let mut pages = HashMap::new();
+        pages.insert(
+            "/".to_string(),
+            MapFetch::page("/", "<h1>Grocery list</h1>"),
+        );
+        let app = load_app(&pool, "a").await;
+        let (result, effects) = crawl_app(
+            &pool,
+            &app,
+            &MapFetch { pages },
+            Some(&jev),
+            &test_cfg(),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.verdict, CrawlVerdict::Pass);
+        assert_eq!(
+            load_app(&pool, "a").await.moderation_state,
+            ModerationState::Ok
+        );
+        assert!(effects.purge_host, "the cached held page is purged");
+        assert!(!effects.stop_fleet);
+        assert_eq!(effects.email_to.as_deref(), Some("owner@example.com"));
+        assert_eq!(
+            effects.email_subject.as_deref(),
+            Some("Outer lifted the hold on shop")
+        );
+        assert!(
+            effects
+                .email_body
+                .as_deref()
+                .unwrap()
+                .contains("lifted the hold"),
+            "{:?}",
+            effects.email_body
+        );
+    }
+
+    /// Only `Pass` lifts: queue, hold and a failed crawl keep the app held
+    /// and stay silent (no repeat email on every sweep).
+    #[tokio::test]
+    async fn held_app_stays_held_on_queue_hold_and_error() {
+        let (_dir, pool) = test_pool().await;
+        insert_app(&pool, "hold", "shop-hold").await;
+        insert_app(&pool, "queue", "shop-queue").await;
+        insert_app(&pool, "error", "shop-error").await;
+        for id in ["hold", "queue", "error"] {
+            set_state(&pool, id, "held").await;
+        }
+        // Hold: profanity on the rendered page.
+        let (_profane, profane) = profane_jev().await;
+        let mut pages = HashMap::new();
+        pages.insert(
+            "/".to_string(),
+            MapFetch::page("/", "<h1>Guestbook</h1><p>this list is fucking awesome</p>"),
+        );
+        let app = load_app(&pool, "hold").await;
+        let (result, effects) = crawl_app(
+            &pool,
+            &app,
+            &MapFetch {
+                pages: pages.clone(),
+            },
+            Some(&profane),
+            &test_cfg(),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.verdict, CrawlVerdict::Hold);
+        assert!(effects.email_to.is_none(), "no repeat hold email");
+        assert!(!effects.purge_host);
+        assert_eq!(
+            load_app(&pool, "hold").await.moderation_state,
+            ModerationState::Held
+        );
+        // Queue: severity 2 only.
+        let (_queue, queue) = queue_jev().await;
+        let app = load_app(&pool, "queue").await;
+        let (result, effects) = crawl_app(
+            &pool,
+            &app,
+            &MapFetch {
+                pages: pages.clone(),
+            },
+            Some(&queue),
+            &test_cfg(),
+            2_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.verdict, CrawlVerdict::Queue);
+        assert!(effects.email_to.is_none());
+        assert!(!effects.purge_host);
+        assert_eq!(
+            load_app(&pool, "queue").await.moderation_state,
+            ModerationState::Held
+        );
+        // Error: fail open on a clean page without a Jev client.
+        let app = load_app(&pool, "error").await;
+        let (result, effects) = crawl_app(
+            &pool,
+            &app,
+            &MapFetch {
+                pages: pages.clone(),
+            },
+            None,
+            &test_cfg(),
+            3_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.verdict, CrawlVerdict::Error);
+        assert!(effects.email_to.is_none());
+        assert!(!effects.purge_host);
+        assert_eq!(
+            load_app(&pool, "error").await.moderation_state,
+            ModerationState::Held
+        );
+    }
+
+    /// Suspended never auto-lifts (spec §15.2: admin only), even on a clean
+    /// crawl.
+    #[tokio::test]
+    async fn suspended_app_never_lifts_by_crawl() {
+        let (_dir, pool) = test_pool().await;
+        insert_app(&pool, "a", "shop").await;
+        set_state(&pool, "a", "suspended").await;
+        let (_server, jev) = clean_jev().await;
+        let mut pages = HashMap::new();
+        pages.insert(
+            "/".to_string(),
+            MapFetch::page("/", "<h1>Grocery list</h1>"),
+        );
+        let app = load_app(&pool, "a").await;
+        let (result, effects) = crawl_app(
+            &pool,
+            &app,
+            &MapFetch { pages },
+            Some(&jev),
+            &test_cfg(),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.verdict, CrawlVerdict::Pass);
+        assert_eq!(
+            load_app(&pool, "a").await.moderation_state,
+            ModerationState::Suspended
+        );
+        assert!(effects.email_to.is_none());
+        assert!(!effects.purge_host);
     }
 
     #[tokio::test]
