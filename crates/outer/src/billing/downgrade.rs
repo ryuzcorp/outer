@@ -14,8 +14,8 @@
 //! account. The visitor gate (`access_mode`) is deliberately untouched:
 //! removing it would expose a private app, so a gated app stays gated and
 //! the owner can only turn it off, never set a new one. Re-upgrading
-//! cancels a pending purge (the stamps clear) but restarts nothing: stopped
-//! apps stay stopped until the owner wakes one.
+//! cancels a pending purge (the stamps clear) and restarts the apps the
+//! downgrade stopped; apps an operator stopped (a ban) stay stopped.
 
 use sqlx::SqlitePool;
 
@@ -41,7 +41,10 @@ pub const DOWNGRADE_PURGE_AFTER_SECS: i64 = 30 * 24 * 3600;
 /// (spec §7.7: a downgrade deletes the custom hostname) and public apps go
 /// back to unlisted (public is Pro-only, so a stored `public` on a Free
 /// account must not survive). Same shared paths as the tools: SaaS delete
-/// best-effort, rows dropped, edge caches purged.
+/// best-effort, rows dropped, edge caches purged. Every app host is purged
+/// too: a downgrade stops all but the two oldest, and the edge may still
+/// hold the stopped apps' cached content even though the stopped page is
+/// `no-store`.
 pub async fn strip_pro_extras(
     pool: &SqlitePool,
     cf: Option<&CustomHostnames>,
@@ -67,8 +70,8 @@ pub async fn strip_pro_extras(
             // `unlisted` is never gated, so the plan argument is inert;
             // this is the same function the MCP tool and console call.
             set_visibility(pool, &app.id, Visibility::Unlisted, "free").await?;
-            purge_host_cache(purge, &format!("{}.{}", app.slug, apps_domain)).await;
         }
+        purge_host_cache(purge, &format!("{}.{}", app.slug, apps_domain)).await;
     }
     Ok(())
 }

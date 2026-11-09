@@ -737,25 +737,24 @@ pub async fn restore_binding(
 // Sweep
 // ---------------------------------------------------------------------------
 
-/// Apps that may need a backup: serving apps (`desired_state` running,
-/// moderation ok, neither paused nor expired) with a request or a
+/// Apps that may need a backup: serving apps
+/// ([`crate::apps::serving::SERVING_SQL`]) with a request or a
 /// successful deploy in the last 24 h. Sleeping apps with no recent
 /// activity keep sleeping — their D1 cannot have changed since the last
 /// backup, and waking them nightly would defeat the sleep they earned.
 pub async fn backup_due_apps(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<Vec<App>> {
     let cutoff = now_ms.saturating_sub(BACKUP_EVERY_MS);
-    let ids: Vec<String> = sqlx::query_scalar(
+    let ids: Vec<String> = sqlx::query_scalar(concat!(
         "SELECT a.id FROM app AS a \
-         WHERE a.desired_state = 'running' \
-           AND a.moderation_state = 'ok' \
-           AND a.paused_reason IS NULL \
-           AND a.expired_at IS NULL \
+         WHERE ",
+        crate::apps::serving::serving_sql!(),
+        " \
            AND (a.last_request_at >= ?1 \
                 OR EXISTS (SELECT 1 FROM deploy AS d \
                             WHERE d.app_id = a.id \
                               AND d.status = 'success' \
                               AND d.created_at >= ?1))",
-    )
+    ))
     .bind(cutoff)
     .fetch_all(pool)
     .await?;

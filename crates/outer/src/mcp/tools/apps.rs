@@ -421,6 +421,9 @@ pub(crate) fn app_status(app: &App, last_status: Option<&str>) -> &'static str {
     if app.expired_at.is_some() {
         return "expired";
     }
+    if app.desired_state == crate::apps::serving::DesiredState::Stopped {
+        return "stopped";
+    }
     if app.asleep_since.is_some() {
         return "sleeping";
     }
@@ -831,10 +834,55 @@ pub async fn rename_app(input: RenameAppInput, ctx: &Ctx<'_>) -> Result<Value, T
 
 #[cfg(test)]
 mod tests {
-    use super::seed_deploy_lead;
+    use super::{app_status, seed_deploy_lead};
     use serde_json::json;
 
     const URL: &str = "https://shop.outer.test";
+
+    fn app() -> crate::apps::App {
+        crate::apps::App {
+            id: "app1".to_string(),
+            slug: "shop".to_string(),
+            owner_id: "a1".to_string(),
+            name: None,
+            uid: 10001,
+            port: 18001,
+            internal_port: 18002,
+            visibility: crate::apps::Visibility::Unlisted,
+            moderation_state: crate::apps::ModerationState::Ok,
+            desired_state: crate::apps::serving::DesiredState::Running,
+            paused_reason: None,
+            asleep_since: None,
+            last_request_at: None,
+            last_deploy_sha: Some("a".repeat(40)),
+            last_activity_at: 0,
+            expired_at: None,
+            downgraded_stopped_at: None,
+            created_at: 0,
+            always_on: false,
+            access_mode: crate::access::AccessMode::Open,
+            access_hash: None,
+            access_version: 0,
+            preview_sha: None,
+            preview_updated_at: None,
+            preview_port: None,
+            preview_internal_port: None,
+        }
+    }
+
+    /// A stopped app reads `stopped` (never `sleeping`, whatever its fleet
+    /// state), and an expired app still wins.
+    #[test]
+    fn a_stopped_app_reports_stopped_before_sleeping() {
+        let mut app = app();
+        assert_eq!(app_status(&app, Some("success")), "running");
+        app.asleep_since = Some(1);
+        assert_eq!(app_status(&app, None), "sleeping");
+        app.desired_state = crate::apps::serving::DesiredState::Stopped;
+        assert_eq!(app_status(&app, Some("success")), "stopped");
+        app.expired_at = Some(1);
+        assert_eq!(app_status(&app, Some("success")), "expired");
+    }
 
     #[test]
     fn only_a_successful_seed_deploy_is_reported_live() {

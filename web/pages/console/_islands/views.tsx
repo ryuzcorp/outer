@@ -169,7 +169,7 @@ function statusBadge(status: string): string {
   if (status === "failed" || status === "error" || status === "blocked") {
     return "badge-error";
   }
-  if (status === "expired") {
+  if (status === "expired" || status === "stopped") {
     return "badge-warning";
   }
   if (status === "sleeping") {

@@ -14,6 +14,7 @@ pub mod delete;
 pub mod domains;
 pub(crate) mod local;
 pub mod rename;
+pub mod serving;
 mod slug;
 pub use slug::{
     brand_hit, brand_in_text, check_slug_profanity, validate_slug, ProfanityError, SlugError,
@@ -202,6 +203,11 @@ pub struct App {
     /// fleet stays stopped. Flipped by the crawl engine, cleared by an
     /// admin restore/allow.
     pub moderation_state: ModerationState,
+    /// Whether the app is meant to run (spec §3): a downgrade past the Free
+    /// app cap or an account ban stops it, and the proxy serves the stopped
+    /// page while no sweep wakes its fleet. Cleared back to `running` by a
+    /// re-upgrade only for the downgrade's own stops.
+    pub desired_state: serving::DesiredState,
     /// Quota pause message (spec §4.2 `/.outer/*` pages): when set the proxy
     /// serves the paused page instead of the app.
     pub paused_reason: Option<String>,
@@ -292,7 +298,7 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visibility, \
-    moderation_state, paused_reason, \
+    moderation_state, desired_state, paused_reason, \
     asleep_since, last_request_at, last_deploy_sha, last_activity_at, expired_at, \
     downgraded_stopped_at, created_at, always_on, access_mode, access_hash, access_version, \
     preview_sha, preview_updated_at, \
@@ -309,6 +315,7 @@ struct AppRow {
     internal_port: Option<i64>,
     visibility: String,
     moderation_state: String,
+    desired_state: String,
     paused_reason: Option<String>,
     asleep_since: Option<i64>,
     last_request_at: Option<i64>,
@@ -333,6 +340,7 @@ impl AppRow {
         let internal_port = self.internal_port.context("app row has no internal_port")?;
         let visibility = Visibility::parse(&self.visibility)?;
         let moderation_state = ModerationState::parse(&self.moderation_state)?;
+        let desired_state = serving::DesiredState::parse(&self.desired_state)?;
         Ok(App {
             id: self.id,
             slug: self.slug,
@@ -343,6 +351,7 @@ impl AppRow {
             internal_port: u16::try_from(internal_port).context("internal_port out of range")?,
             visibility,
             moderation_state,
+            desired_state,
             paused_reason: self.paused_reason,
             asleep_since: self.asleep_since,
             last_request_at: self.last_request_at,
@@ -571,6 +580,7 @@ async fn create_inner(
         internal_port: internal_port as u16,
         visibility: Visibility::Unlisted,
         moderation_state: ModerationState::Ok,
+        desired_state: serving::DesiredState::Running,
         paused_reason: None,
         asleep_since: None,
         last_request_at: None,

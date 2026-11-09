@@ -350,10 +350,8 @@ async fn api_ban(
             return tool_response(&err);
         }
     };
-    for slug in &outcome.app_slugs {
-        mcp.fleets.stop_app(slug).await;
-        purge_host_cache(mcp, slug).await;
-    }
+    // The audit row lands before any purge or fleet work can delay the
+    // response; a lost row still answers 500.
     if let Err(err) = crate::accounts::try_record_account_action(
         &mcp.pool,
         &account.id,
@@ -376,6 +374,43 @@ async fn api_ban(
             "could not record the admin action right now",
         );
     }
+    for slug in &outcome.app_slugs {
+        mcp.fleets.stop_app(slug).await;
+    }
+    // The stopped page is `no-store`, but the edge may still serve cached
+    // app content: purge every app host and custom hostname the banned
+    // owner's apps carried. Best-effort and detached, so a slow Cloudflare
+    // call never delays or cancels the answer.
+    let purge_cfg = mcp.delete_cfg.cache_purge.clone();
+    let apps_domain = mcp.delete_cfg.apps_domain.clone();
+    let pool = mcp.pool.clone();
+    let user_id = outcome.user_id.clone();
+    let app_slugs = outcome.app_slugs.clone();
+    tokio::spawn(async move {
+        for slug in &app_slugs {
+            let host = format!("{}.{}", slug, apps_domain);
+            crate::cloudflare::purge_host_cache(purge_cfg.as_ref(), &host).await;
+        }
+        let domains: Result<Vec<(String,)>, _> = sqlx::query_as(
+            "SELECT d.hostname FROM app_domain AS d JOIN app AS a ON a.id = d.app_id \
+             WHERE a.owner_id = ?1",
+        )
+        .bind(&user_id)
+        .fetch_all(&pool)
+        .await;
+        match domains {
+            Ok(domains) => {
+                for (hostname,) in domains {
+                    crate::cloudflare::purge_host_cache(purge_cfg.as_ref(), &hostname).await;
+                }
+            }
+            Err(err) => tracing::warn!(
+                user = %user_id,
+                error = %format!("{err:#}"),
+                "admin ban: custom hostname lookup for the cache purge failed"
+            ),
+        }
+    });
     ok_json(json!({
         "banned": true,
         "email": outcome.email,

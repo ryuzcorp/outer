@@ -929,23 +929,24 @@ async fn touch_crawl_unless_error(
 /// Apps due for a crawl at `now`: never crawled since the last deploy
 /// (`last_crawl_at IS NULL`), past their visibility's re-crawl cadence while
 /// awake, or carrying an unreviewed abuse report newer than the last crawl.
-/// Only running, awake, live, unpaused, unexpired, `ok` apps — never a held
-/// or suspended app, and never anything asleep (the crawl must not wake).
+/// Only serving, awake, live, deployed apps — never a stopped, held or
+/// suspended app, and never anything asleep (the crawl must not wake).
 pub async fn due_apps(pool: &SqlitePool, cfg: &CrawlConfig, now: i64) -> anyhow::Result<Vec<App>> {
     let public_due = now.saturating_sub(cfg.public_interval.as_millis() as i64);
     let unlisted_due = now.saturating_sub(cfg.unlisted_interval.as_millis() as i64);
-    let ids: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM app WHERE desired_state = 'running' AND asleep_since IS NULL \
-         AND moderation_state = 'ok' AND paused_reason IS NULL AND expired_at IS NULL \
-         AND last_deploy_sha IS NOT NULL \
-         AND (last_crawl_at IS NULL \
-              OR (visibility = 'public' AND last_crawl_at <= ?1) \
-              OR (visibility = 'unlisted' AND last_crawl_at <= ?2) \
-              OR EXISTS (SELECT 1 FROM moderation_check c WHERE c.app_id = app.id \
+    let ids: Vec<(String,)> = sqlx::query_as(concat!(
+        "SELECT a.id FROM app AS a WHERE ",
+        crate::apps::serving::serving_sql!(),
+        " AND a.asleep_since IS NULL \
+         AND a.last_deploy_sha IS NOT NULL \
+         AND (a.last_crawl_at IS NULL \
+              OR (a.visibility = 'public' AND a.last_crawl_at <= ?1) \
+              OR (a.visibility = 'unlisted' AND a.last_crawl_at <= ?2) \
+              OR EXISTS (SELECT 1 FROM moderation_check c WHERE c.app_id = a.id \
                          AND c.stage = 'report' AND c.reviewed_by IS NULL \
-                         AND c.created_at > COALESCE(app.last_crawl_at, 0))) \
-         ORDER BY last_crawl_at ASC LIMIT ?3",
-    )
+                         AND c.created_at > COALESCE(a.last_crawl_at, 0))) \
+         ORDER BY a.last_crawl_at ASC LIMIT ?3",
+    ))
     .bind(public_due)
     .bind(unlisted_due)
     .bind(SWEEP_BATCH)
