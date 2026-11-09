@@ -363,6 +363,11 @@ pub struct BanOutcome {
 /// rows, so the ban flips the flag and parks every owned app as `stopped`.
 /// The caller stops the live fleets; restore is per-app plus clearing the
 /// flag elsewhere (no self-serve unban here).
+///
+/// A ban is an operator stop, not a plan downgrade: the update clears the
+/// downgrade stamps, so a later checkout cannot restart the apps (see
+/// `billing::set_pro`), the stopped page shows the operator text, and the
+/// day-30 retention never purges a banned owner's evidence.
 pub async fn ban_account(
     pool: &SqlitePool,
     email_or_id: &str,
@@ -397,11 +402,14 @@ pub async fn ban_account(
             .await
             .map_err(|err| ToolError::internal(format!("ban lookup failed: {err:#}")))?;
     let app_slugs: Vec<String> = slugs.into_iter().map(|(slug,)| slug).collect();
-    sqlx::query("UPDATE app SET desired_state = 'stopped' WHERE owner_id = ?1")
-        .bind(&user_id)
-        .execute(pool)
-        .await
-        .map_err(|err| ToolError::internal(format!("ban update failed: {err:#}")))?;
+    sqlx::query(
+        "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = NULL, \
+         downgrade_purge_warned_at = NULL WHERE owner_id = ?1",
+    )
+    .bind(&user_id)
+    .execute(pool)
+    .await
+    .map_err(|err| ToolError::internal(format!("ban update failed: {err:#}")))?;
     Ok(BanOutcome {
         user_id,
         email,

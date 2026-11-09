@@ -1254,6 +1254,25 @@ fn paused_page(reason: Option<&str>) -> Response {
     )
 }
 
+/// The stopped page (spec §3): 503, plain text, and the fleet never wakes.
+/// A plan stop is the owner's to undo by re-upgrading; an operator stop says
+/// nothing more than unavailable.
+fn stopped_page(cause: crate::apps::serving::StopCause) -> Response {
+    let body = match cause {
+        crate::apps::serving::StopCause::Plan => {
+            "This app is stopped because its owner's plan covers fewer apps. \
+             The owner can reactivate it from outer.now."
+        }
+        crate::apps::serving::StopCause::Operator => "This app is unavailable.",
+    };
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("cache-control", "no-store")
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 fn expired_outer_page() -> Response {
     outer_html(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1326,12 +1345,16 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             }
         },
     };
+    // The one serving rule (`apps::serving`): expired beats suspended beats
+    // held beats stopped beats paused. Read once here so the operator pages
+    // and the liveness gates below answer from the same verdict.
+    let serving = crate::apps::serving::decide(&app);
     // Inactive past its deadline (spec §7.8): the app stopped at expiry and
     // the whole host serves the `expired` page until activity during grace
     // restores it or grace lapses and the row is purged. Before every other
     // gate, so an expired app never wakes its fleet or serves a stale build.
     // `no-store`: the page must not outlive the restore on the edge.
-    if app.expired_at.is_some() {
+    if serving == crate::apps::serving::Serving::Expired {
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("cache-control", "no-store")
@@ -1342,22 +1365,22 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // Proxy-owned pages (spec §4.2, §15.2): the abuse report form and the
     // moderation state pages. They never reach the fleet — apps cannot serve
     // the `/.outer/` prefix — and they answer before the liveness gates so a
-    // report lands even while the app is still building.
+    // report lands even while the app is building, held or stopped.
     let outer = outer_suffix(req.uri().path()).map(str::to_string);
     if let Some(suffix) = outer {
         return outer_page(&state, &app, &suffix, req).await;
     }
-    // After-live moderation (spec §15.2): a held or suspended app never wakes
-    // its fleet and never serves the build. The pages are `no-store` so the
-    // edge cannot outlive an admin restore, which flips the row back to `ok`
-    // and the very next request forwards again.
-    match app.moderation_state {
-        apps::ModerationState::Suspended => return suspended_page(),
-        apps::ModerationState::Held => return held_page(),
-        apps::ModerationState::Ok => {}
-    }
-    if let Some(reason) = app.paused_reason.as_deref() {
-        return paused_page(Some(reason));
+    // After-live moderation (spec §15.2) and the owner's stops (spec §3): a
+    // held, suspended, stopped or paused app never wakes its fleet and never
+    // serves the build. The pages are `no-store` so the edge cannot outlive
+    // an admin restore or a re-upgrade, which flips the row and the very
+    // next request forwards again.
+    match serving {
+        crate::apps::serving::Serving::Suspended => return suspended_page(),
+        crate::apps::serving::Serving::Held => return held_page(),
+        crate::apps::serving::Serving::Stopped(cause) => return stopped_page(cause),
+        crate::apps::serving::Serving::Paused(reason) => return paused_page(Some(&reason)),
+        crate::apps::serving::Serving::Live | crate::apps::serving::Serving::Expired => {}
     }
     // No successful deploy yet: never forward. A first deploy uploads before
     // its migrations apply, so a fleet can be awake on unmigrated code while
@@ -4624,6 +4647,89 @@ mod tests {
         let (status, _, body) = outer_get(&state, "shop.outer.test", "/nominated").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("over quota"), "{body}");
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A downgrade-stopped app and a ban-stopped app both answer the plain,
+    /// `no-store` stopped page on every host kind and never wake the fleet;
+    /// the proxy-owned report page still lands.
+    #[tokio::test]
+    async fn stopped_pages_serve_every_host_without_waking_and_reports_still_land() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+        // A plan stop carries the downgrade stamp; a preview fleet and an
+        // active custom domain are set up to prove every host kind reaches
+        // the same gate.
+        sqlx::query(
+            "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = 1, \
+             preview_sha = ?1, preview_updated_at = 1, preview_port = ?2, \
+             preview_internal_port = ?3 WHERE id = 'app-shop'",
+        )
+        .bind("b".repeat(40))
+        .bind(i64::from(fleet.addr.port()) + 2)
+        .bind(i64::from(fleet.addr.port()) + 3)
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_domain (hostname, app_id, cf_custom_hostname_id, status, created_at) \
+             VALUES ('shop.example.com', 'app-shop', 'cf-1', 'active', 0)",
+        )
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        let plan_text = "This app is stopped because its owner's plan covers fewer apps. \
+                         The owner can reactivate it from outer.now.";
+        for host in [
+            "shop.outer.test",
+            "shop--preview.outer.test",
+            "shop.example.com",
+        ] {
+            let (status, headers, body) = outer_get(&state, host, "/nominated").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{host}");
+            assert_eq!(
+                headers.get("cache-control").and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{host}"
+            );
+            assert_eq!(
+                headers.get("content-type").and_then(|v| v.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+                "{host}"
+            );
+            assert_eq!(body, plan_text, "{host}");
+        }
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            0,
+            "a stopped app never wakes its fleet"
+        );
+        // The abuse report form still answers on a stopped app.
+        let (status, _, body) = outer_get(&state, "shop.outer.test", "/.outer/report").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Report this app"), "{body}");
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), 0);
+        // A ban stop (no downgrade stamp) says only that the app is
+        // unavailable.
+        sqlx::query("UPDATE app SET downgraded_stopped_at = NULL WHERE id = 'app-shop'")
+            .execute(&fix.pool)
+            .await
+            .unwrap();
+        let (status, headers, body) = outer_get(&state, "shop.outer.test", "/nominated").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(body, "This app is unavailable.");
         assert_eq!(fleet.hits.load(Ordering::SeqCst), 0);
     }
 

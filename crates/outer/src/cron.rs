@@ -113,20 +113,19 @@ struct DueRow {
 
 /// Apps with a schedule due at or before `now_ms + lead_ms`, earliest due
 /// time first, one entry per app. Only apps that would otherwise serve
-/// requests: `desired_state` running, `moderation_state` ok, neither paused
-/// nor expired. Deleted apps vanish through the join.
+/// requests ([`crate::apps::serving::SERVING_SQL`]): not stopped, not held,
+/// not paused, not expired. Deleted apps vanish through the join.
 pub async fn due(pool: &SqlitePool, now_ms: i64, lead_ms: i64) -> anyhow::Result<Vec<(App, i64)>> {
     let horizon = now_ms.saturating_add(lead_ms);
-    let rows: Vec<DueRow> = sqlx::query_as(
+    let rows: Vec<DueRow> = sqlx::query_as(concat!(
         "SELECT c.app_id AS app_id, c.next_at AS next_at \
          FROM app_cron AS c JOIN app AS a ON a.id = c.app_id \
          WHERE c.next_at <= ?1 \
-           AND a.desired_state = 'running' \
-           AND a.moderation_state = 'ok' \
-           AND a.paused_reason IS NULL \
-           AND a.expired_at IS NULL \
+           AND ",
+        crate::apps::serving::serving_sql!(),
+        " \
          ORDER BY c.next_at",
-    )
+    ))
     .bind(horizon)
     .fetch_all(pool)
     .await?;

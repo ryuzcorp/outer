@@ -548,8 +548,9 @@ async fn user_by_subscription(
 /// Promote to Pro with the Stripe ids attached. Upgrades take effect on the
 /// next tool call because every quota gate reads the live `user` row.
 /// Re-upgrading cancels a pending downgrade purge (the stamps clear) and
-/// any inactivity expiry (the owner is exempt while subscribed), but
-/// restarts nothing: stopped apps stay stopped until the owner wakes one.
+/// any inactivity expiry (the owner is exempt while subscribed), and
+/// restarts the apps the downgrade stopped. Apps stopped by an operator
+/// (a ban) carry no downgrade stamp and stay stopped.
 async fn set_pro(
     conn: &mut sqlx::SqliteConnection,
     account_id: &str,
@@ -567,8 +568,18 @@ async fn set_pro(
     .bind(subscription)
     .execute(&mut *conn)
     .await?;
+    // The CASE reads the pre-update row (SQLite evaluates every SET right
+    // side first), so only apps the downgrade stopped — the ones carrying
+    // its stamp — flip back to running; a ban stop carries no stamp and
+    // stays stopped. The banned check is defense in depth: a stale stamp
+    // (or a ban that raced the stamp) must never hand service back to a
+    // banned owner's app on a late checkout.
     sqlx::query(
-        "UPDATE app SET downgraded_stopped_at = NULL, \
+        "UPDATE app SET desired_state = CASE WHEN downgraded_stopped_at IS NOT NULL \
+                                     AND NOT EXISTS (SELECT 1 FROM user \
+                                                     WHERE id = ?1 AND banned = 1) \
+                                     THEN 'running' ELSE desired_state END, \
+         downgraded_stopped_at = NULL, \
          downgrade_purge_warned_at = NULL, expired_at = NULL, \
          inactivity_notices = 0 WHERE owner_id = ?1",
     )
@@ -1034,6 +1045,13 @@ async fn plan_downgrade(
         .bind(&app.id)
         .execute(&mut *conn)
         .await?;
+        // The stopped page is `no-store`, but the edge may still hold the
+        // app's cached content: purge its host (a public app's host was
+        // already queued above; keep one per host).
+        let host = format!("{}.{}", app.slug, apps_domain);
+        if !pending.purges.contains(&host) {
+            pending.purges.push(host);
+        }
         stopped.push(app.slug.clone());
     }
     Ok(stopped)
@@ -2351,7 +2369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reupgrade_cancels_the_pending_purge() {
+    async fn reupgrade_cancels_the_pending_purge_and_restarts_the_stopped_app() {
         let dir = tempfile::tempdir().unwrap();
         let pool = crate::db::open(&dir.path().join("reupgrade.sqlite"))
             .await
@@ -2367,8 +2385,13 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Resubscribe: the stamps clear and the retention pass stays quiet,
-        // but the app is not restarted.
+        // A ban stops an app with no downgrade stamp: an operator stop.
+        sqlx::query("UPDATE app SET desired_state = 'stopped' WHERE id = 'app3'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Resubscribe: the stamps clear, the downgrade's stop restarts, and
+        // the retention pass stays quiet.
         let object = serde_json::json!({
             "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
             "customer_email": "a@example.com",
@@ -2395,8 +2418,155 @@ mod tests {
         assert_eq!((warned, purged), (0, 0));
         assert_eq!(
             app_state_of(&pool, "app2").await.0,
+            "running",
+            "re-upgrading restarts the app the downgrade stopped"
+        );
+        assert_eq!(
+            app_state_of(&pool, "app3").await.0,
             "stopped",
-            "re-upgrading restarts nothing"
+            "a ban stop carries no downgrade stamp and stays stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn ban_after_a_downgrade_stop_survives_a_late_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("ban.sqlite"))
+            .await
+            .unwrap();
+        let billing = enabled_billing();
+        let (sender, _) = capture();
+        seed_pro_with_apps(&pool).await;
+        // The downgrade stopped `new` and stamped it for the day-30 purge.
+        sqlx::query(
+            "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = ?1, \
+             downgrade_purge_warned_at = ?1 WHERE id = 'app2'",
+        )
+        .bind(NOW - 24 * 24 * 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The ban then parks every owned app as an operator stop: no plan
+        // stamp, nothing for the retention pass to purge.
+        crate::moderation::admin::ban_account(&pool, "a@example.com", "abuse")
+            .await
+            .unwrap();
+        assert_eq!(
+            app_state_of(&pool, "app2").await,
+            ("stopped".to_string(), "unlisted".to_string(), None, None),
+            "a ban clears the downgrade stamps"
+        );
+        // A checkout that lands after the ban (old mailed link, Stripe
+        // retry) must not hand service back.
+        let object = serde_json::json!({
+            "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
+            "customer_email": "a@example.com",
+        });
+        apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_late",
+            "checkout.session.completed",
+            object,
+        )
+        .await;
+        assert_eq!(
+            app_state_of(&pool, "app2").await.0,
+            "stopped",
+            "the ban outranks the checkout"
+        );
+        let app = crate::apps::get_by_id(&pool, "app2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::apps::serving::decide(&app),
+            crate::apps::serving::Serving::Stopped(crate::apps::serving::StopCause::Operator)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_banned_owner_stays_stopped_even_with_a_downgrade_stamp() {
+        let pool = pool().await;
+        let billing = enabled_billing();
+        let (sender, _) = capture();
+        seed_pro_with_apps(&pool).await;
+        sqlx::query(
+            "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = ?1 WHERE id = 'app2'",
+        )
+        .bind(NOW - 24 * 24 * 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Defense in depth: a stamp that survives a ban (a raced write) must
+        // not let `set_pro` restart the app.
+        sqlx::query("UPDATE user SET banned = 1 WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let object = serde_json::json!({
+            "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
+            "customer_email": "a@example.com",
+        });
+        apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_banned",
+            "checkout.session.completed",
+            object,
+        )
+        .await;
+        assert_eq!(app_state_of(&pool, "app2").await.0, "stopped");
+        let app = crate::apps::get_by_id(&pool, "app2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::apps::serving::decide(&app),
+            crate::apps::serving::Serving::Stopped(crate::apps::serving::StopCause::Operator)
+        );
+    }
+
+    #[tokio::test]
+    async fn downgrade_purges_the_stopped_apps_host() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_pro_with_apps(&pool).await;
+        let fake = crate::cloudflare::fake::FakePurge::start().await;
+        let purge = crate::cloudflare::CachePurge::new("zone-1".to_string(), "token-1".to_string())
+            .with_api_base(fake.base_url.clone());
+        let ctx = WebhookCtx {
+            pool: &pool,
+            sender: &sender,
+            billing: &billing,
+            saas: None,
+            purge: Some(purge),
+            apps_domain: "outer.now".to_string(),
+            egress: crate::fleet::egress::EgressFirewall::disabled(),
+        };
+        let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "canceled"});
+        let outcome = apply_event(
+            &ctx,
+            "evt_purge",
+            "customer.subscription.deleted",
+            &object,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { stopped, .. } if stopped == vec!["newer".to_string()])
+        );
+        // The stopped app's host is purged even though it is unlisted and
+        // has no custom hostname.
+        assert_eq!(fake.wait_for(1, std::time::Duration::from_secs(5)).await, 1);
+        let requests = fake.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].body,
+            serde_json::json!({"hosts": ["newer.outer.now"]})
         );
     }
 

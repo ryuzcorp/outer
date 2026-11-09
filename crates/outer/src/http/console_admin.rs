@@ -354,6 +354,29 @@ async fn api_ban(
         mcp.fleets.stop_app(slug).await;
         purge_host_cache(mcp, slug).await;
     }
+    // The stopped page is `no-store`, but the edge may still serve cached
+    // app content: purge every custom hostname the banned owner's apps
+    // carried too. Best-effort, like the app-host purges above.
+    let domains: Result<Vec<(String,)>, _> = sqlx::query_as(
+        "SELECT d.hostname FROM app_domain AS d JOIN app AS a ON a.id = d.app_id \
+         WHERE a.owner_id = ?1",
+    )
+    .bind(&outcome.user_id)
+    .fetch_all(&mcp.pool)
+    .await;
+    match domains {
+        Ok(domains) => {
+            for (hostname,) in domains {
+                crate::cloudflare::purge_host_cache(mcp.delete_cfg.cache_purge.as_ref(), &hostname)
+                    .await;
+            }
+        }
+        Err(err) => tracing::warn!(
+            user = %outcome.user_id,
+            error = %format!("{err:#}"),
+            "admin ban: custom hostname lookup for the cache purge failed"
+        ),
+    }
     if let Err(err) = crate::accounts::try_record_account_action(
         &mcp.pool,
         &account.id,

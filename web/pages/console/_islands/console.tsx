@@ -140,7 +140,7 @@ function statusBadge(status: string): string {
   if (status === "failed" || status === "error" || status === "blocked") {
     return "badge-error";
   }
-  if (status === "expired") {
+  if (status === "expired" || status === "stopped") {
     return "badge-warning";
   }
   return "badge-ghost";
@@ -161,7 +161,7 @@ function statusDot(status: string): string {
   if (status === "failed" || status === "error" || status === "blocked") {
     return "status-error";
   }
-  if (status === "expired") {
+  if (status === "expired" || status === "stopped") {
     return "status-warning";
   }
   return "status-neutral";

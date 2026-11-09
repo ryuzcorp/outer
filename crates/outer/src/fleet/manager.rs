@@ -657,8 +657,8 @@ impl FleetManager {
         Ok(awake)
     }
 
-    /// Wake stopped always-on apps (Pro owner, `desired_state` running,
-    /// moderation ok, neither paused nor expired, deployed at least once):
+    /// Wake stopped always-on apps (Pro owner, serving per
+    /// [`crate::apps::serving::SERVING_SQL`], deployed at least once):
     /// after a restart or crash nothing is tracked, and without this they
     /// would sit asleep until a request. Most-recently-active first, stopping
     /// at `always_on_max` awake — and after that many failures, so crashing
@@ -673,14 +673,15 @@ impl FleetManager {
         }
         // Eligibility mirrors cron's `due` filters: only apps that would
         // otherwise serve requests.
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        let rows: Vec<(String, String)> = sqlx::query_as(concat!(
             "SELECT a.id AS id, a.slug AS slug FROM app AS a JOIN user AS u ON u.id = a.owner_id \
              WHERE a.always_on = 1 AND u.plan = 'pro' \
-               AND a.desired_state = 'running' AND a.moderation_state = 'ok' \
-               AND a.paused_reason IS NULL AND a.expired_at IS NULL \
+               AND ",
+            crate::apps::serving::serving_sql!(),
+            " \
                AND a.last_deploy_sha IS NOT NULL \
              ORDER BY COALESCE(a.last_request_at, a.created_at) DESC",
-        )
+        ))
         .fetch_all(pool)
         .await?;
         let mut awake = self.always_on_awake(pool).await?;
