@@ -1,6 +1,6 @@
 ---
 title: Sign in
-description: OAuth for Claude, Codex, ChatGPT, Gemini and Perplexity; the /keys page for scripts, invite codes, and API keys.
+description: OAuth for Claude, Codex, ChatGPT, Gemini and Perplexity; the /keys page for scripts, review-account passwords, invite codes, and API keys.
 ---
 
 One Outer account is one email address. There are two ways in, both ending
@@ -49,3 +49,24 @@ automatic ones.
 1. Create a key at [Keys](https://outer.now/keys), or in Console → Connections & keys. It is shown once, so store it now.
 2. List keys in the Console; `list_api_keys` shows the same ids, names, and prefixes, never secrets.
 3. Revoke a key by its prefix in the Console, or with `revoke_api_key`.
+
+## Review accounts
+
+Some accounts are listed by the operator for directory review. A listed
+email signs in with a password instead of an email code: the sign-in page
+and the OAuth page both show a "Review account? Sign in with a password"
+form below the email form, and no code is ever sent to a listed address.
+The OAuth steps after sign-in are the same (terms on first use, then
+consent).
+
+Operators seed a review account and its demo apps with
+`outer seed demo --owner EMAIL [--url URL]`, run while the server is up. The
+email must be in `OUTER_REVIEW_LOGINS`; the command makes the account Pro,
+accepts the current terms, then signs in to the running server over MCP and
+creates two small D1-backed apps (notes and tasks), committing their pages
+and migration and waiting for each deploy. `--url` names the platform when it
+is not the configured origin; on localhost that is usually
+`--url http://outer.localhost:8080`. Running it again leaves an app alone when
+its last deploy succeeded and it still carries the demo migration, and
+recommits one whose deploy failed or lost it. Password hashes come from
+`outer hash-password`, which reads the password on standard input.

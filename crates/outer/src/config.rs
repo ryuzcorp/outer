@@ -146,6 +146,82 @@ impl Default for CrawlConfig {
     }
 }
 
+/// Most `OUTER_REVIEW_LOGINS` entries accepted (one Argon2id hash each; the
+/// list is the whole allowlist for password sign-in).
+pub const MAX_REVIEW_LOGINS: usize = 20;
+
+/// One operator-listed reviewer account (`OUTER_REVIEW_LOGINS`): the email
+/// signs in with `password_hash` (Argon2id PHC) instead of an email code.
+/// `Debug` prints only the email — the hash never reaches a log line.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReviewLogin {
+    pub email: String,
+    pub password_hash: String,
+}
+
+impl std::fmt::Debug for ReviewLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewLogin")
+            .field("email", &self.email)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Parse `OUTER_REVIEW_LOGINS`: `;`-separated `email:phc` entries (PHC holds
+/// `$` and `,`, so `;` is the separator). Problems name the variable and the
+/// entry index and never echo the value.
+fn parse_review_logins(raw: &str, problems: &mut Vec<String>) -> Vec<ReviewLogin> {
+    let mut logins: Vec<ReviewLogin> = Vec::new();
+    for (position, entry) in raw
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .enumerate()
+    {
+        let index = position + 1;
+        if index > MAX_REVIEW_LOGINS {
+            problems.push(format!(
+                "OUTER_REVIEW_LOGINS lists more than {MAX_REVIEW_LOGINS} review accounts"
+            ));
+            break;
+        }
+        let Some((email, hash)) = entry.split_once(':') else {
+            problems.push(format!(
+                "OUTER_REVIEW_LOGINS entry {index}: expected email:phc separated by ':'"
+            ));
+            continue;
+        };
+        let email = email.trim().to_ascii_lowercase();
+        if !crate::auth::valid_email(&email) {
+            problems.push(format!(
+                "OUTER_REVIEW_LOGINS entry {index}: the part before ':' is not an email address"
+            ));
+            continue;
+        }
+        if logins.iter().any(|login| login.email == email) {
+            problems.push(format!(
+                "OUTER_REVIEW_LOGINS entry {index}: an earlier entry already lists this email"
+            ));
+            continue;
+        }
+        match argon2::password_hash::PasswordHash::new(hash.trim()) {
+            Ok(parsed) if parsed.algorithm.as_str() != "argon2id" || parsed.hash.is_none() => {
+                problems.push(format!(
+                    "OUTER_REVIEW_LOGINS entry {index}: the password hash must be an argon2id PHC string"
+                ));
+            }
+            Ok(_) => logins.push(ReviewLogin {
+                email,
+                password_hash: hash.trim().to_string(),
+            }),
+            Err(_) => problems.push(format!(
+                "OUTER_REVIEW_LOGINS entry {index}: the password hash is not a PHC string"
+            )),
+        }
+    }
+    logins
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -162,6 +238,7 @@ impl std::fmt::Debug for Config {
             .field("signup_open", &self.signup_open)
             .field("ai_gateway", &self.ai_gateway)
             .field("admin_emails", &self.admin_emails)
+            .field("review_logins", &self.review_logins)
             .field("outer_secret", &"<redacted>")
             .field("oauth_access_ttl", &self.oauth_access_ttl)
             .field("oauth_refresh_ttl", &self.oauth_refresh_ttl)
@@ -202,6 +279,10 @@ pub struct Config {
     pub ai_gateway: String,
     /// `OUTER_ADMIN_EMAILS`: comma-separated, normalized to lowercase.
     pub admin_emails: Vec<String>,
+    /// `OUTER_REVIEW_LOGINS`: operator-listed review accounts that sign in
+    /// with an Argon2id password on the console and OAuth pages. Empty =
+    /// password sign-in is off.
+    pub review_logins: Vec<ReviewLogin>,
     /// `OUTER_TERMS_VERSION`: changing it re-asks every account at next sign-in.
     pub terms_version: String,
     /// `OUTER_SECRET`: HMAC and AES key derivation. A dev value is refused
@@ -432,6 +513,9 @@ impl Config {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let review_logins = get("OUTER_REVIEW_LOGINS")
+            .map(|raw| parse_review_logins(raw, &mut problems))
+            .unwrap_or_default();
         let terms_version = get("OUTER_TERMS_VERSION").map(str::to_string);
         let outer_secret = get("OUTER_SECRET").unwrap_or("dev").to_string();
         let email_from = get("OUTER_EMAIL_FROM")
@@ -615,6 +699,7 @@ impl Config {
             signup_open,
             ai_gateway,
             admin_emails,
+            review_logins,
             terms_version: terms_version.unwrap_or_else(|| "dev".to_string()),
             outer_secret,
             email_from,
@@ -1583,5 +1668,77 @@ mod tests {
             err.iter().any(|p| p.contains("OUTER_INACTIVE_GRACE_DAYS")),
             "{err:?}"
         );
+    }
+
+    /// Valid Argon2id PHC strings (default params); the hash bytes are fixed
+    /// filler because parsing and the algorithm are what config checks.
+    const PHC_A: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const PHC_B: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQy$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    #[test]
+    fn review_logins_parse_normalized_and_never_print_the_hash() {
+        let raw = format!(" Review@Example.com:{PHC_A} ; second@example.com:{PHC_B};");
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_REVIEW_LOGINS", &raw),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.review_logins.len(), 2);
+        assert_eq!(cfg.review_logins[0].email, "review@example.com");
+        assert_eq!(cfg.review_logins[0].password_hash, PHC_A);
+        assert_eq!(cfg.review_logins[1].email, "second@example.com");
+        let shown = format!("{cfg:?}");
+        assert!(shown.contains("review@example.com"), "{shown}");
+        assert!(!shown.contains("$argon2"), "the hash never prints: {shown}");
+        assert!(!shown.contains(PHC_A), "{shown}");
+    }
+
+    #[test]
+    fn review_logins_refuse_malformed_entries_without_echoing_values() {
+        let cases = [
+            (
+                "missing separator",
+                "review@example.com".to_string(),
+                "expected email:phc",
+            ),
+            (
+                "garbage hash",
+                "review@example.com:not-a-phc".to_string(),
+                "not a PHC string",
+            ),
+            (
+                "wrong algorithm",
+                format!(
+                    "review@example.com:{}",
+                    PHC_A.replace("argon2id", "argon2i")
+                ),
+                "argon2id",
+            ),
+            (
+                "duplicate email",
+                format!("Review@Example.com:{PHC_A};review@example.com:{PHC_B}"),
+                "entry 2",
+            ),
+        ];
+        for (label, raw, needle) in cases {
+            let err = Config::from_vars(&vars(&[
+                ("OUTER_STORE", "memory"),
+                ("OUTER_REVIEW_LOGINS", raw.as_str()),
+            ]))
+            .unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains("OUTER_REVIEW_LOGINS") && p.contains(needle)),
+                "{label}: {err:?}"
+            );
+            for problem in &err {
+                assert!(
+                    !problem.contains("$argon2"),
+                    "{label} echoed a hash: {problem}"
+                );
+            }
+        }
     }
 }
