@@ -359,11 +359,13 @@ mod tests {
         let name = "あ".repeat(100);
         let (status, _, _) = send(&router, post_key(&name, Some(&cookie), true)).await;
         assert_eq!(status, StatusCode::OK);
-        let (stored,): (String,) =
-            sqlx::query_as("SELECT name FROM apikey ORDER BY createdAt DESC LIMIT 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stored, name);
+        // The sign-in helper mints a key of its own in the same millisecond,
+        // so look the row up by name rather than by creation order.
+        let (stored,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM apikey WHERE name = ?")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 1, "the whole 100-character name is stored");
     }
 }
