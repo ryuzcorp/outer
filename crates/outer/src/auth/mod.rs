@@ -576,7 +576,7 @@ pub async fn create_api_key(
     let name = name
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(|name| if name.len() > 100 { &name[..100] } else { name }.to_string());
+        .map(|name| name.chars().take(100).collect::<String>());
     let (key, prefix, key_hash) = tokens::new_api_key();
     let id = tokens::new_id();
     sqlx::query(

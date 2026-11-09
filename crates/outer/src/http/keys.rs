@@ -349,4 +349,21 @@ mod tests {
         assert!(body.contains("under 100 characters"), "got: {body}");
         assert_eq!(count().await, before, "a rejected name mints nothing");
     }
+
+    #[tokio::test]
+    async fn post_keeps_a_100_char_multibyte_name_whole() {
+        let (router, pool, config, codes) = app().await;
+        let cookie = signed_in_cookie(&pool, &config, &codes).await;
+        // 100 characters, 300 bytes: within the limit, and a byte-index
+        // truncation would split a character.
+        let name = "あ".repeat(100);
+        let (status, _, _) = send(&router, post_key(&name, Some(&cookie), true)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (stored,): (String,) =
+            sqlx::query_as("SELECT name FROM apikey ORDER BY createdAt DESC LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, name);
+    }
 }
