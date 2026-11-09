@@ -154,6 +154,7 @@ pub fn consent_page(client: &ClientDoc, scope: &str, request_id: &str, csrf: &st
                 li { "Read your apps' code, database rows, logs and live pages." }
                 li { "Create, change and deploy apps, and delete apps or your whole account." }
                 li { "Set app secrets, API keys, sharing, visitor access and custom domains." }
+                li { "See and revoke your other connections to Outer." }
                 li { "Email people you name, such as collaborator invites." }
                 @if offline {
                     li { "Stay signed in after this browser session." }

@@ -827,7 +827,9 @@ async fn register(
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_default();
     let client_id = format!("dcr_{}", hex::encode(rand::random::<[u8; 16]>()));
-    sqlx::query(
+    // A row that was never stored must not hand out a secret: the client
+    // could never authenticate with it, and the 201 would say otherwise.
+    let stored = sqlx::query(
         "INSERT INTO oauthClient (id, clientId, kind, name, host, redirectUris, verified, clientSecret, tokenEndpointAuthMethod, createdAt, updatedAt) \
          VALUES (?, ?, 'dcr', ?, ?, ?, 0, ?, ?, ?, ?)",
     )
@@ -841,8 +843,14 @@ async fn register(
     .bind(now)
     .bind(now)
     .execute(&state.pool)
-    .await
-    .ok();
+    .await;
+    if stored.is_err() {
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "the client could not be registered",
+        );
+    }
     let mut response = json!({
         "client_id": client_id,
         "redirect_uris": redirect_uris,
@@ -958,13 +966,26 @@ fn form_decode(raw: &str) -> String {
 /// so the helper's `Result` stays small; the call site renders it.
 struct ClientAuthError {
     status: StatusCode,
+    code: &'static str,
     description: &'static str,
     via_basic: bool,
 }
 
 impl ClientAuthError {
+    /// Fails closed when the client row cannot be read: treating a DB error
+    /// as "no secret stored" would downgrade a confidential client to a
+    /// public one and skip the secret check.
+    fn server() -> Self {
+        ClientAuthError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "server_error",
+            description: "the client store is unavailable",
+            via_basic: false,
+        }
+    }
+
     fn response(self) -> Response {
-        let mut response = oauth_error(self.status, "invalid_client", self.description);
+        let mut response = oauth_error(self.status, self.code, self.description);
         if self.via_basic {
             response.headers_mut().insert(
                 "www-authenticate",
@@ -990,6 +1011,7 @@ fn client_creds(
         Basic::Credentials(basic_id, basic_secret) => match form_id {
             Some(form_id) if form_id != &basic_id => Err(ClientAuthError {
                 status: StatusCode::UNAUTHORIZED,
+                code: "invalid_client",
                 description: "client_id in the body does not match the Authorization header",
                 via_basic: true,
             }),
@@ -1006,6 +1028,7 @@ fn client_creds(
         },
         Basic::Malformed if form_id.is_none() => Err(ClientAuthError {
             status: StatusCode::UNAUTHORIZED,
+            code: "invalid_client",
             description: "the Authorization header is not valid Basic credentials",
             via_basic: true,
         }),
@@ -1017,6 +1040,7 @@ fn client_creds(
             }),
             None => Err(ClientAuthError {
                 status: StatusCode::BAD_REQUEST,
+                code: "invalid_client",
                 description: "client_id is required for public clients",
                 via_basic: false,
             }),
@@ -1039,11 +1063,14 @@ async fn authenticate_client(
 ) -> Result<AuthenticatedClient, ClientAuthError> {
     let creds = client_creds(headers, form)?;
     let row: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT clientSecret, kind FROM oauthClient WHERE clientId = ?")
+        match sqlx::query_as("SELECT clientSecret, kind FROM oauthClient WHERE clientId = ?")
             .bind(&creds.client_id)
             .fetch_optional(&state.pool)
             .await
-            .unwrap_or(None);
+        {
+            Ok(row) => row,
+            Err(_) => return Err(ClientAuthError::server()),
+        };
     let stored_hash = row.as_ref().and_then(|(secret, kind)| {
         let cimd = kind.as_deref() == Some("cimd");
         (!cimd).then(|| secret.clone()).flatten()
@@ -1056,6 +1083,7 @@ async fn authenticate_client(
     };
     let unauthorized = |description: &'static str| ClientAuthError {
         status: StatusCode::UNAUTHORIZED,
+        code: "invalid_client",
         description,
         via_basic: creds.via_basic,
     };
@@ -1350,11 +1378,10 @@ async fn exchange_refresh(
         // asked for a subset. No reuse detection (D5: Gemini requires the
         // same token back on every refresh).
         let (access, access_hash) = tokens::new_access_token();
-        let Some(mut conn) = begin_immediate(state).await else {
+        let Ok(mut tx) = state.pool.begin_with("BEGIN IMMEDIATE").await else {
             return unavailable();
         };
-        if !consent_live(&mut conn, &grant_id).await {
-            rollback(&mut conn).await;
+        if !consent_live(&mut tx, &grant_id).await {
             return bad("invalid_grant", "the grant was revoked");
         }
         let slid = sqlx::query(
@@ -1364,7 +1391,7 @@ async fn exchange_refresh(
         .bind(now + refresh_ttl_ms)
         .bind(&scope)
         .bind(&hash)
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await
         .map(|done| done.rows_affected() == 1)
         .unwrap_or(false);
@@ -1383,15 +1410,13 @@ async fn exchange_refresh(
             .bind(&grant_resource)
             .bind(now + access_ttl_ms)
             .bind(now)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .is_ok();
         if !inserted {
-            rollback(&mut conn).await;
             return bad("invalid_grant", "the refresh token is no longer usable");
         }
-        if commit(&mut conn).await.is_err() {
-            rollback(&mut conn).await;
+        if tx.commit().await.is_err() {
             return unavailable();
         }
         touch_client(state, &client_id, now).await;
@@ -1419,11 +1444,10 @@ async fn exchange_refresh(
         "refresh_token": refresh,
     })
     .to_string();
-    let Some(mut conn) = begin_immediate(state).await else {
+    let Ok(mut tx) = state.pool.begin_with("BEGIN IMMEDIATE").await else {
         return unavailable();
     };
-    if !consent_live(&mut conn, &grant_id).await {
-        rollback(&mut conn).await;
+    if !consent_live(&mut tx, &grant_id).await {
         return bad("invalid_grant", "the grant was revoked");
     }
     let claimed = sqlx::query(
@@ -1434,12 +1458,14 @@ async fn exchange_refresh(
     .bind(&response)
     .bind(now + REFRESH_REUSE_GRACE_MS)
     .bind(&hash)
-    .execute(&mut *conn)
+    .execute(&mut *tx)
     .await
     .map(|done| done.rows_affected() == 1)
     .unwrap_or(false);
     if !claimed {
-        rollback(&mut conn).await;
+        // Release the write lock first: the replay lookup and the revoke
+        // use the pool, and would otherwise wait on this transaction.
+        tx.rollback().await.ok();
         // The loser of a concurrent refresh must not revoke: the winner
         // committed a replay body for exactly this case.
         if let Some(replay) = replay_after_lost_race(state, &hash, &grant_id, now).await {
@@ -1462,7 +1488,7 @@ async fn exchange_refresh(
     .bind(&grant_resource)
     .bind(now + refresh_ttl_ms)
     .bind(now)
-    .execute(&mut *conn)
+    .execute(&mut *tx)
     .await
     .is_ok()
         && sqlx::query(
@@ -1479,48 +1505,26 @@ async fn exchange_refresh(
         .bind(&grant_resource)
         .bind(now + access_ttl_ms)
         .bind(now)
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await
         .is_ok();
     if !inserted {
-        rollback(&mut conn).await;
         return unavailable();
     }
-    if commit(&mut conn).await.is_err() {
-        rollback(&mut conn).await;
+    if tx.commit().await.is_err() {
         return unavailable();
     }
     touch_client(state, &client_id, now).await;
     json_text_nostore(response)
 }
 
-/// One connection inside `BEGIN IMMEDIATE`: the write lock is taken before
-/// the first read, so a concurrent writer waits at the BEGIN instead of
-/// failing the later upgrade (`SQLITE_BUSY_SNAPSHOT`).
-async fn begin_immediate(state: &AuthState) -> Option<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
-    let mut conn = state.pool.acquire().await.ok()?;
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .ok()?;
-    Some(conn)
-}
-
-async fn commit(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>) -> Result<(), sqlx::Error> {
-    sqlx::query("COMMIT").execute(&mut **conn).await.map(|_| ())
-}
-
-async fn rollback(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>) {
-    sqlx::query("ROLLBACK").execute(&mut **conn).await.ok();
-}
-
 /// Re-checks the consent inside the write transaction: a revoke that landed
 /// first must refuse the refresh even if the token row is still there.
-async fn consent_live(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>, grant_id: &str) -> bool {
+async fn consent_live(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, grant_id: &str) -> bool {
     let live: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT revokedAt FROM oauthConsent WHERE id = ?")
             .bind(grant_id)
-            .fetch_optional(&mut **conn)
+            .fetch_optional(&mut **tx)
             .await
             .unwrap_or(None);
     live.is_some_and(|(revoked,)| revoked.is_none())

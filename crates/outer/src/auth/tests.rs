@@ -1009,6 +1009,57 @@ async fn dcr_confidential_registers_hashes_and_returns_secret() {
     );
 }
 
+/// A DCR row that cannot be stored must not answer 201 with a secret the
+/// client can never authenticate with.
+#[tokio::test]
+async fn dcr_insert_failure_is_500_and_no_secret() {
+    let flow = flow().await;
+    sqlx::query("DROP TABLE oauthClient")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send(
+        &flow.app,
+        post_json(
+            "/oauth/register",
+            &serde_json::json!({
+                "redirect_uris": ["https://app.example/cb"],
+                "token_endpoint_auth_method": "client_secret_post",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("server_error"), "{body}");
+    assert!(!body.contains("client_secret"), "{body}");
+}
+
+/// A client lookup that fails must not read as "public client": that would
+/// skip the secret check for a confidential client.
+#[tokio::test]
+async fn client_lookup_error_fails_closed() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let (client_id, secret) = confidential_client(&flow.app, redirect_uri).await;
+    sqlx::query("DROP TABLE oauthClient")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client_id),
+        ("client_secret", &secret),
+        ("code", "whatever"),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
+    ]);
+    let (status, headers, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("server_error"), "{body}");
+    assert!(!body.contains("invalid_client"), "{body}");
+    assert!(headers.get("www-authenticate").is_none(), "{body}");
+}
+
 /// Confidential clients authenticate with `client_secret_post` or Basic;
 /// a missing or wrong secret is 401 and never burns a code or a grant.
 #[tokio::test]
@@ -2932,6 +2983,7 @@ fn consent_page_never_warns_and_notes_only_self_registered_apps() {
         assert!(page.contains("delete apps or your whole account"), "{page}");
         assert!(page.contains("Set app secrets, API keys"), "{page}");
         assert!(page.contains("custom domains"), "{page}");
+        assert!(page.contains("revoke your other connections"), "{page}");
         assert!(page.contains("collaborator invites"), "{page}");
         assert!(
             page.contains("cannot change your plan or pay for anything"),
