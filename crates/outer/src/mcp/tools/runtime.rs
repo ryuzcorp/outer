@@ -258,7 +258,7 @@ pub struct ReopenErrorInput {
 /// owner-only for membership, visibility, secrets and destructive actions,
 /// while collaborators already make operational writes (`commit`,
 /// `rollback`) — triage is in that second class. The answer carries no
-/// message or frame text, so the tool stays trusted (`Hints::WRITE`):
+/// message or frame text, so the tool stays trusted (`Hints::ADDITIVE`):
 /// read the issue through `app_errors` instead.
 async fn set_issue_status(
     ctx: &Ctx<'_>,
