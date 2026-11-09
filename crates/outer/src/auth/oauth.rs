@@ -26,20 +26,28 @@ const AUTH_CODE_TTL_MS: i64 = 60_000;
 /// Registrations with no token for 30 days are pruned.
 const STALE_DCR_MS: i64 = 30 * 86_400_000;
 
+/// `/.well-known/oauth-protected-resource`: the RFC 9728 document.
+pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
+/// `/.well-known/oauth-protected-resource/mcp`: the protected-resource
+/// document at the path clients derive from the MCP resource URL.
+pub const PROTECTED_RESOURCE_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
+/// `/.well-known/oauth-authorization-server` (RFC 8414).
+pub const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-server";
+
+/// The exact `/.well-known/*` paths the auth router answers. The platform
+/// fallback uses the same list ([`super::owns_path`]): every other
+/// well-known path belongs to the site (its `/.well-known/` files).
+pub const WELL_KNOWN_PATHS: &[&str] = &[
+    PROTECTED_RESOURCE_PATH,
+    PROTECTED_RESOURCE_MCP_PATH,
+    AUTHORIZATION_SERVER_PATH,
+];
+
 pub fn router(state: AuthState) -> Router {
     Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(protected_resource),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource/mcp",
-            get(protected_resource),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(authorization_server),
-        )
+        .route(PROTECTED_RESOURCE_PATH, get(protected_resource))
+        .route(PROTECTED_RESOURCE_MCP_PATH, get(protected_resource))
+        .route(AUTHORIZATION_SERVER_PATH, get(authorization_server))
         .route("/oauth/register", post(register))
         .route("/oauth/authorize", get(authorize_get).post(authorize_post))
         .route("/oauth/token", post(token))

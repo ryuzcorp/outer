@@ -62,6 +62,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// OpenAI's app-submission domain check path: the configured token serves
+/// here verbatim, as plain text.
+const OPENAI_APPS_CHALLENGE_PATH: &str = "/.well-known/openai-apps-challenge";
+
 /// Platform-host fallback, in order: the built web site (static files
 /// from `OUTER_SITE_DIR`), then the auth router (OAuth, well-known
 /// discovery) with its own 404 for anything else.
@@ -70,11 +74,29 @@ async fn platform_fallback(State(state): State<AppState>, req: axum::extract::Re
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
     let headers = req.headers().clone();
-    // OAuth and well-known discovery belong to the auth router even when
-    // the site has no file for them: the site's 404 must not swallow them.
-    let auth_owned =
-        path == "/oauth" || path.starts_with("/oauth/") || path.starts_with("/.well-known/");
+    // OAuth and the exact well-known discovery paths belong to the auth
+    // router even when the site has no file for them: the site's 404 must
+    // not swallow them. Every other `/.well-known/*` path is the site's
+    // (Blume ships `ai-catalog.json`, `ard.json`, `agent-skills/…` there).
+    let auth_owned = crate::auth::owns_path(&path);
     if !auth_owned {
+        // OpenAI's app-submission domain check: the portal-issued token,
+        // served verbatim. Unset leaves the path to the site and its 404.
+        if path == OPENAI_APPS_CHALLENGE_PATH && (method == "GET" || method == "HEAD") {
+            if let Some(challenge) = &state.auth.config.openai_apps_challenge {
+                // HEAD answers the same headers and body length; hyper sends
+                // no body for it.
+                return (
+                    StatusCode::OK,
+                    [
+                        ("content-type", "text/plain; charset=utf-8"),
+                        ("cache-control", "no-store"),
+                    ],
+                    challenge.clone(),
+                )
+                    .into_response();
+            }
+        }
         if let Some(res) = state
             .site
             .serve_request(&method, &path, query.as_deref(), &headers)
@@ -148,6 +170,48 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// One request through the whole platform router.
+    async fn get(
+        app: &Router,
+        path: &str,
+        accept: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut req = Request::get(path);
+        if let Some(accept) = accept {
+            req = req.header(axum::http::header::ACCEPT, accept);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The platform router over a temp database and site dir, carrying an
+    /// optional OpenAI challenge token in the auth config.
+    async fn test_router(
+        dir: &std::path::Path,
+        site_root: &std::path::Path,
+        challenge: Option<&str>,
+    ) -> Router {
+        let pool = crate::db::open(&dir.join("outer.sqlite")).await.unwrap();
+        let mut auth = crate::auth::test_support::test_state(pool.clone());
+        auth.config.openai_apps_challenge = challenge.map(str::to_string);
+        router(AppState {
+            pool: pool.clone(),
+            sync: StateSync::new("test"),
+            auth: auth.clone(),
+            mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
+            site: site::SiteDir::new(site_root),
+        })
+    }
+
     #[tokio::test]
     async fn ready_reports_a_closed_database() {
         let dir = tempfile::tempdir().unwrap();
@@ -204,27 +268,6 @@ mod tests {
             mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
             site: site::SiteDir::new(site_root.path()),
         });
-        async fn get(
-            app: &Router,
-            path: &str,
-            accept: Option<&str>,
-        ) -> (StatusCode, axum::http::HeaderMap, String) {
-            let mut req = Request::get(path);
-            if let Some(accept) = accept {
-                req = req.header(axum::http::header::ACCEPT, accept);
-            }
-            let res = app
-                .clone()
-                .oneshot(req.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = res.status();
-            let headers = res.headers().clone();
-            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            (status, headers, String::from_utf8(body.to_vec()).unwrap())
-        }
 
         // Outer's own routes win and never reach the site.
         let (status, _, body) = get(&app, "/health", None).await;
@@ -257,5 +300,103 @@ mod tests {
         // Unknown non-site paths still reach the auth router.
         let (status, _, _) = get(&app, "/.well-known/oauth-authorization-server", None).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// `/.well-known/*`: only the auth router's exact discovery paths are
+    /// auth-owned; everything else is a site file, and the OpenAI challenge
+    /// token (when configured) wins over both.
+    #[tokio::test]
+    async fn well_known_is_site_except_auth_paths_and_openai_challenge() {
+        let site_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site_root.path().join(".well-known/agent-skills")).unwrap();
+        std::fs::write(
+            site_root.path().join(".well-known/ai-catalog.json"),
+            "{\"apps\":[]}",
+        )
+        .unwrap();
+        std::fs::write(
+            site_root.path().join(".well-known/agent-skills/index.json"),
+            "[]",
+        )
+        .unwrap();
+        // A site file at an auth-owned path must lose to the auth router.
+        std::fs::write(
+            site_root
+                .path()
+                .join(".well-known/oauth-authorization-server"),
+            "from-site",
+        )
+        .unwrap();
+        std::fs::write(site_root.path().join("404.html"), "<h1>Missing</h1>").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_router(dir.path(), site_root.path(), None).await;
+
+        // Blume's own well-known files are served, nested paths included.
+        let (status, headers, body) = get(&app, "/.well-known/ai-catalog.json", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(body, "{\"apps\":[]}");
+        let (status, _, body) = get(&app, "/.well-known/agent-skills/index.json", None).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "[]"));
+
+        // The auth router wins for its exact discovery paths even when the
+        // site dir holds a file with the same name.
+        let (status, headers, body) =
+            get(&app, "/.well-known/oauth-authorization-server", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert!(body.contains("\"issuer\""), "{body}");
+        let (status, _, _) = get(&app, "/.well-known/oauth-protected-resource", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Unknown well-known paths are the site's, so its 404 answers.
+        let (status, _, body) = get(&app, "/.well-known/nope", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "<h1>Missing</h1>");
+
+        // Unset challenge: no handler, so the path falls through to the
+        // site's 404 too.
+        let (status, _, _) = get(&app, "/.well-known/openai-apps-challenge", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Set: the exact token, as plain text, never cached.
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_router(
+            dir.path(),
+            site_root.path(),
+            Some("openai-apps-challenge-token-abc123"),
+        )
+        .await;
+        let (status, headers, body) = get(&app, "/.well-known/openai-apps-challenge", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(headers[axum::http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(body, "openai-apps-challenge-token-abc123");
+
+        // HEAD gets the same status and headers (hyper sends no body).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::head("/.well-known/openai-apps-challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(res.headers()[axum::http::header::CACHE_CONTROL], "no-store");
     }
 }
