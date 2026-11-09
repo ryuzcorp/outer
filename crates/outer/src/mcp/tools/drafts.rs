@@ -449,7 +449,7 @@ pub async fn check(input: CheckInput, ctx: &Ctx<'_>) -> Result<Value, ToolError>
         .ok_or_else(|| ToolError::not_found(format!("no draft for {:?}", app.slug)))?;
     // Admission runs before the work, next to the commit path's own checks:
     // a refused build spends nothing.
-    check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
+    check_build_quota(&ctx.state.pool, &ctx.state.plans_url(), &app.owner_id).await?;
     let bare = crate::git::manifest::ensure_synced(
         &ctx.state.store,
         &ctx.state.git,

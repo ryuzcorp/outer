@@ -171,10 +171,10 @@ async fn api_list(
                 .unwrap_or(None)
         }
         Err(err) => {
-            return super::console_actions::tool_response(
-                &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id)
-                    .await,
-            );
+            return super::console_actions::tool_response(&crate::mcp::tools::domains::tool_error(
+                err,
+                &state.mcp.plans_url(),
+            ));
         }
     };
     let out: Vec<serde_json::Value> = view.iter().map(domain_json).collect();
@@ -257,9 +257,10 @@ async fn api_add(
     }
     match outcome {
         Ok(view) => super::console::ok_json(json!({"domain": domain_json(&view)})),
-        Err(err) => super::console_actions::tool_response(
-            &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id).await,
-        ),
+        Err(err) => super::console_actions::tool_response(&crate::mcp::tools::domains::tool_error(
+            err,
+            &state.mcp.plans_url(),
+        )),
     }
 }
 
@@ -284,9 +285,10 @@ async fn api_refresh(
         Err(domains::DomainError::NotFound(_, _)) => {
             super::console::ok_json(json!({"domain": serde_json::Value::Null}))
         }
-        Err(err) => super::console_actions::tool_response(
-            &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id).await,
-        ),
+        Err(err) => super::console_actions::tool_response(&crate::mcp::tools::domains::tool_error(
+            err,
+            &state.mcp.plans_url(),
+        )),
     }
 }
 
@@ -328,8 +330,9 @@ async fn api_remove(
     }
     match outcome {
         Ok(hostname) => super::console::ok_json(json!({"removed": hostname})),
-        Err(err) => super::console_actions::tool_response(
-            &crate::mcp::tools::domains::tool_error(err, &state.mcp.billing, &app.owner_id).await,
-        ),
+        Err(err) => super::console_actions::tool_response(&crate::mcp::tools::domains::tool_error(
+            err,
+            &state.mcp.plans_url(),
+        )),
     }
 }

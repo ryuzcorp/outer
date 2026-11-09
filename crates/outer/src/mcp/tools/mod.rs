@@ -10,7 +10,6 @@ pub(crate) mod account;
 pub(crate) mod add_example;
 pub(crate) mod apps;
 pub(crate) mod backups;
-pub(crate) mod billing;
 pub(crate) mod code;
 pub(crate) mod collaborators;
 pub(crate) mod data;
@@ -193,16 +192,13 @@ pub fn resets_at_utc() -> String {
         .unwrap_or_default()
 }
 
-/// Attach the account's `upgrade_url` to a `payment_required` or
-/// `quota_exceeded` refusal (spec §3, §8.3): a per-account
-/// checkout-starter link when billing is live, the console plan card when
-/// it is disabled (localhost dev). Pure HMAC, no network.
-pub fn with_upgrade(
-    err: ToolError,
-    billing: &crate::billing::BillingState,
-    account_id: &str,
-) -> ToolError {
-    err.with_upgrade_url(billing.upgrade_url(account_id, chrono::Utc::now().timestamp()))
+/// Attach the informational plans page to a `payment_required` or
+/// `quota_exceeded` refusal (spec §3, §8.3). Commerce guidelines forbid a
+/// checkout link or an upgrade call to action on the MCP surface, so this
+/// is the same `/account/plans` page for every caller; it never mints a
+/// Stripe session.
+pub fn with_plans(err: ToolError, plans_url: &str) -> ToolError {
+    err.with_plans_url(plans_url)
 }
 
 /// The account's plan (`free` unless the row says `pro`).
@@ -249,11 +245,11 @@ pub struct Claim {
 /// §14.1); a commit that never happens must give the change back
 /// ([`refund_change`]), while a created commit counts even when its deploy
 /// fails or is blocked (spec §9.2).
-/// `billing` supplies the `upgrade_url` the refusal carries; the claim
-/// itself stays a pure quota check.
+/// `plans_url` is the informational plans page the refusal links to; the
+/// claim itself stays a pure quota check.
 pub async fn claim_change(
     pool: &sqlx::SqlitePool,
-    billing: &crate::billing::BillingState,
+    plans_url: &str,
     account_id: &str,
 ) -> Result<Claim, ToolError> {
     let plan = plan_of(pool, account_id).await?;
@@ -273,24 +269,46 @@ pub async fn claim_change(
     let used = changes_used_today(pool, account_id).await?;
     if rows == 0 {
         let resets_at = resets_at_utc();
-        let url = billing.upgrade_url(account_id, chrono::Utc::now().timestamp());
-        return Err(with_upgrade(
+        return Err(with_plans(
             ToolError::quota_exceeded(
                 format!("{plan} plan: {limit} code changes per day, {used} used"),
-                format!(
-                    "You've used today's {limit} code changes on your Outer {plan} plan. They reset at midnight UTC, or upgrade to Pro for {pro} a day: {url}",
-                    pro = PRO_CHANGES_PER_DAY,
+                spent_daily_quota_message(
+                    &plan,
+                    "code changes",
+                    limit,
+                    PRO_CHANGES_PER_DAY,
+                    plans_url,
                 ),
                 "code_changes_per_day",
                 limit,
                 used,
                 Some(&resets_at),
             ),
-            billing,
-            account_id,
+            plans_url,
         ));
     }
     Ok(Claim { used, limit })
+}
+
+/// The plain sentence a spent daily quota relays to the human: the limit,
+/// when it resets, and the other plan's number. No prices, no "upgrade
+/// now", no checkout link — just the informational plans page.
+fn spent_daily_quota_message(
+    plan: &str,
+    unit: &str,
+    limit: u64,
+    pro_limit: u64,
+    plans_url: &str,
+) -> String {
+    if plan == "pro" {
+        format!(
+            "You've used today's {limit} {unit} on the Pro plan; they reset at midnight UTC. Plans: {plans_url}"
+        )
+    } else {
+        format!(
+            "You've used today's {limit} {unit} on the Free plan; they reset at midnight UTC. Pro allows {pro_limit} a day — plans: {plans_url}"
+        )
+    }
 }
 
 /// Release handoff or SIGTERM drain: refuse before any quota is claimed or
@@ -326,11 +344,10 @@ pub async fn refund_change(pool: &sqlx::SqlitePool, account_id: &str) -> anyhow:
 /// §3, owner-set 2026-10-26: Free 30 min, Pro 300 min a day). The check runs
 /// before the git work, next to [`claim_change`]; a build in flight always
 /// finishes, and the pipeline charges its install+build wall time after.
-/// `billing` supplies the `upgrade_url` the refusal carries (Free only in
-/// practice: Pro names the limit and the reset).
+/// `plans_url` is the informational plans page the refusal links to.
 pub async fn check_build_quota(
     pool: &sqlx::SqlitePool,
-    billing: &crate::billing::BillingState,
+    plans_url: &str,
     account_id: &str,
 ) -> Result<(u64, u64), ToolError> {
     let plan = plan_of(pool, account_id).await?;
@@ -342,27 +359,22 @@ pub async fn check_build_quota(
     if used_ms >= limit_ms {
         let used_min = used_ms / 60_000;
         let resets_at = resets_at_utc();
-        let url = billing.upgrade_url(account_id, chrono::Utc::now().timestamp());
-        return Err(with_upgrade(
+        return Err(with_plans(
             ToolError::quota_exceeded(
                 format!("{plan} plan: {limit_min} build minutes per day, {used_min} used"),
-                if plan == "pro" {
-                    format!(
-                        "You've used today's {limit_min} build minutes. They reset at midnight UTC."
-                    )
-                } else {
-                    format!(
-                        "You've used today's {limit_min} build minutes on your Outer Free plan. They reset at midnight UTC, or upgrade to Pro for {pro} a day: {url}",
-                        pro = crate::limits::PRO_BUILD_MINUTES_PER_DAY,
-                    )
-                },
+                spent_daily_quota_message(
+                    &plan,
+                    "build minutes",
+                    limit_min,
+                    crate::limits::PRO_BUILD_MINUTES_PER_DAY,
+                    plans_url,
+                ),
                 "build_minutes_per_day",
                 limit_min,
                 used_min,
                 Some(&resets_at),
             ),
-            billing,
-            account_id,
+            plans_url,
         ));
     }
     Ok((used_ms, limit_ms))
@@ -371,10 +383,11 @@ pub async fn check_build_quota(
 /// Refuse a write when the app is frozen read-only at its storage cap
 /// (spec §3). The hourly sweep flips the flag (and emails the owner); the
 /// Console, commit and upload paths refuse while it is set. Nothing is
-/// ever deleted. `billing` supplies the `upgrade_url` the refusal carries.
+/// ever deleted. `plans_url` is the informational plans page the refusal
+/// links to.
 pub async fn check_storage_writable(
     pool: &sqlx::SqlitePool,
-    billing: &crate::billing::BillingState,
+    plans_url: &str,
     app: &crate::apps::App,
 ) -> Result<(), ToolError> {
     let row: Option<(Option<i64>, Option<String>)> =
@@ -394,22 +407,28 @@ pub async fn check_storage_writable(
         return Ok(());
     }
     let plan = plan_of(pool, &app.owner_id).await?;
-    let url = billing.upgrade_url(&app.owner_id, chrono::Utc::now().timestamp());
     let cap = crate::limits::d1_cap_bytes(&plan) + crate::limits::r2_cap_bytes(&plan);
-    Err(with_upgrade(
+    let user = if plan == "pro" {
+        format!(
+            "{} is over its storage cap ({detail}), so writes are refused until it drops back under — nothing is deleted. Free space in Console → D1 / R2. Plans: {plans_url}",
+            app.slug
+        )
+    } else {
+        format!(
+            "{} is over its storage cap on the Free plan ({detail}), so writes are refused until it drops back under — nothing is deleted. Free space in Console → D1 / R2. Pro allows bigger caps — plans: {plans_url}",
+            app.slug
+        )
+    };
+    Err(with_plans(
         ToolError::quota_exceeded(
             format!("{} storage is read-only: {detail}", app.slug),
-            format!(
-                "{} is over its storage cap on your Outer {plan} plan ({detail}), so writes are refused until it drops back under — nothing is deleted. Free space in Console → D1 / R2, or upgrade to Pro for bigger caps: {url}",
-                app.slug
-            ),
+            user,
             "storage_bytes",
             cap,
             cap,
             None,
         ),
-        billing,
-        &app.owner_id,
+        plans_url,
     ))
 }
 
@@ -454,33 +473,40 @@ pub async fn apps_owned(pool: &sqlx::SqlitePool, account_id: &str) -> Result<u64
 
 /// The human-facing text when every app slot is taken, shared by the early
 /// check and the in-lock recheck so both sides of a create race read alike.
-pub fn app_slots_message(plan: &str, limit: u64) -> String {
+/// No prices or upgrade calls: the other plan's number and the plans page.
+pub fn app_slots_message(plan: &str, limit: u64, plans_url: &str) -> String {
     let slots = if limit == 1 { "app slot" } else { "app slots" };
-    format!("You've used all {limit} {slots} on your Outer {plan} plan.")
+    if plan == "pro" {
+        format!("You've used all {limit} {slots} on the Pro plan. Plans: {plans_url}")
+    } else {
+        format!(
+            "You've used all {limit} {slots} on the Free plan. Pro allows {} — plans: {plans_url}",
+            crate::limits::PRO_APPS
+        )
+    }
 }
 
-/// Refuse `create_app` when the owner's app slots are full. `billing`
-/// supplies the `upgrade_url` the refusal carries.
+/// Refuse `create_app` when the owner's app slots are full. `plans_url` is
+/// the informational plans page the refusal links to.
 pub async fn check_app_quota(
     pool: &sqlx::SqlitePool,
-    billing: &crate::billing::BillingState,
+    plans_url: &str,
     account_id: &str,
 ) -> Result<(u64, u64), ToolError> {
     let plan = plan_of(pool, account_id).await?;
     let limit = app_limit(&plan);
     let used = apps_owned(pool, account_id).await?;
     if used >= limit {
-        return Err(with_upgrade(
+        return Err(with_plans(
             ToolError::quota_exceeded(
                 format!("{plan} plan: {limit} app(s) owned, {used} used"),
-                app_slots_message(&plan, limit),
+                app_slots_message(&plan, limit, plans_url),
                 "apps_owned",
                 limit,
                 used,
                 None,
             ),
-            billing,
-            account_id,
+            plans_url,
         ));
     }
     Ok((used, limit))
@@ -874,7 +900,7 @@ async fn run_deploy_inner(
     // between the outer check and the deploy start (commit and rollback
     // claims already count their change/rollback; a created app or commit
     // already exists when this refuses, and the error names the reset).
-    check_build_quota(&state.pool, &state.billing, &app.owner_id).await?;
+    check_build_quota(&state.pool, &state.plans_url(), &app.owner_id).await?;
     // Release handoff or SIGTERM drain: the last backstop before a deploy
     // row is written or a build is spawned, retryably. Callers that claim
     // quota check [`check_no_drain`] first, so this usually fires for
@@ -886,7 +912,7 @@ async fn run_deploy_inner(
             crate::handoff::DRAIN_RETRY_AFTER_S,
         ));
     }
-    check_storage_writable(&state.pool, &state.billing, app).await?;
+    check_storage_writable(&state.pool, &state.plans_url(), app).await?;
     let deploys = state.deploys.clone();
     let pool = state.pool.clone();
     let store = state.store.clone();
@@ -1134,12 +1160,6 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "delete_account" => account::delete_account(parse_args(args)?, ctx)
-            .await
-            .map_err(CallError::from),
-        "upgrade" => billing::upgrade(parse_args(args)?, ctx)
-            .await
-            .map_err(CallError::from),
-        "manage_billing" => billing::manage_billing(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "create_app" => apps::create_app(parse_args(args)?, ctx)

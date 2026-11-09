@@ -170,9 +170,6 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "verify_code" | "create_api_key" | "export_code" | "stage" | "check"
         | "backup_database" | "request_review" | "resolve_error" | "ignore_error"
         | "reopen_error" => Hints::ADDITIVE,
-        // Billing rows are removed on another branch; keep them classified
-        // as they are today so the two changes merge without a hint change.
-        "upgrade" | "manage_billing" => Hints::ADDITIVE,
         // One reversible flag; the same call leaves the same state.
         "set_always_on" => Hints::SETTING,
         // Overwrites a value or replaces who can reach the app: the old
@@ -293,16 +290,6 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<account::DeleteAccountInput>(
             "delete_account",
             "Delete your account: pass confirm equal to your email. Deletes your apps, signs every session out.",
-            Account, false,
-        ),
-        tool::<NoArgs>(
-            "upgrade",
-            "Upgrade to Outer Pro: returns a Checkout link for the human to open (Pro is $8/month, with a $4/month launch price while the promotion runs; tax calculated). The plan lifts on the next call after payment.",
-            Account, false,
-        ),
-        tool::<NoArgs>(
-            "manage_billing",
-            "Manage Outer Pro billing: returns the Customer Portal link to update the card or cancel. Needs an existing subscription — call upgrade first.",
             Account, false,
         ),
         tool::<app_inputs::CreateAppInput>(
@@ -522,7 +509,7 @@ pub fn registry() -> Vec<ToolDef> {
  ),
  tool::<secrets_inputs::SetSecretInput>(
  "set_secret",
- "Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names match ^[A-Z_][A-Z0-9_]{0,63}$, at most 50 per app.",
+ "Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names use uppercase letters, digits and _, at most 64 characters, and at most 50 secrets fit per app.",
  Account, false,
  ),
         tool::<secrets_inputs::UnsetSecretInput>(
@@ -581,7 +568,25 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 63);
+        assert_eq!(tools.len(), 61);
+    }
+
+    /// Commerce guidelines (owner decision D2): no tool description
+    /// advertises a price, a discount, a promotion, a checkout or a coupon.
+    /// "Pro feature" statements stay allowed.
+    #[test]
+    fn no_description_promotes_commerce() {
+        for tool in registry() {
+            let text = tool.description.to_lowercase();
+            for banned in ["$", "checkout", "discount", "launch price", "coupon"] {
+                assert!(
+                    !text.contains(banned),
+                    "{} description mentions {banned:?}: {}",
+                    tool.name,
+                    tool.description
+                );
+            }
+        }
     }
 }
 

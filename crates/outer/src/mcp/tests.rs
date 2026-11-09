@@ -139,6 +139,12 @@ fn is_error(body: &Value) -> &Value {
     &result["structuredContent"]
 }
 
+/// The informational plans page refusals link to, built the way the state
+/// builds it.
+fn plans_url(state: &McpState) -> String {
+    state.plans_url()
+}
+
 /// An account plus a usable API key, bypassing email.
 async fn api_key_for(state: &McpState, email: &str) -> String {
     let account_id = crate::apps::ensure_account(&state.pool, email)
@@ -305,10 +311,13 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 63);
+    assert_eq!(anon.len(), 61);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
     assert!(anon.contains(&"add_example".to_string()));
+    // Billing tools left the agent surface (commerce guidelines).
+    assert!(!anon.contains(&"upgrade".to_string()));
+    assert!(!anon.contains(&"manage_billing".to_string()));
 
     let token = api_key_for(&state, "ana@example.com").await;
     let (_, _, authed) = post(
@@ -323,12 +332,12 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 61);
+    assert_eq!(authed.len(), 59);
     assert!(authed.contains(&"set_access".to_string()));
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
-    assert!(authed.contains(&"upgrade".to_string()));
-    assert!(authed.contains(&"manage_billing".to_string()));
+    assert!(!authed.contains(&"upgrade".to_string()));
+    assert!(!authed.contains(&"manage_billing".to_string()));
 
     // The test admin sees the same rows: M1 has no admin tools.
     let admin = api_key_for(&state, "owner@example.com").await;
@@ -738,10 +747,16 @@ async fn free_plan_caps_apps_at_two() {
     assert_eq!(err["error"], "quota_exceeded");
     assert_eq!(err["quota"], "apps_owned");
     assert_eq!(err["limit"], 2);
-    assert!(err["user_message"]
-        .as_str()
-        .unwrap()
-        .contains("all 2 app slots on your Outer free plan"));
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("all 2 app slots on the Free plan"), "{user}");
+    assert!(user.contains("Pro allows 20"), "{user}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
+    assert!(
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
+    );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
 
     let (_, who) = call(&state, Some(&token), "whoami", json!({})).await;
     let who = &result(&who)["structuredContent"];
@@ -957,6 +972,16 @@ async fn free_plan_caps_changes_per_day() {
     assert_eq!(err["limit"], 40);
     assert_eq!(err["used"], 40);
     assert!(err["resets_at"].as_str().unwrap().ends_with('Z'));
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("40 code changes on the Free plan"), "{user}");
+    assert!(user.contains("Pro allows 1000 a day"), "{user}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
+    assert!(
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
+    );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
 }
 
 #[tokio::test]
@@ -988,10 +1013,16 @@ async fn build_minutes_cap_refuses_a_new_build() {
     assert_eq!(err["limit"], 30);
     assert_eq!(err["used"], 30);
     assert!(err["resets_at"].as_str().unwrap().ends_with('Z'));
-    assert!(err["user_message"]
-        .as_str()
-        .unwrap()
-        .contains("upgrade to Pro"));
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("Free plan"), "{user}");
+    assert!(user.contains("Pro allows 300 a day"), "{user}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
+    assert!(
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
+    );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
     let changes: i64 = sqlx::query_scalar("SELECT code_changes FROM usage_day WHERE userId = ?1")
         .bind(&account_id)
         .fetch_one(&state.pool)
@@ -1031,10 +1062,15 @@ async fn frozen_storage_refuses_commit_until_back_under_cap() {
         err["message"].as_str().unwrap().contains("read-only"),
         "{err}"
     );
-    assert!(err["user_message"]
-        .as_str()
-        .unwrap()
-        .contains("nothing is deleted"));
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("nothing is deleted"), "{user}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
+    assert!(
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
+    );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
 }
 
 #[tokio::test]
@@ -2914,10 +2950,12 @@ async fn collaborator_invite_free_gets_one() {
     assert_eq!(err["quota"], "collaborators");
     assert_eq!(err["limit"], 1);
     assert_eq!(err["used"], 1);
-    assert!(err["user_message"]
-        .as_str()
-        .unwrap()
-        .contains("Upgrade to Pro"));
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("Pro allows"), "{user}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
+    assert!(!user.contains('$'), "{user}");
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
 
     set_plan(&state, "ana@example.com", "pro").await;
     // Pro raises the cap: the previously refused invite now lands.
@@ -3355,10 +3393,15 @@ async fn set_visibility_public_is_pro_gated() {
     .await;
     let err = is_error(&refused);
     assert_eq!(err["error"], "payment_required");
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("Pro"), "{err}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
     assert!(
-        err["user_message"].as_str().unwrap().contains("Pro"),
-        "{err}"
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
     );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
 
     let (_, unlisted) = call(
         &state,
@@ -3404,10 +3447,15 @@ async fn set_always_on_is_pro_gated() {
     .await;
     let err = is_error(&refused);
     assert_eq!(err["error"], "payment_required");
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("Pro"), "{err}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
     assert!(
-        err["user_message"].as_str().unwrap().contains("Pro"),
-        "{err}"
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
     );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
 
     let (_, off) = call(
         &state,
@@ -3453,10 +3501,15 @@ async fn set_access_is_pro_gated_and_never_echoes_the_secret() {
     .await;
     let err = is_error(&refused);
     assert_eq!(err["error"], "payment_required");
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("Pro"), "{err}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
     assert!(
-        err["user_message"].as_str().unwrap().contains("Pro"),
-        "{err}"
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
     );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
 
     // `open` is always allowed, on any plan.
     let (_, open) = call(
@@ -4207,7 +4260,15 @@ async fn add_list_remove_domain_round_trip() {
     .await;
     let err = is_error(&body);
     assert_eq!(err["error"], "payment_required");
-    assert!(err["user_message"].as_str().unwrap().contains("Outer Pro"));
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("Custom domains are a Pro feature"), "{user}");
+    assert!(user.contains(&plans_url(&state)), "{user}");
+    assert!(
+        !user.contains('$') && !user.to_lowercase().contains("checkout"),
+        "{user}"
+    );
+    assert_eq!(err["plans_url"], plans_url(&state));
+    assert!(err.get("upgrade_url").is_none(), "{err}");
     assert!(fake.calls("POST").is_empty(), "Pro gate fires first");
     // Bad hostnames are the caller's bug, before any app checks.
     let (_, body) = call(

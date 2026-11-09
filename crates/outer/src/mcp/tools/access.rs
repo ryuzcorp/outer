@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{internal, ok, owner_app, with_upgrade, Ctx};
+use super::{internal, ok, owner_app, with_plans, Ctx};
 use crate::access::AccessMode;
 use crate::mcp::error::ToolError;
 
@@ -46,7 +46,7 @@ pub async fn set_access(input: SetAccessInput, ctx: &Ctx<'_>) -> Result<Value, T
         &plan,
     )
     .await
-    .map_err(|err| access_tool_error(&app.slug, err, &ctx.state.billing, &app.owner_id))?;
+    .map_err(|err| access_tool_error(&app.slug, err, &ctx.state.plans_url()))?;
     // A real change evicts anything cached before the lock (or unlock):
     // the live host, the preview host and every active custom domain.
     if changed {
@@ -80,24 +80,22 @@ pub async fn set_access(input: SetAccessInput, ctx: &Ctx<'_>) -> Result<Value, T
 /// `isError` and the console HTTP body carry the same code and user
 /// message. Free owners get `payment_required` with a user message pointing
 /// to Pro; switching back to `open` never reaches this gate.
-/// `billing` + `owner_id` supply the `upgrade_url` the refusal carries.
+/// `plans_url` is the informational plans page the refusal links to.
 pub fn access_tool_error(
     slug: &str,
     err: crate::access::AccessError,
-    billing: &crate::billing::BillingState,
-    owner_id: &str,
+    plans_url: &str,
 ) -> ToolError {
     match err {
-        crate::access::AccessError::ProOnly => with_upgrade(
+        crate::access::AccessError::ProOnly => with_plans(
             ToolError::new(
                 "payment_required",
                 format!("{slug} is on a Free account; a visitor gate is a Pro feature"),
             )
             .with_user(format!(
-                "Visitor gates are Pro. Upgrade to Pro to gate {slug} with a PIN or password; switching back to open is always free.",
+                "Visitor gates are a Pro feature, not included on the Free plan — plans: {plans_url}. Switching back to open is always free.",
             )),
-            billing,
-            owner_id,
+            plans_url,
         ),
         crate::access::AccessError::BadSecret(message) => ToolError::invalid_argument(message),
         crate::access::AccessError::Internal(err) => internal(err),

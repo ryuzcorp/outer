@@ -82,17 +82,18 @@ impl DomainError {
         }
     }
 
-    /// The human sentence the agent relays word for word (spec §8.3).
-    /// `launch_discount_active` is the live Stripe promo state: the $4
-    /// launch price is named only while it applies.
-    pub fn user_message(&self, launch_discount_active: bool) -> String {
+    /// The human sentence the agent relays word for word (spec §8.3). Plans
+    /// are named, never priced: commerce guidelines forbid promoting an
+    /// upgrade on the agent surface.
+    pub fn user_message(&self, plans_url: &str) -> String {
         match self {
             DomainError::InvalidArgument(_)
             | DomainError::AlreadyHas(_, _)
             | DomainError::Conflict(_)
             | DomainError::NotFound(_, _) => self.to_string(),
-            DomainError::ProRequired if launch_discount_active => "Custom domains need Outer Pro ($8/month, $4 at the launch price). Upgrade in billing, then call add_domain again.".to_string(),
-            DomainError::ProRequired => "Custom domains need Outer Pro ($8/month). Upgrade in billing, then call add_domain again.".to_string(),
+            DomainError::ProRequired => format!(
+                "Custom domains are a Pro feature, not included on the Free plan — plans: {plans_url}."
+            ),
             DomainError::Unavailable(_) => self.to_string(),
             DomainError::Internal(_) => "Something broke on Outer's side; try again in a bit.".to_string(),
         }
@@ -601,24 +602,24 @@ mod tests {
         ));
         assert_eq!(err.code(), "invalid_argument");
         assert!(
-            err.user_message(false).contains("example.com"),
+            err.user_message("https://outer.now/account/plans")
+                .contains("example.com"),
             "{}",
-            err.user_message(false)
+            err.user_message("https://outer.now/account/plans")
         );
         assert!(
-            !err.user_message(false).contains("400"),
+            !err.user_message("https://outer.now/account/plans")
+                .contains("400"),
             "{}",
-            err.user_message(false)
+            err.user_message("https://outer.now/account/plans")
         );
     }
     #[test]
-    fn pro_refusal_names_the_launch_price_only_while_it_runs() {
-        assert!(DomainError::ProRequired
-            .user_message(true)
-            .contains("$4 at the launch price"),);
-        let over = DomainError::ProRequired.user_message(false);
-        assert!(over.contains("Outer Pro ($8/month)"), "{over}");
-        assert!(!over.contains("$4"), "{over}");
+    fn pro_refusal_names_the_plans_page_without_a_price() {
+        let over = DomainError::ProRequired.user_message("https://outer.now/account/plans");
+        assert!(over.contains("https://outer.now/account/plans"), "{over}");
+        assert!(!over.contains('$'), "{over}");
+        assert!(!over.to_lowercase().contains("checkout"), "{over}");
     }
 
     async fn pool() -> (tempfile::TempDir, sqlx::SqlitePool) {

@@ -228,12 +228,7 @@ async fn set_app_visibility(
     crate::apps::set_visibility(&mcp.pool, &app.id, visibility, &plan)
         .await
         .map_err(|err| {
-            crate::mcp::tools::apps::visibility_tool_error(
-                &app.slug,
-                err,
-                &mcp.billing,
-                &app.owner_id,
-            )
+            crate::mcp::tools::apps::visibility_tool_error(&app.slug, err, &mcp.plans_url())
         })?;
     // Same purge as the MCP tool: visibility changes `X-Robots-Tag` and
     // `/robots.txt`, which the edge caches for hours.
@@ -292,12 +287,7 @@ async fn set_app_access(
     let (mode, changed) = crate::access::set_access(&mcp.pool, &app.id, mode, secret, &plan)
         .await
         .map_err(|err| {
-            crate::mcp::tools::access::access_tool_error(
-                &app.slug,
-                err,
-                &mcp.billing,
-                &app.owner_id,
-            )
+            crate::mcp::tools::access::access_tool_error(&app.slug, err, &mcp.plans_url())
         })?;
     // Same purge as the MCP tool: a real change evicts anything cached
     // before the lock (or unlock) on every host serving the app.
@@ -357,12 +347,7 @@ async fn set_app_always_on(
     crate::apps::always_on::set_always_on(&mcp.pool, &app.id, on, &plan)
         .await
         .map_err(|err| {
-            crate::mcp::tools::apps::always_on_tool_error(
-                &app.slug,
-                err,
-                &mcp.billing,
-                &app.owner_id,
-            )
+            crate::mcp::tools::apps::always_on_tool_error(&app.slug, err, &mcp.plans_url())
         })?;
     Ok(json!({"always_on": on}))
 }
@@ -821,7 +806,7 @@ async fn api_rename(
     }
     // Quota follows the app owner, never the admin acting on their behalf.
     let billing = super::console::billing_id(&account, &app, admin);
-    if let Err(err) = claim_change(&mcp.pool, &mcp.billing, billing).await {
+    if let Err(err) = claim_change(&mcp.pool, &mcp.plans_url(), billing).await {
         let _ = audit(
             &summary_for(&slug, &new_slug),
             "error",
@@ -837,7 +822,7 @@ async fn api_rename(
     // change is refunded). The inner `run_deploy` gate backstops the quota
     // spent after this check.
     if let Err(err) =
-        crate::mcp::tools::check_build_quota(&mcp.pool, &mcp.billing, &account.id).await
+        crate::mcp::tools::check_build_quota(&mcp.pool, &mcp.plans_url(), &account.id).await
     {
         let _ = refund_change(&mcp.pool, &account.id).await;
         let _ = audit(
@@ -849,7 +834,8 @@ async fn api_rename(
         .await;
         return tool_response(&err);
     }
-    if let Err(err) = crate::mcp::tools::check_storage_writable(&mcp.pool, &mcp.billing, &app).await
+    if let Err(err) =
+        crate::mcp::tools::check_storage_writable(&mcp.pool, &mcp.plans_url(), &app).await
     {
         let _ = refund_change(&mcp.pool, &account.id).await;
         let _ = audit(

@@ -65,19 +65,22 @@ pub async fn add_collaborator(
                 "collaborator": collaborator_json(&collaborator),
             }),
         )),
-        Err(AddError::LimitReached { limit }) => Err(super::with_upgrade(
+        Err(AddError::LimitReached { limit }) => Err(super::with_plans(
             ToolError::quota_exceeded(
                 format!("app quota: {limit} collaborator(s) allowed on {}", app.slug),
                 if limit == crate::limits::FREE_COLLABORATORS {
                     format!(
-                        "{} already has its Free collaborator. Upgrade to Pro for up to {} per app.",
+                        "{} already has its Free collaborator. Pro allows up to {} per app — plans: {plans_url}.",
                         app.slug,
-                        crate::limits::PRO_COLLABORATORS
+                        crate::limits::PRO_COLLABORATORS,
+                        plans_url = ctx.state.plans_url(),
                     )
                 } else {
                     format!(
-                        "{} already has the maximum {} collaborators.",
-                        app.slug, limit
+                        "{} already has the maximum {} collaborators. Plans: {plans_url}.",
+                        app.slug,
+                        limit,
+                        plans_url = ctx.state.plans_url(),
                     )
                 },
                 "collaborators",
@@ -85,8 +88,7 @@ pub async fn add_collaborator(
                 limit,
                 None,
             ),
-            &ctx.state.billing,
-            &app.owner_id,
+            &ctx.state.plans_url(),
         )),
         Err(AddError::InvalidEmail(_)) => Err(ToolError::invalid_argument(format!(
             "{:?} is not an address that can be invited to {}",

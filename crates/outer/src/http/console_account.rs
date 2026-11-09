@@ -978,13 +978,11 @@ mod tests {
 
         // Two claimed changes plus one refunded: the summary must read 1,
         // exactly what `changes_used_today` computes for the quota check.
-        let billing = crate::billing::BillingState::Disabled {
-            platform_base: "http://outer.localhost".to_string(),
-        };
-        crate::mcp::tools::claim_change(&pool, &billing, &id)
+        let plans = "http://outer.localhost/account/plans";
+        crate::mcp::tools::claim_change(&pool, plans, &id)
             .await
             .unwrap();
-        crate::mcp::tools::claim_change(&pool, &billing, &id)
+        crate::mcp::tools::claim_change(&pool, plans, &id)
             .await
             .unwrap();
         crate::mcp::tools::refund_change(&pool, &id).await.unwrap();
