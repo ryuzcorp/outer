@@ -23,9 +23,17 @@ pub struct FleetSpec {
     pub bucket_url: String,
     pub s3_endpoint: String,
     pub s3_region: String,
+    /// Read-write over the state prefixes (`fleets/{slug}/cells/`, ...).
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
+    /// Read-only over the deployment artifacts (`fleets/{slug}/deploy/`,
+    /// `fleets/{slug}/deploy-blobs/`), passed as `CELLD_DEPLOY_AWS_*`. A
+    /// credential copied out of the fleet's environment can serve the
+    /// deployment it runs but never publish one.
+    pub deploy_access_key_id: String,
+    pub deploy_secret_access_key: String,
+    pub deploy_session_token: Option<String>,
     pub cgroup_leaf: PathBuf,
     /// Whether `cgroups::setup()` succeeded: the caller sets this from
     /// `setup().is_some()`. Active means the leaf carries real limits, so a
@@ -54,6 +62,12 @@ impl std::fmt::Debug for FleetSpec {
             .field(
                 "session_token",
                 &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("deploy_access_key_id", &self.deploy_access_key_id)
+            .field("deploy_secret_access_key", &"<redacted>")
+            .field(
+                "deploy_session_token",
+                &self.deploy_session_token.as_ref().map(|_| "<redacted>"),
             )
             .field("cgroup_leaf", &self.cgroup_leaf)
             .field("cgroups_active", &self.cgroups_active)
@@ -87,9 +101,11 @@ pub struct FleetOpts {
 /// Pure construction of the celld invocation: (program, argv, env). The
 /// command line and `CELLD_*` env mirror Noite's tenant fleets: listeners,
 /// `CELLD_DURABILITY=bucket`, the shutdown budget, and the asset-cache and
-/// deploy-poll bounds. The S3 creds ride the same `AWS_*` env Noite passes,
-/// plus `AWS_SESSION_TOKEN` when the minted credentials carry one. Reserved
-/// names in `extra_env` are dropped (logged), never injected.
+/// deploy-poll bounds. The state creds ride `AWS_*` plus
+/// `AWS_SESSION_TOKEN`; the read-only deployment creds ride
+/// `CELLD_DEPLOY_AWS_*` (celld `0052`), so the node reads `deploy/` and
+/// `deploy-blobs/` with a credential that cannot publish. Reserved names in
+/// `extra_env` are dropped (logged), never injected.
 pub fn fleet_command(
     spec: &FleetSpec,
     opts: &FleetOpts,
@@ -164,6 +180,20 @@ pub fn fleet_command(
     ];
     if let Some(token) = &spec.session_token {
         env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
+    }
+    // The fork's separate deployment-artifact credential (`0052`): the node
+    // reads `deploy/` and `deploy-blobs/` with this one, never with the
+    // state grant above.
+    env.push((
+        "CELLD_DEPLOY_AWS_ACCESS_KEY_ID".to_string(),
+        spec.deploy_access_key_id.clone(),
+    ));
+    env.push((
+        "CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY".to_string(),
+        spec.deploy_secret_access_key.clone(),
+    ));
+    if let Some(token) = &spec.deploy_session_token {
+        env.push(("CELLD_DEPLOY_AWS_SESSION_TOKEN".to_string(), token.clone()));
     }
     // The derived per-slug token guards the internal listener; the manager
     // fills it, never user input (`extra_env` reserved names are skipped
@@ -592,6 +622,9 @@ mod tests {
             access_key_id: "key".to_string(),
             secret_access_key: "secret".to_string(),
             session_token: Some("token".to_string()),
+            deploy_access_key_id: "deploy-key".to_string(),
+            deploy_secret_access_key: "deploy-secret".to_string(),
+            deploy_session_token: Some("deploy-token".to_string()),
             cgroup_leaf: state.to_path_buf(),
             // Dev-like default: no active cgroups, so a refused move warns.
             cgroups_active: false,
@@ -649,6 +682,11 @@ mod tests {
         assert_eq!(env["AWS_ACCESS_KEY_ID"], "key");
         assert_eq!(env["AWS_SECRET_ACCESS_KEY"], "secret");
         assert_eq!(env["AWS_SESSION_TOKEN"], "token");
+        // The deployment read credential rides its own names, so the node
+        // never reads `deploy/` with the state grant.
+        assert_eq!(env["CELLD_DEPLOY_AWS_ACCESS_KEY_ID"], "deploy-key");
+        assert_eq!(env["CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"], "deploy-secret");
+        assert_eq!(env["CELLD_DEPLOY_AWS_SESSION_TOKEN"], "deploy-token");
         assert_eq!(env["AWS_REGION"], "auto");
         assert_eq!(env["AWS_EC2_METADATA_DISABLED"], "true");
         assert_eq!(env["GROCERY"], "milk");
@@ -667,6 +705,8 @@ mod tests {
         let (spec, _) = test_spec(dir.path());
         let shown = format!("{spec:?}");
         assert!(!shown.contains("secret\""), "{shown}");
+        assert!(!shown.contains("deploy-secret"), "{shown}");
+        assert!(!shown.contains("deploy-token"), "{shown}");
         assert!(!shown.contains("\"token\""), "{shown}");
         assert!(!shown.contains("tok-test"), "{shown}");
         assert!(!shown.contains("milk"), "extra_env values: {shown}");
@@ -678,9 +718,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut spec, opts) = test_spec(dir.path());
         spec.session_token = None;
+        spec.deploy_session_token = None;
         let (_, _, env) = fleet_command(&spec, &opts);
         let env: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert!(!env.contains_key("AWS_SESSION_TOKEN"));
+        assert!(!env.contains_key("CELLD_DEPLOY_AWS_SESSION_TOKEN"));
+        // The deploy access key and secret are never optional: an unset
+        // token must not turn the pair off.
+        assert_eq!(env["CELLD_DEPLOY_AWS_ACCESS_KEY_ID"], "deploy-key");
+        assert_eq!(env["CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"], "deploy-secret");
     }
 
     #[test]

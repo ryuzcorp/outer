@@ -213,6 +213,71 @@ fn hostile_credential_prefixes_stay_scoped() {
     );
 }
 
+/// A fleet's two grants never overlap, and only the deployment one names
+/// deployment artifacts: the state grant is read-write, the deployment
+/// grant read-only, so no credential a fleet holds can publish.
+#[test]
+fn hostile_fleet_grants_cannot_publish_a_deployment() {
+    use outer::fleet::manager::FleetStorage;
+    use outer::store::credentials::Permission;
+
+    let grants = FleetStorage::fleet_grants("hostile");
+    let [(data_permission, data), (deploy_permission, deploy)] = grants;
+    assert_eq!(data_permission, Permission::ReadWrite);
+    assert_eq!(deploy_permission, Permission::ReadOnly);
+    // The exact state namespaces, a cross-repo contract with celld: any
+    // runtime write outside these is a failed write, and any list wider
+    // than this (in particular anything covering `deploy/`) is a publish
+    // hole. `node-cells/` and the non-terminated `wake-` are celld's dead
+    // node GC and legacy wake guard.
+    assert_eq!(
+        data,
+        vec![
+            "fleets/hostile/cells/",
+            "fleets/hostile/log/",
+            "fleets/hostile/nodes/",
+            "fleets/hostile/node-cells/",
+            "fleets/hostile/fleet/",
+            "fleets/hostile/wake/",
+            "fleets/hostile/wake-",
+            "fleets/hostile/drain/",
+            "fleets/hostile/kv/",
+            "fleets/hostile/r2/",
+            "fleets/hostile/probe/",
+            "fleets/hostile/telemetry/",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        deploy,
+        vec![
+            "fleets/hostile/deploy/".to_string(),
+            "fleets/hostile/deploy-blobs/".to_string()
+        ]
+    );
+    for prefix in data.iter().chain(&deploy) {
+        outer::store::credentials::validate_prefix(prefix)
+            .unwrap_or_else(|err| panic!("grant prefix {prefix:?}: {err:#}"));
+        assert!(prefix.starts_with("fleets/hostile/"), "{prefix}");
+    }
+    // No write prefix may cover the pointer or an asset body. `deploy/` and
+    // `deploy-blobs/` are different namespaces, so a prefix check is exact.
+    for write_prefix in &data {
+        assert!(
+            !write_prefix.starts_with("fleets/hostile/deploy"),
+            "write grant covers {write_prefix}"
+        );
+        for read_prefix in &deploy {
+            assert!(
+                !read_prefix.starts_with(write_prefix) && !write_prefix.starts_with(read_prefix),
+                "{write_prefix} and {read_prefix} overlap"
+            );
+        }
+    }
+}
+
 /// Platform secret names never reach app code: the reserved filter drops
 /// every `*_SECRET`, provider and platform prefix the fixtures plant, while
 /// ordinary app secrets and the bun cache dir pass through.
@@ -268,6 +333,9 @@ fn hostile_fleet_command_is_loopback_only_and_scoped() {
         access_key_id: "scoped-key".to_string(),
         secret_access_key: "scoped-secret".to_string(),
         session_token: Some("scoped-token".to_string()),
+        deploy_access_key_id: "scoped-deploy-key".to_string(),
+        deploy_secret_access_key: "scoped-deploy-secret".to_string(),
+        deploy_session_token: Some("scoped-deploy-token".to_string()),
         operator_token: None,
         cgroup_leaf: PathBuf::from("/sys/fs/cgroup/outer/hostile"),
         cgroups_active: true,
@@ -744,11 +812,16 @@ async fn hostile_build_probes_are_contained() {
     assert_contained(&report, "build", &manifest());
 }
 
-/// Scoped R2 credentials stay in their prefix: `r2-probe.mjs` round-trips
-/// inside its own prefix and must be refused (403/401, never 404 or a
-/// transport error) on a sibling prefix and the bucket root. Needs
-/// `HOSTILE_S3_*` env (the integrator mints a scoped key on the VPS); the
-/// worker fixture's release phase runs this with the deploy's scoped key.
+/// A fleet's state credential stays in its state prefixes: `r2-probe.mjs`
+/// round-trips inside one and must be refused (403/401, never 404 or a
+/// transport error) on a sibling prefix, the bucket root, and the deploy
+/// pointer (`deploy/current.json`), because the node reads deployments with
+/// its separate read-only `CELLD_DEPLOY_AWS_*` grant. The probe then uses
+/// that deploy grant (`HOSTILE_S3_DEPLOY_*`) to LIST and GET under
+/// `deploy/` (must succeed) and to PUT there (must be refused). Needs
+/// `HOSTILE_S3_*` env with both grants, minted by the integrator on the VPS
+/// (`scripts/hostile-suite.sh --r2`); the worker fixture's release phase
+/// runs this with the fleet's state-scoped key.
 #[tokio::test]
 #[ignore = "needs HOSTILE_S3_* scoped credentials (scripts/hostile-suite.sh --r2)"]
 async fn hostile_r2_scope_holds() {
@@ -764,9 +837,13 @@ async fn hostile_r2_scope_holds() {
         "HOSTILE_S3_KEY",
         "HOSTILE_S3_SECRET",
         "HOSTILE_S3_PREFIX",
+        "HOSTILE_S3_DEPLOY_KEY",
+        "HOSTILE_S3_DEPLOY_SECRET",
     ] {
         if std::env::var(name).is_err() {
-            eprintln!("SKIP: {name} not set; mint a scoped key for a fixture prefix first");
+            eprintln!(
+                "SKIP: {name} not set; mint the state and deploy grants for a fixture prefix first"
+            );
             return;
         }
     }
@@ -776,10 +853,35 @@ async fn hostile_r2_scope_holds() {
         dir.path().join("r2-probe.mjs"),
     )
     .expect("stage probe");
+    // The probe reads its scoped credential from the environment; the
+    // sandbox starts from env_clear, so the harness hands these through.
+    let probe_env: Vec<(String, String)> = [
+        "HOSTILE_S3_ENDPOINT",
+        "HOSTILE_S3_BUCKET",
+        "HOSTILE_S3_REGION",
+        "HOSTILE_S3_KEY",
+        "HOSTILE_S3_SECRET",
+        "HOSTILE_S3_TOKEN",
+        "HOSTILE_S3_PREFIX",
+        "HOSTILE_S3_SIBLING",
+        "HOSTILE_S3_DATA_PREFIX",
+        "HOSTILE_S3_DEPLOY_KEY",
+        "HOSTILE_S3_DEPLOY_SECRET",
+        "HOSTILE_S3_DEPLOY_TOKEN",
+        "HOSTILE_S3_DEPLOY_PREFIX",
+        "HOSTILE_S3_DEPLOY_OBJECT",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| (name.to_string(), value))
+    })
+    .collect();
     let child = outer::fleet::sandbox::Sandbox {
         uid: None,
         gid: None,
-        platform_env: &[],
+        platform_env: &probe_env,
         env: &[],
         cache_root: dir.path(),
         cgroup_leaf: None,
