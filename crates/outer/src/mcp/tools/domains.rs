@@ -38,29 +38,16 @@ pub struct ListDomainsInput {
 
 /// A [`domains::DomainError`] as the MCP [`ToolError`] the tool and the
 /// console endpoint report (same codes, same user message).
-/// `billing` + `owner_id` supply the `upgrade_url` the Pro refusal carries;
-/// `billing` also supplies the live promo state the $4 mention gates on.
-pub(crate) async fn tool_error(
-    err: domains::DomainError,
-    billing: &crate::billing::BillingState,
-    owner_id: &str,
-) -> ToolError {
+/// `plans_url` is the informational plans page the Pro refusal links to.
+pub(crate) fn tool_error(err: domains::DomainError, plans_url: &str) -> ToolError {
     let code = err.code();
     let message = err.to_string();
-    // The promo lookup hits Stripe: only pay for it on the path that names
-    // the launch price. Every other refusal keeps today's wording.
-    let user = if code == "payment_required" {
-        err.user_message(billing.launch_discount_active().await)
-    } else {
-        err.user_message(false)
-    };
+    let user = err.user_message(plans_url);
     match code {
         "not_found" => ToolError::not_found(message),
-        "payment_required" => super::with_upgrade(
-            ToolError::new(code, message).with_user(user),
-            billing,
-            owner_id,
-        ),
+        "payment_required" => {
+            super::with_plans(ToolError::new(code, message).with_user(user), plans_url)
+        }
         "internal" => ToolError::internal(message).with_user(user),
         _ => ToolError::invalid_argument(message).with_user(user),
     }
@@ -107,7 +94,7 @@ pub async fn add_domain(input: AddDomainInput, ctx: &Ctx<'_>) -> Result<Value, T
     .await
     {
         Ok(view) => view,
-        Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await),
+        Err(err) => return Err(tool_error(err, &ctx.state.plans_url())),
     };
     // The POST may omit validation records, so one GET fills them in: the
     // agent relays the full DNS setup word for word.
@@ -136,7 +123,7 @@ pub async fn remove_domain(input: RemoveDomainInput, ctx: &Ctx<'_>) -> Result<Va
     .await
     {
         Ok(hostname) => hostname,
-        Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await),
+        Err(err) => return Err(tool_error(err, &ctx.state.plans_url())),
     };
     let message = format!("{hostname} no longer serves {}.", app.slug);
     Ok(ok(
@@ -159,12 +146,10 @@ pub async fn list_domains(input: ListDomainsInput, ctx: &Ctx<'_>) -> Result<Valu
             Err(domains::DomainError::Unavailable(_)) => {
                 match domains::list_domains(&ctx.state.pool, &ctx.state.domain, &app).await {
                     Ok(rows) => rows.into_iter().next(),
-                    Err(err) => {
-                        return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await)
-                    }
+                    Err(err) => return Err(tool_error(err, &ctx.state.plans_url())),
                 }
             }
-            Err(err) => return Err(tool_error(err, &ctx.state.billing, &app.owner_id).await),
+            Err(err) => return Err(tool_error(err, &ctx.state.plans_url())),
         };
     let out: Vec<Value> = view.iter().map(domain_json).collect();
     let summary = match view.as_ref() {

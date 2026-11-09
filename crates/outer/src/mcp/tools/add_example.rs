@@ -44,11 +44,11 @@ pub async fn add_example(input: AddExampleInput, ctx: &Ctx<'_>) -> Result<Value,
         .collect();
     // The same gates and quota as `commit`, charged to the app owner whoever
     // calls: a collaborator's apply counts against the owner's daily changes.
-    check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
-    check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await?;
+    check_build_quota(&ctx.state.pool, &ctx.state.plans_url(), &app.owner_id).await?;
+    check_storage_writable(&ctx.state.pool, &ctx.state.plans_url(), &app).await?;
     // A handoff refuses before the claim, so a retry costs no quota.
     super::check_no_drain(ctx.state)?;
-    let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
+    let claim = claim_change(&ctx.state.pool, &ctx.state.plans_url(), &app.owner_id).await?;
     let planned = async {
         let bare = super::code::mirror_for(ctx, &app.slug).await?;
         let (head, tree) = head_tree(&bare, &inputs).await?;

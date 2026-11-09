@@ -116,20 +116,6 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `confirm` | string | yes | Type your account email again to confirm: must equal it exactly. |
 
-## `upgrade`
-
-- **Access:** signed in
-- **Description:** Upgrade to Outer Pro: returns a Checkout link for the human to open (Pro is $8/month, with a $4/month launch price while the promotion runs; tax calculated). The plan lifts on the next call after payment.
-
-**Input:** none.
-
-## `manage_billing`
-
-- **Access:** signed in
-- **Description:** Manage Outer Pro billing: returns the Customer Portal link to update the card or cancel. Needs an existing subscription â€” call upgrade first.
-
-**Input:** none.
-
 ## `create_app`
 
 - **Access:** signed in
@@ -688,14 +674,14 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `set_secret`
 
 - **Access:** signed in
-- **Description:** Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names match ^[A-Z_][A-Z0-9_]{0,63}$, at most 50 per app.
+- **Description:** Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names use uppercase letters, digits and _, at most 64 characters, and at most 50 secrets fit per app.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `key` | string | yes | Worker-env name: `^[A-Z_][A-Z0-9_]{0,63}$`, platform-reserved names refused. |
+| `key` | string | yes | Worker-env name: uppercase letters, digits and `_`, at most 64 characters; platform-reserved names refused. |
 | `value` | string | yes | The secret value (at most 4 KiB). Encrypted at rest, never shown again. |
 
 ## `unset_secret`

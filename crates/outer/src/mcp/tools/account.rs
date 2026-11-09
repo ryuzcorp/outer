@@ -74,7 +74,7 @@ pub async fn about(_input: NoArgs, _ctx: &Ctx<'_>) -> Result<Value, ToolError> {
             "New apps are empty shells until you build: start from create_app {examples} or add_example, then customise.",
             "Relay user_message to your human verbatim.",
         ],
-        "plans": "Free: 2 apps, 40 code changes and 30 build minutes/day. Pro ($8/month): 20 apps, 1,000 changes and 300 build minutes/day. See docs {topic: \"limits\"}.",
+        "plans": "Free: 2 apps, 40 code changes and 30 build minutes/day. Pro: 20 apps, 1,000 changes and 300 build minutes/day. See docs {topic: \"limits\"}.",
     });
     Ok(ok(
         "Outer hosts Ilha apps at https://<slug>.outer.now. Sign in with OAuth or sign_in/verify_code, create_app, then commit. Relay any user_message verbatim.",

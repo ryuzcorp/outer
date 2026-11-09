@@ -4,9 +4,10 @@
 //! Every number below is the approved 2026-10-26 table. Enforcement reads
 //! these functions, never a second copy of the number:
 //! - apps/changes/build minutes/collaborators/storage: hard refusals
-//!   (`quota_exceeded` + `upgrade_url`, §8.3) at the call sites in
-//!   [`crate::mcp::tools`], [`crate::apps`], [`crate::collaborators`],
-//!   [`crate::deploy`] and the console data panels;
+//!   (`quota_exceeded`, §8.3) at the call sites in [`crate::mcp::tools`],
+//!   [`crate::apps`], [`crate::collaborators`], [`crate::deploy`] and the
+//!   console data panels. Agent-surface refusals carry `plans_url`; the
+//!   console and owner emails still carry `upgrade_url`;
 //! - requests: soft caps, one owner email per month, the app keeps serving;
 //! - logs/backups: the daily prune sweeps read the retention numbers here.
 //!

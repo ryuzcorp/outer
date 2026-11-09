@@ -25,7 +25,7 @@ pub struct ListSecretsInput {
 pub struct SetSecretInput {
     /// The app slug.
     pub app: String,
-    /// Worker-env name: `^[A-Z_][A-Z0-9_]{0,63}$`, platform-reserved names refused.
+    /// Worker-env name: uppercase letters, digits and `_`, at most 64 characters; platform-reserved names refused.
     pub key: String,
     /// The secret value (at most 4 KiB). Encrypted at rest, never shown again.
     pub value: String,

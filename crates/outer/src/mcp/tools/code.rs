@@ -957,11 +957,11 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
     // the change claim, so a capped account keeps its code changes.
     // Charged to the app owner whoever calls (spec §3): a collaborator's
     // commit counts against the owner's daily changes.
-    check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
-    check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await?;
+    check_build_quota(&ctx.state.pool, &ctx.state.plans_url(), &app.owner_id).await?;
+    check_storage_writable(&ctx.state.pool, &ctx.state.plans_url(), &app).await?;
     // A handoff refuses before the claim, so a retry costs no quota.
     super::check_no_drain(ctx.state)?;
-    let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
+    let claim = claim_change(&ctx.state.pool, &ctx.state.plans_url(), &app.owner_id).await?;
     let outcome = match git::commit::commit_with_outcome(
         &ctx.state.store,
         &ctx.state.git,
@@ -1019,15 +1019,7 @@ pub async fn commit(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolErro
 /// still counts the change, exactly like a live commit.
 async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let (app, _) = visible_app(ctx, &input.app).await?;
-    super::preview::require_pro(
-        ctx,
-        &app.owner_id,
-        &app.slug,
-        "preview deploys",
-        "are",
-        "try changes at a temporary URL before they go live",
-    )
-    .await?;
+    super::preview::require_pro(ctx, &app.owner_id, &app.slug, "preview deploys", "are").await?;
     let caller = authed(ctx)?;
     let author = noreply_author(&caller.account_id, &caller.email, &ctx.state.domain);
     let request = to_commit_request(&input, author)?;
@@ -1056,11 +1048,11 @@ async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, T
             ));
         }
     }
-    check_build_quota(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
-    check_storage_writable(&ctx.state.pool, &ctx.state.billing, &app).await?;
+    check_build_quota(&ctx.state.pool, &ctx.state.plans_url(), &app.owner_id).await?;
+    check_storage_writable(&ctx.state.pool, &ctx.state.plans_url(), &app).await?;
     // A handoff refuses before the claim, so a retry costs no quota.
     super::check_no_drain(ctx.state)?;
-    let claim = claim_change(&ctx.state.pool, &ctx.state.billing, &app.owner_id).await?;
+    let claim = claim_change(&ctx.state.pool, &ctx.state.plans_url(), &app.owner_id).await?;
     let outcome = match git::commit::commit_preview(
         &ctx.state.store,
         &ctx.state.git,
@@ -1377,14 +1369,15 @@ pub async fn rollback_to(
     super::claim_rollback(&state.pool, &app.id).await?;
     // A refused build spends nothing: the rollback budget is refunded, so a
     // capped account can still roll back after midnight.
-    if let Err(err) = super::check_build_quota(&state.pool, &state.billing, &app.owner_id).await {
+    if let Err(err) = super::check_build_quota(&state.pool, &state.plans_url(), &app.owner_id).await
+    {
         if let Err(refund) = super::refund_rollback(&state.pool, &app.id).await {
             tracing::warn!("rollback refund failed: {refund:#}");
         }
         return Err(err);
     }
     // A frozen app refuses the write like a capped build does: same refund.
-    if let Err(err) = super::check_storage_writable(&state.pool, &state.billing, app).await {
+    if let Err(err) = super::check_storage_writable(&state.pool, &state.plans_url(), app).await {
         if let Err(refund) = super::refund_rollback(&state.pool, &app.id).await {
             tracing::warn!("rollback refund failed: {refund:#}");
         }

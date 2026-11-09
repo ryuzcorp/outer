@@ -2095,40 +2095,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forty_first_change_is_refused_with_an_upgrade_url() {
+    async fn forty_first_change_is_refused_with_the_plans_page() {
         use crate::mcp::tools::{change_limit, claim_change};
         let pool = pool().await;
-        let billing = enabled_billing();
         seed_user(&pool, "a1", "a@example.com").await;
         let limit = change_limit("free") as usize;
+        let plans = "https://outer.now/account/plans";
         for _ in 0..limit {
-            claim_change(&pool, &billing, "a1").await.unwrap();
+            claim_change(&pool, plans, "a1").await.unwrap();
         }
-        let err = claim_change(&pool, &billing, "a1").await.unwrap_err();
+        let err = claim_change(&pool, plans, "a1").await.unwrap_err();
         assert_eq!(err.code, "quota_exceeded");
-        let url = err
-            .extra
-            .get("upgrade_url")
-            .and_then(serde_json::Value::as_str)
-            .unwrap();
-        assert!(
-            url.starts_with("https://outer.now/billing/checkout?t=a1."),
-            "{url}"
-        );
-        // The agent-relayed sentence names the upgrade too (spec §8.3).
-        let user = err.user_message.unwrap();
-        assert!(user.contains(url), "{user}");
-        // Disabled billing points at the console plan card instead.
-        let disabled = BillingState::Disabled {
-            platform_base: "https://outer.now".to_string(),
-        };
-        let err = claim_change(&pool, &disabled, "a1").await.unwrap_err();
+        // Commerce guidelines: an informational plans page, never a
+        // checkout-starter link, and no price anywhere in the sentence.
         assert_eq!(
             err.extra
-                .get("upgrade_url")
+                .get("plans_url")
                 .and_then(serde_json::Value::as_str),
-            Some("https://outer.now/console")
+            Some(plans)
         );
+        assert!(err.extra.get("upgrade_url").is_none());
+        let user = err.user_message.unwrap();
+        assert!(user.contains(plans), "{user}");
+        assert!(!user.contains('$'), "{user}");
+        assert!(!user.to_lowercase().contains("checkout"), "{user}");
     }
 
     #[test]

@@ -488,9 +488,10 @@ pub struct McpState {
     pub look_tokens: crate::look_tokens::LookTokens,
     /// At most one rollback runs per app (fails fast otherwise).
     pub rollback_locks: RollbackLocks,
-    /// Stripe billing (spec §14.2): checkout/portal links, the
-    /// per-account checkout-starter links refusals carry, and webhook
-    /// state. `Disabled` on localhost dev without `STRIPE_*`.
+    /// Stripe billing (spec §14.2) for the console plan card and the
+    /// webhook. MCP refusals never touch it: they link the informational
+    /// plans page instead of minting checkout links. `Disabled` on localhost
+    /// dev without `STRIPE_*`.
     pub billing: crate::billing::BillingState,
     /// What `delete_app` wipes and purges: dirs, edge host, zone.
     pub delete_cfg: crate::apps::delete::DeleteConfig,
@@ -514,6 +515,19 @@ impl McpState {
     /// The absolute MCP endpoint clients connect to.
     pub fn mcp_url(&self) -> String {
         self.auth.config.resource.clone()
+    }
+
+    /// The human-facing platform site, from the same config-built issuer
+    /// (`{scheme}://{domain}{port_suffix}`) the auth module uses.
+    pub fn platform_url(&self) -> String {
+        self.auth.config.issuer.clone()
+    }
+
+    /// The informational plans page every `payment_required` and
+    /// `quota_exceeded` refusal links to (commerce guidelines §D2): a page
+    /// that explains plans, never a checkout or an upgrade call to action.
+    pub fn plans_url(&self) -> String {
+        format!("{}/account/plans", self.platform_url())
     }
 }
 

@@ -31,17 +31,16 @@ pub struct DiscardPreviewInput {
 /// The Pro gate for preview creation and promotion: the owner's plan pays,
 /// whoever calls. A plan-lookup failure propagates as `internal`: a transient
 /// DB error must never read as a Free plan refusing with `payment_required`.
-/// `feature` is the lowercase noun ("preview deploys"), `action` the verb
-/// phrase for the human text.
+/// `feature` is the lowercase noun ("preview deploys") and `verb` its
+/// agreeing form ("are").
 pub(crate) async fn require_pro(
     ctx: &Ctx<'_>,
     owner_id: &str,
     slug: &str,
     feature: &str,
     verb: &str,
-    action: &str,
 ) -> Result<(), ToolError> {
-    require_pro_state(ctx.state, owner_id, slug, feature, verb, action).await
+    require_pro_state(ctx.state, owner_id, slug, feature, verb).await
 }
 
 pub(crate) async fn require_pro_state(
@@ -50,20 +49,19 @@ pub(crate) async fn require_pro_state(
     slug: &str,
     feature: &str,
     verb: &str,
-    action: &str,
 ) -> Result<(), ToolError> {
     let plan = plan_of(&state.pool, owner_id).await?;
     if plan != "pro" {
-        return Err(super::with_upgrade(
+        let plans_url = state.plans_url();
+        return Err(super::with_plans(
             ToolError::payment_required(
                 format!("{slug} is on a Free account; {feature} {verb} a Pro feature"),
                 format!(
-                    "{} {verb} a Pro feature. Upgrade to Pro to {action}.",
+                    "{} {verb} a Pro feature, not included on the Free plan — plans: {plans_url}.",
                     capitalize(feature)
                 ),
             ),
-            &state.billing,
-            owner_id,
+            &plans_url,
         ));
     }
     Ok(())
@@ -94,20 +92,12 @@ pub async fn promote_preview_to(
     app: &crate::apps::App,
     wait: bool,
 ) -> Result<Value, ToolError> {
-    require_pro_state(
-        state,
-        &app.owner_id,
-        &app.slug,
-        "preview promotion",
-        "is",
-        "promote a preview to live",
-    )
-    .await?;
+    require_pro_state(state, &app.owner_id, &app.slug, "preview promotion", "is").await?;
     // Fail fast before the fast-forward and the trial-state wipe below: a
     // capped or frozen app refuses here with the quota shape, and the inner
     // `run_deploy` gate backstops the quota spent in between.
-    super::check_build_quota(&state.pool, &state.billing, &app.owner_id).await?;
-    super::check_storage_writable(&state.pool, &state.billing, app).await?;
+    super::check_build_quota(&state.pool, &state.plans_url(), &app.owner_id).await?;
+    super::check_storage_writable(&state.pool, &state.plans_url(), app).await?;
     let preview = preview_of(app)
         .ok_or_else(|| ToolError::not_found(format!("no active preview for {:?}", app.slug)))?;
     let row = latest_preview_deploy(&state.pool, &app.id).await?;

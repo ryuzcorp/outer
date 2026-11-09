@@ -22,7 +22,7 @@ description: Track counted quotas, abuse limits, fleet caps, and overage behavio
 1. Charge each `commit` that creates a commit to the app owner, whoever makes it.
 2. Exclude the template commit from `create_app` and every `rollback` from counting.
 3. Check usage and reset times with `whoami`.
-4. Relay `quota_exceeded` plus its verbatim `user_message` to the person. Refusals name the limit, the reset time, and the upgrade link.
+4. Relay `quota_exceeded` plus its verbatim `user_message` to the person. Refusals name the limit, the reset time, and the informational plans link (`plans_url`, `/account/plans`). There is no checkout link on the agent surface: the person upgrades from the Outer console if they choose to.
 5. Merge extra databases or buckets; a second `d1_databases` or `r2_buckets` entry fails validation.
 6. Export is available on every plan (owner only). Collaborators on Free are limited to 1 per app.
 7. Downgrade keeps the 2 oldest apps live and stops the rest for 30 days; collaborators beyond 1 per app become read-only.
