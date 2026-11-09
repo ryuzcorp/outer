@@ -17,6 +17,7 @@ pub mod console_data;
 pub mod console_domains;
 pub mod console_export;
 pub mod console_observe;
+pub mod keys;
 pub mod proxy;
 pub mod site;
 pub mod tls;
@@ -49,6 +50,9 @@ pub fn router(state: AppState) -> Router {
     // Data panels (D1, R2, Durable Objects): explicit Axum routes like the
     // console API above, so they win over the site fallback below.
     let console_data = console_data::routes();
+    // `/keys` (D3): the web flow scripts use to mint an API key. An explicit
+    // route, like the console above, so it wins over the site fallback.
+    let keys = keys::routes();
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -58,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .route("/mcp", post(crate::mcp::mcp_handler))
         .merge(console)
         .merge(console_data)
+        .merge(keys)
         .fallback(platform_fallback)
         .with_state(state)
 }

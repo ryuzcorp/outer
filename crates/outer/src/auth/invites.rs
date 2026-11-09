@@ -6,7 +6,8 @@
 //! admins mint `admin` codes in bulk through the console. A code is valid
 //! while it exists, is unredeemed and is unrevoked; redemption consumes it
 //! in the same transaction that creates the account, so a code spent
-//! between `sign_in` and `verify_code` refuses the second verifier.
+//! between starting sign-in and verifying the code refuses the second
+//! verifier.
 
 use sqlx::{Sqlite, SqlitePool, Transaction};
 

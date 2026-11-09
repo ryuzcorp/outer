@@ -1135,16 +1135,7 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
         "docs" => account::docs(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
-        "sign_in" => account::sign_in(parse_args(args)?, ctx)
-            .await
-            .map_err(CallError::from),
-        "verify_code" => account::verify_code(parse_args(args)?, ctx)
-            .await
-            .map_err(CallError::from),
         "whoami" => account::whoami(parse_args(args)?, ctx)
-            .await
-            .map_err(CallError::from),
-        "create_api_key" => account::create_api_key(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "list_api_keys" => account::list_api_keys(parse_args(args)?, ctx)

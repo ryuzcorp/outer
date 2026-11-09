@@ -25,49 +25,12 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | --- | --- | --- | --- |
 | `topic` | string | yes | Which agent guide to read: quickstart, templates, ilha, void, website, celld, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look. |
 
-## `sign_in`
-
-- **Access:** anyone (no token needed)
-- **Description:** Start email sign-in (clients without OAuth): emails a 6-digit code. Then call verify_code. During the closed beta a new email also needs invite_code (OUTER-XXXX-XXXX). Disappears after sign-in.
-
-**Input:**
-
-| Property | Type | Required | Description |
-| --- | --- | --- | --- |
-| `email` | string | yes | The email address to sign in as. |
-| `invite_code` | string | no | Optional invite code for the closed beta (`OUTER-XXXX-XXXX`; dashes and the prefix are optional). Only needed when the email is new and not allowlisted: existing, allowlisted and admin emails ignore it. |
-
-## `verify_code`
-
-- **Access:** anyone (no token needed)
-- **Description:** Finish email sign-in: verify the emailed code and get an API key. accept_terms is required on first use. Disappears after sign-in.
-
-**Input:**
-
-| Property | Type | Required | Description |
-| --- | --- | --- | --- |
-| `accept_terms` | boolean | yes | Required on first sign-in: accept the Terms and Privacy Policy. |
-| `code` | string | yes | The 6-digit code from the inbox. |
-| `email` | string | yes | The email address the code was sent to. |
-| `key_name` | string | no | A label for the minted API key (shown in `list_api_keys`). |
-
 ## `whoami`
 
 - **Access:** signed in
 - **Description:** Your account: email, plan, usage, limits and when they reset. deletes_at is your soonest Free-app deletion date for inactivity (null on Pro or with no apps).
 
 **Input:** none.
-
-## `create_api_key`
-
-- **Access:** signed in
-- **Description:** Mint an API key. It is shown once â€” store it in your MCP config.
-
-**Input:**
-
-| Property | Type | Required | Description |
-| --- | --- | --- | --- |
-| `name` | string | no | A label for the new key (shown in `list_api_keys`). |
 
 ## `list_api_keys`
 

@@ -277,9 +277,10 @@ struct CreateKey {
     name: Option<String>,
 }
 
-/// `POST /api/console/api-keys {name?}`: same domain function as MCP
-/// `create_api_key`. The key is returned once; the UI shows it in a modal
-/// with copy + "you won't see it again".
+/// `POST /api/console/api-keys {name?}`: the same domain function the
+/// agent-facing surface used before keys moved to `/keys`. The key is
+/// returned once; the UI shows it in a modal with copy + "you won't see it
+/// again".
 async fn api_create_key(
     State(state): State<super::AppState>,
     headers: HeaderMap,

@@ -1,6 +1,6 @@
 ---
 title: Connect your agent
-description: Point your agent at Outer's MCP endpoint — one command per client, OAuth or emailed code.
+description: Point your agent at Outer's MCP endpoint — one command per client, OAuth or an API key.
 ---
 
 Your agent talks to Outer over MCP at `https://outer.now/mcp` (Streamable HTTP,
@@ -55,8 +55,8 @@ Settings → Connectors → add a custom MCP connector with
 
 ### Anything else
 
-Any MCP client works with OAuth 2.1. Clients without OAuth use the emailed-code
-fallback instead ([Sign in](/get-started/sign-in)).
+Any MCP client works with OAuth 2.1. Clients without OAuth create an API key
+at [Keys](https://outer.now/keys) and send it as a Bearer header ([Sign in](/get-started/sign-in)).
 
 ## Ask for your first app
 
@@ -83,7 +83,7 @@ sign-in page:
 2. Accept the terms on first sign-in.
 3. Approve the client.
 
-Clients without OAuth use two MCP tools instead. Details in
+Clients without OAuth create an API key at [Keys](https://outer.now/keys). Details in
 [Sign in](/get-started/sign-in).
 
 When a limit or refusal hits, the tool result carries a `user_message` written

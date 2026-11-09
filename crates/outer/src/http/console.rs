@@ -1414,10 +1414,10 @@ async fn api_sign_out(State(state): State<super::AppState>, headers: HeaderMap) 
 
 // --- Sign-in pages ---------------------------------------------------------
 
-const SIGNIN_CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'self'; \
+pub(crate) const SIGNIN_CSP: &str = "default-src 'none'; base-uri 'none'; form-action 'self'; \
     frame-ancestors 'none'; style-src 'unsafe-inline'";
 
-fn layout(title: &str, body: Markup) -> Markup {
+pub(crate) fn layout(title: &str, body: Markup) -> Markup {
     html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -1434,7 +1434,27 @@ fn layout(title: &str, body: Markup) -> Markup {
     }
 }
 
-fn email_form(error: Option<&str>, invite_open: bool, invite_value: &str) -> Markup {
+/// The post-sign-in destination a `next` form field names: only a local
+/// path (starts with a single `/`, no `//`, no `\`, no scheme, no control
+/// characters). Anything else falls back to `/console`, so an attacker
+/// cannot turn sign-in into an open redirect.
+fn safe_next(next: Option<&str>) -> String {
+    let Some(next) = next else {
+        return "/console".to_string();
+    };
+    let local = next.starts_with('/')
+        && !next.starts_with("//")
+        && !next.contains('\\')
+        && !next.contains("://")
+        && !next.chars().any(char::is_control);
+    if local {
+        next.to_string()
+    } else {
+        "/console".to_string()
+    }
+}
+
+fn email_form(error: Option<&str>, invite_open: bool, invite_value: &str, next: &str) -> Markup {
     layout(
         "Sign in",
         html! {
@@ -1444,6 +1464,7 @@ fn email_form(error: Option<&str>, invite_open: bool, invite_value: &str) -> Mar
             }
             form method="post" action="/console/sign-in" {
                 input type="hidden" name="step" value="email";
+                input type="hidden" name="next" value=(next);
                 label {
                     "Email" br;
                     input type="email" name="email" required autocomplete="email"
@@ -1467,7 +1488,7 @@ fn email_form(error: Option<&str>, invite_open: bool, invite_value: &str) -> Mar
     )
 }
 
-fn code_form(email: &str, error: Option<&str>) -> Markup {
+fn code_form(email: &str, error: Option<&str>, next: &str) -> Markup {
     layout(
         "Enter code",
         html! {
@@ -1478,6 +1499,7 @@ fn code_form(email: &str, error: Option<&str>) -> Markup {
             form method="post" action="/console/sign-in" {
                 input type="hidden" name="step" value="code";
                 input type="hidden" name="email" value=(email);
+                input type="hidden" name="next" value=(next);
                 label {
                     "Code" br;
                     input type="text" name="code" required inputmode="numeric"
@@ -1490,7 +1512,7 @@ fn code_form(email: &str, error: Option<&str>) -> Markup {
     )
 }
 
-fn terms_form(version: &str, error: Option<&str>) -> Markup {
+fn terms_form(version: &str, error: Option<&str>, next: &str) -> Markup {
     layout(
         "Terms",
         html! {
@@ -1500,6 +1522,7 @@ fn terms_form(version: &str, error: Option<&str>) -> Markup {
             }
             form method="post" action="/console/sign-in" {
                 input type="hidden" name="step" value="terms";
+                input type="hidden" name="next" value=(next);
                 label {
                     input type="checkbox" name="accept" value="yes" required;
                     " I accept the Terms and Privacy Policy"
@@ -1551,28 +1574,35 @@ fn request_ip(
 }
 
 /// `GET /console/sign-in`: a signed-in session with current terms skips
-/// straight to `/console`; a session owing terms sees the terms step; else
-/// the email form.
-async fn sign_in_get(State(state): State<super::AppState>, headers: HeaderMap) -> Response {
+/// straight to `next` (or `/console`); a session owing terms sees the terms
+/// step; else the email form. `next` must be a local path.
+async fn sign_in_get(
+    State(state): State<super::AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
     let mcp = &state.mcp;
+    let target = safe_next(query.get("next").map(String::as_str));
     if let Some(session) = crate::auth::session_from_headers(&headers) {
         if let Ok(Some(account)) = crate::auth::account_from_session(&mcp.pool, &session).await {
             if account.terms_accepted(&mcp.auth.config) {
-                return redirect("/console", None);
+                return redirect(&target, None);
             }
             return page(
                 StatusCode::OK,
-                terms_form(&mcp.auth.config.terms_version, None),
+                terms_form(&mcp.auth.config.terms_version, None, &target),
                 None,
             );
         }
     }
-    page(StatusCode::OK, email_form(None, false, ""), None)
+    page(StatusCode::OK, email_form(None, false, "", &target), None)
 }
 
 /// `POST /console/sign-in`: one step per form (`email` → `code` → `terms`).
 /// Same codes, limits and beta gate as the OAuth email step; the session is
-/// minted at `code`, so the `terms` step is already authenticated.
+/// minted at `code`, so the `terms` step is already authenticated. The
+/// `next` field rides through every step and is validated each time: only a
+/// local path survives, anything else lands on `/console`.
 async fn sign_in_post(
     State(state): State<super::AppState>,
     headers: HeaderMap,
@@ -1588,12 +1618,14 @@ async fn sign_in_post(
                 Some("Open the sign-in page on outer.now and try again."),
                 false,
                 "",
+                "/console",
             ),
             None,
         );
     }
     let mcp = &state.mcp;
     let ip = request_ip(&headers, mcp.auth.config.origin_locked, Some(peer));
+    let target = safe_next(form.get("next").map(String::as_str));
     match form.get("step").map(String::as_str) {
         Some("email") => {
             let email = form.get("email").cloned().unwrap_or_default();
@@ -1612,7 +1644,7 @@ async fn sign_in_post(
             {
                 Ok(_) => page(
                     StatusCode::OK,
-                    code_form(&crate::auth::normalize_email(&email), None),
+                    code_form(&crate::auth::normalize_email(&email), None, &target),
                     None,
                 ),
                 Err(err) => {
@@ -1627,6 +1659,7 @@ async fn sign_in_post(
                             Some(crate::auth::pages::friendly_error(err.code)),
                             err.code == "closed_beta",
                             &invite_value,
+                            &target,
                         ),
                         None,
                     )
@@ -1653,17 +1686,18 @@ async fn sign_in_post(
                     if !terms_ok {
                         return page(
                             StatusCode::OK,
-                            terms_form(&mcp.auth.config.terms_version, None),
+                            terms_form(&mcp.auth.config.terms_version, None, &target),
                             session,
                         );
                     }
-                    redirect("/console", session)
+                    redirect(&target, session)
                 }
                 Err(err) => page(
                     StatusCode::BAD_REQUEST,
                     code_form(
                         &crate::auth::normalize_email(&email),
                         Some(crate::auth::pages::friendly_error(err.code)),
+                        &target,
                     ),
                     None,
                 ),
@@ -1673,7 +1707,7 @@ async fn sign_in_post(
             let Some(session) = crate::auth::session_from_headers(&headers) else {
                 return page(
                     StatusCode::BAD_REQUEST,
-                    email_form(Some("Sign in with email first."), false, ""),
+                    email_form(Some("Sign in with email first."), false, "", "/console"),
                     None,
                 );
             };
@@ -1681,7 +1715,7 @@ async fn sign_in_post(
             else {
                 return page(
                     StatusCode::BAD_REQUEST,
-                    email_form(Some("Sign in with email first."), false, ""),
+                    email_form(Some("Sign in with email first."), false, "", "/console"),
                     None,
                 );
             };
@@ -1691,6 +1725,7 @@ async fn sign_in_post(
                     terms_form(
                         &mcp.auth.config.terms_version,
                         Some("Accept the Terms and Privacy Policy to continue."),
+                        &target,
                     ),
                     None,
                 );
@@ -1704,15 +1739,16 @@ async fn sign_in_post(
                     terms_form(
                         &mcp.auth.config.terms_version,
                         Some("Sign-in is unavailable right now."),
+                        &target,
                     ),
                     None,
                 );
             }
-            redirect("/console", None)
+            redirect(&target, None)
         }
         _ => page(
             StatusCode::BAD_REQUEST,
-            email_form(Some("Unknown sign-in step."), false, ""),
+            email_form(Some("Unknown sign-in step."), false, "", "/console"),
             None,
         ),
     }
@@ -1882,18 +1918,17 @@ mod tests {
         let (app, pool, config, codes) = test_app().await;
         // A real account with a real API key: the Authorization header
         // must still not authenticate the console API.
-        crate::auth::send_code(&pool, &config, "ana@example.com", None, None)
-            .await
-            .unwrap();
-        let code = captured(&codes, "ana@example.com");
-        let verified =
-            crate::auth::otp_verify(&pool, &config, "ana@example.com", &code, true, None, None)
-                .await
-                .unwrap();
+        let (_, key) = crate::auth::test_support::sign_in_and_accept_terms(
+            &pool,
+            &config,
+            &codes,
+            "ana@example.com",
+        )
+        .await;
         let (status, _, _) = send(
             &app,
             same_origin(Request::get("/api/console/me"))
-                .header("authorization", format!("Bearer {}", verified.api_key))
+                .header("authorization", format!("Bearer {}", key.key))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2053,6 +2088,86 @@ mod tests {
 
     /// The terms step acts on the session cookie: a cross-site form must not
     /// drive any sign-in step.
+    /// `next` rides through the email/code/terms steps and only ever names a
+    /// local path: the `/keys` page uses it, and open redirects fall back.
+    #[tokio::test]
+    async fn sign_in_next_is_local_and_lands_on_keys() {
+        let (app, _, _, codes) = test_app().await;
+        let (status, _, body) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[
+                    ("step", "email"),
+                    ("email", "next@example.com"),
+                    ("next", "/keys"),
+                ]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("name=\"next\" value=\"/keys\""),
+            "next rides through the code step, got: {body}"
+        );
+        let code = captured(&codes, "next@example.com");
+        let (status, headers, body) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[
+                    ("step", "code"),
+                    ("email", "next@example.com"),
+                    ("code", &code),
+                    ("next", "/keys"),
+                ]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "terms step renders: {body}");
+        let cookie = session_cookie(&headers);
+        let (status, headers, _) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[("step", "terms"), ("accept", "yes"), ("next", "/keys")]),
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/keys");
+
+        // Already signed in with current terms: sign-in goes straight there.
+        let (status, headers, _) = send(
+            &app,
+            Request::get("/console/sign-in?next=/keys")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/keys");
+
+        // Forged targets are refused and fall back to the console.
+        for evil in ["//evil.com", "https://evil.com", "/\\evil"] {
+            let (status, headers, _) = send(
+                &app,
+                post_form(
+                    "/console/sign-in",
+                    &form(&[("step", "terms"), ("accept", "yes"), ("next", evil)]),
+                    Some(&cookie),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{evil}");
+            assert_eq!(headers["location"], "/console", "{evil}");
+        }
+    }
+
     #[tokio::test]
     async fn sign_in_post_refuses_cross_site_forms() {
         let (app, _, _, codes) = test_app().await;

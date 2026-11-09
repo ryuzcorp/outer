@@ -1,5 +1,5 @@
-//! Public tools (`about`, `docs`, `sign_in`, `verify_code`) and the account
-//! tools (`whoami`, API keys, OAuth connections).
+//! Public tools (`about`, `docs`) and the account tools (`whoami`, API keys,
+//! OAuth connections).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,34 +16,6 @@ use crate::mcp::error::ToolError;
 pub struct DocsInput {
     /// Which agent guide to read: quickstart, templates, ilha, void, website, celld, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look.
     pub topic: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SignInInput {
-    /// The email address to sign in as.
-    pub email: String,
-    /// Optional invite code for the closed beta (`OUTER-XXXX-XXXX`; dashes
-    /// and the prefix are optional). Only needed when the email is new and
-    /// not allowlisted: existing, allowlisted and admin emails ignore it.
-    pub invite_code: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct VerifyCodeInput {
-    /// The email address the code was sent to.
-    pub email: String,
-    /// The 6-digit code from the inbox.
-    pub code: String,
-    /// Required on first sign-in: accept the Terms and Privacy Policy.
-    pub accept_terms: bool,
-    /// A label for the minted API key (shown in `list_api_keys`).
-    pub key_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct CreateApiKeyInput {
-    /// A label for the new key (shown in `list_api_keys`).
-    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -64,10 +36,13 @@ pub struct DeleteAccountInput {
     pub confirm: String,
 }
 
-pub async fn about(_input: NoArgs, _ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+pub async fn about(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let keys_url = format!("{}/keys", ctx.state.platform_url());
     let structured = json!({
         "what": "Outer is your agent's own app cloud, built on Ilha. Your agent talks to Outer, Outer builds the app and serves it at https://<slug>.outer.now.",
-        "connect": "Claude, Codex and ChatGPT sign in through OAuth automatically. Without OAuth: sign_in {email}, read the emailed code, verify_code {email, code, accept_terms: true}, then send Authorization: Bearer <api_key>.",
+        "connect": format!(
+            "Claude, Codex and ChatGPT sign in through OAuth automatically. Clients without OAuth: sign in at {keys_url} and send `Authorization: Bearer <key>`."
+        ),
         "rules": [
             "Call docs {topic: \"ilha\"} before writing code.",
             "create_app {examples}, then add_example, then commit (prefer edits). Every code tool waits for the deploy.",
@@ -77,7 +52,9 @@ pub async fn about(_input: NoArgs, _ctx: &Ctx<'_>) -> Result<Value, ToolError> {
         "plans": "Free: 2 apps, 40 code changes and 30 build minutes/day. Pro: 20 apps, 1,000 changes and 300 build minutes/day. See docs {topic: \"limits\"}.",
     });
     Ok(ok(
-        "Outer hosts Ilha apps at https://<slug>.outer.now. Sign in with OAuth or sign_in/verify_code, create_app, then commit. Relay any user_message verbatim.",
+        format!(
+            "Outer hosts Ilha apps at https://<slug>.outer.now. Sign in with OAuth (or get a key at {keys_url}), create_app, then commit. Relay any user_message verbatim."
+        ),
         structured,
     ))
 }
@@ -95,45 +72,6 @@ pub async fn docs(input: DocsInput, _ctx: &Ctx<'_>) -> Result<Value, ToolError> 
             docs::topic_list().join(", ")
         ))),
     }
-}
-
-pub async fn sign_in(input: SignInInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let sent = auth::otp_sign_in(
-        &ctx.state.pool,
-        &ctx.state.auth.config,
-        &input.email,
-        input.invite_code.as_deref(),
-        ctx.client_ip.as_deref(),
-    )
-    .await
-    .map_err(ToolError::from_auth)?;
-    Ok(ok(
-        "Code sent. Ask your human for the 6-digit code, then call verify_code.".to_string(),
-        json!({"sent": true, "expires_in_s": sent.expires_in_s}),
-    ))
-}
-
-pub async fn verify_code(input: VerifyCodeInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let verified = auth::otp_verify(
-        &ctx.state.pool,
-        &ctx.state.auth.config,
-        &input.email,
-        &input.code,
-        input.accept_terms,
-        input.key_name.as_deref(),
-        ctx.client_ip.as_deref(),
-    )
-    .await
-    .map_err(ToolError::from_auth)?;
-    let mcp_url = ctx.state.mcp_url();
-    Ok(ok(
-        "Signed in. Save the API key in your MCP config and send it as Authorization: Bearer <api_key>.".to_string(),
-        json!({
-            "api_key": verified.api_key,
-            "account": {"id": verified.account_id, "email": verified.email},
-            "mcp_url": mcp_url,
-        }),
-    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -205,17 +143,6 @@ pub async fn whoami(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
             "stopped_apps": [],
             "deletes_at": deletes_at,
         }),
-    ))
-}
-
-pub async fn create_api_key(input: CreateApiKeyInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
-    let caller = authed(ctx)?;
-    let key = auth::create_api_key(&ctx.state.pool, &caller.account_id, input.name.as_deref())
-        .await
-        .map_err(ToolError::from_auth)?;
-    Ok(ok(
-        "API key minted. It is shown once — store it now.".to_string(),
-        json!({"id": key.id, "name": input.name, "prefix": key.prefix, "api_key": key.key}),
     ))
 }
 

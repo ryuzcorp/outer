@@ -1,6 +1,6 @@
 ---
 title: Sign in
-description: OAuth for Claude, Codex, ChatGPT, Gemini and Perplexity; the emailed-code fallback, invite codes, and API keys.
+description: OAuth for Claude, Codex, ChatGPT, Gemini and Perplexity; the /keys page for scripts, invite codes, and API keys.
 ---
 
 One Outer account is one email address. There are two ways in, both ending
@@ -21,15 +21,18 @@ and Perplexity. Your client opens Outer's sign-in page:
 The client retries the call with its new token. You can revoke a client any
 time on the Console's Connections and keys page, or by asking your agent.
 
-## Email code fallback
+## Without OAuth: the /keys page
 
-For scripts, older clients, and agent harnesses without OAuth, your agent signs in with an emailed code instead:
+For scripts, older clients, and agent harnesses without OAuth, sign in on the
+web and copy an API key from [Keys](https://outer.now/keys):
 
-1. Your agent starts sign-in with your email. Outer emails a 6-digit code (10-minute expiry, 5 attempts). During the closed beta, a new email that is not allowlisted also needs an invite code.
-2. Read the code from your inbox and give it to your agent. On first use your agent also accepts the Terms for you.
-3. Your agent saves the returned API key in its MCP config and sends it as the `Authorization: Bearer` header.
+1. Open [Keys](https://outer.now/keys). It sends you to the sign-in page first: enter your email. Outer emails a 6-digit code (10-minute expiry, 5 attempts). During the closed beta, a new email that is not allowlisted also needs an invite code.
+2. Enter the code from your inbox. On first sign-in, accept the Terms.
+3. Optionally name the key, then select "Create API key". It is shown once.
+4. Add it to your MCP config or script as the `Authorization: Bearer` header.
 
-After sign-in, the sign-in tools disappear from your agent's tool list.
+The key is only a credential. Your agent cannot sign you in or mint keys over
+MCP: there are no sign-in or key tools on the endpoint.
 
 ## Invite codes
 
@@ -43,6 +46,6 @@ automatic ones.
 
 ## API keys
 
-1. Ask your agent to create a key. It is shown once, so store it in your MCP config now.
-2. Ask your agent to list keys. It shows ids, names, and prefixes, never secrets.
-3. Ask your agent to revoke a key by its prefix.
+1. Create a key at [Keys](https://outer.now/keys), or in Console → Connections & keys. It is shown once, so store it now.
+2. List keys in the Console; `list_api_keys` shows the same ids, names, and prefixes, never secrets.
+3. Revoke a key by its prefix in the Console, or with `revoke_api_key`.

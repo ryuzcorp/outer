@@ -715,8 +715,7 @@ pub async fn mcp_handler(
                 Some(id) => id,
                 None => return StatusCode::ACCEPTED.into_response(),
             };
-            let caller = resolve_caller(state, &headers).await;
-            let tools: Vec<Value> = registry::visible_tools(caller.is_some())
+            let tools: Vec<Value> = registry::registry()
                 .iter()
                 .map(|t| {
                     json!({
@@ -830,8 +829,8 @@ async fn handle_call(
     };
     let args = params.get("arguments").cloned();
     // Lazy auth (spec §6.1): the gate lives in the HTTP handler, before the
-    // tool runs. Anonymous callers may still list account tools — only
-    // calling one without a token answers 401.
+    // tool runs. Anonymous callers see the same `tools/list` — only calling
+    // a non-`Public` tool without a token answers 401.
     let caller = resolve_caller(state, headers).await;
     // Owner activity (spec §7.8): any authenticated tool call stamps the
     // account, plus the touched app when the caller has a role on it. Runs

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use crate::auth::test_support::{captured, test_config, test_pool};
+use crate::auth::test_support::{captured, test_config, test_pool, verify_and_accept_terms};
 use crate::auth::{self, tokens, AuthState};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -1282,42 +1282,26 @@ async fn otp_attempts_expiry_and_limits() {
     };
 
     // Five wrong codes burn the row.
-    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None, None)
+    auth::send_code(&pool, &state.config, "ana@example.com", None, None)
         .await
         .unwrap();
     for _ in 0..5 {
-        let err = auth::otp_verify(
-            &pool,
-            &state.config,
-            "ana@example.com",
-            "000000",
-            false,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = auth::verify_code_core(&pool, &state.config, "ana@example.com", "000000", None)
+            .await
+            .unwrap_err();
         assert!(
             err.code == "invalid_code" || err.code == "too_many_attempts",
             "{}",
             err.code
         );
     }
-    let err = auth::otp_verify(
-        &pool,
-        &state.config,
-        "ana@example.com",
-        "000000",
-        false,
-        None,
-        None,
-    )
-    .await
-    .unwrap_err();
+    let err = auth::verify_code_core(&pool, &state.config, "ana@example.com", "000000", None)
+        .await
+        .unwrap_err();
     assert_eq!(err.code, "invalid_code", "burned row reads as unknown");
 
     // Expired codes are rejected and cleared.
-    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None, None)
+    auth::send_code(&pool, &state.config, "ana@example.com", None, None)
         .await
         .unwrap();
     let code = captured(&codes, "ana@example.com");
@@ -1325,29 +1309,21 @@ async fn otp_attempts_expiry_and_limits() {
         .execute(&pool)
         .await
         .unwrap();
-    let err = auth::otp_verify(
-        &pool,
-        &state.config,
-        "ana@example.com",
-        &code,
-        true,
-        None,
-        None,
-    )
-    .await
-    .unwrap_err();
+    let err = auth::verify_code_core(&pool, &state.config, "ana@example.com", &code, None)
+        .await
+        .unwrap_err();
     assert_eq!(err.code, "code_expired");
 
     // Five sends per hour per email.
     for _ in 0..4 {
-        auth::otp_sign_in(&pool, &state.config, "limited@example.com", None, None)
+        auth::send_code(&pool, &state.config, "limited@example.com", None, None)
             .await
             .unwrap();
     }
-    auth::otp_sign_in(&pool, &state.config, "limited@example.com", None, None)
+    auth::send_code(&pool, &state.config, "limited@example.com", None, None)
         .await
         .unwrap();
-    let err = auth::otp_sign_in(&pool, &state.config, "limited@example.com", None, None)
+    let err = auth::send_code(&pool, &state.config, "limited@example.com", None, None)
         .await
         .unwrap_err();
     assert_eq!(err.code, "rate_limited");
@@ -1355,7 +1331,7 @@ async fn otp_attempts_expiry_and_limits() {
 
     // Twenty sends per hour per IP.
     for index in 0..20 {
-        auth::otp_sign_in(
+        auth::send_code(
             &pool,
             &state.config,
             &format!("user{index}@example.com"),
@@ -1365,7 +1341,7 @@ async fn otp_attempts_expiry_and_limits() {
         .await
         .unwrap();
     }
-    let err = auth::otp_sign_in(
+    let err = auth::send_code(
         &pool,
         &state.config,
         "one-more@example.com",
@@ -1387,7 +1363,7 @@ async fn closed_beta_waitlists_by_default() {
         config,
     };
 
-    let err = auth::otp_sign_in(&pool, &state.config, "new@example.com", None, None)
+    let err = auth::send_code(&pool, &state.config, "new@example.com", None, None)
         .await
         .unwrap_err();
     assert_eq!(err.code, "closed_beta");
@@ -1401,7 +1377,7 @@ async fn closed_beta_waitlists_by_default() {
             .await
             .unwrap();
     assert_eq!(attempts, 1);
-    let _ = auth::otp_sign_in(&pool, &state.config, "new@example.com", None, None)
+    let _ = auth::send_code(&pool, &state.config, "new@example.com", None, None)
         .await
         .unwrap_err();
     let (attempts,): (i64,) =
@@ -1416,10 +1392,10 @@ async fn closed_beta_waitlists_by_default() {
         .execute(&pool)
         .await
         .unwrap();
-    auth::otp_sign_in(&pool, &state.config, "friend@example.com", None, None)
+    auth::send_code(&pool, &state.config, "friend@example.com", None, None)
         .await
         .unwrap();
-    auth::otp_sign_in(&pool, &state.config, "owner@example.com", None, None)
+    auth::send_code(&pool, &state.config, "owner@example.com", None, None)
         .await
         .unwrap();
 }
@@ -1433,13 +1409,13 @@ async fn only_invite_joiners_get_grants() {
     let (config, codes) = test_config();
 
     for email in ["ana@example.com", "owner@example.com"] {
-        auth::otp_sign_in(&pool, &config, email, None, None)
+        auth::send_code(&pool, &config, email, None, None)
             .await
             .unwrap();
     }
     for email in ["ana@example.com", "owner@example.com"] {
         let code = captured(&codes, email);
-        auth::otp_verify(&pool, &config, email, &code, true, None, None)
+        verify_and_accept_terms(&pool, &config, email, &code)
             .await
             .unwrap();
     }
@@ -1486,11 +1462,11 @@ async fn invite_code_admits_and_is_consumed_on_verify() {
         .unwrap()
         .replace('-', "")
         .to_lowercase();
-    auth::otp_sign_in(&pool, &config, "joined@example.com", Some(&loose), None)
+    auth::send_code(&pool, &config, "joined@example.com", Some(&loose), None)
         .await
         .unwrap();
     let otp = captured(&codes, "joined@example.com");
-    auth::otp_verify(&pool, &config, "joined@example.com", &otp, true, None, None)
+    verify_and_accept_terms(&pool, &config, "joined@example.com", &otp)
         .await
         .unwrap();
 
@@ -1531,11 +1507,11 @@ async fn bad_invite_codes_waitlist_without_otp() {
         .await
         .unwrap();
     // Redeem one via a first joiner, revoke another.
-    auth::otp_sign_in(&pool, &config, "first@example.com", Some(&made[0]), None)
+    auth::send_code(&pool, &config, "first@example.com", Some(&made[0]), None)
         .await
         .unwrap();
     let otp = captured(&codes, "first@example.com");
-    auth::otp_verify(&pool, &config, "first@example.com", &otp, true, None, None)
+    verify_and_accept_terms(&pool, &config, "first@example.com", &otp)
         .await
         .unwrap();
     auth::invites::revoke(&pool, &made[1], 1).await.unwrap();
@@ -1545,7 +1521,7 @@ async fn bad_invite_codes_waitlist_without_otp() {
         ("bad2@example.com", &made[0]),
         ("bad3@example.com", &made[1]),
     ] {
-        let err = auth::otp_sign_in(&pool, &config, email, Some(code), None)
+        let err = auth::send_code(&pool, &config, email, Some(code), None)
             .await
             .unwrap_err();
         assert_eq!(err.code, "closed_beta", "{email} with {code}");
@@ -1579,34 +1555,18 @@ async fn invite_double_spend_second_verify_refused() {
         .unwrap();
 
     for email in ["racer1@example.com", "racer2@example.com"] {
-        auth::otp_sign_in(&pool, &config, email, Some(&made[0]), None)
+        auth::send_code(&pool, &config, email, Some(&made[0]), None)
             .await
             .unwrap();
     }
     let first = captured(&codes, "racer1@example.com");
-    auth::otp_verify(
-        &pool,
-        &config,
-        "racer1@example.com",
-        &first,
-        true,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    verify_and_accept_terms(&pool, &config, "racer1@example.com", &first)
+        .await
+        .unwrap();
     let second = captured(&codes, "racer2@example.com");
-    let err = auth::otp_verify(
-        &pool,
-        &config,
-        "racer2@example.com",
-        &second,
-        true,
-        None,
-        None,
-    )
-    .await
-    .unwrap_err();
+    let err = auth::verify_code_core(&pool, &config, "racer2@example.com", &second, None)
+        .await
+        .unwrap_err();
     assert_eq!(err.code, "invite_used");
     assert_eq!(
         err.user_message.as_deref(),
@@ -1639,11 +1599,11 @@ async fn allowlisted_email_ignores_invite_code() {
         .await
         .unwrap();
 
-    auth::otp_sign_in(&pool, &config, "friend@example.com", Some(&made[0]), None)
+    auth::send_code(&pool, &config, "friend@example.com", Some(&made[0]), None)
         .await
         .unwrap();
     let otp = captured(&codes, "friend@example.com");
-    auth::otp_verify(&pool, &config, "friend@example.com", &otp, true, None, None)
+    verify_and_accept_terms(&pool, &config, "friend@example.com", &otp)
         .await
         .unwrap();
     let (redeemed_by,): (Option<String>,) =
@@ -1664,48 +1624,41 @@ async fn api_keys_create_list_revoke_and_resolve() {
         config,
     };
 
-    auth::otp_sign_in(&pool, &state.config, "ana@example.com", None, None)
+    auth::send_code(&pool, &state.config, "ana@example.com", None, None)
         .await
         .unwrap();
     let code = captured(&codes, "ana@example.com");
-    let verified = auth::otp_verify(
-        &pool,
-        &state.config,
-        "ana@example.com",
-        &code,
-        true,
-        Some("laptop"),
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(verified.api_key.starts_with("outer_"));
+    let account_id = verify_and_accept_terms(&pool, &state.config, "ana@example.com", &code)
+        .await
+        .unwrap();
+    let key = auth::create_api_key(&pool, &account_id, Some("laptop"))
+        .await
+        .unwrap();
+    assert!(key.key.starts_with("outer_"));
 
     // Terms are stored on first verify.
     let (terms,): (Option<String>,) = sqlx::query_as("SELECT termsVersion FROM user WHERE id = ?")
-        .bind(&verified.account_id)
+        .bind(&account_id)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(terms.as_deref(), Some("2026-10-23"));
 
-    let principal = auth::resolve_bearer(&pool, &state.config, &verified.api_key)
+    let principal = auth::resolve_bearer(&pool, &state.config, &key.key)
         .await
         .unwrap()
         .expect("fresh key resolves");
-    assert_eq!(principal.account_id, verified.account_id);
+    assert_eq!(principal.account_id, account_id);
     assert!(matches!(
         principal.credential,
         auth::Credential::ApiKey { .. }
     ));
 
-    let keys = auth::list_api_keys(&pool, &verified.account_id)
-        .await
-        .unwrap();
+    let keys = auth::list_api_keys(&pool, &account_id).await.unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].name.as_deref(), Some("laptop"));
     assert_eq!(keys[0].prefix.len(), 10);
-    assert!(verified.api_key.contains(&keys[0].prefix));
+    assert!(key.key.contains(&keys[0].prefix));
 
     // Unknown and malformed tokens resolve to nothing.
     assert!(auth::resolve_bearer(&pool, &state.config, "outer_deadbeef")
@@ -1723,18 +1676,14 @@ async fn api_keys_create_list_revoke_and_resolve() {
         .unwrap()
         .is_none());
 
+    assert!(auth::revoke_api_key(&pool, &account_id, &keys[0].prefix)
+        .await
+        .unwrap());
+    assert!(!auth::revoke_api_key(&pool, &account_id, &keys[0].prefix)
+        .await
+        .unwrap());
     assert!(
-        auth::revoke_api_key(&pool, &verified.account_id, &keys[0].prefix)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !auth::revoke_api_key(&pool, &verified.account_id, &keys[0].prefix)
-            .await
-            .unwrap()
-    );
-    assert!(
-        auth::resolve_bearer(&pool, &state.config, &verified.api_key)
+        auth::resolve_bearer(&pool, &state.config, &key.key)
             .await
             .unwrap()
             .is_none(),
