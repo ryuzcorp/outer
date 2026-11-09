@@ -56,7 +56,8 @@ fn hidden(request_id: &str, csrf: &str, step: &str) -> Markup {
 /// The email-first sign-in step. The invite field stays collapsed behind
 /// "Have an invite code?" (a no-JS `<details>`), opening automatically when
 /// the server refuses with the closed-beta message. `invite_value` preserves
-/// what the user typed across that refusal.
+/// what the user typed across that refusal. Below the primary email form sits
+/// the review-account password form (operator-listed emails only).
 pub fn email_page(
     client: &ClientDoc,
     request_id: &str,
@@ -64,6 +65,7 @@ pub fn email_page(
     error: Option<&str>,
     invite_open: bool,
     invite_value: &str,
+    password_error: Option<&str>,
 ) -> Markup {
     layout(
         "Sign in",
@@ -91,6 +93,25 @@ pub fn email_page(
                 }
                 br;
                 button type="submit" style="font-size:1rem;padding:.5rem 1rem;" { "Send code" }
+            }
+            hr style="margin:2rem 0 1.25rem;border:0;border-top:1px solid #ddd;";
+            h2 style="font-size:1.1rem;" { "Review account? Sign in with a password" }
+            @if let Some(error) = password_error {
+                p role="alert" style="color:#a00;" { (error) }
+            }
+            form method="post" action="/oauth/authorize" {
+                (hidden(request_id, csrf, "password"))
+                label for="password-email" { "Email" }
+                br;
+                input type="email" name="email" id="password-email" required autocomplete="username"
+                    style="width:100%;font-size:1rem;padding:.5rem;" {}
+                br;
+                label for="password" { "Password" }
+                br;
+                input type="password" name="password" id="password" required autocomplete="current-password"
+                    style="width:100%;font-size:1rem;padding:.5rem;" {}
+                br; br;
+                button type="submit" style="font-size:1rem;padding:.5rem 1rem;" { "Sign in" }
             }
         },
     )
@@ -226,6 +247,8 @@ pub fn friendly_error(code: &str) -> &str {
         "email_retry" => "Outer couldn't send the code. Try again shortly.",
         "email_failed" => "Outer couldn't send the code to that address.",
         "invite_used" => "That invite code was just used.",
+        "password_required" => "This account signs in with a password.",
+        "invalid_credentials" => "Wrong email or password.",
         _ => "Something went wrong signing in. Start over from the app.",
     }
 }

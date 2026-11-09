@@ -461,7 +461,7 @@ async fn authorize_get(
     }
     html(
         StatusCode::OK,
-        pages::email_page(&client, &id, &csrf, None, false, ""),
+        pages::email_page(&client, &id, &csrf, None, false, "", None),
         None,
     )
 }
@@ -567,6 +567,7 @@ async fn authorize_post(
                             Some(pages::friendly_error(err.code)),
                             invite_open,
                             &invite_value,
+                            None,
                         ),
                         None,
                     )
@@ -618,6 +619,69 @@ async fn authorize_post(
                     ),
                     None,
                 ),
+            }
+        }
+        "password" => {
+            let email = form.get("email").cloned().unwrap_or_default();
+            let password = form.get("password").cloned().unwrap_or_default();
+            match super::reviewer_sign_in(
+                &state.pool,
+                &state.config,
+                &email,
+                &password,
+                ip.as_deref(),
+            )
+            .await
+            {
+                Ok((account_id, terms_ok)) => {
+                    sqlx::query("UPDATE oauth_request SET userId = ? WHERE id = ?")
+                        .bind(&account_id)
+                        .bind(&pending.id)
+                        .execute(&state.pool)
+                        .await
+                        .ok();
+                    let session = super::create_session(&state.pool, &account_id)
+                        .await
+                        .ok()
+                        .map(|id| super::set_session_cookie(&id));
+                    if !terms_ok {
+                        return html(
+                            StatusCode::OK,
+                            pages::terms_page(
+                                &state.config.terms_version,
+                                &pending.id,
+                                &pending.csrf,
+                                None,
+                            ),
+                            session,
+                        );
+                    }
+                    consent(
+                        pages::consent_page(&client, &pending.scope, &pending.id, &pending.csrf),
+                        &pending.redirect_uri,
+                        session,
+                    )
+                }
+                Err(err) => {
+                    let status = if err.code == "rate_limited" {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    html(
+                        status,
+                        pages::email_page(
+                            &client,
+                            &pending.id,
+                            &pending.csrf,
+                            None,
+                            false,
+                            "",
+                            Some(pages::friendly_error(err.code)),
+                        ),
+                        None,
+                    )
+                }
             }
         }
         "terms" => {

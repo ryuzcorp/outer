@@ -32,5 +32,6 @@ pub mod observe;
 pub mod ops;
 pub mod preview;
 pub mod secrets;
+pub mod seed;
 pub mod store;
 pub mod templates;

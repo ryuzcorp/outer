@@ -1,4 +1,5 @@
-//! Accounts, sign-in (OAuth 2.1 + email OTP) and API keys.
+//! Accounts, sign-in (OAuth 2.1 + email OTP, plus password sign-in for
+//! operator-listed review accounts) and API keys.
 //!
 //! This module owns the Better Auth-shaped `user`, `session`, `account`,
 //! `verification`, `apikey` and `oauth*` tables plus Outer's `oauthRequest`,
@@ -13,10 +14,13 @@ pub mod oauth;
 pub mod pages;
 pub mod tokens;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::HeaderValue;
 use sqlx::SqlitePool;
+
+use crate::config::ReviewLogin;
 
 pub use email::{EmailFrom, EmailSender};
 pub use oauth::router;
@@ -45,6 +49,13 @@ pub struct AuthConfig {
     pub resource: String,
     /// `OUTER_ADMIN_EMAILS`, normalized.
     pub admin_emails: Vec<String>,
+    /// `OUTER_REVIEW_LOGINS`: reviewer accounts that sign in with a password
+    /// on the console and OAuth pages. Empty = password sign-in is off.
+    pub review_logins: Vec<ReviewLogin>,
+    /// Concurrent Argon2 verifications (8 permits). A permit is taken before
+    /// any hash runs; with every permit busy the sign-in fails fast with
+    /// `rate_limited` instead of queueing expensive work.
+    pub password_permits: Arc<tokio::sync::Semaphore>,
     /// `OUTER_SIGNUP=open|closed` (default closed).
     pub signup_open: bool,
     /// `OUTER_TERMS_VERSION`.
@@ -168,6 +179,38 @@ pub fn is_admin(cfg: &AuthConfig, email: &str) -> bool {
     cfg.admin_emails.iter().any(|admin| admin == email)
 }
 
+/// A valid Argon2id PHC (default params, fixed salt, 32-byte hash) that no
+/// password matches. Unlisted emails verify against it so response time never
+/// reveals allowlist membership.
+const DUMMY_REVIEW_PHC: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// The review-login entry for `email` (normalized by the caller).
+fn review_login<'a>(cfg: &'a AuthConfig, email: &str) -> Option<&'a ReviewLogin> {
+    cfg.review_logins.iter().find(|login| login.email == email)
+}
+
+/// A review address tried the email-code path: no code is ever minted.
+fn password_required() -> AuthError {
+    AuthError {
+        code: "password_required",
+        message: "this account signs in with a password".to_string(),
+        user_message: Some("This account signs in with a password.".to_string()),
+        retry_after_s: None,
+    }
+}
+
+/// One message for an unlisted email and for a wrong password: the form must
+/// never confirm which emails are review accounts.
+fn invalid_credentials() -> AuthError {
+    AuthError {
+        code: "invalid_credentials",
+        message: "email and password don't match a review account".to_string(),
+        user_message: Some("Wrong email or password.".to_string()),
+        retry_after_s: None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountRow {
     pub id: String,
@@ -280,6 +323,12 @@ pub async fn send_code(
             format!("{email:?} is not an email address"),
         ));
     }
+    // Operator-listed review accounts never get a code: refusing here covers
+    // the console, the OAuth email step and the MCP send path in one place.
+    // No account, beta or limit work happens for them.
+    if review_login(cfg, &email).is_some() {
+        return Err(password_required());
+    }
     let existing = account_by_email(pool, &email)
         .await
         .map_err(|err| AuthError::new("db", format!("account lookup failed: {err}")))?;
@@ -374,6 +423,11 @@ pub async fn verify_code_core(
     let db = |err: sqlx::Error| AuthError::new("db", format!("{err}"));
     let now = now_ms();
     let email = normalize_email(email);
+    // Defense in depth: `send_code` never mints a code for a review address,
+    // and a code planted another way still cannot verify one.
+    if review_login(cfg, &email).is_some() {
+        return Err(password_required());
+    }
     let identifier = otp_identifier(&email);
     let row: Option<(String, i64, i64, Option<String>)> = sqlx::query_as(
         "SELECT value, expiresAt, attempts, inviteCode FROM verification WHERE identifier = ?",
@@ -538,6 +592,99 @@ pub async fn verify_code_core(
         .map_err(db)?;
     let terms_ok = account.terms_accepted(cfg);
     Ok((account.id, terms_ok))
+}
+
+/// Password sign-in for an operator-listed review account
+/// (`OUTER_REVIEW_LOGINS`). Returns `(account_id, terms_ok)` exactly like
+/// `verify_code_core`; mints no OTP and no API key, and never logs the
+/// password or hash.
+///
+/// The env list is the allowlist: closed beta, invites and the waitlist do
+/// not apply. An unknown email spends the same Argon2 time as a known one and
+/// gets the same generic refusal as a wrong password, so the form never
+/// confirms which addresses are review accounts.
+pub async fn reviewer_sign_in(
+    pool: &SqlitePool,
+    cfg: &AuthConfig,
+    email: &str,
+    password: &str,
+    client_ip: Option<&str>,
+) -> Result<(String, bool), AuthError> {
+    let db = |err: sqlx::Error| AuthError::new("db", format!("{err}"));
+    let now = now_ms();
+    let email = normalize_email(email);
+    // Limits before any hashing. Every attempt counts against the IP (twenty
+    // per fifteen minutes), which bounds hashing and guessing. Only wrong
+    // passwords count against the email, and per email *and* IP (five per
+    // fifteen minutes): a reviewer who signs in from several clients never
+    // trips it, and a stranger who knows a review address can lock out only
+    // their own IP, not the reviewer.
+    if let Some(ip) = client_ip {
+        match limits::check_and_record(
+            pool,
+            &format!("ip:{ip}"),
+            "password_login",
+            20,
+            900_000,
+            now,
+        )
+        .await
+        {
+            Ok(Some(retry_after_s)) => return Err(AuthError::rate_limited(retry_after_s)),
+            Ok(None) => {}
+            Err(err) => return Err(AuthError::new("db", format!("{err}"))),
+        }
+    }
+    let failures = format!("email:{email}|ip:{}", client_ip.unwrap_or("-"));
+    match limits::check(pool, &failures, "password_failure", 5, 900_000, now).await {
+        Ok(Some(retry_after_s)) => return Err(AuthError::rate_limited(retry_after_s)),
+        Ok(None) => {}
+        Err(err) => return Err(AuthError::new("db", format!("{err}"))),
+    }
+    // One Argon2 verify at a time per permit; with all eight busy the caller
+    // gets a retry instead of queueing another expensive hash.
+    let permit = match cfg.password_permits.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => return Err(AuthError::rate_limited(1)),
+    };
+    let matched = match review_login(cfg, &email) {
+        Some(login) => crate::access::verify_secret(&login.password_hash, password).await,
+        None => {
+            let _ = crate::access::verify_secret(DUMMY_REVIEW_PHC, password).await;
+            false
+        }
+    };
+    drop(permit);
+    if !matched {
+        limits::record(pool, &failures, "password_failure", now)
+            .await
+            .map_err(|err| AuthError::new("db", format!("{err}")))?;
+        return Err(invalid_credentials());
+    }
+    let account_id = crate::apps::ensure_account(pool, &email)
+        .await
+        .map_err(|err| AuthError::new("db", format!("{err}")))?;
+    let account = account_by_email(pool, &email)
+        .await
+        .map_err(|err| AuthError::new("db", format!("{err}")))?
+        .ok_or_else(|| {
+            AuthError::new("db", "the account row vanished after creation".to_string())
+        })?;
+    if account.banned {
+        return Err(AuthError::new(
+            "forbidden",
+            "this account is banned".to_string(),
+        ));
+    }
+    sqlx::query("UPDATE user SET lastActiveAt = ?, updatedAt = ? WHERE id = ?")
+        .bind(now)
+        .bind(now)
+        .bind(&account_id)
+        .execute(pool)
+        .await
+        .map_err(db)?;
+    let terms_ok = account.terms_accepted(cfg);
+    Ok((account_id, terms_ok))
 }
 
 /// Accept the current terms for `account_id` (first sign-in, or a version
@@ -1017,6 +1164,14 @@ pub mod test_support {
     use std::sync::{Arc, Mutex};
 
     pub type Codes = Arc<Mutex<HashMap<String, String>>>;
+    /// A review account every test config carries: password sign-in, no OTP.
+    pub const REVIEW_EMAIL: &str = "review@example.com";
+    /// The password hashed in [`REVIEW_PHC`].
+    pub const REVIEW_PASSWORD: &str = "review-password-1";
+    /// Argon2id PHC of [`REVIEW_PASSWORD`] (fixed salt): a constant so
+    /// building a test config costs no hashing.
+    pub const REVIEW_PHC: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$HL6eRSwxts6l2Ijs6QF7ncIJFQ1TDBnZMlPYWH1sXUo";
 
     /// Deterministic test config: codes are captured, loopback CIMD allowed,
     /// real network never touched.
@@ -1026,6 +1181,11 @@ pub mod test_support {
             issuer: "http://outer.localhost:8080".to_string(),
             resource: "http://outer.localhost:8080/mcp".to_string(),
             admin_emails: vec!["owner@example.com".to_string()],
+            review_logins: vec![crate::config::ReviewLogin {
+                email: REVIEW_EMAIL.to_string(),
+                password_hash: REVIEW_PHC.to_string(),
+            }],
+            password_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             signup_open: true,
             terms_version: "2026-10-23".to_string(),
             openai_apps_challenge: None,

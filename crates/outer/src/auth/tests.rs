@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use crate::auth::test_support::{captured, test_config, test_pool, verify_and_accept_terms};
+use crate::auth::test_support::{
+    captured, test_config, test_pool, verify_and_accept_terms, REVIEW_EMAIL, REVIEW_PASSWORD,
+};
 use crate::auth::{self, tokens, AuthState};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -3156,4 +3158,280 @@ async fn oauth_prune_expired_keeps_live_and_other_kinds() {
             .await
             .unwrap();
     assert_eq!(kept_clients, vec!["c", "cimd-old", "dcr-fresh"]);
+}
+
+#[tokio::test]
+async fn reviewer_password_sign_in_admits_a_listed_account_without_a_code() {
+    let pool = test_pool().await;
+    let (config, codes) = test_config();
+    let (account_id, terms_ok) = auth::reviewer_sign_in(
+        &pool,
+        &config,
+        "Review@Example.COM",
+        REVIEW_PASSWORD,
+        Some("10.0.0.7"),
+    )
+    .await
+    .unwrap();
+    assert!(!terms_ok, "a fresh reviewer owes the terms step");
+    let (email,): (String,) = sqlx::query_as("SELECT email FROM user WHERE id = ?")
+        .bind(&account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(email, REVIEW_EMAIL, "the email is normalized");
+    assert!(
+        codes.lock().unwrap().is_empty(),
+        "password sign-in mints no email code"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_password_errors_are_generic_and_banned_is_forbidden() {
+    let pool = test_pool().await;
+    let (config, _) = test_config();
+    let wrong = auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, "wrong", None)
+        .await
+        .unwrap_err();
+    let unlisted = auth::reviewer_sign_in(
+        &pool,
+        &config,
+        "stranger@example.com",
+        REVIEW_PASSWORD,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(wrong.code, "invalid_credentials");
+    assert_eq!(unlisted.code, "invalid_credentials");
+    assert_eq!(
+        wrong.user_message, unlisted.user_message,
+        "the form must not reveal allowlist membership"
+    );
+    assert_eq!(wrong.message, unlisted.message);
+
+    auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, REVIEW_PASSWORD, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE user SET banned = 1 WHERE email = ?")
+        .bind(REVIEW_EMAIL)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let banned = auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, REVIEW_PASSWORD, None)
+        .await
+        .unwrap_err();
+    assert_eq!(banned.code, "forbidden");
+}
+
+#[tokio::test]
+async fn reviewer_password_sign_in_limits_per_email_before_hashing() {
+    let pool = test_pool().await;
+    let (config, _) = test_config();
+    for attempt in 0..5 {
+        let err = auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, "wrong", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_credentials", "attempt {attempt}");
+    }
+    let limited = auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, REVIEW_PASSWORD, None)
+        .await
+        .unwrap_err();
+    assert_eq!(limited.code, "rate_limited");
+    assert!(
+        limited.retry_after_s.is_some_and(|s| s > 0 && s <= 900),
+        "{limited:?}"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_password_limit_counts_only_failures_per_ip() {
+    let pool = test_pool().await;
+    let (config, _) = test_config();
+    // A reviewer connecting several clients signs in often: successes never
+    // count toward the lockout.
+    for attempt in 0..7 {
+        auth::reviewer_sign_in(
+            &pool,
+            &config,
+            REVIEW_EMAIL,
+            REVIEW_PASSWORD,
+            Some("198.51.100.7"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("sign-in {attempt}: {err:?}"));
+    }
+    // A stranger who knows the address burns the failure budget from their IP…
+    for _ in 0..5 {
+        let err =
+            auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, "wrong", Some("203.0.113.9"))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, "invalid_credentials");
+    }
+    let locked = auth::reviewer_sign_in(
+        &pool,
+        &config,
+        REVIEW_EMAIL,
+        REVIEW_PASSWORD,
+        Some("203.0.113.9"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(locked.code, "rate_limited", "the stranger's IP is locked");
+    // …but the reviewer's own IP still signs in.
+    auth::reviewer_sign_in(
+        &pool,
+        &config,
+        REVIEW_EMAIL,
+        REVIEW_PASSWORD,
+        Some("198.51.100.7"),
+    )
+    .await
+    .expect("the reviewer is not locked out by someone else's failures");
+}
+
+#[tokio::test]
+async fn reviewer_password_sign_in_ignores_the_closed_beta() {
+    let pool = test_pool().await;
+    let (mut config, _) = test_config();
+    config.signup_open = false;
+    let (account_id, _) =
+        auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, REVIEW_PASSWORD, None)
+            .await
+            .unwrap();
+    assert!(!account_id.is_empty());
+    let waitlisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM waitlist")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(waitlisted, 0, "review logins never touch the waitlist");
+}
+
+#[tokio::test]
+async fn send_code_refuses_a_review_email_with_no_code_or_row() {
+    let pool = test_pool().await;
+    let (mut config, codes) = test_config();
+    config.signup_open = false;
+    let err = auth::send_code(
+        &pool,
+        &config,
+        REVIEW_EMAIL,
+        Some("OUTER-AAAA-BBBB"),
+        Some("10.0.0.8"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "password_required");
+    assert!(codes.lock().unwrap().is_empty(), "no code was sent");
+    let verification: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM verification")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(verification, 0, "no verification row is created");
+    let waitlist: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM waitlist")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(waitlist, 0, "the beta gate never runs for review emails");
+    let refused = auth::verify_code_core(&pool, &config, REVIEW_EMAIL, "123456", None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "password_required");
+}
+
+#[tokio::test]
+async fn password_sign_in_authorizes_without_an_email_code() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_id = dcr_client(&flow.app, redirect_uri).await;
+    let (status, _, body) = send(&flow.app, get(&authorize_url(&client_id, redirect_uri))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("Review account? Sign in with a password"),
+        "the password form is on the page: {body}"
+    );
+    let request_id = hidden(&body, "request_id");
+    let csrf = hidden(&body, "csrf");
+
+    // A wrong CSRF refuses before any password work.
+    let (status, _, _) = send(
+        &flow.app,
+        post_form(
+            "/oauth/authorize",
+            &form(&[
+                ("request_id", &request_id),
+                ("csrf", "not-the-csrf"),
+                ("step", "password"),
+                ("email", REVIEW_EMAIL),
+                ("password", REVIEW_PASSWORD),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, headers, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/authorize",
+            &form(&[
+                ("request_id", &request_id),
+                ("csrf", &csrf),
+                ("step", "password"),
+                ("email", REVIEW_EMAIL),
+                ("password", REVIEW_PASSWORD),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Terms"), "first sign-in owes terms: {body}");
+    let session = set_session(&headers);
+    assert!(
+        flow.codes.lock().unwrap().is_empty(),
+        "no email code was sent for the password flow"
+    );
+
+    let (status, _, body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/authorize",
+            &form(&[
+                ("request_id", &request_id),
+                ("csrf", &csrf),
+                ("step", "terms"),
+                ("accept", "yes"),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Allow"), "consent follows terms: {body}");
+
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens: serde_json::Value = exchange(&flow, &client_id, &params, redirect_uri).await;
+    let principal = auth::resolve_bearer(
+        &flow.state.pool,
+        &flow.state.config,
+        tokens["access_token"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("password sign-in mints a working token");
+    assert_eq!(principal.email, REVIEW_EMAIL);
+}
+
+#[test]
+fn dummy_review_hash_is_a_valid_argon2id_phc() {
+    // Unlisted emails verify against this hash for timing symmetry; a value
+    // that fails to parse would return early and leak allowlist membership.
+    let parsed = argon2::password_hash::PasswordHash::new(crate::auth::DUMMY_REVIEW_PHC)
+        .expect("the dummy review hash parses");
+    assert_eq!(parsed.algorithm.as_str(), "argon2id");
+    assert!(parsed.hash.is_some(), "the dummy hash carries output bytes");
+    assert!(
+        crate::access::has_default_argon2_cost(&parsed),
+        "the dummy hash keeps the cost `outer hash-password` produces"
+    );
 }

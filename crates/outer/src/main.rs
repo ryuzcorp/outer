@@ -34,6 +34,8 @@ const USAGE: &str = "usage:
   outer app delete SLUG
   outer app list
   outer oauth-client add --name NAME --redirect-uri URI [--redirect-uri URI…] [--auth client_secret_basic|client_secret_post]
+  outer seed demo --owner EMAIL [--url URL]
+  outer hash-password
   outer docs tools
   outer version";
 
@@ -79,6 +81,11 @@ async fn main() -> ExitCode {
             let rest: Vec<String> = rest.iter().map(|word| word.to_string()).collect();
             run(move |config| oauth_client_add(config, rest)).await
         }
+        ["seed", "demo", rest @ ..] => {
+            let rest = rest.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+            run(move |config| seed_demo(config, rest)).await
+        }
+        ["hash-password"] => hash_password().await,
         ["docs", "tools"] => {
             // Generated site content: the registry rendered as Markdown.
             print!(
@@ -457,19 +464,23 @@ fn end_outcome(outcome: &outer::deploy::DeployOutcome) -> anyhow::Result<()> {
     }
 }
 
+fn app_url(config: &Config, slug: &str) -> String {
+    format!(
+        "{}://{}.{}{}",
+        scheme(config),
+        slug,
+        config.runtime.apps_domain,
+        port_suffix(config.listen, config.tls_enabled())
+    )
+}
+
 fn print_outcome(
     config: &Config,
     app: &apps::App,
     outcome: &outer::deploy::DeployOutcome,
     reloaded: bool,
 ) -> anyhow::Result<()> {
-    let url = format!(
-        "{}://{}.{}{}",
-        scheme(config),
-        app.slug,
-        config.runtime.apps_domain,
-        port_suffix(config.listen, config.tls_enabled())
-    );
+    let url = app_url(config, &app.slug);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -482,16 +493,70 @@ fn print_outcome(
     Ok(())
 }
 
+/// `outer seed demo --owner EMAIL [--url URL]`: Pro, terms-accepted review
+/// account plus its two demo apps, created through the running server over
+/// MCP. Prints each app URL; a rerun skips an app that is live and complete.
+async fn seed_demo(config: Config, rest: Vec<String>) -> anyhow::Result<()> {
+    let words = rest.iter().map(String::as_str).collect::<Vec<_>>();
+    let flags = flags(&words, &["--owner", "--url"])?;
+    let Some(owner) = flag(&flags, "--owner") else {
+        anyhow::bail!("seed demo needs --owner EMAIL");
+    };
+    // The server owns the fleet manager: a first deploy with D1 migrations
+    // only works through `/mcp`, so the default target is the platform URL.
+    let url = flag(&flags, "--url")
+        .map(str::to_string)
+        .unwrap_or_else(|| platform_url(&config));
+    std::fs::create_dir_all(&config.data_dir)?;
+    let pool = db::open(&config.db_path()).await?;
+    let seeded = outer::seed::seed_demo(
+        &pool,
+        &config.terms_version,
+        owner,
+        &config.review_logins,
+        &url,
+    )
+    .await;
+    pool.close().await;
+    for app in seeded? {
+        println!("{}", app.url);
+    }
+    Ok(())
+}
+
+/// `outer hash-password`: read the password from stdin (never argv) and
+/// print its Argon2id PHC for `OUTER_REVIEW_LOGINS`.
+async fn hash_password() -> ExitCode {
+    use tokio::io::AsyncReadExt as _;
+    let mut input = String::new();
+    if let Err(err) = tokio::io::stdin().read_to_string(&mut input).await {
+        eprintln!("outer: reading the password from stdin: {err}");
+        return ExitCode::FAILURE;
+    }
+    let password = input.trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        eprintln!(
+            "outer: empty password on stdin; pipe it in, e.g. printf %s \"$pw\" | outer hash-password"
+        );
+        return ExitCode::FAILURE;
+    }
+    match outer::access::hash_secret(password).await {
+        Ok(phc) => {
+            println!("{phc}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("outer: hashing the password: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Build the auth module's state from config: issuer from scheme + domain +
 /// port, Cloudflare Email Service when the Cloudflare pair is set, log-only
 /// codes on localhost without it.
 fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> anyhow::Result<outer::auth::AuthState> {
-    let issuer = format!(
-        "{}://{}{}",
-        scheme(config),
-        config.domain,
-        port_suffix(config.listen, config.tls_enabled())
-    );
+    let issuer = platform_url(config);
     let email = match &config.cloudflare {
         Some(cf) => outer::auth::EmailSender::cloudflare(
             cf.account_id.clone(),
@@ -511,6 +576,8 @@ fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> anyhow::Result<outer:
             issuer: issuer.clone(),
             resource: format!("{issuer}/mcp"),
             admin_emails: config.admin_emails.clone(),
+            review_logins: config.review_logins.clone(),
+            password_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             signup_open: config.signup_open,
             terms_version: config.terms_version.clone(),
             openai_apps_challenge: config.openai_apps_challenge.clone(),
@@ -522,6 +589,17 @@ fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> anyhow::Result<outer:
             origin_locked: config.tls_enabled(),
         },
     })
+}
+
+/// The platform origin (`{scheme}://{domain}{port}`): the auth issuer, the
+/// MCP endpoint clients see, and the seed command's default URL.
+fn platform_url(config: &Config) -> String {
+    format!(
+        "{}://{}{}",
+        scheme(config),
+        config.domain,
+        port_suffix(config.listen, config.tls_enabled())
+    )
 }
 
 /// `:8080` unless the listener is on the scheme's default port.

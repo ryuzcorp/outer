@@ -179,6 +179,27 @@ pub async fn verify_secret(hash: &str, candidate: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// The cost [`hash_secret`] hashes with, spelled out because the PHC format
+/// carries no output-length parameter: [`argon2::Params::try_from`] derives
+/// `output_len` from the hash bytes, while `Params::DEFAULT` leaves it unset.
+fn default_argon2_params() -> argon2::Params {
+    argon2::Params::new(
+        argon2::Params::DEFAULT_M_COST,
+        argon2::Params::DEFAULT_T_COST,
+        argon2::Params::DEFAULT_P_COST,
+        Some(argon2::Params::DEFAULT_OUTPUT_LEN),
+    )
+    .expect("the default Argon2id params are valid")
+}
+
+/// Whether a PHC hashes at exactly the cost [`hash_secret`] (and the dummy
+/// review hash) uses: [`argon2::Params::DEFAULT`] at its default output
+/// width. A cheaper parameter set would weaken every stored password, and an
+/// unparsable parameter is refused rather than guessed at.
+pub(crate) fn has_default_argon2_cost(hash: &argon2::password_hash::PasswordHash<'_>) -> bool {
+    argon2::Params::try_from(hash).is_ok_and(|params| params == default_argon2_params())
+}
+
 /// Set the app's access gate. Owner-only (the MCP/console layers enforce the
 /// role); `plan` is the owner's plan. `pin`/`password` require Pro; `open`
 /// never does. Only a real change bumps `access_version` (a secret change
@@ -718,6 +739,10 @@ mod tests {
         assert!(verify_secret(&hash, "123456").await);
         assert!(!verify_secret(&hash, "123457").await);
         assert!(!verify_secret("not-a-hash", "123456").await);
+        // The review-login gate pins this cost; a fresh hash must pass it.
+        let parsed =
+            argon2::password_hash::PasswordHash::new(&hash).expect("the fresh hash parses");
+        assert!(has_default_argon2_cost(&parsed), "{hash}");
     }
 
     #[test]

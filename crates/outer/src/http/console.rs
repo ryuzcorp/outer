@@ -3,10 +3,11 @@
 //! Routes (platform host only; explicit Axum routes, so they win over the
 //! site fallback in [`super::platform_fallback`]):
 //!
-//! - `GET /console/sign-in` + `POST /console/sign-in`: the email-code web
-//!   sign-in. Same codes, rate limits, beta gate and terms acceptance as the
-//!   OAuth email step ([`crate::auth`]); success mints a `__Host-outer_sid`
-//!   session and redirects to `/console`.
+//! - `GET /console/sign-in` + `POST /console/sign-in`: the web sign-in. The
+//!   email step sends a code; the password step admits operator-listed review
+//!   accounts (`OUTER_REVIEW_LOGINS`) with no code. Same rate limits, beta
+//!   gate and terms acceptance as the OAuth steps ([`crate::auth`]); success
+//!   mints a `__Host-outer_sid` session and redirects to `/console`.
 //! - `GET /api/console/me`: `{email, plan}`.
 //! - `GET /api/console/apps`: the caller's apps (same rows as MCP
 //!   `list_apps`, plus `last_request_at` and the last deploy).
@@ -1454,7 +1455,13 @@ fn safe_next(next: Option<&str>) -> String {
     }
 }
 
-fn email_form(error: Option<&str>, invite_open: bool, invite_value: &str, next: &str) -> Markup {
+fn email_form(
+    error: Option<&str>,
+    password_error: Option<&str>,
+    invite_open: bool,
+    invite_value: &str,
+    next: &str,
+) -> Markup {
     layout(
         "Sign in",
         html! {
@@ -1483,6 +1490,27 @@ fn email_form(error: Option<&str>, invite_open: bool, invite_value: &str, next: 
                 }
                 br;
                 button type="submit" style="padding:.5rem 1rem" { "Send code" }
+            }
+            hr style="margin:2rem 0 1.25rem;border:0;border-top:1px solid #ddd";
+            h2 style="font-size:1.1rem" { "Review account? Sign in with a password" }
+            @if let Some(error) = password_error {
+                p style="color:#a00" { (error) }
+            }
+            form method="post" action="/console/sign-in" {
+                input type="hidden" name="step" value="password";
+                input type="hidden" name="next" value=(next);
+                label {
+                    "Email" br;
+                    input type="email" name="email" required autocomplete="username"
+                        style="width:100%;padding:.5rem;margin:.25rem 0";
+                }
+                label {
+                    "Password" br;
+                    input type="password" name="password" required autocomplete="current-password"
+                        style="width:100%;padding:.5rem;margin:.25rem 0";
+                }
+                br;
+                button type="submit" style="padding:.5rem 1rem" { "Sign in" }
             }
         },
     )
@@ -1595,14 +1623,19 @@ async fn sign_in_get(
             );
         }
     }
-    page(StatusCode::OK, email_form(None, false, "", &target), None)
+    page(
+        StatusCode::OK,
+        email_form(None, None, false, "", &target),
+        None,
+    )
 }
 
-/// `POST /console/sign-in`: one step per form (`email` → `code` → `terms`).
-/// Same codes, limits and beta gate as the OAuth email step; the session is
-/// minted at `code`, so the `terms` step is already authenticated. The
-/// `next` field rides through every step and is validated each time: only a
-/// local path survives, anything else lands on `/console`.
+/// `POST /console/sign-in`: one step per form (`email` → `code`, or
+/// `password` for a review account; then `terms`). Same codes, limits and
+/// beta gate as the OAuth email step; the session is minted at `code` or
+/// `password`, so the `terms` step is already authenticated. The `next`
+/// field rides through every step and is validated each time: only a local
+/// path survives, anything else lands on `/console`.
 async fn sign_in_post(
     State(state): State<super::AppState>,
     headers: HeaderMap,
@@ -1616,6 +1649,7 @@ async fn sign_in_post(
             StatusCode::FORBIDDEN,
             email_form(
                 Some("Open the sign-in page on outer.now and try again."),
+                None,
                 false,
                 "",
                 "/console",
@@ -1657,6 +1691,7 @@ async fn sign_in_post(
                         status,
                         email_form(
                             Some(crate::auth::pages::friendly_error(err.code)),
+                            None,
                             err.code == "closed_beta",
                             &invite_value,
                             &target,
@@ -1703,11 +1738,63 @@ async fn sign_in_post(
                 ),
             }
         }
+        Some("password") => {
+            let email = form.get("email").cloned().unwrap_or_default();
+            let password = form.get("password").cloned().unwrap_or_default();
+            match crate::auth::reviewer_sign_in(
+                &mcp.pool,
+                &mcp.auth.config,
+                &email,
+                &password,
+                ip.as_deref(),
+            )
+            .await
+            {
+                Ok((account_id, terms_ok)) => {
+                    let session = crate::auth::create_session(&mcp.pool, &account_id)
+                        .await
+                        .ok()
+                        .map(|id| crate::auth::set_session_cookie(&id));
+                    if !terms_ok {
+                        return page(
+                            StatusCode::OK,
+                            terms_form(&mcp.auth.config.terms_version, None, &target),
+                            session,
+                        );
+                    }
+                    redirect(&target, session)
+                }
+                Err(err) => {
+                    let status = if err.code == "rate_limited" {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    page(
+                        status,
+                        email_form(
+                            None,
+                            Some(crate::auth::pages::friendly_error(err.code)),
+                            false,
+                            "",
+                            &target,
+                        ),
+                        None,
+                    )
+                }
+            }
+        }
         Some("terms") => {
             let Some(session) = crate::auth::session_from_headers(&headers) else {
                 return page(
                     StatusCode::BAD_REQUEST,
-                    email_form(Some("Sign in with email first."), false, "", "/console"),
+                    email_form(
+                        Some("Sign in with email first."),
+                        None,
+                        false,
+                        "",
+                        "/console",
+                    ),
                     None,
                 );
             };
@@ -1715,7 +1802,13 @@ async fn sign_in_post(
             else {
                 return page(
                     StatusCode::BAD_REQUEST,
-                    email_form(Some("Sign in with email first."), false, "", "/console"),
+                    email_form(
+                        Some("Sign in with email first."),
+                        None,
+                        false,
+                        "",
+                        "/console",
+                    ),
                     None,
                 );
             };
@@ -1748,7 +1841,7 @@ async fn sign_in_post(
         }
         _ => page(
             StatusCode::BAD_REQUEST,
-            email_form(Some("Unknown sign-in step."), false, "", "/console"),
+            email_form(Some("Unknown sign-in step."), None, false, "", "/console"),
             None,
         ),
     }
@@ -1757,7 +1850,9 @@ async fn sign_in_post(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::test_support::{captured, test_config, test_pool};
+    use crate::auth::test_support::{
+        captured, test_config, test_pool, REVIEW_EMAIL, REVIEW_PASSWORD,
+    };
     use crate::auth::AuthConfig;
     use crate::store::snapshot::StateSync;
     use axum::body::Body;
@@ -4778,5 +4873,217 @@ mod tests {
             .unwrap();
         seed_log(&pool, 1, now / 1000, "stdout", "after the ban").await;
         expect_stream_end(&mut body, "banned caller stream must end").await;
+    }
+
+    fn password_post(email: &str, password: &str) -> String {
+        form(&[
+            ("step", "password"),
+            ("email", email),
+            ("password", password),
+        ])
+    }
+
+    #[tokio::test]
+    async fn password_sign_in_sets_the_session_and_owes_terms() {
+        let (app, pool, _, _) = test_app().await;
+        let (status, headers, body) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &password_post(REVIEW_EMAIL, REVIEW_PASSWORD),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("Terms"), "first sign-in owes terms: {body}");
+        let cookie = session_cookie(&headers);
+        let (status, headers, _) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[("step", "terms"), ("accept", "yes")]),
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/console");
+        let (status, _, body) = send(&app, authed("/api/console/me", &cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        let me: serde_json::Value = body.parse().unwrap();
+        assert_eq!(me["email"], REVIEW_EMAIL);
+        assert_eq!(me["plan"], "free");
+        let (email,): (String,) = sqlx::query_as("SELECT email FROM user WHERE email = ?")
+            .bind(REVIEW_EMAIL)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(email, REVIEW_EMAIL);
+    }
+
+    #[tokio::test]
+    async fn password_sign_in_redirects_when_terms_are_current() {
+        let (app, pool, config, _) = test_app().await;
+        let (account_id, _) =
+            crate::auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, REVIEW_PASSWORD, None)
+                .await
+                .unwrap();
+        crate::auth::record_terms_acceptance(&pool, &config, &account_id)
+            .await
+            .unwrap();
+        let (status, headers, _) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &password_post(REVIEW_EMAIL, REVIEW_PASSWORD),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/console");
+        session_cookie(&headers);
+    }
+
+    #[tokio::test]
+    async fn password_sign_in_honors_a_local_next_and_refuses_forged_targets() {
+        let (app, pool, config, _) = test_app().await;
+        let (account_id, _) =
+            crate::auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, REVIEW_PASSWORD, None)
+                .await
+                .unwrap();
+        crate::auth::record_terms_acceptance(&pool, &config, &account_id)
+            .await
+            .unwrap();
+
+        // The form carries the validated target through to the POST.
+        let (status, _, body) = send(
+            &app,
+            Request::get("/console/sign-in?next=/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(r#"name="next" value="/keys""#),
+            "the password form carries next: {body}"
+        );
+
+        let (status, headers, _) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[
+                    ("step", "password"),
+                    ("email", REVIEW_EMAIL),
+                    ("password", REVIEW_PASSWORD),
+                    ("next", "/keys"),
+                ]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/keys");
+
+        // A forged target falls back to the console.
+        for evil in ["//evil.com", "https://evil.com"] {
+            let (status, headers, _) = send(
+                &app,
+                post_form(
+                    "/console/sign-in",
+                    &form(&[
+                        ("step", "password"),
+                        ("email", REVIEW_EMAIL),
+                        ("password", REVIEW_PASSWORD),
+                        ("next", evil),
+                    ]),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{evil}");
+            assert_eq!(headers["location"], "/console", "{evil}");
+        }
+    }
+
+    #[tokio::test]
+    async fn password_sign_in_keeps_next_through_the_terms_step() {
+        let (app, _, _, _) = test_app().await;
+        let (status, headers, body) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[
+                    ("step", "password"),
+                    ("email", REVIEW_EMAIL),
+                    ("password", REVIEW_PASSWORD),
+                    ("next", "/keys"),
+                ]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "terms step renders: {body}");
+        assert!(
+            body.contains(r#"name="next" value="/keys""#),
+            "the terms form carries next: {body}"
+        );
+        let cookie = session_cookie(&headers);
+        let (status, headers, _) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[("step", "terms"), ("accept", "yes"), ("next", "/keys")]),
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/keys");
+    }
+
+    #[tokio::test]
+    async fn password_sign_in_wrong_password_rerenders_the_generic_message() {
+        let (app, _, _, _) = test_app().await;
+        let (status, _, body) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &password_post(REVIEW_EMAIL, "not-the-password"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Wrong email or password."), "{body}");
+        assert!(
+            body.contains("Review account? Sign in with a password"),
+            "the password form is re-rendered: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_step_refuses_a_cross_site_post() {
+        let (app, pool, _, _) = test_app().await;
+        let req = Request::post("/console/sign-in")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::from(password_post(REVIEW_EMAIL, REVIEW_PASSWORD)))
+            .unwrap();
+        let (status, headers, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            headers.get_all("set-cookie").iter().next().is_none(),
+            "a refused cross-site request mints no session"
+        );
+        let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE email = ?")
+            .bind(REVIEW_EMAIL)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(accounts, 0, "no account is created");
     }
 }
