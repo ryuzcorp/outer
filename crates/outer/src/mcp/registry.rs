@@ -84,8 +84,8 @@ impl Hints {
         open_world: false,
     };
     /// Overwrites a stored value or replaces who can reach the app (a
-    /// secret, the visitor PIN, the app name). The old value is gone, so a
-    /// retry can never recover it: destructive, never a no-op.
+    /// secret, the visitor PIN). The old value is gone, so a retry can
+    /// never recover it: destructive, never a no-op.
     const OVERWRITE: Self = Self {
         read_only: false,
         destructive: true,
@@ -93,8 +93,9 @@ impl Hints {
         open_world: false,
     };
     /// Overwrites a setting whose effect is public: publishing an app can
-    /// expose it to search engines and crawlers, and the previous setting
-    /// is gone, so clients must confirm.
+    /// expose it to search engines and crawlers, and renaming it serves the
+    /// same app at a new public hostname. The previous setting or URL is
+    /// gone, so clients must confirm.
     const OVERWRITE_PUBLIC: Self = Self {
         read_only: false,
         destructive: true,
@@ -175,14 +176,16 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         // One reversible flag; the same call leaves the same state.
         "set_always_on" => Hints::SETTING,
         // Overwrites a value or replaces who can reach the app: the old
-        // secret, PIN, slug or tables are gone, and a retry can't restore
-        // them. `set_secret` is the audit's example: non-destructive would
-        // let injected text swap a Stripe key without a confirmation.
-        "set_secret" | "set_access" | "rename_app" | "restore_backup" => Hints::OVERWRITE,
-        // Replaces the current visibility *and* can publish the app to
-        // search engines: open-world because the pages leave the private
-        // account, destructive because the previous setting is overwritten.
-        "set_visibility" => Hints::OVERWRITE_PUBLIC,
+        // secret, PIN or tables are gone, and a retry can't restore them.
+        // `set_secret` is the audit's example: non-destructive would let
+        // injected text swap a Stripe key without a confirmation.
+        "set_secret" | "set_access" | "restore_backup" => Hints::OVERWRITE,
+        // Replaces the current visibility or name *and* publishes outside
+        // the private account: `set_visibility` can expose the app to
+        // search engines and `rename_app` serves it at a new public
+        // hostname. Open-world because those pages leave the account,
+        // destructive because the previous setting or URL is overwritten.
+        "set_visibility" | "rename_app" => Hints::OVERWRITE_PUBLIC,
         // Ends access or data for good: the same call reaches the same end
         // state, so repeating it is a no-op.
         "revoke_api_key"
@@ -691,5 +694,8 @@ mod hint_tests {
         // The audit's example: a silent `set_secret` would let injected text
         // swap a Stripe key without the human ever seeing a prompt.
         assert!(hints_for("set_secret").is_some_and(|h| h.destructive && !h.read_only));
+        // `rename_app` retires the old URL and serves the app at a new
+        // public hostname, so it is open-world as well as destructive.
+        assert!(hints_for("rename_app").is_some_and(|h| h.destructive && h.open_world));
     }
 }
