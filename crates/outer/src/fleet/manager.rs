@@ -660,19 +660,26 @@ impl FleetManager {
     /// Wake stopped always-on apps (Pro owner, serving per
     /// [`crate::apps::serving::SERVING_SQL`], deployed at least once):
     /// after a restart or crash nothing is tracked, and without this they
-    /// would sit asleep until a request. Most-recently-active first, stopping
-    /// at `always_on_max` awake — and after that many failures, so crashing
-    /// fleets can't stall the sweep — on top of the wake semaphore inside
-    /// [`Self::ensure_awake`]. Failures warn and the next tick retries.
-    /// Apps that never deployed are skipped: there is nothing
-    /// to serve yet, and waking them would fail the health gate every tick.
+    /// would sit asleep until a request. Ordered by intent: an app whose
+    /// last live deploy is newer than its last activity has not run since
+    /// that deploy and comes first, so a fresh deploy is never starved by
+    /// apps that are merely busier; the rest keep most-recently-active
+    /// first. The wake stops at `always_on_max` awake — and after that many
+    /// failures, so crashing fleets can't stall the sweep — on top of the
+    /// wake semaphore inside [`Self::ensure_awake`]. Failures warn and the
+    /// next tick retries. Apps that never deployed are skipped: there is
+    /// nothing to serve yet, and waking them would fail the health gate
+    /// every tick.
     pub async fn warm_always_on(&self, pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
         let max = self.inner.always_on_max;
         if max == 0 {
             return Ok(Vec::new());
         }
         // Eligibility mirrors cron's `due` filters: only apps that would
-        // otherwise serve requests.
+        // otherwise serve requests. `deployed_at` names the deploy that
+        // produced `last_deploy_sha`; every wake records activity
+        // (`last_request_at`), so "deploy newer than activity" is exactly
+        // "nothing has run this app since the deploy".
         let rows: Vec<(String, String)> = sqlx::query_as(concat!(
             "SELECT a.id AS id, a.slug AS slug FROM app AS a JOIN user AS u ON u.id = a.owner_id \
              WHERE a.always_on = 1 AND u.plan = 'pro' \
@@ -680,7 +687,11 @@ impl FleetManager {
             crate::apps::serving::serving_sql!(),
             " \
                AND a.last_deploy_sha IS NOT NULL \
-             ORDER BY COALESCE(a.last_request_at, a.created_at) DESC",
+             ORDER BY (COALESCE((SELECT MAX(d.finished_at) FROM deploy AS d \
+                                 WHERE d.app_id = a.id AND d.kind = 'main' \
+                                   AND d.sha = a.last_deploy_sha), 0) \
+                       > COALESCE(a.last_request_at, 0)) DESC, \
+                      COALESCE(a.last_request_at, a.created_at) DESC",
         ))
         .fetch_all(pool)
         .await?;
@@ -720,6 +731,34 @@ impl FleetManager {
             }
         }
         Ok(woken)
+    }
+
+    /// After a deploy switched the app's live version, make sure the new
+    /// version actually runs when the app is meant to stay warm: flagged
+    /// always-on, Pro owner, and serving per
+    /// [`crate::apps::serving::decide`]. Free apps keep sleeping as before,
+    /// and a stopped or held app is not woken.
+    ///
+    /// `ensure_awake` covers the sleeping case (a booted celld adopts the
+    /// deployment pointer and arms the new generation's cron schedule) and
+    /// is a no-op for a tracked fleet. The one warm-up request then drives
+    /// a real visitor path into the fleet: celld's health gate and
+    /// `/reload` both answer without running the Worker, so only a request
+    /// proves the deployed version serves. Neither step fails a deploy; the
+    /// caller logs an error and the keep-warm sweep retries.
+    pub async fn warm_after_deploy(&self, pool: &SqlitePool, app: &App) -> anyhow::Result<()> {
+        if !app.always_on || app.last_deploy_sha.is_none() {
+            return Ok(());
+        }
+        if crate::apps::always_on::owner_plan(pool, &app.owner_id).await? != "pro" {
+            return Ok(());
+        }
+        if crate::apps::serving::decide(app) != crate::apps::serving::Serving::Live {
+            return Ok(());
+        }
+        self.ensure_awake(pool, app).await?;
+        warm_up(&app.slug, app.port).await;
+        Ok(())
     }
 
     /// Stop every fleet whose app has been quieter than `sleep_after`, drop
@@ -1117,6 +1156,32 @@ pub fn over_cap_victims(mut idle: Vec<(String, i64)>, max: usize) -> Vec<String>
 /// `refresh_after` old restart this tick rather than the next.
 pub fn should_refresh(credential_age: Duration, refresh_after: Duration) -> bool {
     credential_age >= refresh_after
+}
+
+/// One visitor request into the app's public listener — the same hop the
+/// proxy makes (`http://127.0.0.1:{port}`). Any HTTP answer proves the
+/// deployed Worker ran; a refused connection or a timeout is logged and
+/// nothing else, because a deploy must never fail on its warm-up.
+async fn warm_up(slug: &str, port: u16) {
+    let url = format!("http://127.0.0.1:{port}/");
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return;
+    };
+    match client.get(&url).send().await {
+        Ok(response) => tracing::info!(
+            slug = %slug,
+            status = response.status().as_u16(),
+            "post-deploy warm-up complete"
+        ),
+        Err(err) => tracing::warn!(
+            slug = %slug,
+            error = %format!("{err:#}"),
+            "post-deploy warm-up failed; the keep-warm sweep retries"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1688,6 +1753,64 @@ mod tests {
             (listener, port)
         }
 
+        /// A listener that answers 200 to every request and records each
+        /// request line, so a test can prove a request reached the fleet.
+        /// The health gate is answered too, so `ensure_awake` adopts the
+        /// port without spawning a celld.
+        async fn recording_port(&mut self) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            self.listeners.push(tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let line = String::from_utf8_lossy(&buf[..n])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        seen.lock().unwrap().push(line);
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                    });
+                }
+            }));
+            (port, requests)
+        }
+
+        /// One live-history deploy row: what `warm_always_on` reads to date
+        /// the deploy that produced the app's `last_deploy_sha`.
+        async fn insert_deploy(&self, app_id: &str, sha: &str, status: &str, finished_at: i64) {
+            sqlx::query(
+                "INSERT INTO deploy (id, app_id, sha, status, kind, created_at, finished_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'main', ?5, ?5)",
+            )
+            .bind(format!("{app_id}-{sha}"))
+            .bind(app_id)
+            .bind(sha)
+            .bind(status)
+            .bind(finished_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        async fn asleep_since(&self, slug: &str) -> Option<i64> {
+            sqlx::query_scalar("SELECT asleep_since FROM app WHERE slug = ?1")
+                .bind(slug)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap()
+        }
+
         /// Start and health-gate the app's fleet, then backdate its
         /// activity so the sweep sees it as idle. Serves `listener`, bound
         /// up front by [`Self::gated_listener`] and held since seeding:
@@ -2007,6 +2130,129 @@ mod tests {
         assert_eq!(
             attempts, 2,
             "the third eligible app waits for the next tick"
+        );
+        rig.manager.stop_all().await;
+    }
+
+    /// The 2026-11-06 incident: a successful deploy left an always-on app
+    /// asleep. `alive` is process liveness and the deploy's `/reload` never
+    /// reaches a sleeping fleet, so the deploy step itself must wake the app
+    /// AND send one visitor request: celld's health gate answers without
+    /// running the deployed Worker.
+    #[tokio::test]
+    async fn post_deploy_wakes_and_warms_an_always_on_app() {
+        let mut rig = WarmRig::new(10).await;
+        rig.seed_user("a1", "a@example.com", "pro").await;
+        rig.seed_user("b1", "b@example.com", "free").await;
+        let (port, requests) = rig.recording_port().await;
+        let (free_port, free_requests) = rig.recording_port().await;
+        let now = apps::now_ms();
+        rig.seed_app(
+            "app1",
+            "warm",
+            "a1",
+            220101,
+            port as i64,
+            true,
+            Some(now - 600_000),
+            Some("sha"),
+            Some(now),
+        )
+        .await;
+        // Free flag is stored but never warmed (Free sleep behavior is
+        // unchanged by the deploy step).
+        rig.seed_app(
+            "app2",
+            "free",
+            "b1",
+            220102,
+            free_port as i64,
+            true,
+            Some(now - 600_000),
+            Some("sha"),
+            Some(now),
+        )
+        .await;
+
+        let app = apps::get_by_slug(&rig.pool, "warm").await.unwrap().unwrap();
+        rig.manager
+            .warm_after_deploy(&rig.pool, &app)
+            .await
+            .unwrap();
+        assert!(
+            rig.asleep_since("warm").await.is_none(),
+            "the deploy wakes a sleeping always-on app"
+        );
+        let lines = requests.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|line| line.starts_with("GET / ")),
+            "the deploy warms the fleet through its own port: {lines:?}"
+        );
+
+        let free = apps::get_by_slug(&rig.pool, "free").await.unwrap().unwrap();
+        rig.manager
+            .warm_after_deploy(&rig.pool, &free)
+            .await
+            .unwrap();
+        assert!(
+            free_requests.lock().unwrap().is_empty(),
+            "a Free-owned always-on flag never warms"
+        );
+        assert!(rig.asleep_since("free").await.is_some());
+        rig.manager.stop_all().await;
+    }
+
+    /// Intent ordering: an app whose deploy is newer than any of its
+    /// activity has not run since that deploy, so it outranks a busier app
+    /// and the single cap slot cannot starve it.
+    #[tokio::test]
+    async fn warm_ranking_prefers_an_app_not_warmed_since_its_deploy() {
+        let mut rig = WarmRig::new(1).await;
+        rig.seed_user("a1", "a@example.com", "pro").await;
+        let now = apps::now_ms();
+        let (fresh_port, _) = rig.recording_port().await;
+        let (busy_port, _) = rig.recording_port().await;
+        // `busy` served a visitor a moment ago; `fresh` has not run since
+        // the deploy a minute ago.
+        rig.seed_app(
+            "app1",
+            "fresh",
+            "a1",
+            220101,
+            fresh_port as i64,
+            true,
+            Some(now - 3_600_000),
+            Some("sha-fresh"),
+            Some(now - 3_600_000),
+        )
+        .await;
+        rig.seed_app(
+            "app2",
+            "busy",
+            "a1",
+            220102,
+            busy_port as i64,
+            true,
+            Some(now),
+            Some("sha-busy"),
+            Some(now),
+        )
+        .await;
+        rig.insert_deploy("app1", "sha-fresh", "success", now - 60_000)
+            .await;
+        rig.insert_deploy("app2", "sha-busy", "success", now - 3_600_000)
+            .await;
+
+        let woken = rig.manager.warm_always_on(&rig.pool).await.unwrap();
+        assert_eq!(
+            woken,
+            vec!["fresh"],
+            "a deploy newer than the last activity ranks first"
+        );
+        assert!(rig.asleep_since("fresh").await.is_none());
+        assert!(
+            rig.asleep_since("busy").await.is_some(),
+            "the cap slot went to the freshly deployed app"
         );
         rig.manager.stop_all().await;
     }

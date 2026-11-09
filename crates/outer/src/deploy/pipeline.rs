@@ -845,6 +845,9 @@ impl Deployer {
                 let operator_token =
                     crate::secrets::operator_token(&self.settings.secrets_key, &app.slug);
                 let reloaded = reload_if_awake(app, &operator_token).await;
+                if kind == DeployKind::Main {
+                    self.settle_always_on(pool, &app.id);
+                }
                 self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
                 Ok(DeployOutcome {
                     deploy_id,
@@ -920,6 +923,7 @@ impl Deployer {
                                 &app.slug,
                             );
                             let reloaded = reload_if_awake(app, &operator_token).await;
+                            self.settle_always_on(pool, &app.id);
                             self.spawn_edge_purge(pool, &app.id, &app.slug, kind);
                             reloaded
                         }
@@ -954,6 +958,37 @@ impl Deployer {
                 })
             }
         }
+    }
+
+    /// After the live version switched, make an always-on app actually run
+    /// the new version. A code-only deploy otherwise only reloads a fleet
+    /// that already listens: a sleeping one adopts the deploy whenever it
+    /// next wakes, which may be the next keep-warm slot or a visitor.
+    /// `warm_after_deploy` wakes it and drives one visitor request through
+    /// its loopback port (a cold wake plus the warm-up GET can take several
+    /// seconds, so the work runs detached and never adds to the deploy's
+    /// response). The row is re-read inside the task so the just-written
+    /// `last_deploy_sha` is part of the eligibility check. Never fails the
+    /// deploy: a fleet that will not start is logged and the keep-warm
+    /// sweep retries.
+    fn settle_always_on(&self, pool: &SqlitePool, app_id: &str) {
+        let Some(wake) = self.settings.wake.clone() else {
+            return;
+        };
+        let pool = pool.clone();
+        let app_id = app_id.to_string();
+        tokio::spawn(async move {
+            let Ok(Some(app)) = apps::get_by_id(&pool, &app_id).await else {
+                return;
+            };
+            if let Err(err) = wake.warm_after_deploy(&pool, &app).await {
+                tracing::warn!(
+                    slug = %app.slug,
+                    error = %format!("{err:#}"),
+                    "post-deploy warm-up failed; the keep-warm sweep retries"
+                );
+            }
+        });
     }
 
     /// Purge `<slug>.<apps_domain>` plus every `active` custom hostname from
