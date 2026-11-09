@@ -51,27 +51,81 @@ pub struct Hints {
 }
 
 impl Hints {
-    /// Reads Outer's own state only.
+    /// Reads Outer's own state and modifies nothing.
     const READ: Self = Self {
         read_only: true,
         destructive: false,
         idempotent: true,
         open_world: false,
     };
-    /// Adds or changes state that the next call (or `rollback`) can undo:
-    /// commits append history, nothing is lost.
-    const WRITE: Self = Self {
+    /// Strictly additive and confined to the account: creates a row, a
+    /// backup or a queued review, losing nothing. Repeating the call can
+    /// create a second artifact, so it is not idempotent.
+    const ADDITIVE: Self = Self {
         read_only: false,
         destructive: false,
         idempotent: false,
         open_world: false,
     };
-    /// Ends access for good (a revoked key or connection can't come back).
+    /// Additive, but the result leaves the private account: a public app
+    /// URL, an invite email, a 6-digit code mailed to the caller.
+    const ADDITIVE_PUBLIC: Self = Self {
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: true,
+    };
+    /// Changes a reversible flag and nothing else; the same call leaves the
+    /// same state, so a retry is a no-op.
+    const SETTING: Self = Self {
+        read_only: false,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    };
+    /// Overwrites a stored value or replaces who can reach the app (a
+    /// secret, the visitor PIN). The old value is gone, so a retry can
+    /// never recover it: destructive, never a no-op.
+    const OVERWRITE: Self = Self {
+        read_only: false,
+        destructive: true,
+        idempotent: false,
+        open_world: false,
+    };
+    /// Overwrites a setting whose effect is public: publishing an app can
+    /// expose it to search engines and crawlers, and renaming it serves the
+    /// same app at a new public hostname. The previous setting or URL is
+    /// gone, so clients must confirm.
+    const OVERWRITE_PUBLIC: Self = Self {
+        read_only: false,
+        destructive: true,
+        idempotent: true,
+        open_world: true,
+    };
+    /// Ends access or data for good (a revoked key, a deleted app, a
+    /// discarded draft). Repeating it reaches the same end state.
     const DESTRUCTIVE: Self = Self {
         read_only: false,
         destructive: true,
         idempotent: true,
         open_world: false,
+    };
+    /// Deploys code to a live or preview URL: it replaces what serves,
+    /// publishes to the open web, and every run creates a new commit.
+    const PUBLISH: Self = Self {
+        read_only: false,
+        destructive: true,
+        idempotent: false,
+        open_world: true,
+    };
+    /// The fallback for a name this table doesn't know: clients must
+    /// confirm, and it may reach the open web. The registry test refuses
+    /// any unclassified tool, so this never ships.
+    const CAUTIOUS: Self = Self {
+        read_only: false,
+        destructive: true,
+        idempotent: false,
+        open_world: true,
     };
 
     pub fn to_json(self, title: &str) -> Value {
@@ -89,41 +143,60 @@ impl Hints {
 /// registry test fails on it, so a new tool can't ship without a decision.
 pub fn hints_for(name: &str) -> Option<Hints> {
     Some(match name {
+        // Retrieval and computation only: no row, object or deploy changes.
+        // `look_at_app` renders the page in a browser but writes nothing;
+        // `share_app` formats a URL and a QR code.
         "about" | "docs" | "whoami" | "list_api_keys" | "list_connections" | "list_apps"
         | "get_app" | "share_app" | "look_at_app" | "open_app" | "list_files" | "read_files"
         | "search_code" | "history" | "show_commit" | "deploy_status" | "deploy_log"
         | "app_logs" | "app_errors" | "app_metrics" | "db_query" | "list_secrets"
-        | "list_collaborators" | "list_domains" | "export_code" | "list_backups" | "diff_draft"
-        | "examples" => Hints::READ,
-        "verify_code" | "create_api_key" | "create_app" | "commit" | "rollback" | "rename_app"
-        | "request_review" | "set_secret" | "resolve_error" | "ignore_error" | "reopen_error"
-        | "add_domain" | "backup_database" | "promote_preview" | "upgrade" | "manage_billing"
-        | "stage" | "check" | "ship" | "add_example" | "set_access" => Hints::WRITE,
-        // Emails an invite to an address outside Outer.
-        "add_collaborator" => Hints {
-            open_world: true,
-            ..Hints::WRITE
-        },
-        "remove_collaborator" => Hints::DESTRUCTIVE,
-        "set_visibility" | "set_always_on" => Hints {
-            idempotent: true,
-            ..Hints::WRITE
-        },
-        // Emails a code to an address outside Outer.
-        "sign_in" => Hints {
-            open_world: true,
-            ..Hints::WRITE
-        },
-        "revoke_api_key" | "revoke_connection" | "delete_app" | "delete_account"
-        | "unset_secret" | "remove_domain" | "discard_preview" | "discard_draft" => {
-            Hints::DESTRUCTIVE
+        | "list_collaborators" | "list_domains" | "list_backups" | "diff_draft" | "examples" => {
+            Hints::READ
         }
-        // Repeating a restore takes another fresh backup, so one call is
-        // never a no-op repeat of the last: not idempotent.
-        "restore_backup" => Hints {
-            idempotent: false,
-            ..Hints::DESTRUCTIVE
-        },
+        // Each of these commits code and deploys it: it overwrites what the
+        // live (or preview) URL serves, publishes to the open web, and
+        // every call mints a new commit. `commit {preview: true}` deploys
+        // the preview host, which is public too.
+        "commit" | "ship" | "rollback" | "promote_preview" | "add_example" => Hints::PUBLISH,
+        // Additive writes whose result is visible outside the private
+        // account: `create_app` publishes a new app URL, `sign_in` mails a
+        // code, `add_collaborator` emails an invite, `add_domain` registers
+        // a public hostname.
+        "create_app" | "sign_in" | "add_collaborator" | "add_domain" => Hints::ADDITIVE_PUBLIC,
+        // Additive writes confined to the account: a new key or row, a
+        // staged draft op, a build (which consumes build minutes, so not
+        // read-only), a fresh backup, a queued review or triage change,
+        // and `export_code` (which persists a new zip in the bucket).
+        "verify_code" | "create_api_key" | "export_code" | "stage" | "check"
+        | "backup_database" | "request_review" | "resolve_error" | "ignore_error"
+        | "reopen_error" => Hints::ADDITIVE,
+        // Billing rows are removed on another branch; keep them classified
+        // as they are today so the two changes merge without a hint change.
+        "upgrade" | "manage_billing" => Hints::ADDITIVE,
+        // One reversible flag; the same call leaves the same state.
+        "set_always_on" => Hints::SETTING,
+        // Overwrites a value or replaces who can reach the app: the old
+        // secret, PIN or tables are gone, and a retry can't restore them.
+        // `set_secret` is the audit's example: non-destructive would let
+        // injected text swap a Stripe key without a confirmation.
+        "set_secret" | "set_access" | "restore_backup" => Hints::OVERWRITE,
+        // Replaces the current visibility or name *and* publishes outside
+        // the private account: `set_visibility` can expose the app to
+        // search engines and `rename_app` serves it at a new public
+        // hostname. Open-world because those pages leave the account,
+        // destructive because the previous setting or URL is overwritten.
+        "set_visibility" | "rename_app" => Hints::OVERWRITE_PUBLIC,
+        // Ends access or data for good: the same call reaches the same end
+        // state, so repeating it is a no-op.
+        "revoke_api_key"
+        | "revoke_connection"
+        | "delete_app"
+        | "delete_account"
+        | "unset_secret"
+        | "remove_domain"
+        | "remove_collaborator"
+        | "discard_preview"
+        | "discard_draft" => Hints::DESTRUCTIVE,
         _ => return None,
     })
 }
@@ -159,7 +232,7 @@ fn tool<T: schemars::JsonSchema>(
         input_schema,
         // Unclassified names fall back to the cautious default; the
         // registry test refuses them, so this never ships.
-        hints: hints_for(name).unwrap_or(Hints::DESTRUCTIVE),
+        hints: hints_for(name).unwrap_or(Hints::CAUTIOUS),
     }
 }
 
@@ -515,9 +588,12 @@ mod tests {
 #[cfg(test)]
 mod hint_tests {
     use super::*;
+
+    /// Every tool has a decision, no tool is both read-only and
+    /// destructive, untrusted tools never change state, and the pinned
+    /// destructive set matches the handlers' actual effects.
     #[test]
-    fn every_tool_is_classified_and_only_revoke_delete_unset_remove_discard_and_restore_are_destructive(
-    ) {
+    fn every_tool_is_classified_and_the_destructive_set_is_pinned() {
         for tool in registry() {
             let hints = hints_for(tool.name)
                 .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
@@ -538,6 +614,15 @@ mod hint_tests {
                     | "discard_preview"
                     | "discard_draft"
                     | "restore_backup"
+                    | "set_secret"
+                    | "set_access"
+                    | "rename_app"
+                    | "set_visibility"
+                    | "commit"
+                    | "ship"
+                    | "rollback"
+                    | "promote_preview"
+                    | "add_example"
             );
             assert_eq!(hints.destructive, destructive, "{}", tool.name);
             // Untrusted tools return app content; they must never change state.
@@ -549,11 +634,68 @@ mod hint_tests {
                 );
             }
         }
-        assert!(hints_for("commit").is_some_and(|h| !h.read_only && !h.destructive));
         assert!(hints_for("list_apps").is_some_and(|h| h.read_only));
         // Every restore takes a fresh backup first, so a retry is never a
         // no-op: destructive but not idempotent.
         assert!(hints_for("restore_backup").is_some_and(|h| h.destructive && !h.idempotent));
         assert_eq!(title_of("create_app"), "Create app");
+    }
+
+    /// The classes pinned by what a caller would notice: a live deploy is
+    /// open-world and destructive (except `create_app`, which adds an app
+    /// rather than replacing one), every `delete_`/`remove_`/`revoke_`/
+    /// `unset_`/`discard_` tool is destructive, and a read-only tool never
+    /// claims an effect.
+    #[test]
+    fn hints_follow_the_handlers_effects() {
+        // These can deploy live code; the owner's site changes.
+        for name in [
+            "commit",
+            "ship",
+            "rollback",
+            "promote_preview",
+            "add_example",
+            "create_app",
+        ] {
+            let hints = hints_for(name).unwrap_or_else(|| panic!("{name} is unclassified"));
+            assert!(!hints.read_only, "{name} deploys but reads as read-only");
+            assert!(hints.open_world, "{name} deploys but reads as closed-world");
+            if name == "create_app" {
+                // A new app overwrites nothing.
+                assert!(!hints.destructive, "create_app adds an app");
+            } else {
+                assert!(hints.destructive, "{name} replaces what is live");
+            }
+        }
+        for tool in registry() {
+            let hints =
+                hints_for(tool.name).unwrap_or_else(|| panic!("{} unclassified", tool.name));
+            if tool.name.starts_with("delete_")
+                || tool.name.starts_with("remove_")
+                || tool.name.starts_with("revoke_")
+                || tool.name.starts_with("unset_")
+                || tool.name.starts_with("discard_")
+            {
+                assert!(hints.destructive, "{} removes something", tool.name);
+            }
+            if hints.read_only {
+                assert!(
+                    !hints.destructive,
+                    "{} is read-only and destructive",
+                    tool.name
+                );
+                assert!(
+                    !hints.open_world,
+                    "{} is read-only and open-world",
+                    tool.name
+                );
+            }
+        }
+        // The audit's example: a silent `set_secret` would let injected text
+        // swap a Stripe key without the human ever seeing a prompt.
+        assert!(hints_for("set_secret").is_some_and(|h| h.destructive && !h.read_only));
+        // `rename_app` retires the old URL and serves the app at a new
+        // public hostname, so it is open-world as well as destructive.
+        assert!(hints_for("rename_app").is_some_and(|h| h.destructive && h.open_world));
     }
 }
