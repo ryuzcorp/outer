@@ -212,14 +212,14 @@ fn check_redirect(mut doc: ClientDoc, redirect_uri: &str) -> Result<ClientDoc, C
 }
 
 async fn dcr_client(pool: &SqlitePool, client_id: &str) -> anyhow::Result<Option<ClientDoc>> {
-    let row: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT clientId, name, host, redirectUris FROM oauthClient \
+    let row: Option<DcrDoc> = sqlx::query_as(
+        "SELECT clientId, name, host, redirectUris, verified FROM oauthClient \
          WHERE clientId = ? AND kind = 'dcr'",
     )
     .bind(client_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(client_id, name, host, redirect_uris)| {
+    Ok(row.map(|(client_id, name, host, redirect_uris, verified)| {
         let redirect_uris: Vec<String> = serde_json::from_str(&redirect_uris).unwrap_or_default();
         let host = host.unwrap_or_else(|| {
             redirect_host(
@@ -235,7 +235,9 @@ async fn dcr_client(pool: &SqlitePool, client_id: &str) -> anyhow::Result<Option
             name: name.unwrap_or_else(|| host.clone()),
             host,
             redirect_uris,
-            verified: false,
+            // Only operator-created rows carry `verified = 1`: DCR clients
+            // registered themselves and keep the neutral note.
+            verified: verified != 0,
             client_id,
             loopback_only,
         }
@@ -416,6 +418,10 @@ fn cache_ttl(headers: &reqwest::header::HeaderMap) -> i64 {
 
 /// One cached CIMD row: name, host, redirect_uris JSON, fetched_at.
 type CachedDoc = (Option<String>, Option<String>, String, Option<i64>);
+
+/// One `dcr`-kind client row: clientId, name, host, redirect_uris JSON,
+/// `verified` (1 only for operator-created clients).
+type DcrDoc = (String, Option<String>, Option<String>, String, i64);
 
 fn redirect_host(uri: &str) -> String {
     Url::parse(uri)
