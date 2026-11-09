@@ -954,6 +954,12 @@ async fn run_deploy_inner(
                     let apps_domain = crawl_apps_domain.clone();
                     let purge = crawl_purge.clone();
                     tokio::spawn(async move {
+                        // A held app was blocked from waking since the hold;
+                        // wake it and re-read the row so the crawl can lift
+                        // the hold on a clean result.
+                        let app =
+                            crate::moderation::crawl::prepare_deploy_crawl(&pool, &fleets, &app)
+                                .await;
                         let Ok(fetch) = crate::moderation::crawl::LoopbackFetch::new(
                             app.port,
                             cfg.page_timeout,
@@ -1143,6 +1149,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "get_app" => apps::get_app(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "request_review" => apps::request_review(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "set_visibility" => apps::set_visibility(parse_args(args)?, ctx)

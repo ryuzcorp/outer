@@ -305,7 +305,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(anon.len(), 62);
+    assert_eq!(anon.len(), 63);
     assert!(anon.contains(&"sign_in".to_string()));
     assert!(anon.contains(&"create_app".to_string()));
     assert!(anon.contains(&"add_example".to_string()));
@@ -323,7 +323,7 @@ async fn tools_list_filters_per_caller() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(authed.len(), 60);
+    assert_eq!(authed.len(), 61);
     assert!(authed.contains(&"set_access".to_string()));
     assert!(!authed.contains(&"sign_in".to_string()));
     assert!(!authed.contains(&"verify_code".to_string()));
@@ -8779,4 +8779,419 @@ async fn invalid_params_name_tool_and_shape() {
     .await;
     assert_eq!(shape["error"]["code"], -32602);
     assert_eq!(shape["error"]["data"]["shape"]["sha"], "number");
+}
+
+// --- request_review (spec §15.2–15.3) --------------------------------------
+//
+// The tools' held branch runs a real crawl through the loopback fetch, so
+// these tests point the app's port at a stub that answers the health probe
+// and serves one page. The app rows are inserted directly: `create_app`
+// spawns the post-deploy crawl, which would race the crawl under test.
+
+static REVIEW_UID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// One live app row with no deploy history, owned by `email`.
+async fn moderation_app(
+    state: &McpState,
+    email: &str,
+    slug: &str,
+    port: u16,
+    moderation: &str,
+) -> String {
+    let owner_id = crate::apps::ensure_account(&state.pool, email)
+        .await
+        .unwrap();
+    let id = format!("app-{slug}");
+    let uid = 220_000 + REVIEW_UID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    sqlx::query(
+        "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at, moderation_state, last_deploy_sha) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, 'abc')",
+    )
+    .bind(&id)
+    .bind(slug)
+    .bind(&owner_id)
+    .bind(uid)
+    .bind(port as i64)
+    .bind(port as i64 + 1)
+    .bind(moderation)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Answers every request with 200 and the same HTML: the fleet health probe
+/// and the crawl's page fetch both see it. The counter proves a wake ran.
+async fn review_stub(
+    html: &'static str,
+) -> (
+    u16,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{html}",
+                    html.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (port, hits, handle)
+}
+
+/// A Jev stand-in: clean everywhere, or flagging profanity (which holds).
+async fn review_jev(
+    profane: bool,
+) -> (
+    crate::moderation::jev::fake::FakeJev,
+    crate::moderation::jev::JevClient,
+) {
+    let server =
+        crate::moderation::jev::fake::FakeJev::start(std::sync::Arc::new(move |body: &Value| {
+            let mut answers = serde_json::Map::new();
+            if let Some(questions) = body.pointer("/input/questions").and_then(|q| q.as_object()) {
+                for (qid, question) in questions {
+                    let kind = question.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let flagged = profane
+                        && question
+                            .get("instructions")
+                            .and_then(|q| q.as_str())
+                            .unwrap_or("")
+                            .contains("profanity");
+                    answers.insert(
+                        qid.clone(),
+                        if kind == "score" {
+                            json!({"type": "score", "score": 0.0, "confidence": 0.9})
+                        } else if flagged {
+                            json!({"type": "noul", "noul": 0.95})
+                        } else {
+                            json!({"type": "noul", "noul": 0.01})
+                        },
+                    );
+                }
+            }
+            (
+                200,
+                crate::moderation::jev::fake::envelope(json!({
+                    "answers": answers, "usage": {},
+                })),
+            )
+        }))
+        .await;
+    let mut config = crate::moderation::jev::JevConfig::new(
+        "test-account".to_string(),
+        "test-token".to_string(),
+        "outer".to_string(),
+    );
+    config.api_base = server.base_url.clone();
+    config.timeout = std::time::Duration::from_millis(500);
+    let jev = crate::moderation::jev::JevClient::new(config).unwrap();
+    (server, jev)
+}
+
+async fn app_moderation(state: &McpState, slug: &str) -> String {
+    sqlx::query_scalar("SELECT moderation_state FROM app WHERE slug = ?1")
+        .bind(slug)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn request_review_lifts_a_clean_held_app() {
+    let (mut state, codes) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (port, _hits, _stub) = review_stub("<h1>Grocery list</h1>").await;
+    moderation_app(&state, "ana@example.com", "groceries", port, "held").await;
+    let (_jev_server, jev) = review_jev(false).await;
+    state.jev = Some(jev);
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "request_review",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["state"], "ok", "{body}");
+    assert_eq!(structured["lifted"], true, "{body}");
+    let text = result(&body)["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("serves again"), "{text}");
+    assert_eq!(app_moderation(&state, "groceries").await, "ok");
+    let email = codes
+        .lock()
+        .unwrap()
+        .get("ana@example.com")
+        .cloned()
+        .expect("lift email");
+    assert!(
+        email.starts_with("Outer lifted the hold on groceries"),
+        "{email}"
+    );
+}
+
+#[tokio::test]
+async fn request_review_keeps_a_flagged_held_app_queued() {
+    let (mut state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (port, _hits, _stub) =
+        review_stub("<h1>Guestbook</h1><p>this list is fucking awesome</p>").await;
+    moderation_app(&state, "ana@example.com", "groceries", port, "held").await;
+    let (_jev_server, jev) = review_jev(true).await;
+    state.jev = Some(jev);
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "request_review",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["state"], "held", "{body}");
+    assert_eq!(structured["findings"][0]["page"], "/", "{body}");
+    assert!(!structured["findings"][0]["excerpt"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    let text = result(&body)["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("admin review queue"), "{text}");
+    assert!(text.contains("was flagged"), "{text}");
+    assert_eq!(app_moderation(&state, "groceries").await, "held");
+}
+
+#[tokio::test]
+async fn request_review_rate_limits_a_fresh_held_crawl() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let (port, hits, _stub) = review_stub("<h1>Grocery list</h1>").await;
+    moderation_app(&state, "ana@example.com", "groceries", port, "held").await;
+    let crawled_at = crate::apps::now_ms() - 10_000;
+    sqlx::query("UPDATE app SET last_crawl_at = ?1 WHERE slug = 'groceries'")
+        .bind(crawled_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "request_review",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "rate_limited", "{body}");
+    let retry = err["retry_after_s"].as_u64().unwrap();
+    assert!((100..=120).contains(&retry), "{retry}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(app_moderation(&state, "groceries").await, "held");
+}
+
+#[tokio::test]
+async fn request_review_queues_a_suspended_app_without_crawling() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    moderation_app(&state, "ana@example.com", "groceries", 1, "suspended").await;
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "request_review",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["state"], "suspended", "{body}");
+    assert_eq!(structured["queued"], true, "{body}");
+    let text = result(&body)["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("admin reviews it"), "{text}");
+    let checks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM moderation_check")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(checks, 0, "a suspended app is not crawled");
+    assert_eq!(app_moderation(&state, "groceries").await, "suspended");
+}
+
+#[tokio::test]
+async fn request_review_queues_the_latest_blocked_deploy() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    let app_id = moderation_app(&state, "ana@example.com", "groceries", 1, "ok").await;
+    sqlx::query(
+        "INSERT INTO deploy (id, app_id, sha, status, created_at) \
+         VALUES ('d-blocked', ?1, 'abc123', 'blocked', 10)",
+    )
+    .bind(&app_id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "request_review",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    let structured = &result(&body)["structuredContent"];
+    assert_eq!(structured["state"], "ok", "{body}");
+    assert_eq!(structured["blocked_deploy"], "d-blocked/abc123", "{body}");
+    assert_eq!(structured["queued"], true, "{body}");
+    let text = result(&body)["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("admin review queue"), "{text}");
+
+    // A newer deploy supersedes the block: nothing is left to review.
+    sqlx::query(
+        "INSERT INTO deploy (id, app_id, sha, status, created_at) \
+         VALUES ('d-newer', ?1, 'def456', 'success', 20)",
+    )
+    .bind(&app_id)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "request_review",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "invalid_argument", "{body}");
+
+    // An ok app with no blocked deploy has nothing to review.
+    let app_id = moderation_app(&state, "ana@example.com", "pantry", 2, "ok").await;
+    let _ = app_id;
+    let (_, body) = call(
+        &state,
+        Some(&token),
+        "request_review",
+        json!({"app": "pantry"}),
+    )
+    .await;
+    let err = is_error(&body);
+    assert_eq!(err["error"], "invalid_argument", "{body}");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to review"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn request_review_is_owner_only() {
+    let (state, _) = setup().await;
+    let owner = api_key_for(&state, "ana@example.com").await;
+    set_plan(&state, "ana@example.com", "pro").await;
+    moderation_app(&state, "ana@example.com", "groceries", 1, "ok").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+
+    let (_, body) = call(
+        &state,
+        Some(&bruno),
+        "request_review",
+        json!({"app": "groceries"}),
+    )
+    .await;
+    assert_eq!(is_error(&body)["error"], "forbidden", "{body}");
+}
+
+/// The extracted post-deploy step: a held row is re-read and woken before
+/// the crawl; ok and suspended rows are returned without a wake.
+#[tokio::test]
+async fn post_deploy_crawl_wakes_only_held_apps() {
+    let (state, _) = setup().await;
+    let (port, hits, _stub) = review_stub("<h1>Grocery list</h1>").await;
+
+    moderation_app(&state, "ana@example.com", "held-app", port, "ok").await;
+    let app = crate::apps::get_by_slug(&state.pool, "held-app")
+        .await
+        .unwrap()
+        .unwrap();
+    // The state changed after the caller loaded the row (the deploy hook's
+    // shape): the helper must re-read it.
+    sqlx::query("UPDATE app SET moderation_state = 'held' WHERE id = ?1")
+        .bind(&app.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let prepared =
+        crate::moderation::crawl::prepare_deploy_crawl(&state.pool, &state.fleets, &app).await;
+    assert_eq!(
+        prepared.moderation_state,
+        crate::apps::ModerationState::Held
+    );
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "a held app is woken before its crawl"
+    );
+
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    moderation_app(
+        &state,
+        "ana@example.com",
+        "suspended-app",
+        port.wrapping_add(1_000),
+        "suspended",
+    )
+    .await;
+    let a_suspended = crate::apps::get_by_slug(&state.pool, "suspended-app")
+        .await
+        .unwrap()
+        .unwrap();
+    let prepared =
+        crate::moderation::crawl::prepare_deploy_crawl(&state.pool, &state.fleets, &a_suspended)
+            .await;
+    assert_eq!(
+        prepared.moderation_state,
+        crate::apps::ModerationState::Suspended
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "a suspended app is not woken"
+    );
+
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    moderation_app(
+        &state,
+        "ana@example.com",
+        "ok-app",
+        port.wrapping_add(2_000),
+        "ok",
+    )
+    .await;
+    let ok_app = crate::apps::get_by_slug(&state.pool, "ok-app")
+        .await
+        .unwrap()
+        .unwrap();
+    let prepared =
+        crate::moderation::crawl::prepare_deploy_crawl(&state.pool, &state.fleets, &ok_app).await;
+    assert_eq!(prepared.moderation_state, crate::apps::ModerationState::Ok);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "an ok app keeps today's behavior"
+    );
 }

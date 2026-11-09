@@ -11,9 +11,10 @@ use super::{
     authed, check_app_quota, internal, latest_deploy, latest_preview_deploy, ok, owner_app,
     run_deploy, visible_app, Ctx, NoArgs,
 };
-use crate::apps::{self, App, Visibility};
+use crate::apps::{self, App, ModerationState, Visibility};
 use crate::collaborators::Role;
 use crate::mcp::error::ToolError;
+use crate::moderation::crawl::{self, EffectDeps, LoopbackFetch};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateAppInput {
@@ -517,6 +518,143 @@ pub async fn get_app(input: GetAppInput, ctx: &Ctx<'_>) -> Result<Value, ToolErr
     Ok(ok(
         format!("{} ({})", app.slug, ctx.state.app_url(&app.slug)),
         app_summary(ctx, &app, role).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RequestReviewInput {
+    /// The app slug.
+    pub app: String,
+}
+
+/// `request_review` (spec §15.2–15.3): the owner's appeal. A held app is
+/// re-crawled now (woken first), a suspended app or a blocked deploy goes to
+/// the admin queue that already lists it. Owner only: a collaborator's call
+/// answers `forbidden` like every other owner-only tool.
+pub async fn request_review(input: RequestReviewInput, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
+    let app = owner_app(ctx, &input.app).await?;
+    match app.moderation_state {
+        ModerationState::Held => review_held(ctx, app).await,
+        ModerationState::Suspended => Ok(ok(
+            format!(
+                "Outer restores a suspended app only after an admin reviews it. {} is in the admin review queue, which is worked daily.",
+                app.slug
+            ),
+            json!({"state": "suspended", "queued": true}),
+        )),
+        ModerationState::Ok => {
+            let queue = crate::moderation::admin::queue(&ctx.state.pool)
+                .await
+                .map_err(internal)?;
+            let blocked = queue
+                .into_iter()
+                .find(|item| item.kind == "blocked_deploy" && item.app_id == app.id);
+            let Some(item) = blocked else {
+                return Err(ToolError::invalid_argument(format!(
+                    "nothing to review on {:?}",
+                    app.slug
+                )));
+            };
+            let sha = item.sha.clone().unwrap_or_default();
+            Ok(ok(
+                format!(
+                    "The blocked deploy {id} ({sha}) is in the admin review queue. Committing a fix and deploying again is faster: the new commit supersedes it.",
+                    id = item.id,
+                ),
+                json!({
+                    "state": "ok",
+                    "blocked_deploy": format!("{}/{}", item.id, sha),
+                    "queued": true,
+                }),
+            ))
+        }
+    }
+}
+
+/// The held branch: rate limit, wake, crawl now, apply. The crawl is bounded
+/// by `(1 + max_pages) × page_timeout` plus one Jev call, so running it inline
+/// is cheaper than a poll loop. A clean result lifts the hold (the crawl's
+/// own `held → ok` edge) and the answer says the app serves again; anything
+/// else leaves it held with the finding that keeps it queued.
+async fn review_held(ctx: &Ctx<'_>, app: App) -> Result<Value, ToolError> {
+    let last_crawl_at: Option<i64> =
+        sqlx::query_scalar("SELECT last_crawl_at FROM app WHERE id = ?1")
+            .bind(&app.id)
+            .fetch_optional(&ctx.state.pool)
+            .await
+            .map_err(internal)?;
+    let now = crate::apps::now_ms();
+    if let Some(last) = last_crawl_at {
+        let elapsed = now.saturating_sub(last);
+        if elapsed < crawl::REVIEW_COOLDOWN_MS {
+            let retry_after_s = ((crawl::REVIEW_COOLDOWN_MS - elapsed) as u64).div_ceil(1000);
+            return Err(ToolError::rate_limited(
+                format!(
+                    "{} was crawled {} s ago; try again in {} s",
+                    app.slug,
+                    elapsed / 1000,
+                    retry_after_s
+                ),
+                retry_after_s,
+            ));
+        }
+    }
+    ctx.state
+        .fleets
+        .ensure_awake(&ctx.state.pool, &app)
+        .await
+        .map_err(internal)?;
+    // The crawl's clock starts after the wake, so its watermark reflects
+    // when the pages were actually read.
+    let now = crate::apps::now_ms();
+    let app = crate::apps::get_by_id(&ctx.state.pool, &app.id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ToolError::not_found(format!("no app {:?}", app.slug)))?;
+    let fetch = LoopbackFetch::new(app.port, ctx.state.crawl.page_timeout).map_err(internal)?;
+    let (result, effects) = crawl::crawl_app(
+        &ctx.state.pool,
+        &app,
+        &fetch,
+        ctx.state.jev.as_ref(),
+        &ctx.state.crawl,
+        now,
+    )
+    .await
+    .map_err(internal)?;
+    let deps = EffectDeps {
+        sender: ctx.state.auth.config.email.clone(),
+        apps_domain: ctx.state.apps_domain.clone(),
+        fleets: ctx.state.fleets.clone(),
+        purge: ctx.state.delete_cfg.cache_purge.clone(),
+    };
+    crawl::apply_effects(&deps, &app, &effects).await;
+    let current = crate::apps::get_by_id(&ctx.state.pool, &app.id)
+        .await
+        .map_err(internal)?
+        .unwrap_or(app);
+    if current.moderation_state == ModerationState::Ok {
+        return Ok(ok(
+            format!(
+                "The hold is lifted; {} serves again.",
+                ctx.state.app_url(&current.slug)
+            ),
+            json!({"state": "ok", "lifted": true}),
+        ));
+    }
+    let text = match result.findings.first() {
+        Some(finding) => format!(
+            "The hold stays: {} was flagged ({:?}). The app is in the admin review queue, which is worked daily.",
+            finding.page, finding.excerpt
+        ),
+        None => format!(
+            "The hold stays: the re-crawl of {} did not come back clean. The app is in the admin review queue, which is worked daily.",
+            current.slug
+        ),
+    };
+    Ok(ok(
+        text,
+        json!({"state": "held", "findings": result.findings}),
     ))
 }
 

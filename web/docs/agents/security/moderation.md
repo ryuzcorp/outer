@@ -42,14 +42,14 @@ Mild words pass. The classifier reads masked spellings, leetspeak, and other lan
 4. Fix flagged lines and commit again; a block counts as a code change and never becomes a rollback target.
 5. Expect brand fragments (`paypal`, `apple`, `bank`, `login`, whole or embedded) refused at claim time.
 6. Expect fail-closed `review_unavailable` when Jev is down; localhost dev without the Cloudflare pair passes with a warning.
-7. Offer no self-serve override; there is no appeal tool. Relay `user_message` verbatim instead of inventing a workaround.
+7. Offer no self-serve override: `request_review` re-crawls a held app and queues a blocked deploy or suspended app for the admin, but a person decides. Relay `user_message` verbatim instead of inventing a workaround.
 
 ## Respect after-live enforcement
 
 1. Expect an after-live crawl of rendered pages after each successful deploy: `/` plus up to 10 same-origin links, fetched through the internal path with 5 s per page. New chunks re-enter the gate.
 2. Expect hard phishing signals (credentials posted off-origin, a brand name with a password/card field, a link on the operator's bad-host list) to suspend the app without waiting for Jev.
-3. Expect strong profanity on a rendered page (Jev `profanity ≥ 0.5`) to hold the app: the proxy serves a 503 review page until a clean crawl after the next deploy, or an admin restore, lifts it.
-4. Expect a suspended app to stop its fleet and serve a 451 page; the owner gets an email either way.
+3. Expect strong profanity on a rendered page (Jev `profanity ≥ 0.5`) to hold the app: the proxy serves a 503 review page until a clean crawl after the next successful deploy, a clean `request_review` crawl, or an admin restore lifts it.
+4. Expect a suspended app to stop its fleet and serve a 451 page; the owner gets an email either way, and only an admin restores a suspension (`request_review` queues it for review).
 5. Expect flagged apps to land in the admin moderation queue; an admin can hold or suspend the app, and suspension stops its fleet.
 6. Expect a Jev outage to fail the crawl open: the app keeps serving, the outage is logged, and the next sweep retries. Only the pre-live gate fails closed.
 7. Expect `/.outer/report` on every app host to take abuse reports (rate-limited per client); reports queue for the admin and trigger a re-crawl.
