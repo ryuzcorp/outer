@@ -1,7 +1,8 @@
 //! The built docs site on the platform host: static files from `dist/`.
 //!
-//! After Outer's own routes (`/mcp`, `/oauth/*`, `/.well-known/oauth-*`,
-//! `/health`, `/ready`), the platform fallback serves Blume's output:
+//! After Outer's own routes (`/mcp`, `/oauth/*`, the auth router's exact
+//! `/.well-known/oauth-*` discovery paths, `/health`, `/ready`), the platform
+//! fallback serves Blume's output, including its `/.well-known/` files:
 //! `/` → `index.html`, `/x` → `x/index.html` or `x.html`, a trailing-slash
 //! redirect (`/x/` → `/x`), `Accept: text/markdown` negotiation onto
 //! `<route>.md` when it exists, and Blume's `404.html` with a 404 status.

@@ -23,6 +23,13 @@ pub use oauth::router;
 
 pub use tokens::{ACCESS_PREFIX, API_KEY_PREFIX, REFRESH_PREFIX};
 
+/// True for a platform-host path the auth router owns: `/oauth` and its
+/// subpaths, plus the exact well-known discovery paths it defines. Every
+/// other `/.well-known/*` path belongs to the site and falls through to it.
+pub fn owns_path(path: &str) -> bool {
+    path == "/oauth" || path.starts_with("/oauth/") || oauth::WELL_KNOWN_PATHS.contains(&path)
+}
+
 /// Milliseconds of wall clock. Tests set row timestamps directly instead of
 /// sleeping, so every expiry test stays deterministic.
 pub fn now_ms() -> i64 {
@@ -42,6 +49,10 @@ pub struct AuthConfig {
     pub signup_open: bool,
     /// `OUTER_TERMS_VERSION`.
     pub terms_version: String,
+    /// `OUTER_OPENAI_APPS_CHALLENGE`: when set, `GET
+    /// /.well-known/openai-apps-challenge` serves it verbatim (OpenAI app
+    /// submission domain check). `None` leaves the path to the site/404.
+    pub openai_apps_challenge: Option<String>,
     /// `OUTER_OAUTH_ACCESS_TTL_S` (3600).
     pub access_ttl: Duration,
     /// `OUTER_OAUTH_REFRESH_TTL_D` (90 d).
@@ -1079,6 +1090,7 @@ pub mod test_support {
             admin_emails: vec!["owner@example.com".to_string()],
             signup_open: true,
             terms_version: "2026-10-23".to_string(),
+            openai_apps_challenge: None,
             access_ttl: Duration::from_secs(3600),
             refresh_ttl: Duration::from_secs(90 * 86400),
             email: EmailSender::Capture {

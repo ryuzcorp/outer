@@ -214,6 +214,10 @@ pub struct Config {
     /// header so Chrome enables WebMCP. The console's strict CSP is
     /// untouched.
     pub webmcp_origin_trial: Option<String>,
+    /// OpenAI app submission domain check (`OUTER_OPENAI_APPS_CHALLENGE`,
+    /// absent = none): when set, `GET /.well-known/openai-apps-challenge`
+    /// on the platform host serves the exact token as `text/plain`.
+    pub openai_apps_challenge: Option<String>,
     /// `OUTER_OAUTH_ACCESS_TTL_S` (default 3600).
     pub oauth_access_ttl: Duration,
     /// `OUTER_OAUTH_REFRESH_TTL_D` (default 90).
@@ -434,6 +438,7 @@ impl Config {
             .unwrap_or("Outer <hello@outer.now>")
             .to_string();
         let webmcp_origin_trial = get("OUTER_WEBMCP_ORIGIN_TRIAL").map(str::to_string);
+        let openai_apps_challenge = get("OUTER_OPENAI_APPS_CHALLENGE").map(str::to_string);
         let oauth_access_ttl = Duration::from_secs(parse_num(
             get("OUTER_OAUTH_ACCESS_TTL_S"),
             "OUTER_OAUTH_ACCESS_TTL_S",
@@ -614,6 +619,7 @@ impl Config {
             outer_secret,
             email_from,
             webmcp_origin_trial,
+            openai_apps_challenge,
             oauth_access_ttl,
             oauth_refresh_ttl,
             tool_wait,
@@ -713,6 +719,25 @@ impl Config {
                 problems.push(format!(
                     "OUTER_WEBMCP_ORIGIN_TRIAL={token:?} is not a valid HTTP header value"
                 ));
+            }
+        }
+        // OpenAI compares the domain-check body byte for byte: whitespace,
+        // control characters or an oversized value only ever fail the check.
+        if let Some(challenge) = &self.openai_apps_challenge {
+            if challenge.len() > 512 {
+                problems.push(format!(
+                    "OUTER_OPENAI_APPS_CHALLENGE is {} bytes; it must be at most 512",
+                    challenge.len()
+                ));
+            }
+            if challenge
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+            {
+                problems.push(
+                    "OUTER_OPENAI_APPS_CHALLENGE must not contain whitespace or control characters (it is served verbatim as the domain-check body)"
+                        .to_string(),
+                );
             }
         }
         if !self.is_local() && self.terms_version == "dev" {
@@ -997,6 +1022,31 @@ mod tests {
             err.iter().any(|p| p.contains("OUTER_WEBMCP_ORIGIN_TRIAL")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn openai_apps_challenge_must_be_a_single_short_token() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert_eq!(cfg.openai_apps_challenge, None);
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_OPENAI_APPS_CHALLENGE", "abc123-def"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.openai_apps_challenge.as_deref(), Some("abc123-def"));
+        let long = "a".repeat(513);
+        for bad in ["abc def", "abc\ndef", long.as_str()] {
+            let err = Config::from_vars(&vars(&[
+                ("OUTER_STORE", "memory"),
+                ("OUTER_OPENAI_APPS_CHALLENGE", bad),
+            ]))
+            .unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains("OUTER_OPENAI_APPS_CHALLENGE")),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
