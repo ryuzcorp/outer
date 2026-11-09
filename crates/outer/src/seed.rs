@@ -8,7 +8,8 @@
 //!
 //! Idempotent: an app owned by the account whose latest deploy succeeded and
 //! whose head still carries the demo migration is left alone; a failed or
-//! incomplete app is recommitted and redeployed.
+//! incomplete app is recommitted and redeployed. `--url` must be `https`, or
+//! `http` only for a loopback host.
 
 use std::time::Duration;
 
@@ -93,6 +94,7 @@ pub async fn seed_demo(
     review_logins: &[ReviewLogin],
     mcp_url: &str,
 ) -> anyhow::Result<Vec<SeededApp>> {
+    check_mcp_url(mcp_url)?;
     let owner_email = auth::normalize_email(owner_email);
     anyhow::ensure!(
         review_logins.iter().any(|login| login.email == owner_email),
@@ -103,6 +105,9 @@ pub async fn seed_demo(
     // never stop on the terms page.
     let now = apps::now_ms();
     let owner_id = apps::ensure_account(pool, &owner_email).await?;
+    // A run killed by a panic or Ctrl-C never reaches the revocation below,
+    // leaving a live credential behind. Clear any such key before minting.
+    revoke_stale_seed_keys(pool, &owner_id).await?;
     sqlx::query(
         "UPDATE user SET plan = 'pro', planStatus = 'active', emailVerified = 1, \
          termsVersion = ?, termsAcceptedAt = ?, lastActiveAt = ?, updatedAt = ? WHERE id = ?",
@@ -142,8 +147,50 @@ pub async fn seed_demo(
     }
 }
 
-/// The per-app loop: read what the server already has, decide, then create or
-/// recommit through MCP.
+/// Disable every still-enabled key of `owner_id` named [`SEED_KEY_NAME`],
+/// left by a run that never reached its revocation. Returns how many it
+/// revoked.
+async fn revoke_stale_seed_keys(pool: &SqlitePool, owner_id: &str) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "UPDATE apikey SET enabled = 0, updatedAt = ? \
+         WHERE referenceId = ? AND name = ? AND enabled != 0",
+    )
+    .bind(apps::now_ms())
+    .bind(owner_id)
+    .bind(SEED_KEY_NAME)
+    .execute(pool)
+    .await
+    .context("revoking stale seed API keys")?;
+    Ok(result.rows_affected())
+}
+
+/// `--url` must be `https`, or `http` only for a loopback host: the seed
+/// mints an API key and sends it in a header, so a plain-HTTP hop would put a
+/// live credential on the wire. Loopback stays allowed for a local `serve`.
+fn check_mcp_url(raw: &str) -> anyhow::Result<()> {
+    let url =
+        url::Url::parse(raw).map_err(|err| anyhow::anyhow!("--url {raw:?} is not a URL: {err}"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if host_is_loopback(&url) => Ok(()),
+        "http" => anyhow::bail!(
+            "--url {raw:?} is plain http: use https, or http with a loopback host \
+             (localhost, *.localhost, 127.0.0.0/8, ::1)"
+        ),
+        scheme => anyhow::bail!("--url {raw:?} uses scheme {scheme:?}: use https"),
+    }
+}
+
+fn host_is_loopback(url: &url::Url) -> bool {
+    use url::Host;
+    match url.host() {
+        Some(Host::Domain(domain)) => domain == "localhost" || domain.ends_with(".localhost"),
+        Some(Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
+}
+
 async fn seed_apps(client: &SeedMcp, owner_email: &str) -> anyhow::Result<Vec<SeededApp>> {
     let local = owner_email.split('@').next().unwrap_or("review");
     let mut seeded = Vec::with_capacity(DEMO_APPS.len());
@@ -1240,6 +1287,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(live_keys, 0, "the seed key is revoked after a failed run");
+        pool.close().await;
+    }
+
+    #[test]
+    fn seed_url_is_https_or_http_on_loopback_only() {
+        for ok in [
+            "https://outer.now",
+            "https://outer.now:8443/mcp",
+            "http://localhost:8080",
+            "http://outer.localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://127.9.9.9",
+            "http://[::1]:8080",
+        ] {
+            check_mcp_url(ok).unwrap_or_else(|err| panic!("{ok}: {err:#}"));
+        }
+        for bad in [
+            "http://outer.now",
+            "http://192.168.1.5:8080",
+            "http://localhost.evil.example",
+            "not-a-url",
+            "ftp://outer.now",
+        ] {
+            let err = check_mcp_url(bad).unwrap_err();
+            assert!(format!("{err:#}").contains("--url"), "{bad}: {err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_revokes_a_stale_seed_key_left_by_a_killed_run() {
+        let (_state, pool, _url, _dir, _server) = server().await;
+        let owner = apps::ensure_account(&pool, auth_ts::REVIEW_EMAIL)
+            .await
+            .unwrap();
+        let stale = auth::create_api_key(&pool, &owner, Some(SEED_KEY_NAME))
+            .await
+            .unwrap();
+        // Any run proves the sweep: this one cannot reach a server at all.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let logins = vec![login(auth_ts::REVIEW_EMAIL)];
+        seed_demo(&pool, "2026-10-23", auth_ts::REVIEW_EMAIL, &logins, &closed)
+            .await
+            .unwrap_err();
+        let stale_enabled: i64 = sqlx::query_scalar("SELECT enabled FROM apikey WHERE prefix = ?1")
+            .bind(&stale.prefix)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stale_enabled, 0, "the stale key is revoked");
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apikey WHERE enabled != 0")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(live, 0, "no seed key stays live after the run");
         pool.close().await;
     }
 

@@ -3383,4 +3383,8 @@ fn dummy_review_hash_is_a_valid_argon2id_phc() {
         .expect("the dummy review hash parses");
     assert_eq!(parsed.algorithm.as_str(), "argon2id");
     assert!(parsed.hash.is_some(), "the dummy hash carries output bytes");
+    assert!(
+        crate::access::has_default_argon2_cost(&parsed),
+        "the dummy hash keeps the cost `outer hash-password` produces"
+    );
 }

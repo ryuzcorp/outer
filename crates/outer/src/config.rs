@@ -168,8 +168,12 @@ impl std::fmt::Debug for ReviewLogin {
 }
 
 /// Parse `OUTER_REVIEW_LOGINS`: `;`-separated `email:phc` entries (PHC holds
-/// `$` and `,`, so `;` is the separator). Problems name the variable and the
-/// entry index and never echo the value.
+/// `$` and `,`, so `;` is the separator). Emails must be ASCII: `normalize_email`
+/// lowercases ASCII only while `ensure_account` lowercases Unicode, so a
+/// non-ASCII entry could never match the account it signs in to. The hash must
+/// carry `Params::DEFAULT` (the cost `outer hash-password` and the dummy PHC
+/// use); a cheaper PHC would weaken every reviewer password. Problems name the
+/// variable and the entry index and never echo the value.
 fn parse_review_logins(raw: &str, problems: &mut Vec<String>) -> Vec<ReviewLogin> {
     let mut logins: Vec<ReviewLogin> = Vec::new();
     for (position, entry) in raw
@@ -192,6 +196,12 @@ fn parse_review_logins(raw: &str, problems: &mut Vec<String>) -> Vec<ReviewLogin
             continue;
         };
         let email = email.trim().to_ascii_lowercase();
+        if !email.is_ascii() {
+            problems.push(format!(
+                "OUTER_REVIEW_LOGINS entry {index}: the part before ':' is not an ASCII email address"
+            ));
+            continue;
+        }
         if !crate::auth::valid_email(&email) {
             problems.push(format!(
                 "OUTER_REVIEW_LOGINS entry {index}: the part before ':' is not an email address"
@@ -210,10 +220,18 @@ fn parse_review_logins(raw: &str, problems: &mut Vec<String>) -> Vec<ReviewLogin
                     "OUTER_REVIEW_LOGINS entry {index}: the password hash must be an argon2id PHC string"
                 ));
             }
-            Ok(_) => logins.push(ReviewLogin {
-                email,
-                password_hash: hash.trim().to_string(),
-            }),
+            Ok(parsed) => {
+                if !crate::access::has_default_argon2_cost(&parsed) {
+                    problems.push(format!(
+                        "OUTER_REVIEW_LOGINS entry {index}: the password hash must use the default Argon2id cost; generate it with `outer hash-password`"
+                    ));
+                    continue;
+                }
+                logins.push(ReviewLogin {
+                    email,
+                    password_hash: hash.trim().to_string(),
+                });
+            }
             Err(_) => problems.push(format!(
                 "OUTER_REVIEW_LOGINS entry {index}: the password hash is not a PHC string"
             )),
@@ -1720,6 +1738,21 @@ mod tests {
                 "duplicate email",
                 format!("Review@Example.com:{PHC_A};review@example.com:{PHC_B}"),
                 "entry 2",
+            ),
+            (
+                "cheaper cost",
+                format!("review@example.com:{}", PHC_A.replace("m=19456", "m=65536")),
+                "outer hash-password",
+            ),
+            (
+                "unparsable param",
+                format!("review@example.com:{}", PHC_A.replace("t=2", "t=nope")),
+                "outer hash-password",
+            ),
+            (
+                "non-ascii email",
+                format!("réview@example.com:{PHC_A}"),
+                "not an ASCII email",
             ),
         ];
         for (label, raw, needle) in cases {
