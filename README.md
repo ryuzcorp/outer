@@ -60,6 +60,9 @@ Outer is in closed beta. New accounts need an invite code
 (`OUTER-XXXX-XXXX`) — without one, sign-in puts you on the waitlist.
 Details: [Sign in](https://outer.now/get-started/sign-in).
 
+Scripts and clients without OAuth mint an API key at
+[outer.now/keys](https://outer.now/keys).
+
 [Terms](https://outer.now/terms) · [Privacy](https://outer.now/privacy)
 
 ## Development

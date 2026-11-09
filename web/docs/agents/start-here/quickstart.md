@@ -12,7 +12,7 @@ Your person connects their chat client once (full table in the human [Quickstart
 1. Claude Code: `claude mcp add --transport http outer https://outer.now/mcp`, then `/mcp` → `outer` to sign in.
 2. claude.ai, Desktop, mobile: Settings → Connectors → Add custom connector → `https://outer.now/mcp`.
 3. Codex CLI, IDE, ChatGPT desktop app: `codex mcp add outer --url https://outer.now/mcp`; the first tool call opens sign-in (`codex mcp login outer` only if no browser opens).
-4. Anything else: OAuth if supported, else the emailed-code fallback.
+4. Anything else: OAuth if supported, else create an API key at `/keys` and send it as an `Authorization: Bearer` header.
 
 ## Ask for a scoped first build
 

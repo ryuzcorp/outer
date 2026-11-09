@@ -1,6 +1,6 @@
-//! End-to-end MCP tests: JSON-RPC envelope, lazy auth, every tool group and
-//! the OTP sign-in round trip. Deterministic: memory store, temp dirs, fake
-//! deploys, captured email codes — no celld, no network.
+//! End-to-end MCP tests: JSON-RPC envelope, lazy auth, every tool group.
+//! Deterministic: memory store, temp dirs, fake deploys, captured email
+//! codes — no celld, no network.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -297,24 +297,30 @@ async fn initialize_negotiates_and_pins_instructions() {
 }
 
 #[tokio::test]
-async fn tools_list_filters_per_caller() {
+async fn tools_list_is_identical_per_caller() {
     let (state, _) = setup().await;
+    let list = |body: &Value| -> Vec<String> {
+        result(body)["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
     let (_, _, anon) = post(
         &state,
         None,
         json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
     )
     .await;
-    let anon: Vec<String> = result(&anon)["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(anon.len(), 61);
-    assert!(anon.contains(&"sign_in".to_string()));
+    let anon = list(&anon);
+    assert_eq!(anon.len(), 58);
     assert!(anon.contains(&"create_app".to_string()));
     assert!(anon.contains(&"add_example".to_string()));
+    // Sign-in and key minting moved to the web (`/keys`), never MCP tools.
+    for removed in ["sign_in", "verify_code", "create_api_key"] {
+        assert!(!anon.contains(&removed.to_string()), "{removed} is gone");
+    }
     // Billing tools left the agent surface (commerce guidelines).
     assert!(!anon.contains(&"upgrade".to_string()));
     assert!(!anon.contains(&"manage_billing".to_string()));
@@ -326,18 +332,9 @@ async fn tools_list_filters_per_caller() {
         json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
     )
     .await;
-    let authed: Vec<String> = result(&authed)["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(authed.len(), 59);
+    let authed = list(&authed);
+    assert_eq!(authed, anon, "authentication does not change the list");
     assert!(authed.contains(&"set_access".to_string()));
-    assert!(!authed.contains(&"sign_in".to_string()));
-    assert!(!authed.contains(&"verify_code".to_string()));
-    assert!(!authed.contains(&"upgrade".to_string()));
-    assert!(!authed.contains(&"manage_billing".to_string()));
 
     // The test admin sees the same rows: M1 has no admin tools.
     let admin = api_key_for(&state, "owner@example.com").await;
@@ -347,13 +344,32 @@ async fn tools_list_filters_per_caller() {
         json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
     )
     .await;
-    let admin: Vec<String> = result(&admin_list)["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(admin, authed);
+    assert_eq!(list(&admin_list), anon);
+}
+
+#[tokio::test]
+async fn removed_sign_in_tools_answer_unknown_tool() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    for (name, args) in [
+        ("sign_in", json!({"email": "ana@example.com"})),
+        (
+            "verify_code",
+            json!({"email": "ana@example.com", "code": "000000"}),
+        ),
+        ("create_api_key", json!({"name": "laptop"})),
+    ] {
+        let (status, body) = call(&state, Some(&token), name, args).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["error"]["code"], -32602, "{name}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool"),
+            "{name}: {body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1315,65 +1331,25 @@ async fn unawaited_calls_return_and_poll_resolves() {
 }
 
 #[tokio::test]
-async fn otp_sign_in_round_trip_then_account_tools() {
-    let (state, codes) = setup().await;
-    // No token yet: the full OTP fallback through the tools.
-    let (_, sent) = call(&state, None, "sign_in", json!({"email": "New@Example.com"})).await;
-    assert_eq!(result(&sent)["structuredContent"]["sent"], true);
-    let code = auth_ts::captured(&codes, "new@example.com");
-
-    // First use without accept_terms is refused — and the spent code is
-    // gone, so sign in again for a fresh one.
-    let (_, denied) = call(
-        &state,
-        None,
-        "verify_code",
-        json!({"email": "new@example.com", "code": code, "accept_terms": false}),
-    )
-    .await;
-    assert_eq!(is_error(&denied)["error"], "invalid_argument");
-
-    let (_, resent) = call(&state, None, "sign_in", json!({"email": "new@example.com"})).await;
-    assert_eq!(result(&resent)["structuredContent"]["sent"], true);
-    let code = auth_ts::captured(&codes, "new@example.com");
-
-    let (_, verified) = call(
-        &state,
-        None,
-        "verify_code",
-        json!({"email": "new@example.com", "code": code, "accept_terms": true,
-               "key_name": "laptop"}),
-    )
-    .await;
-    let verified = &result(&verified)["structuredContent"];
-    let key = verified["api_key"].as_str().unwrap().to_string();
-    assert!(key.starts_with("outer_"));
-    assert_eq!(verified["account"]["email"], "new@example.com");
-    assert!(verified["mcp_url"].as_str().unwrap().ends_with("/mcp"));
-
-    let (_, who) = call(&state, Some(&key), "whoami", json!({})).await;
-    assert_eq!(
-        result(&who)["structuredContent"]["email"],
-        "new@example.com"
-    );
-
-    let (_, minted) = call(
-        &state,
-        Some(&key),
-        "create_api_key",
-        json!({"name": "phone"}),
-    )
-    .await;
-    let prefix = result(&minted)["structuredContent"]["prefix"]
-        .as_str()
-        .unwrap()
-        .to_string();
+async fn account_key_and_connection_tools() {
+    let (state, _) = setup().await;
+    let key = api_key_for(&state, "ana@example.com").await;
+    // A second key to revoke: revoking the caller's only key would 401 the
+    // rest of the test.
+    let account_id = crate::apps::ensure_account(&state.pool, "ana@example.com")
+        .await
+        .unwrap();
+    let spare = crate::auth::create_api_key(&state.pool, &account_id, Some("phone"))
+        .await
+        .unwrap();
 
     let (_, listed) = call(&state, Some(&key), "list_api_keys", json!({})).await;
     let keys = result(&listed)["structuredContent"]["keys"]
         .as_array()
         .unwrap();
-    assert!(keys.iter().any(|k| k["prefix"] == prefix));
+    assert_eq!(keys.len(), 2);
+    assert!(keys.iter().any(|k| k["prefix"] == spare.prefix));
+    let prefix = spare.prefix.clone();
 
     let (_, revoked) = call(
         &state,
@@ -3032,38 +3008,52 @@ async fn collaborator_joins_through_the_closed_beta_without_invite_codes() {
     let owner = pro_app(&state, "ana@example.com", "groceries").await;
     invite(&state, &owner, "groceries", "bruno@example.com").await;
 
-    // A non-allowlisted stranger is still refused a code (the auth layer's
-    // `closed_beta` maps to `forbidden` on the wire).
-    let (_, refused) = call(
-        &state,
+    // A non-allowlisted stranger is still refused a code (the console and
+    // OAuth pages map `closed_beta` to the invite prompt).
+    let err = crate::auth::send_code(
+        &state.pool,
+        &state.auth.config,
+        "stranger@example.com",
         None,
-        "sign_in",
-        json!({"email": "stranger@example.com"}),
+        None,
     )
-    .await;
-    assert_eq!(is_error(&refused)["error"], "forbidden");
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, "closed_beta");
+    assert_eq!(
+        crate::mcp::error::ToolError::from_auth(err).code,
+        "forbidden"
+    );
 
     // The invited email signs straight in: no invite code involved.
-    let (_, sent) = call(
-        &state,
+    crate::auth::send_code(
+        &state.pool,
+        &state.auth.config,
+        "bruno@example.com",
         None,
-        "sign_in",
-        json!({"email": "bruno@example.com"}),
+        None,
     )
-    .await;
-    assert_eq!(result(&sent)["structuredContent"]["sent"], true);
+    .await
+    .unwrap();
     let code = auth_ts::captured(&codes, "bruno@example.com");
-    let (_, verified) = call(
-        &state,
+    let (account_id, terms_ok) = crate::auth::verify_code_core(
+        &state.pool,
+        &state.auth.config,
+        "bruno@example.com",
+        &code,
         None,
-        "verify_code",
-        json!({"email": "bruno@example.com", "code": code, "accept_terms": true}),
     )
-    .await;
-    let key = result(&verified)["structuredContent"]["api_key"]
-        .as_str()
+    .await
+    .unwrap();
+    if !terms_ok {
+        crate::auth::record_terms_acceptance(&state.pool, &state.auth.config, &account_id)
+            .await
+            .unwrap();
+    }
+    let key = crate::auth::create_api_key(&state.pool, &account_id, None)
+        .await
         .unwrap()
-        .to_string();
+        .key;
 
     // The row links to the new account: joined, visible in list_apps.
     let linked: Option<String> =

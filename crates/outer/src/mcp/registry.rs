@@ -159,17 +159,15 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         // the preview host, which is public too.
         "commit" | "ship" | "rollback" | "promote_preview" | "add_example" => Hints::PUBLISH,
         // Additive writes whose result is visible outside the private
-        // account: `create_app` publishes a new app URL, `sign_in` mails a
-        // code, `add_collaborator` emails an invite, `add_domain` registers
-        // a public hostname.
-        "create_app" | "sign_in" | "add_collaborator" | "add_domain" => Hints::ADDITIVE_PUBLIC,
-        // Additive writes confined to the account: a new key or row, a
-        // staged draft op, a build (which consumes build minutes, so not
+        // account: `create_app` publishes a new app URL, `add_collaborator`
+        // emails an invite, `add_domain` registers a public hostname.
+        "create_app" | "add_collaborator" | "add_domain" => Hints::ADDITIVE_PUBLIC,
+        // Additive writes confined to the account: a new row, a staged
+        // draft op, a build (which consumes build minutes, so not
         // read-only), a fresh backup, a queued review or triage change,
         // and `export_code` (which persists a new zip in the bucket).
-        "verify_code" | "create_api_key" | "export_code" | "stage" | "check"
-        | "backup_database" | "request_review" | "resolve_error" | "ignore_error"
-        | "reopen_error" => Hints::ADDITIVE,
+        "export_code" | "stage" | "check" | "backup_database" | "request_review"
+        | "resolve_error" | "ignore_error" | "reopen_error" => Hints::ADDITIVE,
         // One reversible flag; the same call leaves the same state.
         "set_always_on" => Hints::SETTING,
         // Overwrites a value or replaces who can reach the app: the old
@@ -247,24 +245,9 @@ pub fn registry() -> Vec<ToolDef> {
 "Read an Outer agent guide: quickstart, templates, ilha, void, website, celld, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look. Read the ilha guide before writing any code.",
             Public, false,
         ),
-        tool::<account::SignInInput>(
-            "sign_in",
-            "Start email sign-in (clients without OAuth): emails a 6-digit code. Then call verify_code. During the closed beta a new email also needs invite_code (OUTER-XXXX-XXXX). Disappears after sign-in.",
-            Public, false,
-        ),
-        tool::<account::VerifyCodeInput>(
-            "verify_code",
-            "Finish email sign-in: verify the emailed code and get an API key. accept_terms is required on first use. Disappears after sign-in.",
-            Public, false,
-        ),
         tool::<NoArgs>(
             "whoami",
             "Your account: email, plan, usage, limits and when they reset. deletes_at is your soonest Free-app deletion date for inactivity (null on Pro or with no apps).",
-            Account, false,
-        ),
-        tool::<account::CreateApiKeyInput>(
-            "create_api_key",
-            "Mint an API key. It is shown once — store it in your MCP config.",
             Account, false,
         ),
         tool::<NoArgs>(
@@ -545,22 +528,6 @@ pub fn registry() -> Vec<ToolDef> {
     ]
 }
 
-/// The tools `tools/list` shows this caller: anonymous callers see every
-/// non-admin tool (so the model can pick `create_app` first), signed-in
-/// callers no longer see `sign_in`/`verify_code`, admins see the admin
-/// additions (none in M1).
-pub fn visible_tools(authenticated: bool) -> Vec<ToolDef> {
-    registry()
-        .into_iter()
-        .filter(|t| {
-            if !authenticated {
-                return true;
-            }
-            !matches!(t.name, "sign_in" | "verify_code")
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,7 +535,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 61);
+        assert_eq!(tools.len(), 58);
     }
 
     /// Commerce guidelines (owner decision D2): no tool description

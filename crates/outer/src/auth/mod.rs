@@ -126,18 +126,6 @@ impl std::fmt::Display for AuthError {
 impl std::error::Error for AuthError {}
 
 #[derive(Debug)]
-pub struct SignInSent {
-    pub expires_in_s: u64,
-}
-
-#[derive(Debug)]
-pub struct Verified {
-    pub api_key: String,
-    pub account_id: String,
-    pub email: String,
-}
-
-#[derive(Debug)]
 pub struct NewApiKey {
     pub id: String,
     pub prefix: String,
@@ -272,7 +260,7 @@ async fn check_beta(
     })
 }
 
-/// Shared send path for `otp_sign_in` and the OAuth email step: same codes,
+/// Shared send path for the web sign-in and the OAuth email step: same codes,
 /// same 10-minute expiry, same 5/h-per-email and 20/h-per-IP limits. The
 /// optional invite code (§6.5.1) only matters for a new email during the
 /// closed beta: existing accounts, allowlisted emails and admins ignore it.
@@ -477,8 +465,8 @@ pub async fn verify_code_core(
             }
             // One transaction: insert the account, consume the carried
             // invite, mint the 3 grant codes (admins get none). The consume
-            // is conditional, so a code spent between `sign_in` and verify
-            // refuses here and creates nothing.
+            // is conditional, so a code spent between starting sign-in and
+            // verify refuses here and creates nothing.
             let mut tx = pool.begin().await.map_err(db)?;
             let id = tokens::new_id();
             sqlx::query(
@@ -576,58 +564,6 @@ pub async fn record_terms_acceptance(
         .execute(pool)
         .await?;
     Ok(())
-}
-
-/// `sign_in` tool (§6.2): normalize, beta allowlist/waitlist or invite code
-/// (§6.5.1), limits (5/h per email, 20/h per IP, §14.3), store sha256(code)
-/// 10 min / 5 attempts, send.
-pub async fn otp_sign_in(
-    pool: &SqlitePool,
-    cfg: &AuthConfig,
-    email: &str,
-    invite_code: Option<&str>,
-    client_ip: Option<&str>,
-) -> Result<SignInSent, AuthError> {
-    Ok(SignInSent {
-        expires_in_s: send_code(pool, cfg, email, invite_code, client_ip).await?,
-    })
-}
-
-/// `verify_code` tool: creates the account on first use (`accept_terms`
-/// required then; stores terms_version + accepted_at), mints an API key
-/// returned once.
-pub async fn otp_verify(
-    pool: &SqlitePool,
-    cfg: &AuthConfig,
-    email: &str,
-    code: &str,
-    accept_terms: bool,
-    key_name: Option<&str>,
-    client_ip: Option<&str>,
-) -> Result<Verified, AuthError> {
-    let email = normalize_email(email);
-    let (account_id, terms_ok) = verify_code_core(pool, cfg, &email, code, client_ip).await?;
-    if !terms_ok && !accept_terms {
-        return Err(AuthError {
-            code: "terms_required",
-            message: "first sign-in requires accept_terms".to_string(),
-            user_message: Some(
-                "Accept the Terms and Privacy Policy to finish signing in.".to_string(),
-            ),
-            retry_after_s: None,
-        });
-    }
-    if accept_terms || !terms_ok {
-        record_terms_acceptance(pool, cfg, &account_id)
-            .await
-            .map_err(|err| AuthError::new("db", format!("{err}")))?;
-    }
-    let key = create_api_key(pool, &account_id, key_name).await?;
-    Ok(Verified {
-        api_key: key.key,
-        account_id,
-        email,
-    })
 }
 
 pub async fn create_api_key(
@@ -1080,6 +1016,8 @@ pub mod test_support {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    pub type Codes = Arc<Mutex<HashMap<String, String>>>;
+
     /// Deterministic test config: codes are captured, loopback CIMD allowed,
     /// real network never touched.
     pub fn test_config() -> (AuthConfig, Arc<Mutex<HashMap<String, String>>>) {
@@ -1126,5 +1064,46 @@ pub mod test_support {
             .get(email)
             .cloned()
             .unwrap_or_else(|| panic!("no code sent to {email}"))
+    }
+
+    /// Verify a captured code and accept the current terms when the account
+    /// still owes them. Returns the account id.
+    pub async fn verify_and_accept_terms(
+        pool: &SqlitePool,
+        cfg: &AuthConfig,
+        email: &str,
+        code: &str,
+    ) -> Result<String, AuthError> {
+        let (account_id, terms_ok) = verify_code_core(pool, cfg, email, code, None).await?;
+        if !terms_ok {
+            record_terms_acceptance(pool, cfg, &account_id)
+                .await
+                .map_err(|err| AuthError::new("db", format!("{err}")))?;
+        }
+        Ok(account_id)
+    }
+
+    /// The full non-OAuth sign-in the `/keys` page drives: send a code,
+    /// capture it, verify it, accept the terms when this account still owes
+    /// them, then mint an API key.
+    pub async fn sign_in_and_accept_terms(
+        pool: &SqlitePool,
+        cfg: &AuthConfig,
+        codes: &Arc<Mutex<HashMap<String, String>>>,
+        email: &str,
+    ) -> (String, NewApiKey) {
+        let email = normalize_email(email);
+        send_code(pool, cfg, &email, None, None).await.unwrap();
+        let code = captured(codes, &email);
+        let (account_id, terms_ok) = verify_code_core(pool, cfg, &email, &code, None)
+            .await
+            .unwrap();
+        if !terms_ok {
+            record_terms_acceptance(pool, cfg, &account_id)
+                .await
+                .unwrap();
+        }
+        let key = create_api_key(pool, &account_id, None).await.unwrap();
+        (account_id, key)
     }
 }
