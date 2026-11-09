@@ -271,6 +271,11 @@ pub(crate) async fn run_celld(
     let celld_bin = deploy_settings(state)?.celld_bin.clone();
     let mut cmd = tokio::process::Command::new(&celld_bin);
     cmd.args(args);
+    // Like `d1.rs` and the fleet supervisor: start from an empty env so the
+    // server's own environment (parent bucket keys included) never reaches
+    // the child, then add only the PATH and the caller's scoped grant.
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
     cmd.envs(env.iter().map(|(k, v)| (k, v)));
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());

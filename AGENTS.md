@@ -30,8 +30,9 @@ is `crates/outer/tests/hostile.rs`, in two layers:
 - **Safe** (`cargo test --locked hostile`, runs in CI on every PR touching
   `fleet/`, `deploy/`, `store/credentials.rs` or the Dockerfile): asserts the
   generated sandbox config for each fixture category — nft ruleset, cgroup
-  limits, `fleets/{slug}/` credential scope, reserved-env filter,
-  loopback-only fleet command, data-dir layout.
+  limits, the fleet's two credential grants (read-write state prefixes,
+  read-only `deploy/` + `deploy-blobs/`, so no fleet credential can publish),
+  reserved-env filter, loopback-only fleet command, data-dir layout.
 - **Privileged** (`cargo test --locked -- --ignored hostile`, VPS only via
   `sudo scripts/hostile-suite.sh` — or, where no cargo exists,
   `scripts/hostile-probe-vps.sh` as root inside the container): runs the

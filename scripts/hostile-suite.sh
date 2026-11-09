@@ -29,13 +29,27 @@
 #   `/sys/fs/cgroup/outer` anchor. Fixtures ride in via scp + `docker cp`,
 #   the two top-of-range uids travel as arguments (verified spare on the
 #   host first). See that script's header for the exact commands.
-# - R2 layer (`--r2`): `r2-probe.mjs` checks a *scoped* key round-trips
-#   inside its own prefix and is refused (403/401) on a sibling prefix
-#   and the bucket root. Mint it first (Cloudflare API, temporary
-#   credentials on a fixture prefix) and export:
-#     HOSTILE_S3_ENDPOINT HOSTILE_S3_BUCKET HOSTILE_S3_KEY
-#     HOSTILE_S3_SECRET HOSTILE_S3_TOKEN HOSTILE_S3_PREFIX
+# - R2 layer (`--r2`): `r2-probe.mjs` checks the fleet's *state* grant
+#   round-trips inside a state prefix and is refused (403/401) on a sibling
+#   prefix, the bucket root, and `deploy/current.json`; then it checks the
+#   node's *deploy* grant (read-only) LISTs and GETs inside `deploy/` and is
+#   refused on a PUT there. Mint both first (Cloudflare API,
+#   temp-access-credentials) for a fixture prefix, upload
+#   `fleets/hostile/deploy/hostile-probe.json` with the bucket root keys,
+#   then export:
+#     HOSTILE_S3_ENDPOINT HOSTILE_S3_BUCKET HOSTILE_S3_PREFIX
+#     # state grant, permission object-read-write over exactly
+#     # fleets/hostile/{cells,log,nodes,node-cells,fleet,wake,drain,kv,r2,probe,telemetry}/
+#     # plus the non-terminated fleets/hostile/wake-, and NOT over
+#     # fleets/hostile/{deploy,deploy-blobs}/:
+#     HOSTILE_S3_KEY HOSTILE_S3_SECRET HOSTILE_S3_TOKEN
+#     HOSTILE_S3_DATA_PREFIX (default <prefix>cells/, must be writable)
 #     HOSTILE_S3_SIBLING (default fleets/hostile-neighbour/)
+#     # deploy grant, permission object-read-only over exactly
+#     # fleets/hostile/{deploy,deploy-blobs}/:
+#     HOSTILE_S3_DEPLOY_KEY HOSTILE_S3_DEPLOY_SECRET
+#     HOSTILE_S3_DEPLOY_TOKEN HOSTILE_S3_DEPLOY_PREFIX (=<prefix>deploy/)
+#     HOSTILE_S3_DEPLOY_OBJECT (default <prefix>deploy/hostile-probe.json)
 # - Worker layer (manual, needs celld + a bucket): deploy the fixture as
 #   two apps (`hostile`, `hostile-neighbour`), then
 #     curl 'https://hostile.<apps-domain>/probes?neighbour=<port>&platform=<port>'
@@ -84,7 +98,8 @@ case "$MODE" in
 esac
 
 if [ "$MODE" = "--r2" ]; then
-    for name in HOSTILE_S3_ENDPOINT HOSTILE_S3_BUCKET HOSTILE_S3_KEY HOSTILE_S3_SECRET HOSTILE_S3_PREFIX; do
+    for name in HOSTILE_S3_ENDPOINT HOSTILE_S3_BUCKET HOSTILE_S3_KEY HOSTILE_S3_SECRET HOSTILE_S3_PREFIX \
+        HOSTILE_S3_DEPLOY_KEY HOSTILE_S3_DEPLOY_SECRET; do
         eval "value=\${$name:-}"
         [ -n "$value" ] || die "$name is not exported (mint a scoped key first; see header)"
     done

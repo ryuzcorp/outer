@@ -2,15 +2,24 @@
 //!
 //! Fleets and deploy steps never hold the root bucket keys. With
 //! `OUTER_STORE=r2` and the Cloudflare pair set, outer mints Cloudflare R2
-//! temporary credentials scoped to one `fleets/{slug}/` prefix; on localhost
+//! temporary credentials scoped to `fleets/{slug}/` prefixes; on localhost
 //! dev the parent keys are used directly (`CredentialSource::Static`).
 //!
+//! A grant is a [`Permission`] over a prefix list. A fleet receives two:
+//! read-write over the celld state namespaces, and read-only over the
+//! deployment artifacts (`deploy/`, `deploy-blobs/`). An app's build runs as
+//! the same uid as its fleet and can read that fleet's environment, so a
+//! credential found there must not be able to publish a deployment; see
+//! [`crate::fleet::manager::FleetStorage::fleet_data_prefixes`] and
+//! [`crate::fleet::manager::FleetStorage::deploy_read_prefixes`]. Deploy and
+//! migrate steps keep one read-write grant over the whole fleet prefix.
+//!
 //! Fresh mints cost a Cloudflare round trip, so the minter caches the last
-//! grant per prefix (inside the minter, behind a mutex; no globals). A spawn
-//! or deploy reuses the cached grant while `refresh_after - age` still
-//! covers a day, so a reused grant never forces a restart within a day;
-//! otherwise it mints fresh and replaces the entry. The grant carries its
-//! mint time so callers know the credential's age.
+//! grant per (permission, prefixes) (inside the minter, behind a mutex; no
+//! globals). A spawn or deploy reuses the cached grant while
+//! `refresh_after - age` still covers a day, so a reused grant never forces
+//! a restart within a day; otherwise it mints fresh and replaces the entry.
+//! The grant carries its mint time so callers know the credential's age.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,6 +55,48 @@ impl std::fmt::Debug for ScopedCredentials {
     }
 }
 
+/// What a grant may do. Cloudflare R2 temporary credentials carry one
+/// permission for the whole prefix list, so a caller that needs both reads
+/// and writes in different places asks for two grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Permission {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl Permission {
+    /// The Cloudflare `permission` value.
+    fn as_str(self) -> &'static str {
+        match self {
+            Permission::ReadOnly => "object-read-only",
+            Permission::ReadWrite => "object-read-write",
+        }
+    }
+}
+
+/// The cache key: a permission and a prefix list identify one grant. The
+/// permission is part of the key because the same prefixes under another
+/// permission are a different credential.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GrantKey {
+    permission: Permission,
+    /// The request's prefix list, sorted and deduplicated.
+    prefixes: Vec<String>,
+}
+
+impl GrantKey {
+    pub(crate) fn new(prefixes: &[String], permission: Permission) -> anyhow::Result<Self> {
+        validate_prefixes(prefixes)?;
+        let mut prefixes = prefixes.to_vec();
+        prefixes.sort();
+        prefixes.dedup();
+        Ok(Self {
+            permission,
+            prefixes,
+        })
+    }
+}
+
 /// Where a fleet's or deploy's bucket credentials come from.
 #[derive(Clone)]
 pub enum CredentialSource {
@@ -72,11 +123,24 @@ impl std::fmt::Debug for CredentialSource {
 }
 
 impl CredentialSource {
-    /// Credentials for `prefix` (e.g. `fleets/{slug}/`). Static returns the
+    /// Credentials for `prefix` (e.g. `fleets/{slug}/`), read-write: the
+    /// whole-prefix grant deploy and migrate steps use. Static returns the
     /// parent keys; R2Temp reuses the cached grant while it stays fresh
     /// enough (see [`should_reuse`]) and mints a fresh one otherwise.
     pub async fn for_prefix(&self, prefix: &str) -> anyhow::Result<ScopedCredentials> {
-        validate_prefix(prefix)?;
+        self.for_prefixes(&[prefix.to_string()], Permission::ReadWrite)
+            .await
+    }
+
+    /// Credentials for `prefixes` under `permission`. This is the only
+    /// minting entry point: one place validates the shape, keys the cache,
+    /// and calls Cloudflare.
+    pub async fn for_prefixes(
+        &self,
+        prefixes: &[String],
+        permission: Permission,
+    ) -> anyhow::Result<ScopedCredentials> {
+        let key = GrantKey::new(prefixes, permission)?;
         match self {
             CredentialSource::Static {
                 access_key_id,
@@ -88,7 +152,7 @@ impl CredentialSource {
                 minted_at: None,
                 reused: false,
             }),
-            CredentialSource::R2Temp(minter) => minter.mint_cached(prefix).await,
+            CredentialSource::R2Temp(minter) => minter.mint_cached(&key).await,
         }
     }
 
@@ -96,7 +160,17 @@ impl CredentialSource {
     /// entry. The credential-refresh sweep uses this: restarting on a cached
     /// grant would restart on the same near-expiry credentials.
     pub async fn for_prefix_fresh(&self, prefix: &str) -> anyhow::Result<ScopedCredentials> {
-        validate_prefix(prefix)?;
+        self.for_prefixes_fresh(&[prefix.to_string()], Permission::ReadWrite)
+            .await
+    }
+
+    /// [`Self::for_prefixes`], always freshly minted.
+    pub async fn for_prefixes_fresh(
+        &self,
+        prefixes: &[String],
+        permission: Permission,
+    ) -> anyhow::Result<ScopedCredentials> {
+        let key = GrantKey::new(prefixes, permission)?;
         match self {
             CredentialSource::Static {
                 access_key_id,
@@ -108,22 +182,33 @@ impl CredentialSource {
                 minted_at: None,
                 reused: false,
             }),
-            CredentialSource::R2Temp(minter) => minter.mint_fresh(prefix).await,
+            CredentialSource::R2Temp(minter) => minter.mint_fresh(&key).await,
         }
     }
-    /// Drop the cached grant for `prefix`, if any. `delete_app` calls this
-    /// after stopping the fleet: a deleted app must never hand out its old
-    /// grant again (a recreated slug mints fresh). Static holds no cache.
-    /// Best effort: an unknown prefix is a no-op, never an error.
+
+    /// Drop the cached read-write grant for `prefix`, if any. `delete_app`
+    /// calls this after stopping the fleet: a deleted app must never hand
+    /// out its old grant again (a recreated slug mints fresh). Static holds
+    /// no cache. Best effort: an unknown grant is a no-op, never an error.
     pub fn forget_prefix(&self, prefix: &str) {
+        self.forget_prefixes(&[prefix.to_string()], Permission::ReadWrite);
+    }
+
+    /// [`Self::forget_prefix`] for any grant shape.
+    pub fn forget_prefixes(&self, prefixes: &[String], permission: Permission) {
+        let Ok(key) = GrantKey::new(prefixes, permission) else {
+            return;
+        };
         if let CredentialSource::R2Temp(minter) = self {
-            minter.forget(prefix);
+            minter.forget(&key);
         }
     }
 }
 
-/// `fleets/{slug}/`: the only prefix shape outer ever mints for. Must be
-/// non-empty, relative, slash-terminated, and free of `..`.
+/// `fleets/{slug}/` plus, for one celld legacy contract, `fleets/{slug}/wake-`:
+/// the only prefix shapes outer ever mints for. Must be non-empty, relative,
+/// and free of `..`; otherwise slash-terminated, except that one
+/// non-terminated shape under an app's fleet root.
 pub fn validate_prefix(prefix: &str) -> anyhow::Result<()> {
     if prefix.is_empty() {
         anyhow::bail!("credential prefix must not be empty");
@@ -131,11 +216,40 @@ pub fn validate_prefix(prefix: &str) -> anyhow::Result<()> {
     if prefix.starts_with('/') {
         anyhow::bail!("credential prefix {prefix:?} must be relative (no leading '/')");
     }
-    if !prefix.ends_with('/') {
-        anyhow::bail!("credential prefix {prefix:?} must end with '/'");
-    }
     if prefix.split('/').any(|segment| segment == "..") {
         anyhow::bail!("credential prefix {prefix:?} must not contain '..'");
+    }
+    if prefix.ends_with('/') {
+        return Ok(());
+    }
+    // The celld wake-legacy keys are siblings, not children, of one name:
+    // `wake-format.json`, `wake-v2/` and `wake-retired-v2/`. A `wake-`
+    // prefix covers exactly them (and not `wake/`), but this shape is only
+    // legal directly under the app's `fleets/{slug}/` root, never at the
+    // bucket root or after another app's prefix.
+    if let Some(root) = prefix.strip_suffix("/wake-") {
+        let Some(slug) = root.strip_prefix("fleets/") else {
+            anyhow::bail!("credential prefix {prefix:?}: 'wake-' must sit under fleets/<slug>/");
+        };
+        if !slug.is_empty() && !slug.contains('/') {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "credential prefix {prefix:?} must end with '/' (the one exception is fleets/<slug>/wake-)"
+    );
+}
+
+/// Validate a grant's whole prefix list: non-empty, and every entry a
+/// [`validate_prefix`] shape. An empty list would mint a credential over
+/// nothing, which Cloudflare accepts and which then silently fails every
+/// call.
+pub fn validate_prefixes(prefixes: &[String]) -> anyhow::Result<()> {
+    if prefixes.is_empty() {
+        anyhow::bail!("a credential grant needs at least one prefix");
+    }
+    for prefix in prefixes {
+        validate_prefix(prefix)?;
     }
     Ok(())
 }
@@ -199,10 +313,11 @@ pub struct R2TempConfig {
 pub struct R2TempMinter {
     client: reqwest::Client,
     config: R2TempConfig,
-    /// Last grant per prefix. Entries hold no lock across the mint round
-    /// trip: lookup-then-mint can double-mint under concurrent misses for
-    /// one prefix, which the per-slug wake lock already serializes.
-    cache: Mutex<HashMap<String, ScopedCredentials>>,
+    /// Last grant per (permission, prefixes). Entries hold no lock across
+    /// the mint round trip: lookup-then-mint can double-mint under
+    /// concurrent misses for one grant, which the per-slug wake lock
+    /// already serializes.
+    cache: Mutex<HashMap<GrantKey, ScopedCredentials>>,
 }
 
 impl std::fmt::Debug for R2TempMinter {
@@ -216,7 +331,7 @@ impl std::fmt::Debug for R2TempMinter {
             .field("parent_access_key_id", &self.config.parent_access_key_id)
             .field("ttl", &self.config.ttl)
             .field("refresh_after", &self.config.refresh_after)
-            .field("cached_prefixes", &self.cache_lock().len())
+            .field("cached_grants", &self.cache_lock().len())
             .finish()
     }
 }
@@ -306,8 +421,7 @@ impl R2TempMinter {
         })
     }
 
-    pub async fn mint(&self, prefix: &str) -> anyhow::Result<ScopedCredentials> {
-        validate_prefix(prefix)?;
+    pub(crate) async fn mint(&self, key: &GrantKey) -> anyhow::Result<ScopedCredentials> {
         let url = format!(
             "{}/accounts/{}/r2/temp-access-credentials",
             self.config.api_base.trim_end_matches('/'),
@@ -316,9 +430,9 @@ impl R2TempMinter {
         let body = serde_json::json!({
             "bucket": self.config.bucket,
             "parentAccessKeyId": self.config.parent_access_key_id,
-            "permission": "object-read-write",
+            "permission": key.permission.as_str(),
             "ttlSeconds": self.config.ttl.as_secs(),
-            "prefixes": [prefix],
+            "prefixes": key.prefixes,
         });
         let mut request = self
             .client
@@ -370,7 +484,7 @@ impl R2TempMinter {
     /// The cache lock, recovered from poisoning: the critical sections only
     /// do `HashMap` ops, so poison means a prior panic elsewhere, never
     /// here; dropping the entry (a re-mint) is always safe.
-    fn cache_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ScopedCredentials>> {
+    fn cache_lock(&self) -> std::sync::MutexGuard<'_, HashMap<GrantKey, ScopedCredentials>> {
         self.cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -380,9 +494,8 @@ impl R2TempMinter {
     /// [`should_reuse`] holds, else minting fresh. A hit returns the
     /// original `minted_at` with `reused` set, so callers see the grant's
     /// true age.
-    pub async fn mint_cached(&self, prefix: &str) -> anyhow::Result<ScopedCredentials> {
-        validate_prefix(prefix)?;
-        let cached = self.cache_lock().get(prefix).cloned();
+    pub(crate) async fn mint_cached(&self, key: &GrantKey) -> anyhow::Result<ScopedCredentials> {
+        let cached = self.cache_lock().get(key).cloned();
         if let Some(mut creds) = cached {
             let fresh = creds
                 .minted_at
@@ -392,23 +505,22 @@ impl R2TempMinter {
                 return Ok(creds);
             }
         }
-        self.mint_fresh(prefix).await
+        self.mint_fresh(key).await
     }
 
     /// Credentials for `prefix`, always freshly minted, replacing the cache
     /// entry. Failures leave the old entry in place: a failed mint never
     /// evicts a grant a fleet may still be running on.
-    pub async fn mint_fresh(&self, prefix: &str) -> anyhow::Result<ScopedCredentials> {
-        validate_prefix(prefix)?;
-        let creds = self.mint(prefix).await?;
-        self.cache_lock().insert(prefix.to_string(), creds.clone());
+    pub(crate) async fn mint_fresh(&self, key: &GrantKey) -> anyhow::Result<ScopedCredentials> {
+        let creds = self.mint(key).await?;
+        self.cache_lock().insert(key.clone(), creds.clone());
         Ok(creds)
     }
 
-    /// Drop the cached grant for `prefix`. `delete_app` calls this after the
+    /// Drop the cached grant for `key`. `delete_app` calls this after the
     /// fleet stops; removing (never minting) cannot fail.
-    pub fn forget(&self, prefix: &str) {
-        self.cache_lock().remove(prefix);
+    pub(crate) fn forget(&self, key: &GrantKey) {
+        self.cache_lock().remove(key);
     }
 }
 
@@ -431,6 +543,10 @@ mod tests {
     #[test]
     fn prefix_validation_rejects_shapes_outside_fleets() {
         assert!(validate_prefix("fleets/grocery/").is_ok());
+        // The celld wake-legacy group (`wake-format.json`, `wake-v2/`,
+        // `wake-retired-v2/`) is one non-slash-terminated prefix, legal only
+        // directly under an app's fleet root.
+        assert!(validate_prefix("fleets/grocery/wake-").is_ok());
         for bad in [
             "",
             "/fleets/grocery/",
@@ -439,6 +555,14 @@ mod tests {
             "fleets/../other/",
             "../fleets/grocery/",
             "fleets/../../etc/",
+            "wake-",
+            "/fleets/grocery/wake-",
+            "fleets/../other/wake-",
+            "other-prefix/wake-",
+            "fleets/grocery/cells/wake-",
+            "fleets/grocery/cells-",
+            "fleets/grocery/other-",
+            "fleets//wake-",
         ] {
             assert!(validate_prefix(bad).is_err(), "{bad:?} must be rejected");
         }
@@ -699,7 +823,8 @@ mod tests {
         })
         .await;
         let minter = minter_for(&api_base, true, Duration::from_secs(1800));
-        let creds = minter.mint("fleets/grocery/").await.unwrap();
+        let key = GrantKey::new(&["fleets/grocery/".to_string()], Permission::ReadWrite).unwrap();
+        let creds = minter.mint(&key).await.unwrap();
         assert_eq!(creds.access_key_id, "minted-id");
         assert_eq!(creds.secret_access_key, "minted-secret");
         assert_eq!(creds.session_token.as_deref(), Some("minted-token"));
@@ -724,6 +849,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_grant_carries_its_permission_and_whole_prefix_list() {
+        let (api_base, seen) = fake_cloudflare(FakeMode::Ok {
+            access: "ro-id".to_string(),
+            secret: "ro-secret".to_string(),
+            token: "ro-token".to_string(),
+        })
+        .await;
+        let prefixes = vec![
+            "fleets/grocery/deploy/".to_string(),
+            "fleets/grocery/deploy-blobs/".to_string(),
+        ];
+        let minter = minter_for(&api_base, false, Duration::from_secs(1800));
+        let creds = minter
+            .mint(&GrantKey::new(&prefixes, Permission::ReadOnly).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(creds.access_key_id, "ro-id");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.body["permission"], "object-read-only");
+        assert_eq!(
+            seen.body["prefixes"],
+            serde_json::json!([
+                // The cache key sorts the list; the request carries it sorted.
+                "fleets/grocery/deploy-blobs/",
+                "fleets/grocery/deploy/",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cache_key_includes_the_permission() {
+        let (api_base, seen) = fake_cloudflare(FakeMode::Unique).await;
+        let source = CredentialSource::R2Temp(Arc::new(production_minter_for(&api_base)));
+        let prefixes = vec!["fleets/grocery/cells/".to_string()];
+        let read = source
+            .for_prefixes(&prefixes, Permission::ReadOnly)
+            .await
+            .unwrap();
+        let write = source
+            .for_prefixes(&prefixes, Permission::ReadWrite)
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().count,
+            2,
+            "one permission never serves another"
+        );
+        assert_ne!(read.access_key_id, write.access_key_id);
+        let read_again = source
+            .for_prefixes(&prefixes, Permission::ReadOnly)
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().unwrap().count, 2, "the read grant is reused");
+        assert!(read_again.reused);
+        assert_eq!(read_again.access_key_id, read.access_key_id);
+    }
+
+    #[test]
+    fn a_grant_needs_at_least_one_prefix() {
+        assert!(GrantKey::new(&[], Permission::ReadOnly).is_err());
+        assert!(GrantKey::new(&["fleets/grocery/".to_string()], Permission::ReadOnly).is_ok());
+        assert!(GrantKey::new(&["fleets/grocery".to_string()], Permission::ReadOnly).is_err());
+    }
+
+    #[tokio::test]
     async fn mint_omits_the_jurisdiction_header_without_one() {
         let (api_base, seen) = fake_cloudflare(FakeMode::Ok {
             access: "id".to_string(),
@@ -731,8 +921,9 @@ mod tests {
             token: "token".to_string(),
         })
         .await;
+        let key = GrantKey::new(&["fleets/grocery/".to_string()], Permission::ReadWrite).unwrap();
         minter_for(&api_base, false, Duration::from_secs(1800))
-            .mint("fleets/grocery/")
+            .mint(&key)
             .await
             .unwrap();
         let seen = seen.lock().unwrap();
@@ -747,8 +938,9 @@ mod tests {
             message: "parent key lacks permission".to_string(),
         })
         .await;
+        let key = GrantKey::new(&["fleets/grocery/".to_string()], Permission::ReadWrite).unwrap();
         let err = minter_for(&api_base, true, Duration::from_secs(1800))
-            .mint("fleets/grocery/")
+            .mint(&key)
             .await
             .unwrap_err();
         let text = format!("{err:#}");
@@ -761,8 +953,9 @@ mod tests {
     async fn non_json_5xx_is_an_error() {
         let (api_base, _) =
             fake_cloudflare(FakeMode::Garbage(axum::http::StatusCode::BAD_GATEWAY)).await;
+        let key = GrantKey::new(&["fleets/grocery/".to_string()], Permission::ReadWrite).unwrap();
         let err = minter_for(&api_base, false, Duration::from_secs(1800))
-            .mint("fleets/grocery/")
+            .mint(&key)
             .await
             .unwrap_err();
         let text = format!("{err:#}");
@@ -846,7 +1039,9 @@ mod tests {
         // refresh: no lifetime margin left).
         if let CredentialSource::R2Temp(minter) = &source {
             let mut cache = minter.cache_lock();
-            let entry = cache.get_mut("fleets/grocery/").unwrap();
+            let key =
+                GrantKey::new(&["fleets/grocery/".to_string()], Permission::ReadWrite).unwrap();
+            let entry = cache.get_mut(&key).unwrap();
             entry.minted_at = Some(std::time::Instant::now() - Duration::from_secs(6 * 86400));
         } else {
             unreachable!();

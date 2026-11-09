@@ -20,6 +20,10 @@
     { "id": "fetch:metadata", "phase": "worker", "category": "blocked-egress", "must": "fail", "desc": "Worker cannot reach the cloud metadata IP" },
     { "id": "fetch:smtp-worker", "phase": "worker", "category": "blocked-egress", "must": "fail", "desc": "Worker cannot open SMTP ports" },
     { "id": "env:worker-secrets", "phase": "worker", "category": "host-secrets", "must": "fail", "desc": "No platform secret names in the worker env" },
+    { "id": "r2:own-prefix", "phase": "r2", "category": "credential-scope", "must": "succeed", "desc": "Positive control: the state grant round-trips inside a state prefix" },
+    { "id": "r2:deploy-ro-read", "phase": "r2", "category": "credential-scope", "must": "succeed", "desc": "Positive control: the read-only deploy grant lists and gets deploy/" },
+    { "id": "r2:deploy-ro-write", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "The read-only deploy grant cannot PUT a deployment object" },
+    { "id": "deploy:pointer-rewrite", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "The fleet's credentials cannot PUT fleets/<slug>/deploy/current.json" },
     { "id": "r2:cross-prefix", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot read a sibling app's prefix" },
     { "id": "r2:cross-prefix-put", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot write into a sibling app's prefix" },
     { "id": "r2:bucket-root", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot list the bucket root" }

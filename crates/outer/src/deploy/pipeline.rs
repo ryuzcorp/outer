@@ -1626,6 +1626,11 @@ impl Deployer {
         let out = tokio::process::Command::new(&self.settings.celld_bin)
             .arg("deploy")
             .arg("--help")
+            // No inherited environment: this probe needs no credential, and
+            // a help print must never see the server's AWS_* or
+            // CELLD_DEPLOY_AWS_* values.
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .output()
             .await;
         out.map(|o| {
@@ -1666,16 +1671,7 @@ impl Deployer {
         let bucket = self.settings.storage.bucket_url(&app.slug);
         let endpoint = self.settings.storage.endpoint.clone();
         let region = self.settings.storage.region.clone();
-        let mut env = vec![
-            ("AWS_ACCESS_KEY_ID".to_string(), creds.access_key_id),
-            ("AWS_SECRET_ACCESS_KEY".to_string(), creds.secret_access_key),
-            ("AWS_REGION".to_string(), region.clone()),
-            ("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string()),
-            ("S3_ENDPOINT".to_string(), endpoint.clone()),
-        ];
-        if let Some(token) = &creds.session_token {
-            env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
-        }
+        let mut env = Self::celld_grant_env(&region, &endpoint, &creds);
         if let Some(esbuild) = &self.settings.esbuild_bin {
             env.push(("CELLD_ESBUILD".to_string(), esbuild.clone()));
         }
@@ -2122,16 +2118,7 @@ impl Deployer {
         let bucket = self.settings.storage.bucket_url(&app.slug);
         let endpoint = self.settings.storage.endpoint.clone();
         let region = self.settings.storage.region.clone();
-        let mut env = vec![
-            ("AWS_ACCESS_KEY_ID".to_string(), creds.access_key_id),
-            ("AWS_SECRET_ACCESS_KEY".to_string(), creds.secret_access_key),
-            ("AWS_REGION".to_string(), region.clone()),
-            ("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string()),
-            ("S3_ENDPOINT".to_string(), endpoint.clone()),
-        ];
-        if let Some(token) = &creds.session_token {
-            env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
-        }
+        let mut env = Self::celld_grant_env(&region, &endpoint, &creds);
         // `celld d1` reaches the database through a fleet node, and the
         // internal listener requires the fleet's token once the fleet sets
         // it — same slug the fleet runs under (the preview app carries the
@@ -2164,6 +2151,33 @@ impl Deployer {
         .await
     }
 
+    /// The bucket environment for a celld child that holds the
+    /// whole-fleet-prefix read-write grant: `AWS_*` only. `CELLD_DEPLOY_AWS_*`
+    /// is the fleet's read-only deployment credential (`fleet::supervisor`);
+    /// a deploy or migrate child publishes through the `AWS_*` grant and
+    /// must never be handed that narrower credential, so this builder emits
+    /// none (and [`Deployer::run_sandboxed_step`] refuses one).
+    fn celld_grant_env(
+        region: &str,
+        endpoint: &str,
+        creds: &crate::store::credentials::ScopedCredentials,
+    ) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("AWS_ACCESS_KEY_ID".to_string(), creds.access_key_id.clone()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                creds.secret_access_key.clone(),
+            ),
+            ("AWS_REGION".to_string(), region.to_string()),
+            ("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string()),
+            ("S3_ENDPOINT".to_string(), endpoint.to_string()),
+        ];
+        if let Some(token) = creds.session_token.as_ref() {
+            env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
+        }
+        env
+    }
+
     /// Run one sandboxed step: the binaries come resolved from the config
     /// (absolute when found on PATH at load, raw names otherwise), and the
     /// step PATH is built from the bun parent dir so the sandboxed env
@@ -2177,6 +2191,18 @@ impl Deployer {
         args: &[String],
         extra_env: Vec<(String, String)>,
     ) -> anyhow::Result<String> {
+        // Fail closed: no deploy/migrate child may carry the fleet's
+        // read-only deployment credential. Those steps publish through the
+        // whole-prefix `AWS_*` grant, and a copied `CELLD_DEPLOY_AWS_*`
+        // would either break the upload or hint at the wrong grant shape.
+        if let Some((name, _)) = extra_env
+            .iter()
+            .find(|(name, _)| name.starts_with("CELLD_DEPLOY_AWS_"))
+        {
+            anyhow::bail!(
+                "sandboxed step env must not carry {name}: deploy and migrate use the whole-prefix AWS_* grant"
+            );
+        }
         let program_str = bin.to_string();
         let parent = Path::new(&self.settings.bun_bin)
             .parent()
@@ -3415,6 +3441,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc_comments(src)).unwrap();
         assert_eq!(parsed["a"], 1);
         assert_eq!(parsed["b"], serde_json::json!([1, 2]));
+    }
+
+    /// `celld deploy` and `celld d1 migrations apply` hold the whole-prefix
+    /// read-write grant through `AWS_*`; the fleet's read-only deployment
+    /// credential (`CELLD_DEPLOY_AWS_*`) must never enter those children.
+    #[test]
+    fn celld_grant_env_carries_no_deploy_credentials() {
+        let creds = crate::store::credentials::ScopedCredentials {
+            access_key_id: "whole-key".to_string(),
+            secret_access_key: "whole-secret".to_string(),
+            session_token: Some("whole-token".to_string()),
+            minted_at: None,
+            reused: false,
+        };
+        let env =
+            Deployer::celld_grant_env("auto", "https://acct.r2.cloudflarestorage.com", &creds);
+        let map: HashMap<_, _> = env.iter().cloned().collect();
+        assert_eq!(map["AWS_ACCESS_KEY_ID"], "whole-key");
+        assert_eq!(map["AWS_SECRET_ACCESS_KEY"], "whole-secret");
+        assert_eq!(map["AWS_SESSION_TOKEN"], "whole-token");
+        assert_eq!(map["AWS_REGION"], "auto");
+        assert_eq!(map["S3_ENDPOINT"], "https://acct.r2.cloudflarestorage.com");
+        assert!(
+            env.iter()
+                .all(|(name, _)| !name.starts_with("CELLD_DEPLOY_AWS_")),
+            "deploy/migrate env names only the whole-prefix grant: {env:?}"
+        );
     }
 
     #[test]

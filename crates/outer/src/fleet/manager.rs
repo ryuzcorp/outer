@@ -19,7 +19,7 @@ use crate::fleet::health;
 use crate::fleet::supervisor::{
     self, FleetOpts, FleetSpec, RunningFleet, SharedLogRing, StopGrace,
 };
-use crate::store::credentials::ScopedCredentials;
+use crate::store::credentials::Permission;
 
 /// What the manager needs that is not per-app identity. The integration
 /// owner builds this from the platform config.
@@ -63,9 +63,11 @@ pub struct ManagerSettings {
 }
 
 /// Bucket and credentials a fleet pulls its deploys from. The credentials
-/// are per-app: `CredentialSource::R2Temp` mints keys scoped to the app's
-/// prefix and reuses the cached grant while it stays fresh (see
-/// `store::credentials`), so fleets never hold the root bucket keys.
+/// are per-app and split in two: `CredentialSource::R2Temp` mints a
+/// read-write grant over the state prefixes and a read-only grant over the
+/// deployment artifacts, and reuses each cached grant while it stays fresh
+/// (see `store::credentials`). Fleets never hold the root bucket keys, and
+/// no credential a fleet holds can publish a deployment.
 #[derive(Debug, Clone)]
 pub struct FleetStorage {
     pub endpoint: String,
@@ -80,10 +82,100 @@ impl FleetStorage {
         format!("s3://{}/fleets/{slug}", self.bucket)
     }
 
-    /// `fleets/{slug}/`: the prefix every scoped credential is minted for,
-    /// matching [`FleetStorage::bucket_url`].
+    /// `fleets/{slug}/`: the whole fleet prefix, matching
+    /// [`FleetStorage::bucket_url`]. Deploy and migrate steps mint
+    /// read-write over this; a running fleet does not (see the two lists
+    /// below).
     pub fn fleet_prefix(slug: &str) -> String {
         format!("fleets/{slug}/")
+    }
+
+    /// The state namespaces a running celld node writes, as read-write
+    /// credential prefixes. **Cross-repo contract:** this list must name
+    /// every key the celld fork touches at runtime. A new namespace in a
+    /// celld release is a failed write (and usually a failed wake) until
+    /// this list names it; that is deliberate, because the alternative is a
+    /// grant wide enough to publish deployments. Each prefix names the
+    /// celld file that reads or writes it (`crates/celld/` unless noted):
+    ///
+    /// - `cells/` — Durable Object state, ownership records, LTX replicas
+    ///   (`cell_cli.rs`, `control_plane.rs`)
+    /// - `log/` — node log bundles and recovery progress (`node_log.rs`)
+    /// - `nodes/` — node leases and tombstones (`fleet.rs`,
+    ///   `dead_node_gc.rs`, `ownership_store.rs`, `wake_format.rs`)
+    /// - `node-cells/` — legacy per-cell node markers, listed and deleted
+    ///   by dead-node GC (`dead_node_gc.rs`;
+    ///   `crates/logic/dead_node_reconciliation.rs` parses the keys)
+    /// - `fleet/` — capacity sample (`ownership_store.rs`) and the
+    ///   peer-auth secret (`peer_auth.rs`)
+    /// - `wake/` — waker state and its format stamp (`wake.rs`,
+    ///   `wake_format.rs`)
+    /// - `wake-` — the legacy wake names `wake-format.json`, `wake-v2/` and
+    ///   `wake-retired-v2/` that startup probes (`wake_format.rs`,
+    ///   `ensure_legacy_layout`); deliberately not slash-terminated so it
+    ///   covers the file and both prefixes, and extends no further than
+    ///   `fleets/{slug}/wake-` (it does not cover `wake/`, listed above)
+    /// - `drain/` — the handoff drain token (`drain_token.rs`)
+    /// - `kv/` — KV large-value blobs (`crates/logic/kv.rs`)
+    /// - `r2/` — R2 bindings (`r2/<bucket_name>/`, `r2_store.rs`)
+    /// - `probe/` — the startup conditional-write and range probes, and
+    ///   `celld diagnose` (`bucket.rs`)
+    /// - `telemetry/` — OTel parquet, only with `CELLD_OTEL` set
+    ///   (`telemetry.rs`)
+    pub fn fleet_data_prefixes(slug: &str) -> Vec<String> {
+        [
+            "cells/",
+            "log/",
+            "nodes/",
+            "node-cells/",
+            "fleet/",
+            "wake/",
+            "wake-",
+            "drain/",
+            "kv/",
+            "r2/",
+            "probe/",
+            "telemetry/",
+        ]
+        .into_iter()
+        .map(|name| format!("fleets/{slug}/{name}"))
+        .collect()
+    }
+
+    /// The deployment artifacts a running fleet only reads: the pointer,
+    /// named pointers, manifests, bundles, queue consumer attachments
+    /// (`deploy/`), asset bodies (`deploy-blobs/`), and container image
+    /// tars (`deploy/images/`). Minted read-only, so a credential copied out
+    /// of a fleet's environment can serve a deployment but never publish
+    /// one.
+    pub fn deploy_read_prefixes(slug: &str) -> Vec<String> {
+        ["deploy/", "deploy-blobs/"]
+            .into_iter()
+            .map(|name| format!("fleets/{slug}/{name}"))
+            .collect()
+    }
+
+    /// The two grants a fleet starts with, exactly as `spec_for` mints
+    /// them: read-write over the state prefixes and read-only over the
+    /// deployment artifacts. One place, so a grant-shape test pins what
+    /// production sends rather than a copy of it.
+    pub fn fleet_grants(slug: &str) -> [(Permission, Vec<String>); 2] {
+        [
+            (Permission::ReadWrite, Self::fleet_data_prefixes(slug)),
+            (Permission::ReadOnly, Self::deploy_read_prefixes(slug)),
+        ]
+    }
+
+    /// Drop every cached grant an app's slug can hold: the fleet's two, and
+    /// the whole-prefix read-write grant the deploy, migrate and console
+    /// steps mint. `delete_app` calls this after stopping the fleet, so a
+    /// recreated slug never inherits an old credential.
+    pub fn forget_fleet_grants(&self, slug: &str) {
+        self.credentials.forget_prefix(&Self::fleet_prefix(slug));
+        self.credentials
+            .forget_prefixes(&Self::fleet_data_prefixes(slug), Permission::ReadWrite);
+        self.credentials
+            .forget_prefixes(&Self::deploy_read_prefixes(slug), Permission::ReadOnly);
     }
 }
 
@@ -118,6 +210,13 @@ struct LiveFleet {
     fleet: RunningFleet,
     started: std::time::Instant,
     credential_minted_at: Option<std::time::Instant>,
+}
+
+/// The age of the two grants a fleet runs on. The refresh sweep restarts on
+/// the older one, so a fleet never keeps serving on an expired credential.
+struct GrantAge {
+    minted_at: Option<std::time::Instant>,
+    reused: bool,
 }
 
 /// Phase timings for one fleet start, for the wake log line.
@@ -265,15 +364,15 @@ impl FleetManager {
             .clone()
     }
 
-    /// Fleet invocation for `app`. Credentials come from the per-prefix
-    /// cache when fresh (`fresh` forces a new mint, replacing the entry).
+    /// Fleet invocation for `app`. Credentials come from the per-grant
+    /// cache when fresh (`fresh` forces new mints, replacing the entries).
     /// A minting failure is a failed wake/refresh with a clear error: never
     /// a panic, never a fallback to the parent keys.
     async fn spec_for(
         &self,
         app: &App,
         fresh: bool,
-    ) -> anyhow::Result<(FleetSpec, FleetOpts, ScopedCredentials)> {
+    ) -> anyhow::Result<(FleetSpec, FleetOpts, GrantAge)> {
         let state_dir = self.inner.data_dir.join("fleets").join(&app.slug);
         let (cgroup_leaf, cgroups_active) = match &self.inner.cgroups {
             Some(anchor) => {
@@ -289,15 +388,40 @@ impl FleetManager {
             None => (state_dir.clone(), false),
         };
         let storage = &self.inner.storage;
-        let prefix = FleetStorage::fleet_prefix(&app.slug);
-        let creds = if fresh {
-            storage.credentials.for_prefix_fresh(&prefix).await
+        let [(data_permission, data_prefixes), (deploy_permission, deploy_prefixes)] =
+            FleetStorage::fleet_grants(&app.slug);
+        let (data, deploy) = if fresh {
+            (
+                storage
+                    .credentials
+                    .for_prefixes_fresh(&data_prefixes, data_permission)
+                    .await,
+                storage
+                    .credentials
+                    .for_prefixes_fresh(&deploy_prefixes, deploy_permission)
+                    .await,
+            )
         } else {
-            storage.credentials.for_prefix(&prefix).await
-        }
-        .map_err(|err| {
+            (
+                storage
+                    .credentials
+                    .for_prefixes(&data_prefixes, data_permission)
+                    .await,
+                storage
+                    .credentials
+                    .for_prefixes(&deploy_prefixes, deploy_permission)
+                    .await,
+            )
+        };
+        let data = data.map_err(|err| {
             anyhow::anyhow!(
-                "minting scoped R2 credentials for fleet {}: {err:#}",
+                "minting the state R2 credentials for fleet {}: {err:#}",
+                app.slug
+            )
+        })?;
+        let deploy = deploy.map_err(|err| {
+            anyhow::anyhow!(
+                "minting the deployment R2 credentials for fleet {}: {err:#}",
                 app.slug
             )
         })?;
@@ -310,9 +434,12 @@ impl FleetManager {
             bucket_url: storage.bucket_url(&app.slug),
             s3_endpoint: storage.endpoint.clone(),
             s3_region: storage.region.clone(),
-            access_key_id: creds.access_key_id.clone(),
-            secret_access_key: creds.secret_access_key.clone(),
-            session_token: creds.session_token.clone(),
+            access_key_id: data.access_key_id.clone(),
+            secret_access_key: data.secret_access_key.clone(),
+            session_token: data.session_token.clone(),
+            deploy_access_key_id: deploy.access_key_id.clone(),
+            deploy_secret_access_key: deploy.secret_access_key.clone(),
+            deploy_session_token: deploy.session_token.clone(),
             cgroup_leaf,
             cgroups_active,
             // Checked against `is_reserved_env_name`: RUST_LOG carries no
@@ -333,7 +460,20 @@ impl FleetManager {
             deploy_poll_secs: 30,
             asset_cache_mb: 64,
         };
-        Ok((spec, opts, creds))
+        // The refresh sweep tracks the older of the two grants: restarting
+        // on the newer one could leave the older expired.
+        let age = match (data.minted_at, deploy.minted_at) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        Ok((
+            spec,
+            opts,
+            GrantAge {
+                minted_at: age,
+                reused: data.reused && deploy.reused,
+            },
+        ))
     }
 
     /// Mint, start and health-gate the app's fleet, tracking it on success
@@ -552,19 +692,13 @@ impl FleetManager {
         let mut fleets = self.inner.fleets.lock().await;
         let Some(live) = fleets.remove(slug) else {
             drop(fleets);
-            self.inner
-                .storage
-                .credentials
-                .forget_prefix(&FleetStorage::fleet_prefix(slug));
+            self.inner.storage.forget_fleet_grants(slug);
             return;
         };
         let mut fleet = live.fleet;
         drop(fleets);
         fleet.stop(StopGrace::NORMAL).await;
-        self.inner
-            .storage
-            .credentials
-            .forget_prefix(&FleetStorage::fleet_prefix(slug));
+        self.inner.storage.forget_fleet_grants(slug);
     }
 
     /// Stop the fleet for `slug` (no-op when asleep or missing) and drop its
