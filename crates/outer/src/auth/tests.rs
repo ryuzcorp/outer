@@ -3245,6 +3245,53 @@ async fn reviewer_password_sign_in_limits_per_email_before_hashing() {
 }
 
 #[tokio::test]
+async fn reviewer_password_limit_counts_only_failures_per_ip() {
+    let pool = test_pool().await;
+    let (config, _) = test_config();
+    // A reviewer connecting several clients signs in often: successes never
+    // count toward the lockout.
+    for attempt in 0..7 {
+        auth::reviewer_sign_in(
+            &pool,
+            &config,
+            REVIEW_EMAIL,
+            REVIEW_PASSWORD,
+            Some("198.51.100.7"),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("sign-in {attempt}: {err:?}"));
+    }
+    // A stranger who knows the address burns the failure budget from their IP…
+    for _ in 0..5 {
+        let err =
+            auth::reviewer_sign_in(&pool, &config, REVIEW_EMAIL, "wrong", Some("203.0.113.9"))
+                .await
+                .unwrap_err();
+        assert_eq!(err.code, "invalid_credentials");
+    }
+    let locked = auth::reviewer_sign_in(
+        &pool,
+        &config,
+        REVIEW_EMAIL,
+        REVIEW_PASSWORD,
+        Some("203.0.113.9"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(locked.code, "rate_limited", "the stranger's IP is locked");
+    // …but the reviewer's own IP still signs in.
+    auth::reviewer_sign_in(
+        &pool,
+        &config,
+        REVIEW_EMAIL,
+        REVIEW_PASSWORD,
+        Some("198.51.100.7"),
+    )
+    .await
+    .expect("the reviewer is not locked out by someone else's failures");
+}
+
+#[tokio::test]
 async fn reviewer_password_sign_in_ignores_the_closed_beta() {
     let pool = test_pool().await;
     let (mut config, _) = test_config();

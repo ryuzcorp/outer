@@ -613,22 +613,12 @@ pub async fn reviewer_sign_in(
     let db = |err: sqlx::Error| AuthError::new("db", format!("{err}"));
     let now = now_ms();
     let email = normalize_email(email);
-    // Limits before any hashing: five wrong passwords per email and twenty
-    // attempts per IP in fifteen minutes.
-    match limits::check_and_record(
-        pool,
-        &format!("email:{email}"),
-        "password_login",
-        5,
-        900_000,
-        now,
-    )
-    .await
-    {
-        Ok(Some(retry_after_s)) => return Err(AuthError::rate_limited(retry_after_s)),
-        Ok(None) => {}
-        Err(err) => return Err(AuthError::new("db", format!("{err}"))),
-    }
+    // Limits before any hashing. Every attempt counts against the IP (twenty
+    // per fifteen minutes), which bounds hashing and guessing. Only wrong
+    // passwords count against the email, and per email *and* IP (five per
+    // fifteen minutes): a reviewer who signs in from several clients never
+    // trips it, and a stranger who knows a review address can lock out only
+    // their own IP, not the reviewer.
     if let Some(ip) = client_ip {
         match limits::check_and_record(
             pool,
@@ -645,6 +635,12 @@ pub async fn reviewer_sign_in(
             Err(err) => return Err(AuthError::new("db", format!("{err}"))),
         }
     }
+    let failures = format!("email:{email}|ip:{}", client_ip.unwrap_or("-"));
+    match limits::check(pool, &failures, "password_failure", 5, 900_000, now).await {
+        Ok(Some(retry_after_s)) => return Err(AuthError::rate_limited(retry_after_s)),
+        Ok(None) => {}
+        Err(err) => return Err(AuthError::new("db", format!("{err}"))),
+    }
     // One Argon2 verify at a time per permit; with all eight busy the caller
     // gets a retry instead of queueing another expensive hash.
     let permit = match cfg.password_permits.try_acquire() {
@@ -660,6 +656,9 @@ pub async fn reviewer_sign_in(
     };
     drop(permit);
     if !matched {
+        limits::record(pool, &failures, "password_failure", now)
+            .await
+            .map_err(|err| AuthError::new("db", format!("{err}")))?;
         return Err(invalid_credentials());
     }
     let account_id = crate::apps::ensure_account(pool, &email)

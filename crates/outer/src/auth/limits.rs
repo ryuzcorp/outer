@@ -22,6 +22,23 @@ pub async fn check_and_record(
     window_ms: i64,
     now: i64,
 ) -> anyhow::Result<Option<u64>> {
+    if let Some(retry_after_s) = check(pool, subject, action, limit, window_ms, now).await? {
+        return Ok(Some(retry_after_s));
+    }
+    record(pool, subject, action, now).await?;
+    Ok(None)
+}
+
+/// [`check_and_record`] without the record: for limits that count only some
+/// outcomes (failed passwords), recorded afterwards with [`record`].
+pub async fn check(
+    pool: &SqlitePool,
+    subject: &str,
+    action: &str,
+    limit: u32,
+    window_ms: i64,
+    now: i64,
+) -> anyhow::Result<Option<u64>> {
     debug_assert!(
         window_ms <= RETENTION_MS,
         "window wider than the daily prune keeps: bump RETENTION_MS"
@@ -43,13 +60,23 @@ pub async fn check_and_record(
             .unwrap_or(1);
         return Ok(Some(retry_after_s));
     }
+    Ok(None)
+}
+
+/// Record one event for `subject` + `action`.
+pub async fn record(
+    pool: &SqlitePool,
+    subject: &str,
+    action: &str,
+    now: i64,
+) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO rate_limit_events (subject, action, created_at) VALUES (?, ?, ?)")
         .bind(subject)
         .bind(action)
         .bind(now)
         .execute(pool)
         .await?;
-    Ok(None)
+    Ok(())
 }
 
 /// Delete ledger rows older than `older_than_ms` (the daily prune).
