@@ -1009,9 +1009,10 @@ async fn plan_downgrade(
     struct AppRow {
         id: String,
         slug: String,
+        desired_state: String,
     }
     let apps: Vec<AppRow> = sqlx::query_as(
-        "SELECT id, slug FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC, rowid ASC",
+        "SELECT id, slug, desired_state FROM app WHERE owner_id = ?1 ORDER BY created_at ASC, id ASC, rowid ASC",
     )
     .bind(account_id)
     .fetch_all(&mut *conn)
@@ -1036,15 +1037,26 @@ async fn plan_downgrade(
     }
     let mut stopped = Vec::new();
     for app in apps.iter().skip(2) {
+        // Only a running app becomes a downgrade stop. The CASE reads the
+        // pre-update row, so an operator stop (a ban: `stopped` with no
+        // stamp) keeps its NULL stamp — operator page, no plan restart,
+        // no day-30 purge — and an app already stamped keeps its stamp.
         sqlx::query(
-            "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = ?1, \
-             downgrade_purge_warned_at = NULL, last_activity_at = ?2 WHERE id = ?3",
+            "UPDATE app SET desired_state = 'stopped', \
+             downgraded_stopped_at = CASE WHEN desired_state = 'running' THEN ?1 \
+                                          ELSE downgraded_stopped_at END, \
+             downgrade_purge_warned_at = CASE WHEN desired_state = 'running' THEN NULL \
+                                              ELSE downgrade_purge_warned_at END, \
+             last_activity_at = ?2 WHERE id = ?3",
         )
         .bind(now_secs)
         .bind(now_ms)
         .bind(&app.id)
         .execute(&mut *conn)
         .await?;
+        if app.desired_state != "running" {
+            continue;
+        }
         // The stopped page is `no-store`, but the edge may still hold the
         // app's cached content: purge its host (a public app's host was
         // already queued above; keep one per host).
@@ -2204,6 +2216,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(domains, 0, "the downgrade deletes the custom hostname");
+    }
+
+    #[tokio::test]
+    async fn downgrade_leaves_an_operator_stop_unstamped() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_pro_with_apps(&pool).await;
+        // `newer` is past the two-app cap and already stopped by an
+        // operator: no downgrade stamp (a ban shape).
+        sqlx::query("UPDATE app SET desired_state = 'stopped' WHERE id = 'app3'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "canceled"});
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_30",
+            "customer.subscription.deleted",
+            object,
+        )
+        .await;
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied { ref stopped, .. } if stopped.is_empty()),
+            "an operator stop is not a downgrade stop: {outcome:?}"
+        );
+        assert_eq!(
+            app_state_of(&pool, "app3").await,
+            ("stopped".to_string(), "unlisted".to_string(), None, None),
+            "an operator stop keeps its NULL stamp, so the day-30 purge skips it"
+        );
     }
 
     #[tokio::test]

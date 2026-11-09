@@ -389,16 +389,23 @@ pub async fn ban_account(
     let Some((user_id, email)) = row else {
         return Err(ToolError::not_found(format!("no account {email_or_id:?}")));
     };
+    // One transaction: the ban flag and the app parking land together, so a
+    // failure mid-ban cannot leave a banned account still serving or a
+    // stopped account that can sign back in.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|err| ToolError::internal(format!("ban update failed: {err:#}")))?;
     sqlx::query("UPDATE user SET banned = 1, banReason = ?1, banExpires = NULL WHERE id = ?2")
         .bind(&reason)
         .bind(&user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| ToolError::internal(format!("ban update failed: {err:#}")))?;
     let slugs: Vec<(String,)> =
         sqlx::query_as("SELECT slug FROM app WHERE owner_id = ?1 ORDER BY slug")
             .bind(&user_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|err| ToolError::internal(format!("ban lookup failed: {err:#}")))?;
     let app_slugs: Vec<String> = slugs.into_iter().map(|(slug,)| slug).collect();
@@ -407,9 +414,12 @@ pub async fn ban_account(
          downgrade_purge_warned_at = NULL WHERE owner_id = ?1",
     )
     .bind(&user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|err| ToolError::internal(format!("ban update failed: {err:#}")))?;
+    tx.commit()
+        .await
+        .map_err(|err| ToolError::internal(format!("ban update failed: {err:#}")))?;
     Ok(BanOutcome {
         user_id,
         email,
