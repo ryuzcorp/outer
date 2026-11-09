@@ -14,6 +14,8 @@ pub const API_KEY_PREFIX: &str = "outer_";
 pub const ACCESS_PREFIX: &str = "outer_at_";
 /// OAuth refresh tokens: `outer_rt_` + base64url of 32 bytes (43 chars).
 pub const REFRESH_PREFIX: &str = "outer_rt_";
+/// OAuth client secrets: `outer_cs_` + base64url of 32 bytes (43 chars).
+pub const CLIENT_SECRET_PREFIX: &str = "outer_cs_";
 
 /// Characters of the API-key body shown in `list_api_keys` and taken by
 /// `revoke_api_key`.
@@ -81,6 +83,14 @@ pub fn new_refresh_token() -> (String, String) {
     let token = format!("{REFRESH_PREFIX}{}", base64url_32());
     let hash = sha256_hex(&token);
     (token, hash)
+}
+
+/// A fresh OAuth client secret and its stored hash. Only the hash reaches
+/// the database; the plaintext appears once in the registration response.
+pub fn new_client_secret() -> (String, String) {
+    let secret = format!("{CLIENT_SECRET_PREFIX}{}", base64url_32());
+    let hash = sha256_hex(&secret);
+    (secret, hash)
 }
 
 /// A fresh web-session id (the cookie value) and its stored hash.
@@ -152,6 +162,14 @@ mod tests {
         let (refresh, refresh_hash) = new_refresh_token();
         assert!(refresh.starts_with(REFRESH_PREFIX));
         assert_eq!(refresh_hash, sha256_hex(&refresh));
+
+        let (secret, secret_hash) = new_client_secret();
+        assert!(secret.starts_with(CLIENT_SECRET_PREFIX));
+        assert_eq!(secret.len(), CLIENT_SECRET_PREFIX.len() + 43);
+        assert!(secret_hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(secret_hash.len(), 64);
+        assert_eq!(secret_hash, sha256_hex(&secret));
+        assert_ne!(new_client_secret().0, secret);
     }
 
     #[test]

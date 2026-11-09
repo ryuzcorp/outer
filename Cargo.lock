@@ -2008,6 +2008,7 @@ dependencies = [
  "oxc_ast_visit",
  "oxc_parser",
  "oxc_span",
+ "percent-encoding",
  "qrcode",
  "rand",
  "rcgen",

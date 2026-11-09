@@ -33,6 +33,7 @@ const USAGE: &str = "usage:
   outer app deploy SLUG
   outer app delete SLUG
   outer app list
+  outer oauth-client add --name NAME --redirect-uri URI [--redirect-uri URI…] [--auth client_secret_basic|client_secret_post]
   outer docs tools
   outer version";
 
@@ -74,6 +75,10 @@ async fn main() -> ExitCode {
             run(move |config| app_delete(config, slug)).await
         }
         ["app", "list"] => run(app_list).await,
+        ["oauth-client", "add", rest @ ..] => {
+            let rest: Vec<String> = rest.iter().map(|word| word.to_string()).collect();
+            run(move |config| oauth_client_add(config, rest)).await
+        }
         ["docs", "tools"] => {
             // Generated site content: the registry rendered as Markdown.
             print!(
@@ -534,6 +539,29 @@ fn scheme(config: &Config) -> &'static str {
     } else {
         "http"
     }
+}
+
+/// `oauth-client add`: register a confidential client for a directory that
+/// takes the client ID and secret out of band. Prints each once.
+async fn oauth_client_add(config: Config, rest: Vec<String>) -> anyhow::Result<()> {
+    let rest = rest.iter().map(String::as_str).collect::<Vec<_>>();
+    let parsed = flags(&rest, &["--name", "--redirect-uri", "--auth"])?;
+    let Some(name) = flag(&parsed, "--name") else {
+        anyhow::bail!("oauth-client add needs --name NAME");
+    };
+    let redirect_uris = parsed
+        .iter()
+        .filter(|(key, _)| *key == "--redirect-uri")
+        .map(|(_, value)| value.to_string())
+        .collect::<Vec<_>>();
+    let auth = flag(&parsed, "--auth").unwrap_or("client_secret_basic");
+    std::fs::create_dir_all(&config.data_dir)?;
+    let pool = db::open(&config.db_path()).await?;
+    let (client_id, secret) =
+        outer::auth::oauth::add_operator_client(&pool, name, &redirect_uris, auth).await?;
+    println!("client_id\t{client_id}");
+    println!("client_secret\t{secret}");
+    Ok(())
 }
 
 async fn app_list(config: Config) -> anyhow::Result<()> {

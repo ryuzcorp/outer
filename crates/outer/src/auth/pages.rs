@@ -68,7 +68,7 @@ pub fn email_page(
     layout(
         "Sign in",
         html! {
-            p { "Sign in to let " strong { (client.name) } " (" (client.host) ") create, change and delete apps on your Outer account." }
+            p { "Sign in to connect " strong { (client.name) } " (" (client.host) ") to your Outer account." }
             @if let Some(error) = error {
                 p role="alert" style="color:#a00;" { (error) }
             }
@@ -143,17 +143,23 @@ pub fn terms_page(version: &str, request_id: &str, csrf: &str, error: Option<&st
     )
 }
 pub fn consent_page(client: &ClientDoc, scope: &str, request_id: &str, csrf: &str) -> Markup {
-    let scopes = if scope.split(' ').any(|part| part == "offline_access") {
-        "create, change and delete apps on your Outer account, and stay signed in"
-    } else {
-        "create, change and delete apps on your Outer account"
-    };
+    let offline = scope.split(' ').any(|part| part == "offline_access");
     layout(
         "Allow access",
         html! {
             p {
-                "Allow " strong { (client.name) } " (" (client.host) ") to " (scopes) "?"
+                "Allow " strong { (client.name) } " (" (client.host) ") to act as you on Outer?"
             }
+            ul {
+                li { "Read your apps' code, database rows, logs and live pages." }
+                li { "Create, change and deploy apps, and delete apps or your whole account." }
+                li { "Set app secrets, API keys, sharing, visitor access and custom domains." }
+                li { "Email people you name, such as collaborator invites." }
+                @if offline {
+                    li { "Stay signed in after this browser session." }
+                }
+            }
+            p { "It cannot change your plan or pay for anything; billing stays in the console." }
             @if !client.verified {
                 p role="note" style="color:#555;" {
                     "This app registered itself with Outer, so its name comes from the app. After you allow it, you return to " (client.host) "."

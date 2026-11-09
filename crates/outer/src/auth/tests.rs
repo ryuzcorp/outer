@@ -71,6 +71,41 @@ fn post_json(path: &str, body: &serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+/// Pre-fill `count` events for one limiter bucket (the ledger is
+/// `rate_limit_events(subject, action, created_at)`).
+async fn fill_rate_events(
+    pool: &sqlx::SqlitePool,
+    subject: &str,
+    action: &str,
+    count: u32,
+    now: i64,
+) {
+    for _ in 0..count {
+        sqlx::query("INSERT INTO rate_limit_events (subject, action, created_at) VALUES (?, ?, ?)")
+            .bind(subject)
+            .bind(action)
+            .bind(now)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+/// The per-IP DCR cap (120/h in `oauth`): filling exactly this many events
+/// trips the next request, which the limiter checks before recording.
+const DCR_IP_TEST_LIMIT: u32 = 120;
+/// The global DCR cap (300/h in `oauth`).
+const DCR_GLOBAL_TEST_LIMIT: u32 = 300;
+
+/// `Authorization: Basic` for a client id/secret pair.
+fn basic(id: &str, secret: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"))
+    )
+}
+
 /// `name="X" value="..."` out of a maud form.
 fn hidden(body: &str, name: &str) -> String {
     let needle = format!(r#"name="{name}" value=""#);
@@ -164,7 +199,7 @@ async fn discovery_documents_match_the_spec() {
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none"],
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
             "client_id_metadata_document_supported": true,
             "authorization_response_iss_parameter_supported": true,
             "scopes_supported": ["apps", "offline_access"],
@@ -348,6 +383,66 @@ async fn exchange(
     body.parse().unwrap()
 }
 
+/// Register a confidential DCR client with `client_secret_post`.
+async fn confidential_client(app: &Router, redirect: &str) -> (String, String) {
+    let (status, _, body) = send(
+        app,
+        post_json(
+            "/oauth/register",
+            &serde_json::json!({
+                "redirect_uris": [redirect],
+                "client_name": "Confidential App",
+                "token_endpoint_auth_method": "client_secret_post",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let doc: serde_json::Value = body.parse().unwrap();
+    (
+        doc["client_id"].as_str().unwrap().to_string(),
+        doc["client_secret"].as_str().unwrap().to_string(),
+    )
+}
+
+/// POST `/oauth/token` with optional extra headers (Basic authentication).
+async fn token_request(
+    flow: &Flow,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, String) {
+    let mut req = post_form("/oauth/token", body);
+    for (name, value) in headers {
+        req.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    send(&flow.app, req).await
+}
+
+/// Redeem a code as a confidential client, presenting the secret in the form.
+async fn exchange_confidential(
+    flow: &Flow,
+    client_id: &str,
+    secret: &str,
+    params: &HashMap<String, String>,
+    redirect_uri: &str,
+) -> serde_json::Value {
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", client_id),
+        ("client_secret", secret),
+        ("code", &params["code"]),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
+        ("resource", RESOURCE),
+    ]);
+    let (status, _, body) = token_request(flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body.parse().unwrap()
+}
+
 #[tokio::test]
 async fn full_authorize_flow_mints_a_working_token() {
     let flow = flow().await;
@@ -397,7 +492,7 @@ async fn full_authorize_flow_mints_a_working_token() {
     ));
 
     // Refresh rotates: a new pair, same grant family.
-    let (status, _, body) = send(
+    let (status, _, rotated_body) = send(
         &flow.app,
         post_form(
             "/oauth/token",
@@ -409,11 +504,47 @@ async fn full_authorize_flow_mints_a_working_token() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let rotated: serde_json::Value = body.parse().unwrap();
+    assert_eq!(status, StatusCode::OK, "{rotated_body}");
+    let rotated: serde_json::Value = rotated_body.parse().unwrap();
     assert_ne!(rotated["access_token"], tokens["access_token"]);
 
-    // The rotated-in refresh is dead: reusing it revokes the whole grant.
+    // A retry with the old token inside the replay grace gets the identical
+    // pair back and the grant stays live (clients retry; a retry is not
+    // theft). The body is byte-identical to the rotation's answer.
+    let (status, _, replay_body) = send(
+        &flow.app,
+        post_form(
+            "/oauth/token",
+            &form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay_body}");
+    assert_eq!(replay_body, rotated_body, "replay returns the stored pair");
+    assert!(
+        auth::resolve_bearer(
+            &flow.state.pool,
+            &flow.state.config,
+            rotated["access_token"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "the replay did not revoke the grant"
+    );
+
+    // After the grace, the same reuse is theft: revoke the whole grant.
+    sqlx::query("UPDATE oauthRefreshToken SET rotationReplayExpiresAt = 0 WHERE token = ?")
+        .bind(tokens::sha256_hex(
+            tokens["refresh_token"].as_str().unwrap(),
+        ))
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
     let (status, _, body) = send(
         &flow.app,
         post_form(
@@ -511,25 +642,38 @@ async fn concurrent_code_and_refresh_reuse_cannot_double_spend() {
         )
     };
     let (a, b) = tokio::join!(use_refresh(), use_refresh());
-    let wins = [&a, &b]
-        .into_iter()
-        .filter(|r| r.0 == StatusCode::OK)
-        .count();
-    assert!(wins <= 1, "a refresh token rotates once: {a:?} {b:?}");
-    if wins == 1 {
-        // The loser was reuse: the whole grant is gone, the winner's
-        // fresh access token included.
-        let winner = if a.0 == StatusCode::OK { &a } else { &b };
-        let rotated: serde_json::Value = winner.2.parse().unwrap();
-        let resolved = auth::resolve_bearer(
-            &flow.state.pool,
-            &flow.state.config,
-            rotated["access_token"].as_str().unwrap(),
-        )
+    // Both succeed: the loser of the rotation gets the winner's stored pair
+    // back instead of a revocation, byte for byte.
+    assert_eq!(a.0, StatusCode::OK, "first refresh: {a:?}");
+    assert_eq!(b.0, StatusCode::OK, "second refresh: {b:?}");
+    assert_eq!(a.2, b.2, "concurrent refreshes answer the same pair");
+    let rotated: serde_json::Value = a.2.parse().unwrap();
+    let resolved = auth::resolve_bearer(
+        &flow.state.pool,
+        &flow.state.config,
+        rotated["access_token"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(resolved.is_some(), "the race did not revoke the grant");
+
+    // Once the grace is over, the same reuse is theft and revokes.
+    sqlx::query("UPDATE oauthRefreshToken SET rotationReplayExpiresAt = 0 WHERE token = ?")
+        .bind(tokens::sha256_hex(&refresh))
+        .execute(&flow.state.pool)
         .await
         .unwrap();
-        assert!(resolved.is_none(), "reuse revoked the grant");
-    }
+    let (status, _, body) = use_refresh().await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"));
+    let resolved = auth::resolve_bearer(
+        &flow.state.pool,
+        &flow.state.config,
+        rotated["access_token"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(resolved.is_none(), "reuse revoked the grant");
 }
 
 #[tokio::test]
@@ -789,13 +933,593 @@ async fn token_endpoint_binds_client_id() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Confidential grants bind the same way: another client's id is
+    // invalid_grant and never revokes, so the real client still refreshes.
+    let (confidential, secret) = confidential_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &confidential, redirect_uri, "carol@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens: serde_json::Value =
+        exchange_confidential(&flow, &confidential, &secret, &params, redirect_uri).await;
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_b),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &confidential),
+        ("client_secret", &secret),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "grant survived the probe: {body}");
 }
 
-/// Two concurrent refreshes of one token: at most one succeeds, and once
-/// the consent is revoked nothing from the family authenticates — not even
-/// a token planted directly on the revoked row (`resolve_bearer` joins
-/// `revokedAt IS NULL`, the second barrier behind the rotation
-/// transaction).
+/// A second registration with a secret method gets a different secret and
+/// stores only its hash.
+#[tokio::test]
+async fn dcr_confidential_registers_hashes_and_returns_secret() {
+    let flow = flow().await;
+    let mut seen = Vec::new();
+    for method in ["client_secret_post", "client_secret_basic"] {
+        for _ in 0..2 {
+            let (status, headers, body) = send(
+                &flow.app,
+                post_json(
+                    "/oauth/register",
+                    &serde_json::json!({
+                        "redirect_uris": ["https://app.example/cb"],
+                        "token_endpoint_auth_method": method,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+            let doc: serde_json::Value = body.parse().unwrap();
+            let secret = doc["client_secret"].as_str().unwrap().to_string();
+            assert!(secret.starts_with("outer_cs_"), "{secret}");
+            assert_eq!(doc["client_secret_expires_at"], 0);
+            assert_eq!(doc["token_endpoint_auth_method"], method);
+            let (stored, stored_method): (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT clientSecret, tokenEndpointAuthMethod FROM oauthClient WHERE clientId = ?",
+            )
+            .bind(doc["client_id"].as_str().unwrap())
+            .fetch_one(&flow.state.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                stored.as_deref(),
+                Some(tokens::sha256_hex(&secret).as_str())
+            );
+            assert_eq!(stored_method.as_deref(), Some(method));
+            seen.push(secret);
+        }
+    }
+    assert_eq!(
+        seen.iter().collect::<std::collections::HashSet<_>>().len(),
+        seen.len(),
+        "every registration mints a fresh secret"
+    );
+}
+
+/// Confidential clients authenticate with `client_secret_post` or Basic;
+/// a missing or wrong secret is 401 and never burns a code or a grant.
+#[tokio::test]
+async fn token_endpoint_authenticates_confidential_clients() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let (client_id, secret) = confidential_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+
+    // Wrong secret: 401 invalid_client, and the code is not consumed.
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client_id),
+        ("client_secret", "outer_cs_wrong"),
+        ("code", &params["code"]),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
+    ]);
+    let (status, headers, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(body.contains("invalid_client"), "{body}");
+    assert!(!headers.contains_key("www-authenticate"));
+
+    // The same code still redeems with the right secret (form post).
+    let tokens = exchange_confidential(&flow, &client_id, &secret, &params, redirect_uri).await;
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &access)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Refresh with Basic works.
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, _, body) = token_request(
+        &flow,
+        &body,
+        &[("authorization", &basic(&client_id, &secret))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let refreshed: serde_json::Value = body.parse().unwrap();
+    assert_eq!(refreshed["refresh_token"], refresh.as_str());
+
+    // A wrong secret in the form: 401 without a Basic challenge.
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("client_secret", "outer_cs_wrong"),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, headers, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(body.contains("invalid_client"), "{body}");
+    assert!(!headers.contains_key("www-authenticate"));
+
+    // A wrong secret in Basic: 401 with the Basic challenge.
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, headers, body) = token_request(
+        &flow,
+        &body,
+        &[("authorization", &basic(&client_id, "outer_cs_wrong"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        headers.get("www-authenticate").unwrap(),
+        "Basic realm=\"outer\""
+    );
+
+    // No secret at all: 401 (a confidential client must present one).
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(body.contains("invalid_client"), "{body}");
+
+    // Only Basic without a form client_id also authenticates.
+    let body = form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+    let (status, _, body) = token_request(
+        &flow,
+        &body,
+        &[("authorization", &basic(&client_id, &secret))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // RFC 6749 §2.3.1: Basic credentials are form-urlencoded. `%2D` decodes
+    // to `-`, which is not in the secret, so this must fail…
+    let encoded_wrong = format!("Basic {}", {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:outer_cs%2Dwrong"))
+    });
+    let body = form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+    let (status, _, body) = token_request(&flow, &body, &[("authorization", &encoded_wrong)]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    // …while percent-encoding the real secret's prefix still authenticates.
+    let encoded_secret = format!("outer%5Fcs%5F{}", &secret["outer_cs_".len()..]);
+    let body = form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+    let (status, _, body) = token_request(
+        &flow,
+        &body,
+        &[("authorization", &basic(&client_id, &encoded_secret))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // None of those failures revoked the grant.
+    assert!(
+        auth::resolve_bearer(&flow.state.pool, &flow.state.config, &access)
+            .await
+            .unwrap()
+            .is_some(),
+        "a secret failure never revokes"
+    );
+}
+
+/// Public clients keep working against clients that send a secret or a
+/// Basic header anyway (the pre-L-11 compatibility promise).
+#[tokio::test]
+async fn public_clients_ignore_secrets_and_basic() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let client_id = dcr_client(&flow.app, redirect_uri).await;
+
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client_id),
+        ("client_secret", "garbage"),
+        ("code", &params["code"]),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
+    ]);
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "form secret ignored: {body}");
+
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "bob@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client_id),
+        ("code", &params["code"]),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
+    ]);
+    let (status, _, body) =
+        token_request(&flow, &body, &[("authorization", &basic(&client_id, ""))]).await;
+    assert_eq!(status, StatusCode::OK, "empty Basic secret ignored: {body}");
+}
+
+/// CIMD clients are public whatever a caller presents: refresh rotates with
+/// the replay grace, never slides (a shared document URL cannot carry a
+/// per-instance secret).
+#[tokio::test]
+async fn cimd_clients_are_always_public() {
+    let flow = flow().await;
+    let (base, _server) = fake_cimd().await;
+    let client_id = format!("{base}/good");
+    let redirect_uri = "http://127.0.0.1:9/cb";
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+
+    // A Basic header with a made-up secret is ignored.
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client_id),
+        ("code", &params["code"]),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
+        ("resource", RESOURCE),
+    ]);
+    let (status, _, body) = token_request(
+        &flow,
+        &body,
+        &[("authorization", &basic(&client_id, "not-a-secret"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tokens: serde_json::Value = body.parse().unwrap();
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    // Rotated, not slid: a new refresh token, and the old row is marked.
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, _, rotated_body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{rotated_body}");
+    let rotated: serde_json::Value = rotated_body.parse().unwrap();
+    assert_ne!(rotated["refresh_token"], refresh.as_str());
+    let (rotated_at,): (Option<i64>,) =
+        sqlx::query_as("SELECT rotatedAt FROM oauthRefreshToken WHERE token = ?")
+            .bind(tokens::sha256_hex(&refresh))
+            .fetch_one(&flow.state.pool)
+            .await
+            .unwrap();
+    assert!(rotated_at.is_some(), "a public refresh rotates");
+
+    // Inside the grace the old token replays the identical pair.
+    let (status, _, replay) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, rotated_body);
+
+    // Past the grace it is theft.
+    sqlx::query("UPDATE oauthRefreshToken SET rotationReplayExpiresAt = 0 WHERE token = ?")
+        .bind(tokens::sha256_hex(&refresh))
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"));
+    assert!(
+        auth::resolve_bearer(
+            &flow.state.pool,
+            &flow.state.config,
+            rotated["access_token"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "reuse past the grace revokes the grant"
+    );
+}
+
+/// Confidential refreshes never rotate: the same token keeps working, its
+/// expiry slides forward, and each use mints a fresh access token.
+#[tokio::test]
+async fn confidential_refresh_does_not_rotate_but_slides() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let (client_id, secret) = confidential_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens = exchange_confidential(&flow, &client_id, &secret, &params, redirect_uri).await;
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    let hash = tokens::sha256_hex(&refresh);
+
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("client_secret", &secret),
+        ("refresh_token", &refresh),
+    ]);
+    let (status, _, first) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first: serde_json::Value = first.parse().unwrap();
+    let (rotated_at, expires_first): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT rotatedAt, expiresAt FROM oauthRefreshToken WHERE token = ?")
+            .bind(&hash)
+            .fetch_one(&flow.state.pool)
+            .await
+            .unwrap();
+    assert!(
+        rotated_at.is_none(),
+        "a confidential refresh does not rotate"
+    );
+    assert_eq!(first["refresh_token"], refresh.as_str());
+
+    let (status, _, second) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let second: serde_json::Value = second.parse().unwrap();
+    assert_eq!(second["refresh_token"], refresh.as_str());
+    assert_ne!(first["access_token"], second["access_token"]);
+    let expires_second: Option<i64> =
+        sqlx::query_scalar("SELECT expiresAt FROM oauthRefreshToken WHERE token = ?")
+            .bind(&hash)
+            .fetch_one(&flow.state.pool)
+            .await
+            .unwrap();
+    assert!(
+        expires_second > expires_first,
+        "each use slides the expiry: {expires_first:?} -> {expires_second:?}"
+    );
+    for token in [
+        first["access_token"].as_str().unwrap(),
+        second["access_token"].as_str().unwrap(),
+    ] {
+        assert!(
+            auth::resolve_bearer(&flow.state.pool, &flow.state.config, token)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // Revoking the connection kills the still-valid refresh token.
+    let principal = auth::resolve_bearer(
+        &flow.state.pool,
+        &flow.state.config,
+        second["access_token"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let grant_id = match &principal.credential {
+        auth::Credential::OAuth { grant_id } => grant_id.clone(),
+        _ => panic!("expected an OAuth grant"),
+    };
+    assert!(
+        auth::revoke_connection(&flow.state.pool, &principal.account_id, &grant_id)
+            .await
+            .unwrap()
+    );
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_grant"), "{body}");
+}
+
+/// A narrow `scope` on a confidential refresh narrows the row, so a later
+/// refresh cannot widen it back.
+#[tokio::test]
+async fn confidential_scope_narrowing_persists() {
+    let flow = flow().await;
+    let redirect_uri = "https://app.example/cb";
+    let (client_id, secret) = confidential_client(&flow.app, redirect_uri).await;
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+    let tokens = exchange_confidential(&flow, &client_id, &secret, &params, redirect_uri).await;
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("client_secret", &secret),
+        ("refresh_token", &refresh),
+        ("scope", "apps"),
+    ]);
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let narrowed: serde_json::Value = body.parse().unwrap();
+    assert_eq!(narrowed["scope"], "apps");
+
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client_id),
+        ("client_secret", &secret),
+        ("refresh_token", &refresh),
+        ("scope", "apps offline_access"),
+    ]);
+    let (status, _, body) = token_request(&flow, &body, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("invalid_scope"), "{body}");
+}
+
+/// The authorize page has its own per-IP budget: over it, a 429 page with
+/// `retry-after`, and no `oauth_request` row is created.
+#[tokio::test]
+async fn authorize_is_rate_limited() {
+    let flow = flow().await;
+    let client_id = dcr_client(&flow.app, "https://app.example/cb").await;
+    sqlx::query("DELETE FROM rate_limit_events")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    fill_rate_events(
+        &flow.state.pool,
+        "ip:127.0.0.1",
+        "oauth_authorize",
+        120,
+        auth::now_ms(),
+    )
+    .await;
+    let (status, headers, body) = send(
+        &flow.app,
+        get(&authorize_url(&client_id, "https://app.example/cb")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(headers.contains_key("retry-after"));
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    assert!(body.contains("Too many attempts"), "{body}");
+    let (requests,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_request")
+        .fetch_one(&flow.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(requests, 0, "a rate-limited GET inserts no request row");
+}
+
+/// `oauth-client add` creates a confidential client (the Gemini-style
+/// out-of-band registration): it completes the full flow with Basic and
+/// gets non-rotating refreshes. Its Google-run redirect is accepted at
+/// registration and at authorize, and the stale-DCR prune keeps it.
+#[tokio::test]
+async fn operator_client_completes_the_flow_with_basic() {
+    use crate::auth::oauth;
+    let flow = flow().await;
+    let redirect_uri = "https://oauth-redirect.googleusercontent.com/r/outer-project";
+    let (client_id, secret) = oauth::add_operator_client(
+        &flow.state.pool,
+        "Gemini",
+        &[redirect_uri.to_string()],
+        "client_secret_basic",
+    )
+    .await
+    .unwrap();
+    assert!(client_id.starts_with("dcr_"));
+    assert!(secret.starts_with("outer_cs_"));
+    let (stored, method, verified): (Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT clientSecret, tokenEndpointAuthMethod, verified FROM oauthClient WHERE clientId = ?",
+    )
+    .bind(&client_id)
+    .fetch_one(&flow.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some(tokens::sha256_hex(&secret).as_str())
+    );
+    assert_eq!(method.as_deref(), Some("client_secret_basic"));
+    assert_eq!(verified, 1);
+
+    let (request_id, csrf, session) =
+        sign_in(&flow, &client_id, redirect_uri, "ana@example.com").await;
+    let params = allow(&flow, &request_id, &csrf, &session).await;
+
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client_id),
+        ("code", &params["code"]),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", VERIFIER),
+        ("resource", RESOURCE),
+    ]);
+    let (status, _, body) = token_request(
+        &flow,
+        &body,
+        &[("authorization", &basic(&client_id, &secret))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tokens: serde_json::Value = body.parse().unwrap();
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    // Non-rotating: the same token twice, each time a new access token.
+    let body = form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)]);
+    for _ in 0..2 {
+        let (status, _, body) = token_request(
+            &flow,
+            &body,
+            &[("authorization", &basic(&client_id, &secret))],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let refreshed: serde_json::Value = body.parse().unwrap();
+        assert_eq!(refreshed["refresh_token"], refresh.as_str());
+        assert!(auth::resolve_bearer(
+            &flow.state.pool,
+            &flow.state.config,
+            refreshed["access_token"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .is_some());
+    }
+    let (rotated_at,): (Option<i64>,) =
+        sqlx::query_as("SELECT rotatedAt FROM oauthRefreshToken WHERE token = ?")
+            .bind(tokens::sha256_hex(&refresh))
+            .fetch_one(&flow.state.pool)
+            .await
+            .unwrap();
+    assert!(rotated_at.is_none(), "operator clients never rotate");
+
+    // The stale-DCR prune runs 30 days later and must keep the operator row
+    // even though it never paid for a token (DCR rows would be deleted).
+    sqlx::query("UPDATE oauthClient SET lastTokenAt = NULL WHERE clientId = ?")
+        .bind(&client_id)
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    let (_requests, _tokens, pruned) =
+        oauth::prune_expired(&flow.state.pool, auth::now_ms() + 31 * 86_400_000)
+            .await
+            .unwrap();
+    assert_eq!(pruned, 0, "operator clients are exempt from the prune");
+    let (kept,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauthClient WHERE clientId = ?")
+        .bind(&client_id)
+        .fetch_one(&flow.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
+}
+
+/// Two concurrent refreshes of one token both answer the same pair (the
+/// loser replays the winner's response), and once the consent is revoked
+/// nothing from the family authenticates — not even a token planted
+/// directly on the revoked row (`resolve_bearer` joins `revokedAt IS NULL`,
+/// the second barrier behind the rotation transaction).
 #[tokio::test]
 async fn refresh_race_and_revocation_leave_no_survivors() {
     let flow = flow().await;
@@ -831,25 +1555,24 @@ async fn refresh_race_and_revocation_leave_no_survivors() {
         )
     };
     let (a, b) = tokio::join!(use_refresh(), use_refresh());
-    let winners: Vec<serde_json::Value> = [&a, &b]
-        .into_iter()
-        .filter(|r| r.0 == StatusCode::OK)
-        .map(|r| r.2.parse().unwrap())
-        .collect();
-    assert!(
-        winners.len() <= 1,
-        "a refresh token rotates once: {a:?} {b:?}"
-    );
-    let mut family = vec![first_access.clone()];
-    for won in &winners {
-        family.push(won["access_token"].as_str().unwrap().to_string());
-    }
+    // Both succeed with the identical pair: the loser replays the winner's
+    // stored response, so a client retry never revokes the grant.
+    assert_eq!(a.0, StatusCode::OK, "first refresh: {a:?}");
+    assert_eq!(b.0, StatusCode::OK, "second refresh: {b:?}");
+    assert_eq!(a.2, b.2, "concurrent refreshes answer the same pair");
+    let won: serde_json::Value = a.2.parse().unwrap();
+    let family = vec![
+        first_access.clone(),
+        won["access_token"].as_str().unwrap().to_string(),
+    ];
 
     // Explicit revocation wipes the family: no survivor authenticates, the
-    // refresh is dead, and the token rows are gone. (When the race had a
-    // winner, the loser already revoked the grant — `revoke_connection`
-    // then reports false, which is fine: the end state is identical.)
-    let _ = auth::revoke_connection(&flow.state.pool, &principal.account_id, &grant_id).await;
+    // refresh is dead, and the token rows are gone.
+    assert!(
+        auth::revoke_connection(&flow.state.pool, &principal.account_id, &grant_id)
+            .await
+            .unwrap()
+    );
     for token in &family {
         assert!(
             auth::resolve_bearer(&flow.state.pool, &flow.state.config, token)
@@ -1214,9 +1937,9 @@ async fn dcr_validates_and_rate_limits() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    // A client defaulting to a secret method is registered public, not
-    // refused: the answer tells it so.
-    let (status, _, body) = send(
+    // A directory that registers with a secret method gets one (hash only
+    // stored); the answer echoes the method it actually registered.
+    let (status, headers, body) = send(
         &flow.app,
         post_json(
             "/oauth/register",
@@ -1225,8 +1948,54 @@ async fn dcr_validates_and_rate_limits() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let registered: serde_json::Value = body.parse().unwrap();
+    assert_eq!(
+        registered["token_endpoint_auth_method"],
+        "client_secret_basic"
+    );
+    assert_eq!(registered["client_secret_expires_at"], 0);
+    let secret = registered["client_secret"].as_str().unwrap();
+    assert!(secret.starts_with("outer_cs_"), "{secret}");
+    let (stored, method): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT clientSecret, tokenEndpointAuthMethod FROM oauthClient WHERE clientId = ?",
+    )
+    .bind(registered["client_id"].as_str().unwrap())
+    .fetch_one(&flow.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.as_deref(), Some(tokens::sha256_hex(secret).as_str()));
+    assert_ne!(stored.as_deref(), Some(secret), "only the hash is stored");
+    assert_eq!(method.as_deref(), Some("client_secret_basic"));
+
+    // An unsupported method falls back to `none` instead of locking the
+    // client out, and carries no `client_secret`.
+    let (status, _, body) = send(
+        &flow.app,
+        post_json(
+            "/oauth/register",
+            &serde_json::json!({ "redirect_uris": ["https://app.example/cb"], "token_endpoint_auth_method": "private_key_jwt" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     let registered: serde_json::Value = body.parse().unwrap();
     assert_eq!(registered["token_endpoint_auth_method"], "none");
+    assert!(registered.get("client_secret").is_none(), "{registered}");
+
+    // No method at all: a public client.
+    let (status, _, body) = send(
+        &flow.app,
+        post_json(
+            "/oauth/register",
+            &serde_json::json!({ "redirect_uris": ["https://app.example/cb"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let registered: serde_json::Value = body.parse().unwrap();
+    assert_eq!(registered["token_endpoint_auth_method"], "none");
+    assert!(registered.get("client_secret").is_none(), "{registered}");
 
     // Loopback http is fine.
     let (status, _, _) = send(
@@ -1238,21 +2007,32 @@ async fn dcr_validates_and_rate_limits() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    // 20 registrations per hour per IP: the failed validations above count
-    // too (6 events so far), so 13 more succeed, the 20th succeeds, the 21st
-    // fails.
-    for _ in 0..13 {
-        let (status, _, _) = send(
-            &flow.app,
-            post_json(
-                "/oauth/register",
-                &serde_json::json!({ "redirect_uris": ["https://app.example/cb"] }),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
-    }
-    let (status, _, _) = send(
+
+    // Gemini registers a Google-run redirect host; the shared rules accept it.
+    let (status, _, body) = send(
+        &flow.app,
+        post_json(
+            "/oauth/register",
+            &serde_json::json!({ "redirect_uris": ["https://oauth-redirect.googleusercontent.com/r/outer-project"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Per-IP budget: 120/h. A full hour already spent trips the next call.
+    sqlx::query("DELETE FROM rate_limit_events")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    fill_rate_events(
+        &flow.state.pool,
+        "ip:127.0.0.1",
+        "dcr_register",
+        DCR_IP_TEST_LIMIT,
+        auth::now_ms(),
+    )
+    .await;
+    let (status, headers, body) = send(
         &flow.app,
         post_json(
             "/oauth/register",
@@ -1260,7 +2040,22 @@ async fn dcr_validates_and_rate_limits() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(headers.contains_key("retry-after"));
+
+    // Global budget: 300/h, independent of the address (provider egress).
+    sqlx::query("DELETE FROM rate_limit_events")
+        .execute(&flow.state.pool)
+        .await
+        .unwrap();
+    fill_rate_events(
+        &flow.state.pool,
+        "global",
+        "dcr_register",
+        DCR_GLOBAL_TEST_LIMIT,
+        auth::now_ms(),
+    )
+    .await;
     let (status, headers, body) = send(
         &flow.app,
         post_json(
@@ -2131,9 +2926,34 @@ fn consent_page_never_warns_and_notes_only_self_registered_apps() {
     let dcr = pages::render(pages::consent_page(&doc(false), "apps", "rid", "csrf"));
     assert!(dcr.contains("registered itself"), "{dcr}");
     for page in [&cimd, &dcr] {
+        // The grant's powers, named plainly.
+        assert!(page.contains("Read your apps' code"), "{page}");
+        assert!(page.contains("logs and live pages"), "{page}");
+        assert!(page.contains("delete apps or your whole account"), "{page}");
+        assert!(page.contains("Set app secrets, API keys"), "{page}");
+        assert!(page.contains("custom domains"), "{page}");
+        assert!(page.contains("collaborator invites"), "{page}");
+        assert!(
+            page.contains("cannot change your plan or pay for anything"),
+            "{page}"
+        );
+        // No stale claim about sign-in codes, and "stay signed in" only
+        // with `offline_access`.
+        assert!(!page.contains("sign-in codes"), "{page}");
+        assert!(!page.contains("Stay signed in"), "{page}");
         assert!(!page.to_lowercase().contains("unverified"), "{page}");
         assert!(!page.contains("Only continue if you trust"), "{page}");
     }
+    let offline = pages::render(pages::consent_page(
+        &doc(true),
+        "apps offline_access",
+        "rid",
+        "csrf",
+    ));
+    assert!(
+        offline.contains("Stay signed in after this browser session"),
+        "{offline}"
+    );
 }
 
 /// The daily prune deletes only codes and sessions every reader agrees are
