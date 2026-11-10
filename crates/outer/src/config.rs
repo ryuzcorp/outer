@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Where platform objects (git bundles, app storage, the state snapshot) live.
@@ -146,11 +146,11 @@ impl Default for CrawlConfig {
     }
 }
 
-/// Most `OUTER_REVIEW_LOGINS` entries accepted (one Argon2id hash each; the
-/// list is the whole allowlist for password sign-in).
+/// Most `OUTER_REVIEW_LOGINS_FILE` entries accepted (one Argon2id hash each;
+/// the list is the whole allowlist for password sign-in).
 pub const MAX_REVIEW_LOGINS: usize = 20;
 
-/// One operator-listed reviewer account (`OUTER_REVIEW_LOGINS`): the email
+/// One operator-listed reviewer account (`OUTER_REVIEW_LOGINS_FILE`): the email
 /// signs in with `password_hash` (Argon2id PHC) instead of an email code.
 /// `Debug` prints only the email — the hash never reaches a log line.
 #[derive(Clone, PartialEq, Eq)]
@@ -167,63 +167,84 @@ impl std::fmt::Debug for ReviewLogin {
     }
 }
 
-/// Parse `OUTER_REVIEW_LOGINS`: `;`-separated `email:phc` entries (PHC holds
-/// `$` and `,`, so `;` is the separator). Emails must be ASCII: `normalize_email`
-/// lowercases ASCII only while `ensure_account` lowercases Unicode, so a
-/// non-ASCII entry could never match the account it signs in to. The hash must
-/// carry `Params::DEFAULT` (the cost `outer hash-password` and the dummy PHC
-/// use); a cheaper PHC would weaken every reviewer password. Problems name the
-/// variable and the entry index and never echo the value.
+/// Read `OUTER_REVIEW_LOGINS_FILE` and parse it: one `email:phc` per line
+/// (PHC holds `$` and `,`; a newline separates entries). Blank lines and
+/// lines whose first non-space character is `#` are ignored and every line is
+/// trimmed. A file that cannot be read is a config problem naming the
+/// variable and the io error kind, never the contents. Problems name the
+/// variable and the line number and never echo the value.
+fn read_review_logins(path: &Path, problems: &mut Vec<String>) -> Vec<ReviewLogin> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            problems.push(format!(
+                "OUTER_REVIEW_LOGINS_FILE: cannot read {}: {}",
+                path.display(),
+                err.kind()
+            ));
+            return Vec::new();
+        }
+    };
+    parse_review_logins(&raw, problems)
+}
+
+/// Parse the `OUTER_REVIEW_LOGINS_FILE` contents. Emails must be ASCII:
+/// `normalize_email` lowercases ASCII only while `ensure_account` lowercases
+/// Unicode, so a non-ASCII entry could never match the account it signs in
+/// to. The hash must carry `Params::DEFAULT` (the cost `outer hash-password`
+/// and the dummy PHC use); a cheaper PHC would weaken every reviewer
+/// password.
 fn parse_review_logins(raw: &str, problems: &mut Vec<String>) -> Vec<ReviewLogin> {
     let mut logins: Vec<ReviewLogin> = Vec::new();
-    for (position, entry) in raw
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .enumerate()
-    {
-        let index = position + 1;
-        if index > MAX_REVIEW_LOGINS {
+    let mut accepted = 0usize;
+    for (offset, line) in raw.lines().enumerate() {
+        let line_number = offset + 1;
+        let entry = line.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        accepted += 1;
+        if accepted > MAX_REVIEW_LOGINS {
             problems.push(format!(
-                "OUTER_REVIEW_LOGINS lists more than {MAX_REVIEW_LOGINS} review accounts"
+                "OUTER_REVIEW_LOGINS_FILE lists more than {MAX_REVIEW_LOGINS} review accounts (line {line_number})"
             ));
             break;
         }
         let Some((email, hash)) = entry.split_once(':') else {
             problems.push(format!(
-                "OUTER_REVIEW_LOGINS entry {index}: expected email:phc separated by ':'"
+                "OUTER_REVIEW_LOGINS_FILE line {line_number}: expected email:phc separated by ':'"
             ));
             continue;
         };
         let email = email.trim().to_ascii_lowercase();
         if !email.is_ascii() {
             problems.push(format!(
-                "OUTER_REVIEW_LOGINS entry {index}: the part before ':' is not an ASCII email address"
+                "OUTER_REVIEW_LOGINS_FILE line {line_number}: the part before ':' is not an ASCII email address"
             ));
             continue;
         }
         if !crate::auth::valid_email(&email) {
             problems.push(format!(
-                "OUTER_REVIEW_LOGINS entry {index}: the part before ':' is not an email address"
+                "OUTER_REVIEW_LOGINS_FILE line {line_number}: the part before ':' is not an email address"
             ));
             continue;
         }
         if logins.iter().any(|login| login.email == email) {
             problems.push(format!(
-                "OUTER_REVIEW_LOGINS entry {index}: an earlier entry already lists this email"
+                "OUTER_REVIEW_LOGINS_FILE line {line_number}: an earlier entry already lists this email"
             ));
             continue;
         }
         match argon2::password_hash::PasswordHash::new(hash.trim()) {
             Ok(parsed) if parsed.algorithm.as_str() != "argon2id" || parsed.hash.is_none() => {
                 problems.push(format!(
-                    "OUTER_REVIEW_LOGINS entry {index}: the password hash must be an argon2id PHC string"
+                    "OUTER_REVIEW_LOGINS_FILE line {line_number}: the password hash must be an argon2id PHC string"
                 ));
             }
             Ok(parsed) => {
                 if !crate::access::has_default_argon2_cost(&parsed) {
                     problems.push(format!(
-                        "OUTER_REVIEW_LOGINS entry {index}: the password hash must use the default Argon2id cost; generate it with `outer hash-password`"
+                        "OUTER_REVIEW_LOGINS_FILE line {line_number}: the password hash must use the default Argon2id cost; generate it with `outer hash-password`"
                     ));
                     continue;
                 }
@@ -233,7 +254,7 @@ fn parse_review_logins(raw: &str, problems: &mut Vec<String>) -> Vec<ReviewLogin
                 });
             }
             Err(_) => problems.push(format!(
-                "OUTER_REVIEW_LOGINS entry {index}: the password hash is not a PHC string"
+                "OUTER_REVIEW_LOGINS_FILE line {line_number}: the password hash is not a PHC string"
             )),
         }
     }
@@ -297,9 +318,10 @@ pub struct Config {
     pub ai_gateway: String,
     /// `OUTER_ADMIN_EMAILS`: comma-separated, normalized to lowercase.
     pub admin_emails: Vec<String>,
-    /// `OUTER_REVIEW_LOGINS`: operator-listed review accounts that sign in
-    /// with an Argon2id password on the console and OAuth pages. Empty =
-    /// password sign-in is off.
+    /// `OUTER_REVIEW_LOGINS_FILE`: path to the file listing operator review
+    /// accounts (one `email:phc` per line) that sign in with an Argon2id
+    /// password on the console and OAuth pages. Empty = password sign-in is
+    /// off.
     pub review_logins: Vec<ReviewLogin>,
     /// `OUTER_TERMS_VERSION`: changing it re-asks every account at next sign-in.
     pub terms_version: String,
@@ -531,8 +553,8 @@ impl Config {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let review_logins = get("OUTER_REVIEW_LOGINS")
-            .map(|raw| parse_review_logins(raw, &mut problems))
+        let review_logins = get("OUTER_REVIEW_LOGINS_FILE")
+            .map(|raw| read_review_logins(Path::new(raw), &mut problems))
             .unwrap_or_default();
         let terms_version = get("OUTER_TERMS_VERSION").map(str::to_string);
         let outer_secret = get("OUTER_SECRET").unwrap_or("dev").to_string();
@@ -1695,12 +1717,24 @@ mod tests {
     const PHC_B: &str =
         "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQy$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
+    /// Writes `contents` to a review-logins file inside `dir` and returns its
+    /// path for `OUTER_REVIEW_LOGINS_FILE`.
+    fn review_logins_file(dir: &tempfile::TempDir, contents: &str) -> String {
+        let path = dir.path().join("review-logins");
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn review_logins_parse_normalized_and_never_print_the_hash() {
-        let raw = format!(" Review@Example.com:{PHC_A} ; second@example.com:{PHC_B};");
+        let dir = tempfile::tempdir().unwrap();
+        let raw = format!(
+            "# reviewer accounts\n\n Review@Example.com:{PHC_A} \nsecond@example.com:{PHC_B}\n"
+        );
+        let path = review_logins_file(&dir, &raw);
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
-            ("OUTER_REVIEW_LOGINS", &raw),
+            ("OUTER_REVIEW_LOGINS_FILE", path.as_str()),
         ]))
         .unwrap();
         assert_eq!(cfg.review_logins.len(), 2);
@@ -1714,17 +1748,46 @@ mod tests {
     }
 
     #[test]
+    fn review_logins_unset_means_no_password_sign_in() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert!(cfg.review_logins.is_empty());
+    }
+
+    #[test]
+    fn review_logins_unreadable_file_names_the_variable_and_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            (
+                "OUTER_REVIEW_LOGINS_FILE",
+                missing.to_string_lossy().as_ref(),
+            ),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.starts_with("OUTER_REVIEW_LOGINS_FILE: cannot read")
+                    && p.contains("not found")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn review_logins_refuse_malformed_entries_without_echoing_values() {
+        // (label, file contents, needle, expected line number)
         let cases = [
             (
                 "missing separator",
                 "review@example.com".to_string(),
                 "expected email:phc",
+                1,
             ),
             (
                 "garbage hash",
                 "review@example.com:not-a-phc".to_string(),
                 "not a PHC string",
+                1,
             ),
             (
                 "wrong algorithm",
@@ -1733,37 +1796,45 @@ mod tests {
                     PHC_A.replace("argon2id", "argon2i")
                 ),
                 "argon2id",
+                1,
             ),
             (
-                "duplicate email",
-                format!("Review@Example.com:{PHC_A};review@example.com:{PHC_B}"),
-                "entry 2",
+                "duplicate email after comments",
+                format!("# first\n\nReview@Example.com:{PHC_A}\nreview@example.com:{PHC_B}\n"),
+                "an earlier entry already lists this email",
+                4,
             ),
             (
                 "cheaper cost",
                 format!("review@example.com:{}", PHC_A.replace("m=19456", "m=65536")),
                 "outer hash-password",
+                1,
             ),
             (
                 "unparsable param",
                 format!("review@example.com:{}", PHC_A.replace("t=2", "t=nope")),
                 "outer hash-password",
+                1,
             ),
             (
                 "non-ascii email",
                 format!("réview@example.com:{PHC_A}"),
                 "not an ASCII email",
+                1,
             ),
         ];
-        for (label, raw, needle) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        for (label, raw, needle, line) in cases {
+            let path = review_logins_file(&dir, &raw);
             let err = Config::from_vars(&vars(&[
                 ("OUTER_STORE", "memory"),
-                ("OUTER_REVIEW_LOGINS", raw.as_str()),
+                ("OUTER_REVIEW_LOGINS_FILE", path.as_str()),
             ]))
             .unwrap_err();
             assert!(
-                err.iter()
-                    .any(|p| p.contains("OUTER_REVIEW_LOGINS") && p.contains(needle)),
+                err.iter().any(|p| p.contains("OUTER_REVIEW_LOGINS_FILE")
+                    && p.contains(needle)
+                    && p.contains(&format!("line {line}"))),
                 "{label}: {err:?}"
             );
             for problem in &err {

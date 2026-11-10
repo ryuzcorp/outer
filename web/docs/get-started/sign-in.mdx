@@ -61,8 +61,8 @@ consent).
 
 Operators seed a review account and its demo apps with
 `outer seed demo --owner EMAIL [--url URL]`, run while the server is up. The
-email must be in `OUTER_REVIEW_LOGINS`; the command makes the account Pro,
-accepts the current terms, then signs in to the running server over MCP and
+email must be in `OUTER_REVIEW_LOGINS_FILE`; the command makes the account
+Pro, accepts the current terms, then signs in to the running server over MCP and
 creates two small D1-backed apps (notes and tasks), committing their pages
 and migration and waiting for each deploy. `--url` names the platform when it
 is not the configured origin; on localhost that is usually
