@@ -5,7 +5,7 @@
 //!
 //! - `GET /console/sign-in` + `POST /console/sign-in`: the web sign-in. The
 //!   email step sends a code; the password step admits operator-listed review
-//!   accounts (`OUTER_REVIEW_LOGINS`) with no code. Same rate limits, beta
+//!   accounts (`OUTER_REVIEW_LOGINS_FILE`) with no code. Same rate limits, beta
 //!   gate and terms acceptance as the OAuth steps ([`crate::auth`]); success
 //!   mints a `__Host-outer_sid` session and redirects to `/console`.
 //! - `GET /api/console/me`: `{email, plan}`.

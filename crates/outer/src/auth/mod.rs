@@ -49,8 +49,9 @@ pub struct AuthConfig {
     pub resource: String,
     /// `OUTER_ADMIN_EMAILS`, normalized.
     pub admin_emails: Vec<String>,
-    /// `OUTER_REVIEW_LOGINS`: reviewer accounts that sign in with a password
-    /// on the console and OAuth pages. Empty = password sign-in is off.
+    /// `OUTER_REVIEW_LOGINS_FILE`: reviewer accounts that sign in with a
+    /// password on the console and OAuth pages. Empty = password sign-in is
+    /// off.
     pub review_logins: Vec<ReviewLogin>,
     /// Concurrent Argon2 verifications (8 permits). A permit is taken before
     /// any hash runs; with every permit busy the sign-in fails fast with
@@ -595,7 +596,7 @@ pub async fn verify_code_core(
 }
 
 /// Password sign-in for an operator-listed review account
-/// (`OUTER_REVIEW_LOGINS`). Returns `(account_id, terms_ok)` exactly like
+/// (`OUTER_REVIEW_LOGINS_FILE`). Returns `(account_id, terms_ok)` exactly like
 /// `verify_code_core`; mints no OTP and no API key, and never logs the
 /// password or hash.
 ///

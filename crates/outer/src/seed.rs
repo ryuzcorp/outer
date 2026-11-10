@@ -82,7 +82,7 @@ const DEMO_APPS: [DemoApp; 2] = [
 ];
 
 /// Seed the demo account and both demo apps for one review login. The email
-/// must be listed in `OUTER_REVIEW_LOGINS`: that env list is the allowlist.
+/// must be listed in `OUTER_REVIEW_LOGINS_FILE`: that file is the allowlist.
 /// Only the account preparation touches the database directly; the apps are
 /// created, committed and deployed by the running server, driven over MCP
 /// with a key minted for the account and revoked before returning. Fails
@@ -98,7 +98,7 @@ pub async fn seed_demo(
     let owner_email = auth::normalize_email(owner_email);
     anyhow::ensure!(
         review_logins.iter().any(|login| login.email == owner_email),
-        "{owner_email} is not in OUTER_REVIEW_LOGINS; list it before seeding its demo apps"
+        "{owner_email} is not in OUTER_REVIEW_LOGINS_FILE; list it before seeding its demo apps"
     );
     // Pro, verified and terms-accepted before any app: `create_app` reads the
     // plan for the app limit and the keep-warm default, and a reviewer must
@@ -1354,7 +1354,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            format!("{err:#}").contains("not in OUTER_REVIEW_LOGINS"),
+            format!("{err:#}").contains("not in OUTER_REVIEW_LOGINS_FILE"),
             "{err:#}"
         );
         let apps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app")

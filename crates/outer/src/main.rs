@@ -525,7 +525,7 @@ async fn seed_demo(config: Config, rest: Vec<String>) -> anyhow::Result<()> {
 }
 
 /// `outer hash-password`: read the password from stdin (never argv) and
-/// print its Argon2id PHC for `OUTER_REVIEW_LOGINS`.
+/// print its Argon2id PHC for `OUTER_REVIEW_LOGINS_FILE`.
 async fn hash_password() -> ExitCode {
     use tokio::io::AsyncReadExt as _;
     let mut input = String::new();
