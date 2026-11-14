@@ -421,10 +421,10 @@ async fn state_release_backup(config: Config, rest: Vec<&str>) -> anyhow::Result
 
 /// Adopt the bucket snapshot lineage into the local sidecar (`<db>.snapshot-sha`),
 /// proving the bucket lineage against an explicitly expected author instance.
-/// `deploy/release.sh` runs this with the running container's hostname before
-/// the handoff (a new container gets a new id, so boot-time adoption can never
-/// match after a handoff). Exit 0 with the outcome as JSON when the sidecar is
-/// written or already present; any other refusal exits non-zero naming it.
+/// A manual operator command: releases need it no more, since the upload gate
+/// adopts a pre-lineage meta written by this host's id on its own. Exit 0 with
+/// the outcome as JSON when the sidecar is written or already present; any
+/// other refusal exits non-zero naming it.
 async fn state_adopt_lineage(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
     let flags = flags(&rest, &["--expect-instance"])?;
     let Some(expect) = flag(&flags, "--expect-instance") else {

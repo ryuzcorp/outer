@@ -246,9 +246,9 @@ pub enum AdoptOutcome {
 }
 
 /// Marker on an expected adoption refusal (no local DB, no bucket
-/// snapshot, unreadable meta, foreign instance): the caller reports it
-/// and moves on, instead of failing like a transport error. Boot warns
-/// and continues; the CLI exits non-zero.
+/// snapshot, unreadable meta, foreign instance): `outer state
+/// adopt-lineage` (a manual operator command) reports it and exits
+/// non-zero, instead of failing like a transport error.
 #[derive(Debug, Clone, Copy)]
 struct AdoptSkip;
 
