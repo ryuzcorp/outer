@@ -152,6 +152,12 @@ impl std::fmt::Debug for StripeClient {
 }
 
 impl StripeClient {
+    /// Outer's configured Pro price (`STRIPE_PRICE_PRO`): the webhook
+    /// upgrade paths match subscription items against it.
+    pub fn price_pro(&self) -> &str {
+        &self.price_pro
+    }
+
     pub fn new(
         secret_key: String,
         price_pro: String,
