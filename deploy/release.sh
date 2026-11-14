@@ -15,7 +15,7 @@
 #   registry), then runs the new image's own `outer check-config` on the host
 #   — as a `docker run --rm` one-off with exactly the environment and mounts
 #   the compose `outer` service gets (`--env-file /srv/outer/outer.env`, the
-#   read-only /tls mount, same OUTER_HOST_ID handling) — BEFORE anything
+#   read-only /tls and /data mounts, same OUTER_HOST_ID handling) — BEFORE anything
 #   changes prod. A non-zero exit aborts the release here with prod untouched:
 #   no uploads, no backup, no handoff. Only then uploads compose.yaml + the
 #   firewall files + handoff.sh to /srv/outer, then hands the new image out:
@@ -109,41 +109,40 @@ fi
 IMAGE="outer:$SHA"
 if [[ "$ENGINE" == "podman" ]]; then
     # podman names unqualified tags localhost/outer:<sha>, and docker load
-    # keeps that name; the retag step below restores the plain name.
+    # keeps that name. Require the retag to the plain name here, before the
+    # preflight and the rollout consume it: a failed retag aborts (set -e),
+    # never letting a stale outer:$SHA pass the preflight. Retagging changes
+    # nothing that is running.
+    # SHA is hex-validated above; expanding it here on the workstation is
+    # intended, same as the rollout heredoc below.
     podman build --format docker -t "$IMAGE" -f docker/Dockerfile .
     podman save "$IMAGE" | ssh "$TARGET" docker load
+    # shellcheck disable=SC2029
+    ssh "$TARGET" docker tag "localhost/outer:$SHA" "outer:$SHA"
+    # shellcheck disable=SC2029
+    ssh "$TARGET" docker rmi "localhost/outer:$SHA" >/dev/null
 else
     docker build -t "$IMAGE" -f docker/Dockerfile .
     docker save "$IMAGE" | ssh "$TARGET" docker load
 fi
 
-# A podman-built image arrives named localhost/outer:<sha> (docker load
-# keeps the name); retag it to the plain name now, before the preflight and
-# the rollout consume it. Retagging changes nothing that is running. (A
-# docker-built image is already plain-named, so the tag is a silent no-op
-# there.)
-# SHA is hex-validated above; expanding it here on the workstation is
-# intended, same as the rollout heredoc below.
-# shellcheck disable=SC2029
- if ssh "$TARGET" docker tag "localhost/outer:$SHA" "outer:$SHA" 2>/dev/null; then
-     ssh "$TARGET" docker rmi "localhost/outer:$SHA" >/dev/null
- fi
-
- # Preflight: the new image proves it accepts the live config BEFORE anything
- # changes prod (no uploads, no backup, no handoff below). Same environment
- # and mounts the compose `outer` service gets: --env-file carries
- # /srv/outer/outer.env (including OUTER_HOST_ID when the operator set it;
- # otherwise outer defaults to the container hostname on both paths), and
- # /tls is the same read-only mount (OUTER_REVIEW_LOGINS_FILE and the TLS
- # triple resolve under it). check-config has no side effects (no DB,
- # no network, no sockets) and names variables, never values. --pull=never:
- # a missing local image must fail here, never pull a same-named registry
- # image and run it with the production env. A non-zero exit aborts the
- # release here with prod untouched: past aborts this must catch are a
- # malformed OUTER_REVIEW_LOGINS PHC, a review-logins path missing its /tls
- # mount, and STRIPE_* missing off localhost.
- if ! ssh "$TARGET" docker run --rm --pull=never --env-file /srv/outer/outer.env \
-     -v /srv/outer/tls:/tls:ro "$IMAGE" check-config; then
+# Preflight: the new image proves it accepts the live config BEFORE anything
+# changes prod (no uploads, no backup, no handoff below). Same environment
+# and mounts the compose `outer` service gets: --env-file carries
+# /srv/outer/outer.env (including OUTER_HOST_ID when the operator set it;
+# otherwise outer defaults to the container hostname on both paths), and
+# every compose volume read-only: /tls (OUTER_REVIEW_LOGINS_FILE and the TLS
+# triple resolve under it) and /data (the live DB dir; check-config never
+# opens it, and read-only keeps even a buggy validation from touching prod).
+# check-config has no side effects (no DB, no network, no sockets) and names
+# variables, never values. --pull=never: a missing local image must fail
+# here, never pull a same-named registry image and run it with the
+# production env. A non-zero exit aborts the release here with prod
+# untouched: past aborts this must catch are a malformed OUTER_REVIEW_LOGINS
+# PHC, a review-logins path missing its /tls mount, and STRIPE_* missing off
+# localhost.
+if ! ssh "$TARGET" docker run --rm --pull=never --env-file /srv/outer/outer.env \
+    -v /srv/outer/tls:/tls:ro -v /srv/outer/data:/data:ro "$IMAGE" check-config; then
     echo "release.sh: preflight check-config on $IMAGE failed; release aborted, prod untouched (fix the config or the image, then release again)" >&2
     exit 1
 fi

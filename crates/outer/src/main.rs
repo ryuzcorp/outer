@@ -50,6 +50,12 @@ async fn main() -> ExitCode {
             let Some(config) = load_config() else {
                 return ExitCode::from(2);
             };
+            // The same file validation `check-config` runs, before
+            // `prepare_host` creates dirs and chmods: refuse an unreadable
+            // TLS triple before touching the host.
+            if !report_boot_files(&config) {
+                return ExitCode::from(2);
+            }
             init_tracing(&config.log_filter);
             if let Err(err) = prepare_host(&config) {
                 return report(Err(err));
@@ -58,15 +64,10 @@ async fn main() -> ExitCode {
         }
         ["check-config"] => match load_config() {
             Some(config) => {
-                let problems = config.boot_file_problems();
-                if problems.is_empty() {
+                if report_boot_files(&config) {
                     println!("configuration ok");
                     ExitCode::SUCCESS
                 } else {
-                    eprintln!("outer: invalid configuration:");
-                    for problem in problems {
-                        eprintln!("  - {problem}");
-                    }
                     ExitCode::from(2)
                 }
             }
@@ -180,6 +181,21 @@ fn load_config() -> Option<Config> {
             None
         }
     }
+}
+
+/// The one shared boot file check: print `Config::boot_file_problems` and
+/// report whether the config is bootable. `serve` runs this before
+/// `prepare_host` touches the host; `check-config` is this and nothing else.
+fn report_boot_files(config: &Config) -> bool {
+    let problems = config.boot_file_problems();
+    if problems.is_empty() {
+        return true;
+    }
+    eprintln!("outer: invalid configuration:");
+    for problem in problems {
+        eprintln!("  - {problem}");
+    }
+    false
 }
 
 fn build_store(config: &Config) -> anyhow::Result<Store> {
@@ -734,17 +750,6 @@ async fn app_list(config: Config) -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
-    // The same file validation `check-config` runs (one shared function):
-    // refuse an unreadable TLS triple before touching the data dir, the
-    // bucket, or any socket. The triple is loaded again below, after the
-    // bind, to build the actual server config.
-    let file_problems = config.boot_file_problems();
-    if !file_problems.is_empty() {
-        for problem in &file_problems {
-            eprintln!("outer: invalid configuration:\n  - {problem}");
-        }
-        anyhow::bail!("invalid configuration ({} problem(s))", file_problems.len());
-    }
     std::fs::create_dir_all(&config.data_dir)?;
     if !config.oxfmt_available() {
         // An explicitly configured binary that isn't executable is a prod
@@ -1231,4 +1236,43 @@ async fn shutdown_signal() {
 async fn drain_and_wait(pool: sqlx::SqlitePool, drain: Option<Arc<std::sync::atomic::AtomicBool>>) {
     shutdown_signal().await;
     outer::handoff::drain_and_wait(&pool, drain, shutdown_signal()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn boot_gate_passes_localhost_and_refuses_garbage_tls() {
+        // The gate both `serve` (before `prepare_host`) and `check-config`
+        // share: localhost without TLS passes, an unreadable triple fails.
+        // Presence alone is not enough — `validate` accepts a set triple
+        // and only this gate reads it.
+        let ok = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert!(report_boot_files(&ok));
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("origin.pem");
+        std::fs::write(&cert, "not pem at all\n").unwrap();
+        let missing = dir
+            .path()
+            .join("missing.pem")
+            .to_string_lossy()
+            .into_owned();
+        let bad = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_TLS_CERT", cert.to_string_lossy().as_ref()),
+            ("OUTER_TLS_KEY", missing.as_str()),
+            ("OUTER_ORIGIN_PULL_CA", missing.as_str()),
+        ]))
+        .unwrap();
+        assert!(!report_boot_files(&bad));
+    }
 }

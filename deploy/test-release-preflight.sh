@@ -23,8 +23,9 @@ mkdir -p "$BIN" "$LOG"
 
 # --- stubs ---------------------------------------------------------------
 # ssh: log every call; fake the prod migration query (no rows); the
-# check-config one-off exits $STUB_CHECK_CONFIG_EXIT; everything else exits 0
-# without executing (the rollout heredoc is recorded, never run).
+# check-config one-off exits $STUB_CHECK_CONFIG_EXIT and the podman retag
+# exits $STUB_RETAG_EXIT; everything else exits 0 without executing (the
+# rollout heredoc is recorded, never run).
 cat >"$BIN/ssh" <<'STUB'
 #!/usr/bin/env bash
 n=0
@@ -34,6 +35,7 @@ printf 'SSH: %s\n' "$*" >>"$STUB_LOG/ssh.log"
 case "$*" in
 *sqlite3*) exit 0 ;;
 *check-config*) exit "${STUB_CHECK_CONFIG_EXIT:-0}" ;;
+*docker\ tag\ localhost*) exit "${STUB_RETAG_EXIT:-0}" ;;
 *) exit 0 ;;
 esac
 STUB
@@ -55,7 +57,7 @@ export STUB_LOG="$LOG"
 # Hermetic PATH: symlinks to exactly the real tools the test and release.sh
 # need, so a workstation podman/docker can never leak in and the cases
 # control engine presence by installing stubs.
-for tool in bash git sha384sum cut grep sed head mktemp rm mkdir chmod cp cat dirname; do
+for tool in bash git sha384sum cut grep sed head mktemp rm mkdir chmod cp cat dirname sort; do
     ln -s "$(command -v "$tool")" "$BIN/$tool"
 done
 export PATH="$BIN"
@@ -79,7 +81,7 @@ reset_case() {
     chmod +x "$BIN/ssh" "$BIN/scp" "$BIN/docker"
     [[ -f "$BIN/podman" ]] && chmod +x "$BIN/podman" || true
     unset OUTER_ENGINE || true
-    export STUB_CHECK_CONFIG_EXIT=0
+    export STUB_CHECK_CONFIG_EXIT=0 STUB_RETAG_EXIT=0
 }
 
 run_release() {
@@ -149,5 +151,31 @@ tag="$(grep -n "docker tag.*localhost/outer" "$LOG/ssh.log" | head -n1 | cut -d:
 pre6="$(grep -n "check-config" "$LOG/ssh.log" | head -n1 | cut -d: -f1 || true)"
 [[ -n "$tag" && -n "$pre6" && "$tag" -lt "$pre6" ]] || fail "retag did not precede the preflight"
 echo "case 6 ok: podman image retagged before check-config (exit 0)"
+
+# --- case 7: a failed podman retag aborts before check-config ---------------
+# The retag is required on the podman path (set -e, no swallowing): a stale
+# outer:<sha> must never reach the preflight.
+reset_case "docker,podman"
+export STUB_RETAG_EXIT=1
+code="$(run_release)"
+[[ "$code" != 0 ]] || fail "failed retag exited 0 (expected abort)"
+grep -q "docker tag.*localhost/outer" "$LOG/ssh.log" || fail "retag never ran"
+if grep -q "check-config" "$LOG/ssh.log"; then fail "check-config ran after a failed retag"; fi
+echo "case 7 ok: failed retag aborts before check-config (exit $code)"
+
+# --- case 8: compose and preflight agree on the outer service ---------------
+# The single-service file must keep its identity (a past edit dropped
+# `restart`), and the preflight's `-v` set must equal the compose `outer`
+# volumes (modes ignored) with every mount read-only, so the two can't drift.
+for key in "restart: unless-stopped" "pull_policy: never" "stop_grace_period:"; do
+    grep -q "$key" "$SCRIPT_DIR/compose.yaml" || fail "compose.yaml lost '$key'"
+done
+compose_vols="$(grep -o -- '- /srv/outer/[^ :]*:[^ :]*' "$SCRIPT_DIR/compose.yaml" | sed 's/^- //; s/:\(ro\|rw\)$//' | sort -u)"
+preflight_line="$(grep -- 'check-config' "$RELEASE_SH" || true)"
+preflight_vols="$(echo "$preflight_line" | grep -o -- '-v /srv/outer/[^ ]*' | sed 's/^-v //; s/:\(ro\|rw\)$//' | sort -u)"
+[[ -n "$preflight_vols" ]] || fail "no preflight -v mounts found in $RELEASE_SH"
+[[ "$compose_vols" == "$preflight_vols" ]] || fail "compose volumes != preflight mounts: [$compose_vols] vs [$preflight_vols]"
+if echo "$preflight_line" | grep -o -- '-v /srv/outer/[^ ]*' | grep -vq ':ro$'; then fail "a preflight mount is not read-only"; fi
+echo "case 8 ok: compose and preflight agree on service identity and mounts"
 
 echo "test-release-preflight: all cases passed"
