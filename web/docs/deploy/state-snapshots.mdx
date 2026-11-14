@@ -7,7 +7,7 @@ Outer snapshots its platform database (accounts, plans, OAuth grants, app secret
 
 ## Lineage: the sidecar
 
-Each upload records the snapshot sha256 in the bucket meta object and in a local sidecar (`/data/outer.sqlite.snapshot-sha`, written atomically after the upload lands). Before every upload the host compares the bucket's sha against the sidecar: empty bucket uploads; a sha matching the sidecar (or the bytes just dumped, for the crash window) uploads; anything else — including a database with no sidecar facing a snapshot — **refuses loudly** (`refusing state snapshot upload`, naming bucket and key), keeps serving, and retries the check. Never overwrites.
+Each upload records the snapshot sha256 in the bucket meta object and in a local sidecar (`/data/outer.sqlite.snapshot-sha`, written atomically after the upload lands). Before every upload the host compares the bucket's sha against the sidecar: empty bucket uploads; a sha matching the sidecar (or the bytes just dumped, for the crash window) uploads; a meta written by a pre-lineage binary under this host's id is adopted (below); anything else — including a database with no sidecar facing a lineage-marked snapshot — **refuses loudly** (`refusing state snapshot upload`, naming bucket and key), keeps serving, and retries the check. Never overwrites.
 
 ## When an upload refuses
 
@@ -15,9 +15,11 @@ Each upload records the snapshot sha256 in the bucket meta object and in a local
 - A second host claimed the same bucket: the newest claimant wins and the old one stops uploading. Give each install its own bucket.
 - There is no `--force`: every recovery goes through the restore below.
 
-- After upgrading to a version with lineage: the first boot adopts the sidecar automatically when the bucket meta names this host (`adopted snapshot sidecar ... uploads resume` in the log). A meta naming another host never adopts — that is the takeover shape, and it refuses as a wrong bucket.
-- Across a release handoff: `deploy/release.sh` runs the new image's `outer state adopt-lineage --expect-instance <id>` before the handoff, while the data volume is still the old container's. `<id>` is the running container's own host id, the value outer writes as the meta `instance`: `OUTER_HOST_ID` when set, otherwise the container's `/etc/hostname` (which changes with every new container, so without `OUTER_HOST_ID` boot-time adoption can't match after a handoff). Skipped when the sidecar already exists; any failure aborts the release. Manual equivalent for other setups: `outer state adopt-lineage --expect-instance <instance-named-in-the-bucket-meta>`.
-- Caveat: adoption keys off the author `instance` only, not the database bytes. A hand-placed different database under a matching container still adopts — then uploads it. Never drop files in place; use the restore below.
+## Lineage across upgrades
+
+Uploads also record `"lineage": 1` in the bucket meta. A meta *without* the marker was written by a pre-lineage binary: if it names this host as `instance`, the upload gate adopts its sha into the sidecar and proceeds (warned in the log), re-checking on every attempt while the bucket meta stays legacy. That covers release handoffs and container swaps: an old binary's last uploads during the overlap can't wedge the newcomer, and once a lineage-aware binary uploads, the strict rule applies. A legacy meta naming another host still refuses. The flip side: any legacy-meta bucket this host id once wrote (a mispointed `OUTER_R2_*` prefix from before the upgrade, say) is adopted and overwritten the same way, so check the bucket and prefix before the first lineage-aware boot. A rollback to a pre-lineage binary still boots — its reader only looks up known meta fields and ignores `lineage` — but uploads ungated while rolled back; the next lineage-aware release re-adopts through the same rule.
+
+`outer state adopt-lineage --expect-instance <id>` remains as a manual operator command: it writes the sidecar from the bucket meta sha when the local DB exists, no sidecar is present, and the meta `instance` equals the given id (exit 0 with `already adopted` when the sidecar exists; every other mismatch exits non-zero naming the reason). Adoption keys off the author `instance` only, not the database bytes: never drop files in place, use the restore below.
 
 ## Runbook: is this host backing up?
 

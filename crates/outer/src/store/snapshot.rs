@@ -74,12 +74,18 @@ const HISTORY_KEEP_DAILY_DAYS: i64 = 30;
 const HISTORY_PRUNE_MAX_DELETES: usize = 10;
 
 /// The bucket's current snapshot identity, from its meta object (reused: no
-/// new companion key; re-read fresh before every upload attempt).
+/// new companion key; re-read fresh before every upload attempt). `instance`
+/// names the binary that wrote it; `lineage` is true only when a
+/// lineage-aware binary wrote it (`"lineage": 1` in the meta).
 enum BucketSnapshot {
     /// No meta object: nothing to overwrite, uploading is safe.
     Absent,
-    /// A meta object exists; `sha` is its `sha256` when readable.
-    Present { sha: Option<String> },
+    /// A meta object exists; `sha`/`instance` are theirs when readable.
+    Present {
+        sha: Option<String>,
+        instance: Option<String>,
+        lineage: bool,
+    },
 }
 
 /// After this many consecutive lineage refusals `/ready` fails: nothing
@@ -99,12 +105,13 @@ fn check_lineage(
 ) -> Result<(), String> {
     match bucket {
         BucketSnapshot::Absent => Ok(()),
-        BucketSnapshot::Present { sha: None } => Err(
+        BucketSnapshot::Present { sha: None, .. } => Err(
             "the bucket holds a snapshot whose meta has no readable sha256; not overwriting"
                 .to_string(),
         ),
         BucketSnapshot::Present {
             sha: Some(bucket_sha),
+            ..
         } => {
             if sidecar == Some(bucket_sha.as_str()) || bucket_sha == local_hash {
                 Ok(())
@@ -239,9 +246,9 @@ pub enum AdoptOutcome {
 }
 
 /// Marker on an expected adoption refusal (no local DB, no bucket
-/// snapshot, unreadable meta, foreign instance): the caller reports it
-/// and moves on, instead of failing like a transport error. Boot warns
-/// and continues; the CLI exits non-zero.
+/// snapshot, unreadable meta, foreign instance): `outer state
+/// adopt-lineage` (a manual operator command) reports it and exits
+/// non-zero, instead of failing like a transport error.
 #[derive(Debug, Clone, Copy)]
 struct AdoptSkip;
 
@@ -345,48 +352,6 @@ impl StateSync {
             last_upload_secs_ago,
             last_error,
             consecutive_lineage_refusals: self.lineage_refusals.load(Ordering::Relaxed),
-        }
-    }
-
-    /// One-shot upgrade adoption, at boot only, before `claim`: a same-host
-    /// restart whose database predates sidecars adopts via [`adopt_lineage`]
-    /// (this host's own id as the expected author). A container handoff
-    /// gets a new id, so `release.sh` adopts with the running container's
-    /// hostname instead (see `state adopt-lineage`). Expected refusals
-    /// (absent snapshot, unreadable meta, foreign instance) warn with the
-    /// reason and continue; transport errors fail the boot. Returns true
-    /// when it adopted.
-    pub async fn adopt_sidecar_at_boot(
-        &self,
-        store: &Store,
-        cfg: &SnapshotConfig,
-    ) -> anyhow::Result<bool> {
-        if !cfg.db_path.exists() {
-            return Ok(false);
-        }
-        if read_sidecar(&cfg.sidecar_path()).await.is_some() {
-            return Ok(false);
-        }
-        match adopt_lineage(store, cfg, self.instance.as_str()).await {
-            Ok(AdoptOutcome::Adopted) => {
-                tracing::warn!(
-                    bucket = store.bucket_label(),
-                    key = cfg.state_key(),
-                    "adopted snapshot sidecar from this host's bucket meta (upgrade without sidecar); uploads resume"
-                );
-                Ok(true)
-            }
-            Ok(AdoptOutcome::AlreadyAdopted) => Ok(false),
-            Err(e) if e.downcast_ref::<AdoptSkip>().is_some() => {
-                tracing::warn!(
-                    bucket = store.bucket_label(),
-                    key = cfg.state_key(),
-                    reason = format!("{e:#}"),
-                    "not adopting snapshot sidecar at boot"
-                );
-                Ok(false)
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -534,20 +499,46 @@ impl StateSync {
         let sidecar = read_sidecar(&cfg.sidecar_path()).await;
         let bucket = bucket_snapshot(store, cfg).await?;
         if let Err(reason) = check_lineage(&bucket, sidecar.as_deref(), &hash) {
-            tracing::error!(
-                bucket = store.bucket_label(),
-                key = cfg.state_key(),
-                reason,
-                "refusing state snapshot upload: bucket identity matches neither the local sidecar nor this database; not overwriting (wrong bucket/prefix?)"
-            );
-            let err = anyhow::anyhow!("refusing state snapshot upload: {reason}");
-            return Err(err.context(LineageRefused));
+            // Legacy-adoption rule: a pre-lineage binary's meta (no marker)
+            // naming this host is this host's own lineage from before the
+            // upgrade — adopt it and proceed. Re-applied on every attempt
+            // while the bucket meta stays legacy, so an old container's last
+            // uploads during a handoff overlap can't wedge the newcomer;
+            // once a lineage-aware binary uploads, the marker is present and
+            // the strict rule applies. A legacy meta naming another instance
+            // still refuses below.
+            let legacy = match &bucket {
+                BucketSnapshot::Present {
+                    sha: Some(sha),
+                    instance,
+                    lineage: false,
+                } if instance.as_deref() == Some(self.instance.as_str()) => Some(sha.clone()),
+                _ => None,
+            };
+            if let Some(bucket_sha) = legacy {
+                write_sidecar(&cfg.sidecar_path(), &bucket_sha).await?;
+                tracing::warn!(
+                    bucket = store.bucket_label(),
+                    key = cfg.state_key(),
+                    instance = self.instance.as_str(),
+                    "adopted snapshot sidecar from a legacy (pre-lineage) bucket meta; uploads resume"
+                );
+            } else {
+                tracing::error!(
+                    bucket = store.bucket_label(),
+                    key = cfg.state_key(),
+                    reason,
+                    "refusing state snapshot upload: bucket identity matches neither the local sidecar nor this database; not overwriting (wrong bucket/prefix?)"
+                );
+                let err = anyhow::anyhow!("refusing state snapshot upload: {reason}");
+                return Err(err.context(LineageRefused));
+            }
         }
         // Crash window: the bucket holds these bytes but the sidecar predates
         // them. Repair now, including on the skip path, so a later change
         // uploads instead of wedging on a stale sidecar.
         let bucket_sha = match &bucket {
-            BucketSnapshot::Present { sha: Some(sha) } => Some(sha.as_str()),
+            BucketSnapshot::Present { sha: Some(sha), .. } => Some(sha.as_str()),
             _ => None,
         };
         if bucket_sha == Some(hash.as_str()) && sidecar.as_deref() != Some(hash.as_str()) {
@@ -583,6 +574,11 @@ impl StateSync {
             "bytes": packed_len,
             "raw_bytes": raw.len(),
             "instance": self.instance.as_str(),
+            // Marks a lineage-aware writer. Pre-lineage binaries ignore
+            // unknown fields (their reader only `.get()`s known ones), so a
+            // rollback still boots; the upload gate treats an unmarked meta
+            // naming this host as adoptable legacy lineage.
+            "lineage": 1,
         });
         upload_text(
             store,
@@ -621,10 +617,17 @@ async fn bucket_snapshot(store: &Store, cfg: &SnapshotConfig) -> anyhow::Result<
     match store.get(&cfg.meta_key()).await? {
         None => Ok(BucketSnapshot::Absent),
         Some(bytes) => {
-            let sha = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| v.get("sha256").and_then(|s| s.as_str().map(str::to_owned)));
-            Ok(BucketSnapshot::Present { sha })
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            let sha = v.get("sha256").and_then(|s| s.as_str().map(str::to_owned));
+            let instance = v
+                .get("instance")
+                .and_then(|s| s.as_str().map(str::to_owned));
+            let lineage = v.get("lineage").and_then(|v| v.as_u64()) == Some(1);
+            Ok(BucketSnapshot::Present {
+                sha,
+                instance,
+                lineage,
+            })
         }
     }
 }
@@ -1443,6 +1446,8 @@ mod tests {
         assert!(check_lineage(&BucketSnapshot::Absent, Some("stale"), "abc").is_ok());
         let present = |sha: Option<&str>| BucketSnapshot::Present {
             sha: sha.map(str::to_string),
+            instance: Some("host-1".to_string()),
+            lineage: true,
         };
         assert!(check_lineage(&present(Some("abc")), Some("abc"), "abc").is_ok());
         // Same bytes, stale sidecar: the crash window recovers.
@@ -1556,99 +1561,6 @@ mod tests {
             .await
             .is_err());
     }
-    /// Upgrade wedge: a database that predates sidecars adopts the bucket
-    /// lineage at boot (same host id) and the next upload lands — including
-    /// when the local database has diverged since the last upload.
-    #[tokio::test]
-    async fn upgrade_adoption_resumes_uploads() {
-        let (_dir, store, cfg, pool) = seed_store().await;
-        pool.close().await;
-        // The pre-sidecar host: local DB exists, no sidecar file.
-        assert!(cfg.db_path.exists());
-        tokio::fs::remove_file(sidecar_path(&cfg))
-            .await
-            .expect("drop sidecar");
-        // Diverge locally after the last upload.
-        let pool = test_pool(&cfg.db_path).await;
-        sqlx::query("INSERT INTO kv (k, v) VALUES ('b', '2')")
-            .execute(&pool)
-            .await
-            .expect("local change");
-        let sync = super::StateSync::new("host-1");
-        assert!(
-            sync.adopt_sidecar_at_boot(&store, &cfg)
-                .await
-                .expect("adopt"),
-            "same-host bucket lineage must adopt"
-        );
-        assert_sidecar_matches_meta(&store, &cfg).await;
-        sync.claim(&store, &cfg).await.expect("claim");
-        assert!(
-            sync.snapshot_now(&pool, &store, &cfg)
-                .await
-                .expect("upload resumes")
-                > 0
-        );
-        pool.close().await;
-    }
-
-    /// Same state, but the bucket was written by another instance: no
-    /// adoption, and the upload still refuses.
-    #[tokio::test]
-    async fn foreign_bucket_is_never_adopted() {
-        let (_dir, store, seed_cfg, pool) = seed_store().await;
-        pool.close().await;
-        // Rewrite the bucket meta to name another instance: same bytes, a
-        // foreign author. Adoption keys off the author, not the bytes.
-        let meta_key = format!("{}/outer.sqlite.meta.json", seed_cfg.key_prefix);
-        let mut meta: serde_json::Value = serde_json::from_slice(
-            &store
-                .get(&meta_key)
-                .await
-                .expect("read meta")
-                .expect("meta exists"),
-        )
-        .expect("meta json");
-        meta["instance"] = serde_json::Value::String("host-2".to_string());
-        store
-            .put(&meta_key, serde_json::to_vec(&meta).expect("meta bytes"))
-            .await
-            .expect("rewrite meta");
-        // A local database facing that foreign bucket, with no sidecar — and
-        // diverged bytes, so the crash-window rule cannot mistake it for the
-        // bucket's own.
-        let local = tempfile::tempdir().expect("temp dir");
-        let cfg = test_cfg(local.path(), "host-1");
-        let pool = test_pool(&cfg.db_path).await;
-        sqlx::query("INSERT INTO kv (k, v) VALUES ('local', '1')")
-            .execute(&pool)
-            .await
-            .expect("local divergence");
-        let sync = super::StateSync::new("host-1");
-        assert!(
-            !sync
-                .adopt_sidecar_at_boot(&store, &cfg)
-                .await
-                .expect("adopt"),
-            "another instance's lineage must not adopt"
-        );
-        assert!(!sidecar_path(&cfg).exists());
-        let before = live_bytes(&store, &seed_cfg).await;
-        // Claim first (as boot would), so the refusal below is the lineage
-        // gate's, not the owner fence's.
-        sync.claim(&store, &cfg).await.expect("claim");
-        let err = sync
-            .snapshot_now(&pool, &store, &cfg)
-            .await
-            .expect_err("foreign bucket must refuse");
-        assert!(
-            format!("{err:#}").contains("refusing"),
-            "unexpected: {err:#}"
-        );
-        assert_eq!(live_bytes(&store, &seed_cfg).await, before);
-        pool.close().await;
-    }
-
     /// `adopt_lineage` writes the sidecar from the bucket meta when the
     /// instance matches, refuses loudly on a mismatch or a missing database,
     /// and no-ops when the sidecar already exists.
@@ -1698,21 +1610,185 @@ mod tests {
         );
     }
 
-    /// Boot adoption with an empty bucket skips quietly: nothing to adopt,
-    /// and the first upload is allowed anyway.
+    /// Simulate a pre-lineage binary's upload: same state bytes and meta
+    /// shape, but no `lineage` marker, with `instance` naming the writer.
+    async fn legacy_upload(
+        store: &super::Store,
+        cfg: &super::SnapshotConfig,
+        pool: &sqlx::SqlitePool,
+        instance: &str,
+    ) {
+        let dir = cfg.db_path.parent().expect("db dir");
+        let tmp = dir.join(format!(".legacy-{}.sqlite", uuid::Uuid::new_v4()));
+        let target = tmp.to_str().expect("utf8");
+        let sql = format!("VACUUM INTO '{}'", target.replace('\'', "''"));
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(pool)
+            .await
+            .expect("vacuum");
+        let raw = tokio::fs::read(&tmp).await.expect("read dump");
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let hash = super::sha256_hex(&raw);
+        let packed = zstd::encode_all(&raw[..], 3).expect("zstd");
+        let packed_len = packed.len();
+        store
+            .put(&format!("{}/outer.sqlite.zst", cfg.key_prefix), packed)
+            .await
+            .expect("legacy state");
+        let meta = serde_json::json!({
+            "generation": meta_generation(store, cfg).await + 1,
+            "written_at": chrono::Utc::now().to_rfc3339(),
+            "codec": "zstd",
+            "sha256": hash,
+            "bytes": packed_len,
+            "raw_bytes": raw.len(),
+            "instance": instance,
+        });
+        store
+            .put(
+                &format!("{}/outer.sqlite.meta.json", cfg.key_prefix),
+                serde_json::to_vec(&meta).expect("meta bytes"),
+            )
+            .await
+            .expect("legacy meta");
+    }
+
+    /// A legacy (pre-lineage, unmarked) meta from this host adopts on
+    /// upload and lands — the upgrade path while an old binary overlaps.
     #[tokio::test]
-    async fn boot_adoption_skips_empty_bucket() {
+    async fn legacy_same_instance_adopts_and_lands() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        tokio::fs::remove_file(sidecar_path(&cfg))
+            .await
+            .expect("drop sidecar");
+        // The old binary uploads once more after the sidecar was dropped.
+        let pool = test_pool(&cfg.db_path).await;
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('b', '2')")
+            .execute(&pool)
+            .await
+            .expect("old write");
+        legacy_upload(&store, &cfg, &pool, "host-1").await;
+        // The newcomer diverges again, then uploads: the gate adopts the
+        // legacy sha instead of refusing.
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('c', '3')")
+            .execute(&pool)
+            .await
+            .expect("new write");
+        let sync = super::StateSync::new("host-1");
+        sync.claim(&store, &cfg).await.expect("claim");
+        assert!(
+            sync.snapshot_now(&pool, &store, &cfg)
+                .await
+                .expect("legacy adopts and lands")
+                > 0
+        );
+        assert_sidecar_matches_meta(&store, &cfg).await;
+        pool.close().await;
+    }
+
+    /// A legacy meta from another instance still refuses: adoption keys
+    /// off the author, not just the missing marker.
+    #[tokio::test]
+    async fn legacy_foreign_instance_refuses() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        tokio::fs::remove_file(sidecar_path(&cfg))
+            .await
+            .expect("drop sidecar");
+        let pool = test_pool(&cfg.db_path).await;
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('b', '2')")
+            .execute(&pool)
+            .await
+            .expect("old write");
+        legacy_upload(&store, &cfg, &pool, "host-2").await;
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('c', '3')")
+            .execute(&pool)
+            .await
+            .expect("new write");
+        let sync = super::StateSync::new("host-1");
+        sync.claim(&store, &cfg).await.expect("claim");
+        let err = sync
+            .snapshot_now(&pool, &store, &cfg)
+            .await
+            .expect_err("foreign legacy must refuse");
+        assert!(
+            format!("{err:#}").contains("refusing"),
+            "unexpected: {err:#}"
+        );
+        pool.close().await;
+    }
+
+    /// The overlap: the newcomer uploaded (sidecar S1, marked meta), then
+    /// the old binary uploaded new bytes with a legacy meta. The next
+    /// attempt must re-adopt and land, not wedge on the stale sidecar.
+    #[tokio::test]
+    async fn overlap_legacy_upload_readopts_and_lands() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('b', '2')")
+            .execute(&pool)
+            .await
+            .expect("old write");
+        legacy_upload(&store, &cfg, &pool, "host-1").await;
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('c', '3')")
+            .execute(&pool)
+            .await
+            .expect("new write");
+        let sync = super::StateSync::new("host-1");
+        sync.claim(&store, &cfg).await.expect("claim");
+        assert!(
+            sync.snapshot_now(&pool, &store, &cfg)
+                .await
+                .expect("re-adopts and lands")
+                > 0
+        );
+        assert_sidecar_matches_meta(&store, &cfg).await;
+        pool.close().await;
+    }
+
+    /// Rollback safety: the pre-lineage Value-based reader (8906f24) only
+    /// `.get()`s known fields, so a lineage-marked meta still boots a
+    /// rollback — generation keeps counting through unknown fields.
+    #[tokio::test]
+    async fn claim_ignores_unknown_meta_fields() {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = super::Store::memory();
         let cfg = test_cfg(dir.path(), "host-1");
         let pool = test_pool(&cfg.db_path).await;
-        pool.close().await;
-        let sync = super::StateSync::new("host-1");
-        assert!(!sync
-            .adopt_sidecar_at_boot(&store, &cfg)
+        let meta = serde_json::json!({
+            "generation": 7u64,
+            "written_at": chrono::Utc::now().to_rfc3339(),
+            "codec": "zstd",
+            "sha256": "abc",
+            "bytes": 1u64,
+            "raw_bytes": 2u64,
+            "instance": "host-1",
+            "lineage": 1u64,
+            "future": {"nested": true},
+        });
+        store
+            .put(
+                &format!("{}/outer.sqlite.meta.json", cfg.key_prefix),
+                serde_json::to_vec(&meta).expect("meta bytes"),
+            )
             .await
-            .expect("skip"));
-        assert!(!sidecar_path(&cfg).exists());
+            .expect("marked meta");
+        // Sidecar matches the marked sha so the gate passes; the upload
+        // then proves `claim` seeded generation 7 through unknown fields.
+        tokio::fs::write(sidecar_path(&cfg), "abc\n")
+            .await
+            .expect("sidecar");
+        let sync = super::StateSync::new("host-1");
+        sync.claim(&store, &cfg).await.expect("claim parses");
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('b', '2')")
+            .execute(&pool)
+            .await
+            .expect("write");
+        sync.snapshot_now(&pool, &store, &cfg)
+            .await
+            .expect("upload");
+        assert_eq!(meta_generation(&store, &cfg).await, 8);
+        pool.close().await;
     }
 
     /// Takeover path: restore, modify, upload lands on the restored lineage,
