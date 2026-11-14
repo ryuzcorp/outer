@@ -13,11 +13,22 @@ Each upload records the snapshot sha256 in the bucket meta object and in a local
 
 - Wrong bucket/prefix in `OUTER_R2_*`: fix the config and restart. If the bad boot already created a fresh local database, stop outer, delete that file (and its sidecar), and boot again — the restore downloads the real snapshot.
 - A second host claimed the same bucket: the newest claimant wins and the old one stops uploading. Give each install its own bucket.
+- After upgrading to a version with lineage: the first boot adopts the sidecar automatically when the bucket meta names this host (`adopted snapshot sidecar ... uploads resume` in the log). A meta naming another host never adopts — that is the takeover shape, and it refuses as a wrong bucket.
 - There is no `--force`: every recovery goes through the restore below.
+
+## Runbook: is this host backing up?
+
+`/ready` reports `snapshot.last_error` (the last failure, truncated) and `snapshot.consecutive_lineage_refusals`. After 30 consecutive lineage refusals `/ready` answers 503 with `snapshot: refusing uploads (N consecutive, backups stopped)`. Compare the three identities:
+
+- bucket: the meta object `outer/state/outer.sqlite.meta.json` (`sha256`, `instance`, `generation`);
+- sidecar: `cat /data/outer.sqlite.snapshot-sha`;
+- local dump: `sqlite3 /data/outer.sqlite "VACUUM INTO '/tmp/check.sqlite'" && sha256sum /tmp/check.sqlite`.
+
+Sidecar == bucket means the host is current (the next change uploads). Bucket == local dump with a stale sidecar is the crash window — the next upload repairs it. Anything else is a wrong bucket/prefix or a foreign database: fix the config, or restore below.
 
 ## History and pre-release copies
 
-Each successful upload also files `outer/state/history/<UTC yyyy-mm-ddTHH>.sqlite.zst` (first copy per hour wins) and prunes: hourly copies past 48 h collapse to the first copy of each day, days past 30 d go, at most 10 deletions per pass. Release copies (`history/release-<UTC timestamp>-<git sha>.sqlite.zst`, filed by `deploy/release.sh` before the handoff) and anything the pruner doesn't recognize are never deleted, and neither is the live key.
+Each successful upload also files `outer/state/history/<UTC yyyy-mm-ddTHH>.sqlite.zst` (first copy per hour wins) and prunes: hourly copies past 48 h collapse to the first copy of each day, days past 30 d go, at most 10 deletions per pass. Release copies (`history/release-<UTC timestamp>-<git sha>.sqlite.zst`, filed by `deploy/release.sh` before the handoff) are kept until removed by hand — the pruner never touches them, so each release leaves a permanent restorable snapshot. Anything the pruner doesn't recognize, and the live key, are never deleted either.
 
 ## Restore a snapshot
 

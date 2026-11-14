@@ -130,8 +130,9 @@ trap 'handoff_abort' EXIT
 # bucket's live snapshot before the newcomer can migrate it, so a bad
 # migration reaching the live key can be restored from history. Skips
 # (exit 0) when the bucket holds no snapshot yet. SHA is hex (validated
-# above), so interpolating it into the docker args is safe.
-docker run --rm --env-file /srv/outer/outer.env -v /srv/outer/data:/data \
+# above), so interpolating it into the docker args is safe. No data mount:
+# the subcommand only reads config env and the bucket, never the local DB.
+docker run --rm --env-file /srv/outer/outer.env \
     "outer:$SHA" state release-backup --sha "$SHA"
 handoff_to "outer:$SHA"
 trap - EXIT

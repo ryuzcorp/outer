@@ -368,7 +368,9 @@ impl S3Backend {
         Ok(())
     }
 
-    /// Delete one key. A missing key is Ok.
+    /// Delete one key. A missing key is Ok — but only a missing *key*: a 404
+    /// naming `<Code>NoSuchBucket</Code>` (or any codeless 404 from a proxy)
+    /// is a misconfiguration and stays an error, like everywhere else.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
         let url = self.delete_url(key);
         let resp = self
@@ -379,9 +381,17 @@ impl S3Backend {
             .await
             .context("s3 DELETE")?;
         // Deleting a missing key is a no-op upstream too (`delete-object` on
-        // a missing key returns 204), so 404 joins the success set.
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // a missing key returns 204), so a missing-key 404 joins the success
+        // set. Any other 404 (wrong bucket, proxy page) is a hard error.
+        if resp.status().is_success() {
             return Ok(());
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
+            if delete_404_is_missing(&body) {
+                return Ok(());
+            }
+            return Err(s3_err_msg("delete", key, 404, &body));
         }
         Err(s3_err("delete", key, resp, Duration::from_secs(20)).await)
     }
@@ -895,6 +905,13 @@ fn s3_err_msg(op: &str, target: &str, status: u16, body: &str) -> anyhow::Error 
     }
 }
 
+/// Whether a DELETE 404 means "already gone" (swallow) or a misconfigured
+/// endpoint (error): only the store's own missing-key code counts — a
+/// bodyless 404 is a HEAD-style answer, not a delete of a missing key.
+fn delete_404_is_missing(body: &str) -> bool {
+    is_not_found(&s3_err_msg("delete", "key", 404, body))
+}
+
 /// Backoff between S3 attempts: 250 ms doubling per failure plus up to one
 /// base of jitter, so a store restart does not get every caller retrying in
 /// lockstep.
@@ -1292,6 +1309,16 @@ mod tests {
         let down =
             anyhow::anyhow!("s3 download tip.bundle transport: error sending request for url");
         assert!(!is_not_found(&down));
+    }
+
+    /// DELETE swallows only a missing-key 404: a wrong bucket or a proxy's
+    /// bodyless 404 stays an error instead of pretending the delete worked.
+    #[test]
+    fn delete_404_swallows_only_missing_keys() {
+        assert!(delete_404_is_missing("<Code>NoSuchKey</Code>"));
+        assert!(!delete_404_is_missing("<Code>NoSuchBucket</Code>"));
+        assert!(!delete_404_is_missing(""));
+        assert!(!delete_404_is_missing("<html>Not Found</html>"));
     }
 
     /// Backoff grows per failure and stays bounded: three attempts cost

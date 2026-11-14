@@ -770,6 +770,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .map(http::tls::load_server_config)
         .transpose()?;
     let sync = store::snapshot::StateSync::new(config.host_id.clone());
+    // Upgrade adoption before the claim below overwrites `owner.json`: a
+    // database that predates sidecars adopts this host's bucket lineage so
+    // uploads (and the final snapshot) resume instead of refusing forever.
+    sync.adopt_sidecar_at_boot(&store, &snapshot_cfg).await?;
     sync.claim(&store, &snapshot_cfg).await?;
     store::snapshot::spawn_sync_task(
         sync.clone(),
