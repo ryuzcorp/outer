@@ -67,10 +67,18 @@ handoff_clear() {
 # operator recovers with a fresh release.
 handoff_abort() {
     handoff_clear
-    local old
+    local old want
     old="$(docker compose --env-file /srv/outer/release.env \
         -f /srv/outer/compose.yaml ps -q outer 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$old" ]] && docker logs "$old" 2>&1 | grep -q 'listening on'; then
+    # Healthy = the compose outer is running on the image this release line
+    # recorded — not a log line: log rotation eats "listening on" on a
+    # long-lived container, and a rotated log must not read as "no healthy
+    # outer" (which would leave outer-next running next to the old one on
+    # 443). Read OUTER_IMAGE without sourcing the whole file. The log line
+    # stays the signal for freshly started containers (wait_for_listening).
+    want="$(grep -E '^OUTER_IMAGE=' /srv/outer/release.env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    if [[ -n "$old" && -n "$want" ]] \
+        && [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$old")" == "true $want" ]]; then
         docker rm -f outer-next >/dev/null 2>&1 || true
     else
         echo "remote: handoff aborted with no healthy compose outer; outer-next is left running — recover with a fresh release" >&2

@@ -125,31 +125,12 @@ source /srv/outer/handoff.sh
 # Whatever fails below, the heartbeat must not outlive the release: abort
 # clears the flag and removes outer-next only while a compose outer serves.
 trap 'handoff_abort' EXIT
-# Lineage adoption for the handoff (audit O-4): before this release the host
-# has no lineage sidecar, so the first upload would be refused. Adopt with the
-# new image, proving the bucket lineage against the host id of the RUNNING
-# container whose data volume this is: the id outer itself uses for the
-# snapshot meta `instance`, i.e. `OUTER_HOST_ID` when set (prod sets it),
-# else the container's /etc/hostname (config.rs reads the same, trimmed).
-# Skipped when the sidecar already exists (steady hosts) or no outer
-# container runs yet (fresh install: boot restores or starts fresh). Any
-# failure aborts the release (fail closed).
-if [[ ! -f /srv/outer/data/outer.sqlite.snapshot-sha ]]; then
-    running="$(docker compose --env-file /srv/outer/release.env \
-        -f /srv/outer/compose.yaml ps -q outer | head -n 1)"
-    if [[ -z "$running" ]]; then
-        echo "remote: no outer container running; skipping lineage adoption (fresh install)" >&2
-    else
-        expect="$(docker exec "$running" sh -c \
-            'id="$(printenv OUTER_HOST_ID || true)"; id="$(printf %s "$id" | tr -d "[:space:]")"; [ -n "$id" ] || id="$(tr -d "[:space:]" < /etc/hostname)"; printf %s "$id"')"
-        [[ -n "$expect" ]] || {
-            echo "remote: cannot read the running outer container's host id" >&2
-            exit 1
-        }
-        docker run --rm --env-file /srv/outer/outer.env -v /srv/outer/data:/data \
-            "outer:$SHA" state adopt-lineage --expect-instance "$expect"
-    fi
-fi
+# Lineage across the handoff needs no release-time step: the upload gate
+# adopts a pre-lineage bucket meta naming this host on every attempt
+# (re-applied while the bucket meta stays legacy, so the old container's
+# last uploads during the overlap can't wedge the newcomer). Boot-time
+# adoption is gone for the same reason. `state adopt-lineage` remains as a
+# manual operator command.
 # Pre-release copy of the platform state (audit O-4): file
 # outer/state/history/release-<UTC timestamp>-<SHA>.sqlite.zst from the
 # bucket's live snapshot before the newcomer can migrate it, so a bad
@@ -157,7 +138,9 @@ fi
 # (exit 0) when the bucket holds no snapshot yet. SHA is hex (validated
 # above), so interpolating it into the docker args is safe. No data mount:
 # the subcommand only reads config env and the bucket, never the local DB.
-docker run --rm --env-file /srv/outer/outer.env \
+# The tls mount (read-only, like the compose service) is required: config
+# validation reads files under /tls (e.g. OUTER_REVIEW_LOGINS_FILE).
+docker run --rm --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
     "outer:$SHA" state release-backup --sha "$SHA"
 handoff_to "outer:$SHA"
 trap - EXIT
