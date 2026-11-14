@@ -1,0 +1,8 @@
+# One toolchain for CI, the release image (docker/Dockerfile `rust:<version>`)
+# and local builds. A floating `stable` broke every PR's clippy on 2026-11-14
+# (clippy 1.100). Bump deliberately: change both here and the Dockerfile tag;
+# CI's `shell` job refuses a mismatch.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

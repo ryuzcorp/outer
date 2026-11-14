@@ -19,11 +19,11 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      # Actions are pinned by commit SHA (a moved tag can't change CI); the
+      # Rust toolchain comes from rust-toolchain.toml.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
@@ -32,7 +32,7 @@ jobs:
       # because commits run the formatter with a cleared environment).
       # Filtered to the one ignored test so no other ignored (privileged)
       # tests run.
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.4
       - run: |
@@ -51,10 +51,10 @@ jobs:
   hostile-gates:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: gate
         with:
           # On pushes to main the base is the previous commit, so a sandbox
@@ -68,9 +68,9 @@ jobs:
               - 'docker/Dockerfile'
               - 'e2e/hostile/**'
               - 'crates/outer/tests/hostile.rs'
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install
         if: steps.gate.outputs.sandbox == 'true'
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: steps.gate.outputs.sandbox == 'true'
       - run: cargo test --locked hostile
         if: steps.gate.outputs.sandbox == 'true'
@@ -81,8 +81,8 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.4
       - run: bun install --frozen-lockfile
@@ -93,6 +93,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - run: shellcheck deploy/*.sh scripts/*.sh
+      - run: scripts/check-pins.sh
