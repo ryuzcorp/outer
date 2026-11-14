@@ -23,7 +23,9 @@
 # Migrations are append-only within a release line: the newcomer runs them
 # at boot while the old container is still serving, so a release's
 # migrations must be additive (nullable columns, new tables). A destructive
-# migration needs an announced maintenance release, not this script.
+# migration needs an announced maintenance release, not this script. Every
+# release also files a pre-release copy of the platform snapshot before the
+# handoff (see below), the backstop when a migration misbehaves anyway.
 #
 # No secrets in args or logs (only image tags travel in release.env).
 
@@ -119,11 +121,41 @@ if ! nft list table inet outer_fw >/dev/null 2>&1; then
     /srv/outer/firewall.sh
 fi
 
-# shellcheck disable=SC1091
 source /srv/outer/handoff.sh
 # Whatever fails below, the heartbeat must not outlive the release: abort
 # clears the flag and removes outer-next only while a compose outer serves.
 trap 'handoff_abort' EXIT
+# Lineage adoption for the handoff (audit O-4 round 2): the newcomer is a new
+# container with a new hostname, so boot-time adoption (bucket meta instance
+# == host id) can never match after a handoff. Adopt with the new image
+# instead, proving the bucket lineage against the hostname of the RUNNING
+# container whose data volume this is. Skipped when the sidecar already
+# exists (steady hosts) or no outer container runs yet (fresh install: boot
+# restores or starts fresh). Any failure aborts the release (fail closed).
+if [[ ! -f /srv/outer/data/outer.sqlite.snapshot-sha ]]; then
+    running="$(docker compose --env-file /srv/outer/release.env \
+        -f /srv/outer/compose.yaml ps -q outer | head -n 1)"
+    if [[ -z "$running" ]]; then
+        echo "remote: no outer container running; skipping lineage adoption (fresh install)" >&2
+    else
+        expect="$(docker inspect -f '{{.Config.Hostname}}' "$running")"
+        [[ -n "$expect" ]] || {
+            echo "remote: cannot read running outer container hostname" >&2
+            exit 1
+        }
+        docker run --rm --env-file /srv/outer/outer.env -v /srv/outer/data:/data \
+            "outer:$SHA" state adopt-lineage --expect-instance "$expect"
+    fi
+fi
+# Pre-release copy of the platform state (audit O-4): file
+# outer/state/history/release-<UTC timestamp>-<SHA>.sqlite.zst from the
+# bucket's live snapshot before the newcomer can migrate it, so a bad
+# migration reaching the live key can be restored from history. Skips
+# (exit 0) when the bucket holds no snapshot yet. SHA is hex (validated
+# above), so interpolating it into the docker args is safe. No data mount:
+# the subcommand only reads config env and the bucket, never the local DB.
+docker run --rm --env-file /srv/outer/outer.env \
+    "outer:$SHA" state release-backup --sha "$SHA"
 handoff_to "outer:$SHA"
 trap - EXIT
 EOF

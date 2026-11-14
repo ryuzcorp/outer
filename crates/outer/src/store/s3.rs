@@ -35,14 +35,10 @@ const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// fresh" must not do so on a transport error, or they overwrite good state.
 ///
 /// Classification never scans free text: the target key rides inside every
-/// message, so a `"NoSuchKey"`/`"NotFound"` substring match reads a 5xx or a
-/// transport failure on a key named `NotFound...` as "missing", and the
-/// manifest reader would restart the seq and lose history. Instead the
-/// backend attaches an [`S3NotFound`] marker when it saw the object answer
-/// 404 / `<Code>NoSuchKey</Code>`, and this matches that marker by downcast.
-/// A `<Code>NoSuchBucket</Code>` body is a configuration error (wrong bucket),
-/// never "missing": reading it as absent would start fresh and upload an
-/// empty database over the good snapshot. Callers that learn "missing"
+/// message, so the backend attaches an [`S3NotFound`] marker when the body
+/// carries the store's own `<Code>NoSuchKey</Code>`, and this matches that
+/// marker by downcast. A bare 404 and a `<Code>NoSuchBucket</Code>` body are
+/// configuration errors, never "missing". Callers that learn "missing"
 /// another way (a `Store::get` that returned `None`) build their error with
 /// [`not_found_error`], so there is exactly one signal.
 pub fn is_not_found(err: &anyhow::Error) -> bool {
@@ -54,11 +50,11 @@ pub fn not_found_error(key: &str) -> anyhow::Error {
     anyhow::Error::new(S3NotFound).context(format!("{key} not found"))
 }
 
-/// Marker for "the store answered 404 / NoSuchKey for the object": the key
-/// is absent, not the store unreachable. Attached at construction by
+/// Marker for "the store answered `<Code>NoSuchKey</Code>` for the object":
+/// the key is absent, not the store unreachable. Attached at construction by
 /// [`s3_err_msg`], matched by [`is_not_found`] through the anyhow chain.
-/// Never attached for `<Code>NoSuchBucket</Code>`, which is a wrong-bucket
-/// configuration error even when its status is 404.
+/// Never attached for a bare 404 or for `<Code>NoSuchBucket</Code>`, which
+/// are configuration errors even when their status is 404.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct S3NotFound;
 
@@ -145,6 +141,11 @@ impl S3Backend {
             bucket_name: cfg.bucket.clone(),
             client,
         })
+    }
+    /// The bucket this backend reads and writes, for error messages that
+    /// must name where a refused write would have gone.
+    pub fn bucket_name(&self) -> &str {
+        &self.bucket_name
     }
 
     fn get_url(&self, key: &str) -> reqwest::Url {
@@ -367,7 +368,9 @@ impl S3Backend {
         Ok(())
     }
 
-    /// Delete one key. A missing key is Ok.
+    /// Delete one key. A missing key is Ok — but only a missing *key*: a 404
+    /// naming `<Code>NoSuchBucket</Code>` (or any codeless 404 from a proxy)
+    /// is a misconfiguration and stays an error, like everywhere else.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
         let url = self.delete_url(key);
         let resp = self
@@ -378,9 +381,17 @@ impl S3Backend {
             .await
             .context("s3 DELETE")?;
         // Deleting a missing key is a no-op upstream too (`delete-object` on
-        // a missing key returns 204), so 404 joins the success set.
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // a missing key returns 204), so a missing-key 404 joins the success
+        // set. Any other 404 (wrong bucket, proxy page) is a hard error.
+        if resp.status().is_success() {
             return Ok(());
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = bounded_text_or_empty(resp, Duration::from_secs(20)).await;
+            if delete_404_is_missing(&body) {
+                return Ok(());
+            }
+            return Err(s3_err_msg("delete", key, 404, &body));
         }
         Err(s3_err("delete", key, resp, Duration::from_secs(20)).await)
     }
@@ -834,10 +845,9 @@ impl futures::Stream for FileChunks {
     }
 }
 
-/// Rich S3 failure: HTTP status plus the store's XML error body.
-/// A 404 (or a body carrying the store's missing-key `<Code>`) also carries
-/// the [`S3NotFound`] marker, so [`is_not_found`] classifies without
-/// scanning the message the key rides in.
+/// Rich S3 failure: HTTP status plus the store's XML error body. Only a body
+/// carrying the missing-key `<Code>` also carries the [`S3NotFound`] marker;
+/// a bare status (even 404) is a misconfigured endpoint, never "missing".
 async fn s3_err(
     op: &str,
     target: &str,
@@ -879,25 +889,27 @@ async fn bounded_text_or_empty(resp: reqwest::Response, timeout: Duration) -> St
         .unwrap_or_default()
 }
 
-/// Same failure without the response: the retryable attempts classify before
-/// they would consume the body, so the message is built from parts.
-///
-/// Only the object answering 404 — or a body carrying the store's
-/// `<Code>NoSuchKey</Code>` — attaches the [`S3NotFound`] marker. A body
-/// naming `<Code>NoSuchBucket</Code>` is a wrong-bucket configuration error
-/// and stays a hard error even when its status is 404, so boot refuses to
-/// start past it. The code match runs on `body`, not on the composed
-/// message, so a key that merely contains those words can never count as
-/// missing.
+/// Same failure without the response. Only `<Code>NoSuchKey</Code>` in the
+/// body attaches the marker (`NoSuchBucket` and codeless 404s stay hard
+/// errors, so boot refuses to start past them); the match runs on `body`,
+/// never the composed message. Bodyless HEAD 404s never reach here (`head`
+/// answers `None` directly).
 fn s3_err_msg(op: &str, target: &str, status: u16, body: &str) -> anyhow::Error {
     let snippet: String = body.trim().chars().take(300).collect();
     let err = anyhow::anyhow!("s3 {op} {target} failed: HTTP {status} {snippet}");
     let missing_bucket = body.contains("<Code>NoSuchBucket</Code>");
-    if !missing_bucket && (status == 404 || body.contains("<Code>NoSuchKey</Code>")) {
+    if !missing_bucket && body.contains("<Code>NoSuchKey</Code>") {
         err.context(S3NotFound)
     } else {
         err
     }
+}
+
+/// Whether a DELETE 404 means "already gone" (swallow) or a misconfigured
+/// endpoint (error): only the store's own missing-key code counts — a
+/// bodyless 404 is a HEAD-style answer, not a delete of a missing key.
+fn delete_404_is_missing(body: &str) -> bool {
+    is_not_found(&s3_err_msg("delete", "key", 404, body))
 }
 
 /// Backoff between S3 attempts: 250 ms doubling per failure plus up to one
@@ -1267,11 +1279,16 @@ mod tests {
         // NoSuchKey in the body counts even when the status is not 404.
         let key_code_on_403 = s3_err_msg("download", "tip.bundle", 403, "<Code>NoSuchKey</Code>");
         assert!(is_not_found(&key_code_on_403));
-        // A 404 with an empty body (HeadObject-style) still counts: the
-        // status alone marks it, as long as the body does not name a bucket.
+        // A 404 with an empty body (a HEAD-style answer) or a proxy's HTML
+        // page carries no store code: not missing. A wrong endpoint path,
+        // reverse proxy or custom domain answers exactly this way, and
+        // reading it as "no snapshot" would start fresh on first boot.
+        // Bodyless HEAD 404s never reach this constructor (`head` answers
+        // `None` directly).
         let bare_404 = s3_err_msg("download", "tip.bundle", 404, "");
-        assert!(is_not_found(&bare_404));
-        // A missing key learned another way (a `get` that returned `None`)
+        assert!(!is_not_found(&bare_404));
+        let html_404 = s3_err_msg("download", "tip.bundle", 404, "<html>Not Found</html>");
+        assert!(!is_not_found(&html_404));
         // counts only when built with `not_found_error`; free text never does.
         assert!(is_not_found(&not_found_error("tip.bundle")));
         let text_only = anyhow::anyhow!("s3 download tip.bundle failed: HTTP 404 NoSuchKey");
@@ -1292,6 +1309,16 @@ mod tests {
         let down =
             anyhow::anyhow!("s3 download tip.bundle transport: error sending request for url");
         assert!(!is_not_found(&down));
+    }
+
+    /// DELETE swallows only a missing-key 404: a wrong bucket or a proxy's
+    /// bodyless 404 stays an error instead of pretending the delete worked.
+    #[test]
+    fn delete_404_swallows_only_missing_keys() {
+        assert!(delete_404_is_missing("<Code>NoSuchKey</Code>"));
+        assert!(!delete_404_is_missing("<Code>NoSuchBucket</Code>"));
+        assert!(!delete_404_is_missing(""));
+        assert!(!delete_404_is_missing("<html>Not Found</html>"));
     }
 
     /// Backoff grows per failure and stays bounded: three attempts cost

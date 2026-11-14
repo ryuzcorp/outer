@@ -149,14 +149,25 @@ async fn health() -> &'static str {
 }
 
 /// Readiness: 200 only when every dependency answers, else 503 naming the
-/// failing checks. The snapshot status is reported but never fails the gate:
-/// a slow bucket must not take the platform out of rotation.
+/// failing checks. The snapshot status rides along, and trips the gate only
+/// after [`READY_LINEAGE_REFUSAL_LIMIT`] consecutive lineage refusals: by
+/// then the host is serving writes it cannot back up, and monitoring must
+/// see it as down. A slow bucket alone never takes the platform out of
+/// rotation.
 async fn ready(State(state): State<AppState>) -> Response {
     let mut failing = Vec::new();
     if let Err(err) = sqlx::query("SELECT 1").execute(&state.pool).await {
         failing.push(format!("db: {err}"));
     }
     let snapshot = state.sync.snapshot_status();
+    if snapshot.consecutive_lineage_refusals >= crate::store::snapshot::READY_LINEAGE_REFUSAL_LIMIT
+    {
+        failing.push(format!(
+            "snapshot: refusing uploads ({} consecutive, backups stopped): {}",
+            snapshot.consecutive_lineage_refusals,
+            snapshot.last_error.as_deref().unwrap_or("lineage refused"),
+        ));
+    }
     if failing.is_empty() {
         Json(json!({ "ok": true, "snapshot": snapshot })).into_response()
     } else {
@@ -245,6 +256,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `/ready` fails after sustained lineage refusals (backups stopped),
+    /// naming the refusal — and recovers when an upload lands again.
+    #[tokio::test]
+    async fn ready_fails_after_sustained_lineage_refusals() {
+        use crate::store::snapshot::{SnapshotConfig, READY_LINEAGE_REFUSAL_LIMIT};
+        use crate::store::Store;
+
+        // A bucket holding another database's snapshot.
+        let bucket_dir = tempfile::tempdir().unwrap();
+        let bucket_db = bucket_dir.path().join("outer.sqlite");
+        let url = format!("sqlite:{0}?mode=rwc", bucket_db.display());
+        let bucket_pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
+            .execute(&bucket_pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('a', '1')")
+            .execute(&bucket_pool)
+            .await
+            .unwrap();
+        let bucket_store = Store::memory();
+        let bucket_cfg = SnapshotConfig {
+            db_path: bucket_db,
+            key_prefix: "outer/state".into(),
+            host_id: "host-1".into(),
+        };
+        let seeder = StateSync::new("host-1");
+        seeder.claim(&bucket_store, &bucket_cfg).await.unwrap();
+        seeder
+            .snapshot_now(&bucket_pool, &bucket_store, &bucket_cfg)
+            .await
+            .unwrap();
+        bucket_pool.close().await;
+
+        // This host: same bucket, different database, no sidecar.
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("outer.sqlite"))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sync = StateSync::new("host-1");
+        let auth = crate::auth::test_support::test_state(pool.clone());
+        let app = router(AppState {
+            pool: pool.clone(),
+            sync: sync.clone(),
+            auth: auth.clone(),
+            mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
+            site: site::SiteDir::new(std::path::Path::new("/nonexistent")),
+        });
+        let cfg = SnapshotConfig {
+            db_path: dir.path().join("outer.sqlite"),
+            key_prefix: "outer/state".into(),
+            host_id: "host-1".into(),
+        };
+        assert_eq!(get(&app, "/ready", None).await.0, StatusCode::OK);
+        for _ in 0..READY_LINEAGE_REFUSAL_LIMIT {
+            sync.snapshot_now(&pool, &bucket_store, &cfg)
+                .await
+                .expect_err("wrong bucket refuses");
+        }
+        let (status, _, body) = get(&app, "/ready", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.contains("refusing uploads") && body.contains("refusing state snapshot upload"),
+            "ready names the refusal: {body}"
+        );
+        // A landed upload clears the tripwire.
+        let home = Store::memory();
+        sync.claim(&home, &cfg).await.unwrap();
+        sync.snapshot_now(&pool, &home, &cfg).await.unwrap();
+        assert_eq!(get(&app, "/ready", None).await.0, StatusCode::OK);
+        pool.close().await;
     }
 
     /// The platform fallback order: Outer's own routes first, then the

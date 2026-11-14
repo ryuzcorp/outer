@@ -57,6 +57,14 @@ impl Store {
             faults: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
+    /// Where this store reads and writes (`"memory"` for the local-dev
+    /// backend), for refusal logs that must name the bucket at risk.
+    pub fn bucket_label(&self) -> String {
+        match &self.inner {
+            StoreInner::S3(backend) => backend.bucket_name().to_string(),
+            StoreInner::Memory(_) => "memory".to_string(),
+        }
+    }
 
     /// In-memory store for tests and local dev; behaves like the bucket.
     pub fn memory() -> Store {

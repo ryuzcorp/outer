@@ -35,6 +35,8 @@ const USAGE: &str = "usage:
   outer app list
   outer oauth-client add --name NAME --redirect-uri URI [--redirect-uri URI…] [--auth client_secret_basic|client_secret_post]
   outer seed demo --owner EMAIL [--url URL]
+  outer state adopt-lineage --expect-instance ID
+  outer state release-backup --sha SHA
   outer hash-password
   outer docs tools
   outer version";
@@ -63,6 +65,14 @@ async fn main() -> ExitCode {
         },
         ["templates", "sync", rest @ ..] => {
             run(|config| templates_sync(config, rest.to_vec())).await
+        }
+        ["state", "adopt-lineage", rest @ ..] => {
+            let rest = rest.to_vec();
+            run(move |config| state_adopt_lineage(config, rest)).await
+        }
+        ["state", "release-backup", rest @ ..] => {
+            let rest = rest.to_vec();
+            run(move |config| state_release_backup(config, rest)).await
         }
         ["app", "create", slug, rest @ ..] => {
             let (slug, rest) = (slug.to_string(), rest.to_vec());
@@ -382,6 +392,58 @@ async fn templates_sync(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
     let sha = flag(&flags, "--sha").unwrap_or(templates::TEMPLATES_SHA);
     let synced = templates::sync(&store, url, sha).await?;
     println!("{}", serde_json::to_string_pretty(&synced)?);
+    Ok(())
+}
+
+/// File the pre-release copy of the platform snapshot
+/// (`history/release-<UTC timestamp>-<SHA>`), which `deploy/release.sh`
+/// runs before the handoff so a bad migration can be restored. Skips
+/// (exit 0) when the bucket holds no snapshot yet.
+async fn state_release_backup(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
+    let flags = flags(&rest, &["--sha"])?;
+    let Some(sha) = flag(&flags, "--sha") else {
+        anyhow::bail!("state release-backup needs --sha SHA");
+    };
+    let store = build_store(&config)?;
+    let snapshot_cfg = store::snapshot::SnapshotConfig {
+        db_path: config.db_path(),
+        key_prefix: "outer/state".to_string(),
+        host_id: config.host_id.clone(),
+    };
+    match store::snapshot::release_copy(&store, &snapshot_cfg, sha, chrono::Utc::now()).await? {
+        Some(key) => println!("{{\"release_backup\": {key:?}}}"),
+        None => {
+            println!("{{\"release_backup\": null, \"note\": \"no snapshot in bucket; skipping\"}}");
+        }
+    }
+    Ok(())
+}
+
+/// Adopt the bucket snapshot lineage into the local sidecar (`<db>.snapshot-sha`),
+/// proving the bucket lineage against an explicitly expected author instance.
+/// `deploy/release.sh` runs this with the running container's hostname before
+/// the handoff (a new container gets a new id, so boot-time adoption can never
+/// match after a handoff). Exit 0 with the outcome as JSON when the sidecar is
+/// written or already present; any other refusal exits non-zero naming it.
+async fn state_adopt_lineage(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
+    let flags = flags(&rest, &["--expect-instance"])?;
+    let Some(expect) = flag(&flags, "--expect-instance") else {
+        anyhow::bail!("state adopt-lineage needs --expect-instance ID");
+    };
+    let store = build_store(&config)?;
+    let snapshot_cfg = store::snapshot::SnapshotConfig {
+        db_path: config.db_path(),
+        key_prefix: "outer/state".to_string(),
+        host_id: config.host_id.clone(),
+    };
+    match store::snapshot::adopt_lineage(&store, &snapshot_cfg, expect).await? {
+        store::snapshot::AdoptOutcome::Adopted => println!("{{\"adopted\": true}}"),
+        store::snapshot::AdoptOutcome::AlreadyAdopted => {
+            println!(
+                "{{\"adopted\": false, \"note\": \"sidecar already present; nothing to do\"}}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -741,6 +803,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .map(http::tls::load_server_config)
         .transpose()?;
     let sync = store::snapshot::StateSync::new(config.host_id.clone());
+    // Upgrade adoption before the claim below overwrites `owner.json`: a
+    // database that predates sidecars adopts this host's bucket lineage so
+    // uploads (and the final snapshot) resume instead of refusing forever.
+    sync.adopt_sidecar_at_boot(&store, &snapshot_cfg).await?;
     sync.claim(&store, &snapshot_cfg).await?;
     store::snapshot::spawn_sync_task(
         sync.clone(),
