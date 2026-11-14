@@ -156,28 +156,86 @@ async fn api_key_for(state: &McpState, email: &str) -> String {
         .key
 }
 
-async fn create_app(state: &McpState, token: &str, slug: &str) -> Value {
-    let (_, body) = call(state, Some(token), "create_app", json!({"slug": slug})).await;
-    let mut structured = result(&body)["structuredContent"].clone();
-    // Under a loaded parallel suite the spawned fake deploy can outlast the
-    // short test `tool_wait`, so the call answers `building`: follow the
-    // deploy to its terminal row instead of asserting on the first answer.
-    // (Tests that want the in-progress shape call the tool directly.)
-    if structured["deploy"]["status"] == "building" {
-        for _ in 0..100 {
-            let (_, status) = call(
-                state,
-                Some(token),
-                "deploy_status",
-                json!({"app": slug, "wait": true}),
-            )
-            .await;
-            structured["deploy"] = result(&status)["structuredContent"].clone();
-            if structured["deploy"]["status"] != "building" {
-                break;
-            }
-        }
+/// A `tool_wait` no fake deploy can outlast, for tests that pin the tool's
+/// own inline completion arm (terminal fields computed by the tool from
+/// `kind` and the finished app, success-only summary text) instead of the
+/// rebuilt answer `call_and_await_outcome` returns. The fake always
+/// finishes, so the call returns as soon as it does; the cap never fires.
+const INLINE_WAIT: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// Call a deploy-producing tool (`create_app`, `commit`, `ship`,
+/// `add_example`, `promote_preview`, `rollback`, `rename_app`) and return
+/// its response body with the deploy resolved to the terminal outcome —
+/// without any wall-clock wait.
+///
+/// The fake deploy runs in a spawned task that can outlast the short test
+/// `tool_wait` under parallel load, so the first answer is often
+/// `building`. Instead of sleeping or retrying, wait on the fake's own
+/// completion signal for the deploy this call started, then rebuild the
+/// exact response the inline path would have returned: the recorded outcome
+/// through the same `outcome_json` constructor, with the content blocks
+/// through the same `ok_deploy` constructor. `preview` renders the preview
+/// URL, matching the tool's own follow-up contract. (Tests that want the
+/// in-progress shape call the tool directly.)
+async fn call_and_await_outcome(
+    state: &McpState,
+    token: &str,
+    tool: &str,
+    args: Value,
+    slug: &str,
+    preview: bool,
+) -> (StatusCode, Value) {
+    let finished = state.deploys.deploys_finished();
+    let (status, mut body) = call(state, Some(token), tool, args).await;
+    let structured = result(&body)["structuredContent"].clone();
+    // Error answers carry no deploy object: `Null` never equals `building`.
+    if structured["deploy"]["status"] != "building" {
+        return (status, body);
     }
+    let sha = structured["deploy"]["sha"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // Await the fake's own record for the deploy this call started; see
+    // `Deploys::finished_deploy` for why there is no deadline. The fake only
+    // errors when the harness itself is broken (a failed row write, a
+    // transport fake nobody awaited): fail loudly instead of hanging.
+    let outcome = state
+        .deploys
+        .finished_deploy(finished, &sha)
+        .await
+        .unwrap_or_else(|err| panic!("fake deploy for {sha} failed: {err}"));
+    let app = crate::apps::get_by_slug(&state.pool, slug)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no app for slug {slug}"));
+    let mut structured = structured;
+    structured["deploy"] = super::tools::outcome_json(state, &app, &outcome, preview);
+    // The first answer's only content block is the summary (`building`
+    // carries no untrusted payload); reattach it through the same
+    // constructor the tool used, so failed/blocked answers carry their
+    // notice and data blocks exactly as the inline path builds them.
+    let summary = body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let rebuilt = super::tools::ok_deploy(summary, &structured["deploy"].clone(), structured);
+    body["result"]["content"] = rebuilt["content"].clone();
+    body["result"]["structuredContent"] = rebuilt["structuredContent"].clone();
+    (status, body)
+}
+
+async fn create_app(state: &McpState, token: &str, slug: &str) -> Value {
+    let (_, body) = call_and_await_outcome(
+        state,
+        token,
+        "create_app",
+        json!({"slug": slug}),
+        slug,
+        false,
+    )
+    .await;
+    let structured = result(&body)["structuredContent"].clone();
     assert_eq!(structured["deploy"]["status"], "success");
     structured
 }
@@ -497,12 +555,14 @@ async fn create_commit_read_history_roundtrip() {
         .as_str()
         .unwrap()
         .starts_with("The following was produced by your app and its visitors."));
-    let (_, commit) = call(
+    let (_, commit) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "Vegetables",
                "edits": [{"path": "pages/index.tsx", "old": "Groceries", "new": "Vegetables"}]}),
+        "groceries",
+        false,
     )
     .await;
     let commit = &result(&commit)["structuredContent"];
@@ -806,11 +866,13 @@ async fn create_app_template_selects_the_starter() {
         "names both templates: {message}"
     );
     // The website starter seeds and deploys like the app one.
-    let (_, site) = call(
+    let (_, site) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "create_app",
         json!({"slug": "site", "template": "website"}),
+        "site",
+        false,
     )
     .await;
     assert_eq!(
@@ -839,12 +901,14 @@ async fn show_seed_file(state: &McpState, slug: &str, sha: &str, path: &str) -> 
 async fn create_app_seed_commit_carries_brand_json() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
-    let (_, body) = call(
+    let (_, body) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "create_app",
         json!({"slug": "pizza", "name": "Pizza Calculator",
                 "description": "Split pizza orders fairly between friends."}),
+        "pizza",
+        false,
     )
     .await;
     assert_eq!(
@@ -878,11 +942,13 @@ async fn create_app_seed_commit_carries_brand_json() {
 async fn create_app_brand_defaults_from_the_slug() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
-    let (_, body) = call(
+    let (_, body) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "create_app",
         json!({"slug": "kalkulator-pizzy"}),
+        "kalkulator-pizzy",
+        false,
     )
     .await;
     assert_eq!(
@@ -1141,12 +1207,14 @@ async fn blocked_and_failed_deploys_are_results_not_errors() {
     create_app(&state, &token, "groceries").await;
 
     state.deploys.set_fake(FakeOutcome::blocked());
-    let (_, blocked) = call(
+    let (_, blocked) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "profane",
                "writes": [{"path": "p.txt", "content": "p"}]}),
+        "groceries",
+        false,
     )
     .await;
     let deploy = &result(&blocked)["structuredContent"]["deploy"];
@@ -1181,12 +1249,14 @@ async fn blocked_and_failed_deploys_are_results_not_errors() {
         .starts_with("The following was produced by your app and its visitors."));
 
     state.deploys.set_fake(FakeOutcome::failed());
-    let (_, failed) = call(
+    let (_, failed) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "broken",
                "writes": [{"path": "q.txt", "content": "q"}]}),
+        "groceries",
+        false,
     )
     .await;
     let deploy = &result(&failed)["structuredContent"]["deploy"];
@@ -1225,11 +1295,13 @@ async fn rollback_redeploys_an_earlier_success() {
         .to_string();
 
     // A short sha, as agents quote it from history, names the target.
-    let (_, rolled) = call(
+    let (_, rolled) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "rollback",
         json!({"app": "groceries", "sha": &sha1[..8]}),
+        "groceries",
+        false,
     )
     .await;
     let rolled = &result(&rolled)["structuredContent"];
@@ -1305,6 +1377,7 @@ async fn slow_deploys_return_in_progress() {
 async fn unawaited_calls_return_and_poll_resolves() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
+    let finished = state.deploys.deploys_finished();
     let (_, creating) = call(
         &state,
         Some(&token),
@@ -1316,16 +1389,20 @@ async fn unawaited_calls_return_and_poll_resolves() {
         result(&creating)["structuredContent"]["deploy"]["status"],
         "building"
     );
-    // The background task finishes the deploy; polling sees success.
-    let mut last = Value::Null;
-    for _ in 0..50 {
-        let (_, status) = call(&state, Some(&token), "deploy_status", json!({"app": "bg"})).await;
-        last = result(&status)["structuredContent"].clone();
-        if last["status"] == "success" {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    // The background task finishes the deploy: await the fake's own record
+    // for it, then read the now-terminal row once.
+    let sha = result(&creating)["structuredContent"]["deploy"]["sha"]
+        .as_str()
+        .expect("building answer names its sha")
+        .to_string();
+    state
+        .deploys
+        .finished_deploy(finished, &sha)
+        .await
+        .expect("fake deploy succeeds");
+    let (_, status) = call(&state, Some(&token), "deploy_status", json!({"app": "bg"})).await;
+    let last = result(&status)["structuredContent"].clone();
+    assert_eq!(last["sha"], sha);
     assert_eq!(last["status"], "success");
     assert!(last["url"].as_str().unwrap().contains("bg"));
 }
@@ -1858,12 +1935,14 @@ async fn untrusted_notice_covers_findings_and_scores_round() {
     let created = create_app(&state, &token, "groceries").await;
     let sha1 = created["deploy"]["sha"].as_str().unwrap().to_string();
     state.deploys.set_fake(FakeOutcome::blocked());
-    let (_, blocked) = call(
+    let (_, blocked) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "profane",
                "writes": [{"path": "p.txt", "content": "p"}]}),
+        "groceries",
+        false,
     )
     .await;
     let structured = &result(&blocked)["structuredContent"];
@@ -1894,11 +1973,13 @@ async fn untrusted_notice_covers_findings_and_scores_round() {
         .unwrap()
         .starts_with("The following was produced by your app and its visitors."));
     // A blocked rollback reports its findings behind the notice as well.
-    let (_, rolled) = call(
+    let (_, rolled) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "rollback",
         json!({"app": "groceries", "sha": sha1}),
+        "groceries",
+        false,
     )
     .await;
     let rolled_blocks = result(&rolled)["content"].as_array().unwrap();
@@ -2304,12 +2385,14 @@ async fn agent_action_commit_logged_with_redacted_summary() {
 
     let marker = "UNIQUE_BODY_MARKER_9Z8X7Y";
     let body = format!("<h1>{marker}</h1>");
-    let (_, commit) = call(
+    let (_, commit) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "Add a header line",
                "writes": [{"path": "pages/about.tsx", "content": body}]}),
+        "groceries",
+        false,
     )
     .await;
     assert_eq!(
@@ -3813,11 +3896,13 @@ async fn rename_app_moves_everything_and_redirects_without_blocking() {
         .unwrap();
     assert!(state.git.repos_dir.join("groceries.git").exists());
 
-    let (_, body) = call(
+    let (_, body) = call_and_await_outcome(
         &state,
-        Some(&ana),
+        &ana,
         "rename_app",
         json!({"app": "groceries", "slug": "pantry"}),
+        "pantry",
+        false,
     )
     .await;
     let structured = &result(&body)["structuredContent"];
@@ -5352,12 +5437,15 @@ async fn preview_commit_needs_pro_and_burns_nothing() {
 
 #[tokio::test]
 async fn preview_commit_promote_discard_round_trip() {
-    let (state, _) = setup().await;
+    let (mut state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
     make_pro(&state, "ana@example.com").await;
     create_app(&state, &token, "groceries").await;
 
     // Trial the change: same gate, fresh namespace, live untouched.
+    // The trial commit takes the tool's inline completion arm: the preview
+    // URL below is the one the tool itself derived from the deploy kind.
+    state.tool_wait = INLINE_WAIT;
     let (_, trialed) = call(
         &state,
         Some(&token),
@@ -5435,11 +5523,13 @@ async fn preview_commit_promote_discard_round_trip() {
     );
 
     // Promote: main fast-forwards, preview clears, live deploys normally.
-    let (_, promoted) = call(
+    let (_, promoted) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "promote_preview",
         json!({"app": "groceries"}),
+        "groceries",
+        false,
     )
     .await;
     let pstructured = &result(&promoted)["structuredContent"];
@@ -5661,13 +5751,15 @@ async fn preview_promote_resumes_a_cancelled_run() {
     create_app(&state, &token, "groceries").await;
 
     // Trial, then promote: main moves and the preview clears.
-    let (_, trialed) = call(
+    let (_, trialed) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "trial",
                "writes": [{"path": "t.txt", "content": "t"}],
                "preview": true}),
+        "groceries",
+        true,
     )
     .await;
     let sha = result(&trialed)["structuredContent"]["commit"]["sha"]
@@ -5731,13 +5823,15 @@ async fn preview_promote_needs_success_and_discard_cleans_up() {
 
     // A blocked preview has no successful deploy: promotion refuses.
     state.deploys.set_fake(FakeOutcome::blocked());
-    let (_, trialed) = call(
+    let (_, trialed) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "trial",
                "writes": [{"path": "t.txt", "content": "t"}],
                "preview": true}),
+        "groceries",
+        true,
     )
     .await;
     assert_eq!(
@@ -6368,7 +6462,9 @@ async fn read_search_strangers_app_is_not_found() {
 
 // --- `open_app` (Wave 4): one orientation call per app -----------------------
 
-/// One `commit` of full-file writes; returns the `structuredContent`.
+/// One `commit` of full-file writes; returns the `structuredContent`. The
+/// deploy resolves through [`call_and_await_outcome`], so a later `open_app`
+/// always reads the terminal row instead of a still-running deploy.
 async fn commit_writes(
     state: &McpState,
     token: &str,
@@ -6379,11 +6475,13 @@ async fn commit_writes(
         .into_iter()
         .map(|(path, content)| json!({"path": path, "content": content}))
         .collect();
-    let (_, body) = call(
+    let (_, body) = call_and_await_outcome(
         state,
-        Some(token),
+        token,
         "commit",
         json!({"app": app, "message": "shape the tree", "writes": writes}),
+        app,
+        false,
     )
     .await;
     result(&body)["structuredContent"].clone()
@@ -7688,11 +7786,13 @@ async fn draft_ship_is_one_commit_and_clears() {
         json!({"app": "groceries", "writes": [{"path": "notes.txt", "content": "hi\n"}]}),
     )
     .await;
-    let (_, shipped) = call(
+    let (_, shipped) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "ship",
         json!({"app": "groceries", "message": "add notes"}),
+        "groceries",
+        false,
     )
     .await;
     let structured = &result(&shipped)["structuredContent"];
@@ -7747,11 +7847,13 @@ async fn draft_ship_rebases_onto_a_moved_head() {
                "writes": [{"path": "lib/other.ts", "content": "export {};\n"}]}),
     )
     .await;
-    let (_, shipped) = call(
+    let (_, shipped) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "ship",
         json!({"app": "groceries", "message": "berries"}),
+        "groceries",
+        false,
     )
     .await;
     let structured = &result(&shipped)["structuredContent"];
@@ -7906,12 +8008,14 @@ async fn failed_commit_deploy_returns_structured_diagnostics() {
     failed.log_tail = Some(DRAFT_TSC_LOG);
     state.deploys.set_fake(failed);
 
-    let (_, committed) = call(
+    let (_, committed) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "groceries", "message": "broken",
                "writes": [{"path": "q.txt", "content": "q"}]}),
+        "groceries",
+        false,
     )
     .await;
     let deploy = &result(&committed)["structuredContent"]["deploy"];
@@ -7975,11 +8079,13 @@ async fn draft_stage_line_edits_and_inserts_ship() {
         .to_string();
     assert!(patch.contains("Berries"), "{patch}");
     assert!(patch.contains("fresh"), "{patch}");
-    let (_, shipped) = call(
+    let (_, shipped) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "ship",
         json!({"app": "groceries", "message": "line edits"}),
+        "groceries",
+        false,
     )
     .await;
     assert_eq!(
@@ -8006,11 +8112,13 @@ async fn draft_stage_patch_ships() {
         result(&staged)["structuredContent"]["draft"]["staged"]["patch"],
         true
     );
-    let (_, shipped) = call(
+    let (_, shipped) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "ship",
         json!({"app": "groceries", "message": "patched"}),
+        "groceries",
+        false,
     )
     .await;
     assert_eq!(
@@ -8244,11 +8352,13 @@ async fn add_example_applies_requires_nav_bindings_and_deploys() {
     let (state, _) = setup_apply().await;
     let token = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &token, "familygram").await;
-    let (_, added) = call(
+    let (_, added) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "add_example",
         json!({"app": "familygram", "name": "photos"}),
+        "familygram",
+        false,
     )
     .await;
     let structured = &result(&added)["structuredContent"];
@@ -8377,12 +8487,14 @@ async fn add_example_conflicting_file_refuses_without_a_commit() {
     let (state, _) = setup_apply().await;
     let token = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &token, "familygram").await;
-    let (_, committed) = call(
+    let (_, committed) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "commit",
         json!({"app": "familygram", "message": "own photos page",
                "writes": [{"path": "pages/photos.tsx", "content": "mine\n"}]}),
+        "familygram",
+        false,
     )
     .await;
     assert_eq!(
@@ -8413,11 +8525,13 @@ async fn add_example_conflicting_file_refuses_without_a_commit() {
 async fn add_example_wrong_template_is_refused() {
     let (state, _) = setup_apply().await;
     let token = api_key_for(&state, "ana@example.com").await;
-    let (_, created) = call(
+    let (_, created) = call_and_await_outcome(
         &state,
-        Some(&token),
+        &token,
         "create_app",
         json!({"slug": "site", "template": "website"}),
+        "site",
+        false,
     )
     .await;
     assert_eq!(
@@ -8443,7 +8557,9 @@ async fn add_example_wrong_template_is_refused() {
 
 #[tokio::test]
 async fn create_app_with_examples_makes_exactly_one_commit() {
-    let (state, _) = setup_apply().await;
+    let (mut state, _) = setup_apply().await;
+    // Inline completion arm: the success-only summary names the new route.
+    state.tool_wait = INLINE_WAIT;
     let token = api_key_for(&state, "ana@example.com").await;
     let (_, created) = call(
         &state,
@@ -8456,9 +8572,9 @@ async fn create_app_with_examples_makes_exactly_one_commit() {
     let text = body["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("with passkeys, photos"), "{text}");
     assert!(text.contains("/photos"), "{text}");
+    assert_eq!(body["structuredContent"]["deploy"]["status"], "success");
     let structured = &body["structuredContent"];
     assert_eq!(structured["added"], json!(["passkeys", "photos"]));
-    assert_eq!(structured["deploy"]["status"], "success");
     // One commit holds the seed and the examples together.
     assert_eq!(history_len(&state, &token, "familygram").await, 1);
     let texts = head_texts(&state, &token, "familygram", &["pages/photos.tsx"]).await;

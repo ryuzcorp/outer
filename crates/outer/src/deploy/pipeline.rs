@@ -394,6 +394,13 @@ pub struct Deployer {
     /// alongside the handoff flag file, so a release handoff refuses new
     /// deploys on both the old and the new process.
     draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam: bumped right after a deploy row is inserted (before any
+    /// lock or permit wait), so tests observe `queued` without sleeping. A
+    /// `watch` counter, not a `Notify`: `wait_for` checks the value before
+    /// sleeping, so a deploy that already inserted still wakes the waiter.
+    /// Production builds never subscribe.
+    #[cfg(test)]
+    row_inserted: tokio::sync::watch::Sender<u64>,
 }
 
 /// Edge purges still in flight. Each runs detached so `deploy` never waits
@@ -668,7 +675,21 @@ impl Deployer {
             purges: PurgeTasks::default(),
             egress: std::sync::RwLock::new(crate::fleet::egress::EgressFirewall::disabled()),
             draining: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            row_inserted: {
+                let (tx, _) = tokio::sync::watch::channel(0u64);
+                tx
+            },
         }
+    }
+
+    /// Subscribe to the row-inserted signal for tests: the sender bumps once
+    /// per deploy right after its `queued` row lands, so a test can await
+    /// visibility instead of sleeping. Subscribe before spawning the deploy;
+    /// `wait_for` still sees a deploy that already inserted.
+    #[cfg(test)]
+    pub fn row_inserted(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.row_inserted.subscribe()
     }
 
     /// The boot-installed egress handle (`serve` and the operator CLI only).
@@ -793,7 +814,8 @@ impl Deployer {
     ) -> anyhow::Result<DeployOutcome> {
         let deploy_id = uuid::Uuid::new_v4().to_string();
         insert_deploy_row(pool, &deploy_id, &app.id, sha, kind, apps::now_ms()).await?;
-
+        #[cfg(test)]
+        self.row_inserted.send_modify(|n| *n += 1);
         // Both after the row: a queued deploy is visible while it waits.
         // App lock first, so deploys queued behind one app hold no build slot.
         let app_lock = self.app_lock(&app.id);
@@ -7025,14 +7047,20 @@ exit 0
         .unwrap();
 
         // Zero permits: the deploy blocks before `building`, and the row is
-        // already there as `queued`.
+        // already there as `queued`. Await the pipeline's own row-inserted
+        // signal instead of sleeping: under parallel load the spawned task
+        // may take longer than any fixed delay to run at all.
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 0);
+        let mut inserted = deployer.row_inserted();
         let pool2 = pool.clone();
         let store2 = store.clone();
         let handle =
             tokio::spawn(async move { deployer.deploy(&pool2, &store2, &cfg, &app, &sha_b).await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        inserted
+            .wait_for(|n| *n > 0)
+            .await
+            .expect("deploy inserts its queued row");
         let (status,): (String,) =
             sqlx::query_as("SELECT status FROM deploy WHERE app_id = 'app1'")
                 .fetch_one(&pool)
