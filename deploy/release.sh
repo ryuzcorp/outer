@@ -125,22 +125,25 @@ source /srv/outer/handoff.sh
 # Whatever fails below, the heartbeat must not outlive the release: abort
 # clears the flag and removes outer-next only while a compose outer serves.
 trap 'handoff_abort' EXIT
-# Lineage adoption for the handoff (audit O-4 round 2): the newcomer is a new
-# container with a new hostname, so boot-time adoption (bucket meta instance
-# == host id) can never match after a handoff. Adopt with the new image
-# instead, proving the bucket lineage against the hostname of the RUNNING
-# container whose data volume this is. Skipped when the sidecar already
-# exists (steady hosts) or no outer container runs yet (fresh install: boot
-# restores or starts fresh). Any failure aborts the release (fail closed).
+# Lineage adoption for the handoff (audit O-4): before this release the host
+# has no lineage sidecar, so the first upload would be refused. Adopt with the
+# new image, proving the bucket lineage against the host id of the RUNNING
+# container whose data volume this is: the id outer itself uses for the
+# snapshot meta `instance`, i.e. `OUTER_HOST_ID` when set (prod sets it),
+# else the container's /etc/hostname (config.rs reads the same, trimmed).
+# Skipped when the sidecar already exists (steady hosts) or no outer
+# container runs yet (fresh install: boot restores or starts fresh). Any
+# failure aborts the release (fail closed).
 if [[ ! -f /srv/outer/data/outer.sqlite.snapshot-sha ]]; then
     running="$(docker compose --env-file /srv/outer/release.env \
         -f /srv/outer/compose.yaml ps -q outer | head -n 1)"
     if [[ -z "$running" ]]; then
         echo "remote: no outer container running; skipping lineage adoption (fresh install)" >&2
     else
-        expect="$(docker inspect -f '{{.Config.Hostname}}' "$running")"
+        expect="$(docker exec "$running" sh -c \
+            'id="$(printenv OUTER_HOST_ID || true)"; id="$(printf %s "$id" | tr -d "[:space:]")"; [ -n "$id" ] || id="$(tr -d "[:space:]" < /etc/hostname)"; printf %s "$id"')"
         [[ -n "$expect" ]] || {
-            echo "remote: cannot read running outer container hostname" >&2
+            echo "remote: cannot read the running outer container's host id" >&2
             exit 1
         }
         docker run --rm --env-file /srv/outer/outer.env -v /srv/outer/data:/data \
