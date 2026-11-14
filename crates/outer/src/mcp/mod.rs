@@ -75,6 +75,7 @@ impl Deploys {
     /// `check` answers every step skipped until `set_fake_check` says more.
     #[cfg(test)]
     pub fn fake(outcome: FakeOutcome) -> Self {
+        let (finished, _) = tokio::sync::watch::channel(Vec::new());
         Self {
             inner: Arc::new(DeploysInner::Fake(Box::new(FakeDeploys {
                 outcome: std::sync::Mutex::new(outcome),
@@ -91,6 +92,7 @@ impl Deploys {
                     log: "fake check ok".to_string(),
                 }),
                 locks: std::sync::Mutex::new(HashMap::new()),
+                finished,
             }))),
         }
     }
@@ -109,6 +111,44 @@ impl Deploys {
         if let DeploysInner::Fake(fake) = &*self.inner {
             *fake.outcome.lock().expect("fake outcome poisoned") = outcome;
         }
+    }
+
+    /// How many fake deploys have finished so far (test-only). Capture it
+    /// before a deploy-producing call and pass it to
+    /// [`Deploys::finished_deploy`].
+    #[cfg(test)]
+    pub fn deploys_finished(&self) -> usize {
+        match &*self.inner {
+            DeploysInner::Live(_) => 0,
+            #[cfg(test)]
+            DeploysInner::Fake(fake) => fake.finished.borrow().len(),
+        }
+    }
+
+    /// Wait for the fake deploy of `sha` that finishes after the first
+    /// `after` deploys, and return how it ended (test-only). No deadline:
+    /// every fake deploy exit records one entry, so this resolves as soon as
+    /// the deploy the caller started ends, however long the scheduler took
+    /// to run it. A wall-clock cap would fire spuriously when the whole
+    /// runtime stalls under load. `wait_for` checks the current value before
+    /// sleeping, so a deploy that already finished returns at once.
+    #[cfg(test)]
+    pub async fn finished_deploy(&self, after: usize, sha: &str) -> Result<DeployOutcome, String> {
+        let mut rx = match &*self.inner {
+            DeploysInner::Live(_) => panic!("finished_deploy needs the fake"),
+            #[cfg(test)]
+            DeploysInner::Fake(fake) => fake.finished.subscribe(),
+        };
+        let finished = rx
+            .wait_for(|done| done.iter().skip(after).any(|r| r.sha == sha))
+            .await
+            .expect("fake deploys outlive every test");
+        finished
+            .iter()
+            .skip(after)
+            .find(|r| r.sha == sha)
+            .map(|r| r.result.clone())
+            .expect("wait_for saw the record")
     }
 
     /// The per-app deploy mutex. Live runs serialize on the pipeline's own
@@ -303,10 +343,21 @@ impl FakeOutcome {
 }
 
 #[cfg(test)]
+/// How one fake deploy ended: its terminal outcome, or the infrastructure
+/// error that replaced it.
+struct RecordedDeploy {
+    sha: String,
+    result: Result<DeployOutcome, String>,
+}
+
+#[cfg(test)]
 struct FakeDeploys {
     outcome: std::sync::Mutex<FakeOutcome>,
     check: std::sync::Mutex<crate::deploy::CheckOutput>,
     locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// How every fake deploy ended, in completion order. A `watch` so
+    /// [`Deploys::finished_deploy`] can await an entry without polling.
+    finished: tokio::sync::watch::Sender<Vec<RecordedDeploy>>,
 }
 
 #[cfg(test)]
@@ -324,16 +375,44 @@ impl FakeDeploys {
         Ok(self.check.lock().expect("fake check poisoned").clone())
     }
 
+    /// File how one fake deploy ended, `Ok` or `Err` alike: every exit of
+    /// `deploy`/`deploy_preview` passes through here, so a waiter on
+    /// [`Deploys::finished_deploy`] never sleeps past a finished deploy.
+    /// `send_modify` updates the value even with no live receiver.
+    fn record(&self, sha: &str, result: &anyhow::Result<DeployOutcome>) {
+        let entry = RecordedDeploy {
+            sha: sha.to_string(),
+            result: match result {
+                Ok(outcome) => Ok(outcome.clone()),
+                Err(err) => Err(format!("{err:#}")),
+            },
+        };
+        self.finished.send_modify(|done| done.push(entry));
+    }
+
     async fn deploy(
         &self,
         pool: &SqlitePool,
         app: &App,
         sha: &str,
     ) -> anyhow::Result<DeployOutcome> {
-        self.deploy_inner(pool, app, sha, "main", true).await
+        let result = self.deploy_inner(pool, app, sha, "main", true).await;
+        self.record(sha, &result);
+        result
     }
 
     async fn deploy_preview(
+        &self,
+        pool: &SqlitePool,
+        app: &App,
+        sha: &str,
+    ) -> anyhow::Result<DeployOutcome> {
+        let result = self.deploy_preview_inner(pool, app, sha).await;
+        self.record(sha, &result);
+        result
+    }
+
+    async fn deploy_preview_inner(
         &self,
         pool: &SqlitePool,
         app: &App,
