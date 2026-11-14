@@ -273,12 +273,16 @@ async fn billing_portal(
             "This portal link is bad or expired. Ask your agent for a fresh billing link.",
         );
     };
+    // Decode the nullable column as `Option`: sqlx reads a NULL into a bare
+    // `String` as "", which would mint a portal session for no customer.
     let customer: Option<String> =
-        sqlx::query_scalar("SELECT stripeCustomerId FROM user WHERE id = ?1")
+        sqlx::query_scalar::<_, Option<String>>("SELECT stripeCustomerId FROM user WHERE id = ?1")
             .bind(&account_id)
             .fetch_optional(&state.mcp.pool)
             .await
-            .unwrap_or(None);
+            .ok()
+            .flatten()
+            .flatten();
     let Some(customer) = customer else {
         return text(
             StatusCode::NOT_FOUND,
@@ -411,11 +415,13 @@ async fn api_console_portal(State(state): State<super::AppState>, headers: Heade
     };
     let started = now_ms();
     let customer: Option<String> =
-        sqlx::query_scalar("SELECT stripeCustomerId FROM user WHERE id = ?1")
+        sqlx::query_scalar::<_, Option<String>>("SELECT stripeCustomerId FROM user WHERE id = ?1")
             .bind(&account.id)
             .fetch_optional(&mcp.pool)
             .await
-            .unwrap_or(None);
+            .ok()
+            .flatten()
+            .flatten();
     let Some(customer) = customer else {
         record_account_action(
             &mcp.pool,
