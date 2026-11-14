@@ -247,8 +247,10 @@ pub async fn run_downgrade_retention(
 /// pass and the inactivity sweep. After taking the locks the row is re-read
 /// by id and the caller's `retention` predicate is re-evaluated, so a user
 /// who returned or resubscribed mid-pass, or a rename, is never deleted on
-/// a stale snapshot. Returns `false` when the row was already gone or the
-/// predicate no longer holds (a concurrent delete or a revival won).
+/// a stale snapshot; the slug is then resolved and must still name this row,
+/// so a slug swap can never delete a different app. Returns `false` when the
+/// row was already gone, the predicate no longer holds, or the slug now
+/// names another row.
 pub(crate) async fn delete_retained(
     pool: &SqlitePool,
     deps: &RetentionDeps,
@@ -271,6 +273,8 @@ pub(crate) async fn delete_retained(
     struct Fresh {
         slug: String,
         plan: String,
+        banned: i64,
+        inactivity_notices: i64,
         last_activity_at: i64,
         expired_at: Option<i64>,
         downgraded_stopped_at: Option<i64>,
@@ -279,7 +283,8 @@ pub(crate) async fn delete_retained(
         owner_last_active: i64,
     }
     let fresh: Option<Fresh> = sqlx::query_as(
-        "SELECT a.slug AS slug, u.plan AS plan, \
+        "SELECT a.slug AS slug, u.plan AS plan, u.banned AS banned, \
+                a.inactivity_notices AS inactivity_notices, \
                 a.last_activity_at AS last_activity_at, a.expired_at AS expired_at, \
                 a.downgraded_stopped_at AS downgraded_stopped_at, \
                 a.downgrade_purge_warned_at AS downgrade_purge_warned_at, \
@@ -292,22 +297,30 @@ pub(crate) async fn delete_retained(
     let Some(fresh) = fresh else {
         return Ok(false);
     };
+    // Exactly the sweep's own purge predicate on fresh data — no stricter,
+    // no looser. Whatever the sweep would purge on a fresh read is purged;
+    // whatever it would restore is not.
     let holds = match retention {
         Retention::Inactive { now_ms, grace_ms } => match fresh.expired_at {
             Some(stamped) => {
+                let effective = fresh.last_activity_at.max(fresh.owner_last_active);
+                let restorable =
+                    effective > stamped && effective <= stamped.saturating_add(grace_ms);
                 fresh.slug == slug
                     && fresh.plan != "pro"
                     && fresh.downgraded_stopped_at.is_none()
+                    && !restorable
                     && now_ms >= stamped.saturating_add(grace_ms)
-                    && fresh.last_activity_at.max(fresh.owner_last_active) <= stamped
+                    && (fresh.inactivity_notices != 0 || fresh.banned != 0)
             }
             None => false,
         },
         Retention::Downgraded { now_secs } => {
             match (fresh.downgraded_stopped_at, fresh.downgrade_purge_warned_at) {
-                (Some(_), Some(warned_at)) => {
+                (Some(stopped_at), Some(warned_at)) => {
                     fresh.slug == slug
                         && fresh.plan != "pro"
+                        && now_secs.saturating_sub(stopped_at) >= DOWNGRADE_PURGE_AFTER_SECS
                         && now_secs.saturating_sub(warned_at) >= DOWNGRADE_WARN_CUSHION_SECS
                 }
                 _ => false,
@@ -315,6 +328,12 @@ pub(crate) async fn delete_retained(
         }
     };
     if !holds {
+        return Ok(false);
+    }
+    // `delete_app` resolves by slug: confirm the slug still names this row,
+    // so a slug swap mid-pass can never delete a different app.
+    let target = crate::apps::get_by_slug(pool, slug).await?;
+    if target.is_none_or(|app| app.id != app_id) {
         return Ok(false);
     }
     let delete_deps = DeleteDeps {

@@ -1150,8 +1150,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = pool().await;
         seed_user(&pool, "a1", "ana@example.com", "free").await;
+        // Deterministic uids/ports: `seed_app` draws the uid at random and
+        // `uid` is UNIQUE, so 27 random draws risk a spurious collision.
         for n in 0..MAX_PURGES_PER_PASS + 2 {
-            seed_app(&pool, &format!("cap{n}"), &format!("shop{n}"), "a1", T0).await;
+            let n = n as i64;
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+                 last_activity_at, created_at) \
+                 VALUES (?1, ?2, 'a1', ?3, ?4, ?5, ?6, ?6)",
+            )
+            .bind(format!("cap{n}"))
+            .bind(format!("shop{n}"))
+            .bind(400_000 + n)
+            .bind(40_000 + 2 * n)
+            .bind(40_000 + 2 * n + 1)
+            .bind(T0)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2")
             .bind(T0 + 90 * DAY_MS)
@@ -1171,5 +1187,138 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 2, "the rest wait for the next pass");
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_when_slug_names_another_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        seed_app(&pool, "app2", "pantry", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Mid-pass the slugs swap: app2 now holds "groceries". Deleting by
+        // the stale (app1, "groceries") pair must refuse, and the app now
+        // holding the slug must survive.
+        sqlx::query("UPDATE app SET slug = 'groceries-old' WHERE id = 'app1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE app SET slug = 'groceries' WHERE id = 'app2'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!deleted, "a slug now naming another app must not delete it");
+        let holder: Option<String> =
+            sqlx::query_scalar("SELECT id FROM app WHERE slug = 'groceries'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(holder.as_deref(), Some("app2"));
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_after_unban_without_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        sqlx::query("UPDATE user SET banned = 1 WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Mid-pass the owner is unbanned, so no delivered reminder exists
+        // and the sweep would only warn: the stale delete must refuse too.
+        sqlx::query("UPDATE user SET banned = 0 WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !deleted,
+            "an unbanned owner without a notice must keep the app"
+        );
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app1"));
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_when_sweep_would_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Owner activity inside grace: the sweep would restore, never purge.
+        sqlx::query("UPDATE user SET lastActiveAt = ?1 WHERE id = 'a1'")
+            .bind(T0 + 91 * DAY_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!deleted, "an app the sweep would restore must survive");
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app1"));
     }
 }

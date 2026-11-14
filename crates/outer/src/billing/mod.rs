@@ -2517,6 +2517,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_delete_waits_out_a_fresh_warning_and_a_young_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("retention-fresh.sqlite"))
+            .await
+            .unwrap();
+        let (deps, _, _) = retention_deps(dir.path());
+        seed_pro_with_apps(&pool).await;
+        sqlx::query("UPDATE user SET plan = 'free' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Stopped 30 days ago but warned 2 days ago: the warning's week is
+        // not out, so the direct delete refuses.
+        sqlx::query(
+            "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = ?1, \
+             downgrade_purge_warned_at = ?2 WHERE id = 'app2'",
+        )
+        .bind(NOW - 30 * 24 * 3600)
+        .bind(NOW - 2 * 24 * 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let deleted = downgrade::delete_retained(
+            &pool,
+            &deps,
+            "app2",
+            "new",
+            downgrade::Retention::Downgraded { now_secs: NOW },
+        )
+        .await
+        .unwrap();
+        assert!(!deleted, "a two-day-old warning still buys its week");
+        // Warned long ago but stopped only 20 days ago: the stop itself is
+        // not past due, so the direct delete refuses (N4).
+        sqlx::query(
+            "UPDATE app SET downgraded_stopped_at = ?1, \
+             downgrade_purge_warned_at = ?2 WHERE id = 'app2'",
+        )
+        .bind(NOW - 20 * 24 * 3600)
+        .bind(NOW - 10 * 24 * 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let deleted = downgrade::delete_retained(
+            &pool,
+            &deps,
+            "app2",
+            "new",
+            downgrade::Retention::Downgraded { now_secs: NOW },
+        )
+        .await
+        .unwrap();
+        assert!(!deleted, "a stop younger than 30 days must not purge");
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app2'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app2"));
+    }
+
+    #[tokio::test]
+    async fn retention_purges_are_capped_per_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&dir.path().join("retention-cap.sqlite"))
+            .await
+            .unwrap();
+        let billing = enabled_billing();
+        let (deps, sender, _) = retention_deps(dir.path());
+        seed_pro_with_apps(&pool).await;
+        // Deterministic uids/ports: `seed_app` draws the uid at random and
+        // `uid` is UNIQUE, so 23 more random draws risk a spurious collision.
+        for n in 0..23 {
+            let n = n as i64;
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+                 last_activity_at, created_at) \
+                 VALUES (?1, ?2, 'a1', ?3, ?4, ?5, 0, ?6)",
+            )
+            .bind(format!("x{n}"))
+            .bind(format!("cap{n}"))
+            .bind(400_000 + n)
+            .bind(40_000 + 2 * n)
+            .bind(40_000 + 2 * n + 1)
+            .bind(10 + n)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE user SET plan = 'free' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 26 stopped apps, each warned a full week ago: all purge-due.
+        sqlx::query(
+            "UPDATE app SET desired_state = 'stopped', downgraded_stopped_at = ?1, \
+             downgrade_purge_warned_at = ?2",
+        )
+        .bind(NOW - 30 * 24 * 3600)
+        .bind(NOW - 7 * 24 * 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (warned, purged) =
+            downgrade::run_downgrade_retention(&pool, &sender, &billing, &deps, NOW)
+                .await
+                .unwrap();
+        assert_eq!((warned, purged), (0, 25));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 26 - 25, "the rest wait for the next pass");
+    }
+
+    #[tokio::test]
     async fn reupgrade_cancels_the_pending_purge_and_restarts_the_stopped_app() {
         let dir = tempfile::tempdir().unwrap();
         let pool = crate::db::open(&dir.path().join("reupgrade.sqlite"))
