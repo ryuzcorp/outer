@@ -25,7 +25,7 @@
 use sqlx::SqlitePool;
 
 use crate::auth::EmailSender;
-use crate::billing::downgrade::RetentionDeps;
+use crate::billing::downgrade::{Retention, RetentionDeps, MAX_PURGES_PER_PASS};
 
 /// Throttle: at most one activity write per hour per account/app, so hot
 /// paths don't write on every request.
@@ -312,21 +312,41 @@ pub async fn run_sweep(pool: &SqlitePool, deps: &SweepDeps, now_ms: i64) -> anyh
                     counts.restored += 1;
                 }
             } else if now_ms >= stamped.saturating_add(windows.grace_ms) {
-                match crate::billing::downgrade::delete_retained(
-                    pool,
-                    &deps.retention,
-                    &row.id,
-                    &row.slug,
-                )
-                .await
-                {
-                    Ok(true) => counts.purged += 1,
-                    Ok(false) => {}
-                    Err(err) => tracing::warn!(
+                if counts.purged >= MAX_PURGES_PER_PASS {
+                    tracing::error!(
+                        purged = counts.purged,
+                        "inactivity purge cap hit; the rest wait for the next pass"
+                    );
+                    break;
+                }
+                // No delivered reminder, no purge — unless the owner is
+                // banned (no mail goes out there; the schedule still holds).
+                if row.inactivity_notices == 0 && row.banned == 0 {
+                    tracing::warn!(
                         slug = %row.slug,
-                        error = %format!("{err:#}"),
-                        "inactivity purge failed; the next tick retries"
-                    ),
+                        "inactivity purge skipped: no reminder was delivered; the next pass retries"
+                    );
+                } else {
+                    match crate::billing::downgrade::delete_retained(
+                        pool,
+                        &deps.retention,
+                        &row.id,
+                        &row.slug,
+                        Retention::Inactive {
+                            now_ms,
+                            grace_ms: windows.grace_ms,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(true) => counts.purged += 1,
+                        Ok(false) => {}
+                        Err(err) => tracing::warn!(
+                            slug = %row.slug,
+                            error = %format!("{err:#}"),
+                            "inactivity purge failed; the next tick retries"
+                        ),
+                    }
                 }
             }
             continue;
@@ -353,21 +373,42 @@ pub async fn run_sweep(pool: &SqlitePool, deps: &SweepDeps, now_ms: i64) -> anyh
             )
             .await;
             if now_ms >= deadline.saturating_add(windows.grace_ms) {
-                match crate::billing::downgrade::delete_retained(
-                    pool,
-                    &deps.retention,
-                    &row.id,
-                    &row.slug,
-                )
-                .await
-                {
-                    Ok(true) => counts.purged += 1,
-                    Ok(false) => {}
-                    Err(err) => tracing::warn!(
+                if counts.purged >= MAX_PURGES_PER_PASS {
+                    tracing::error!(
+                        purged = counts.purged,
+                        "inactivity purge cap hit; the rest wait for the next pass"
+                    );
+                    break;
+                }
+                // Same rule as above: no delivered reminder, no same-pass
+                // purge (banned owners are still exempt from mail).
+                if row.inactivity_notices == 0 && row.banned == 0 {
+                    tracing::warn!(
                         slug = %row.slug,
-                        error = %format!("{err:#}"),
-                        "inactivity purge failed; the next tick retries"
-                    ),
+                        "inactivity purge skipped: no reminder was delivered; the next pass retries"
+                    );
+                    counts.expired += 1;
+                } else {
+                    match crate::billing::downgrade::delete_retained(
+                        pool,
+                        &deps.retention,
+                        &row.id,
+                        &row.slug,
+                        Retention::Inactive {
+                            now_ms,
+                            grace_ms: windows.grace_ms,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(true) => counts.purged += 1,
+                        Ok(false) => {}
+                        Err(err) => tracing::warn!(
+                            slug = %row.slug,
+                            error = %format!("{err:#}"),
+                            "inactivity purge failed; the next tick retries"
+                        ),
+                    }
                 }
             } else {
                 counts.expired += 1;
@@ -665,6 +706,12 @@ mod tests {
         let pool = pool().await;
         seed_user(&pool, "a1", "ana@example.com", "free").await;
         seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        // The purge needs a delivered reminder: the deadline mail went out.
+        sqlx::query("UPDATE app SET inactivity_notices = ?1 WHERE id = 'app1'")
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
         let (sender, _) = capture();
         let deps = sweep_deps(dir.path(), sender);
         // Leftover state across every prefix the delete path owns.
@@ -714,6 +761,12 @@ mod tests {
         let pool = pool().await;
         seed_user(&pool, "a1", "ana@example.com", "free").await;
         seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        // The purge needs a delivered reminder: the deadline mail went out.
+        sqlx::query("UPDATE app SET inactivity_notices = ?1 WHERE id = 'app1'")
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
         let (sender, _) = capture();
         let deps = sweep_deps(dir.path(), sender);
         // A sweep that missed the whole window expires backdated and purges
@@ -902,5 +955,370 @@ mod tests {
             account_deletes_at(&pool, "nobody", "free", 0, w).await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn past_grace_without_a_delivered_reminder_is_not_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Past grace, but no reminder ever went out (a failing mail sender,
+        // a down sweep): the app stays expired, never purged.
+        assert_eq!(
+            run_sweep(&pool, &deps, T0 + 97 * DAY_MS).await.unwrap(),
+            Counts::default()
+        );
+        assert_eq!(expired_of(&pool, "app1").await, Some(T0 + 90 * DAY_MS));
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app1"));
+    }
+
+    #[tokio::test]
+    async fn catch_up_without_a_delivered_reminder_expires_but_does_not_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // A sweep that missed the whole window still expires backdated, but
+        // with no delivered reminder the same-pass purge must not fire.
+        assert_eq!(
+            run_sweep(&pool, &deps, T0 + 100 * DAY_MS).await.unwrap(),
+            Counts {
+                expired: 1,
+                ..Counts::default()
+            }
+        );
+        assert_eq!(expired_of(&pool, "app1").await, Some(T0 + 90 * DAY_MS));
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app1"));
+    }
+
+    #[tokio::test]
+    async fn banned_owner_purges_on_schedule_without_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        sqlx::query("UPDATE user SET banned = 1 WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Banned accounts get no reminder mail; expiry and purge still run
+        // on schedule.
+        assert_eq!(
+            run_sweep(&pool, &deps, T0 + 97 * DAY_MS).await.unwrap(),
+            Counts {
+                purged: 1,
+                ..Counts::default()
+            }
+        );
+        let gone: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(gone, None);
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_when_owner_resubscribed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // The owner resubscribes between the pass's row list and the delete.
+        sqlx::query("UPDATE user SET plan = 'pro' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !deleted,
+            "a resubscribed owner's app must survive the stale delete"
+        );
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app1"));
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_after_restore_or_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Activity restored the app (stamp cleared) between list and delete.
+        sqlx::query("UPDATE app SET expired_at = NULL WHERE id = 'app1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!deleted, "a restored app must survive the stale delete");
+        // Same for a rename: the stale slug no longer names this row.
+        sqlx::query("UPDATE app SET expired_at = ?1, slug = 'pantry' WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !deleted,
+            "a renamed app must survive a delete by stale slug"
+        );
+        let kept: Option<String> = sqlx::query_scalar("SELECT slug FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("pantry"));
+    }
+
+    #[tokio::test]
+    async fn purges_are_capped_per_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        // Deterministic uids/ports: `seed_app` draws the uid at random and
+        // `uid` is UNIQUE, so 27 random draws risk a spurious collision.
+        for n in 0..MAX_PURGES_PER_PASS + 2 {
+            let n = n as i64;
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, \
+                 last_activity_at, created_at) \
+                 VALUES (?1, ?2, 'a1', ?3, ?4, ?5, ?6, ?6)",
+            )
+            .bind(format!("cap{n}"))
+            .bind(format!("shop{n}"))
+            .bind(400_000 + n)
+            .bind(40_000 + 2 * n)
+            .bind(40_000 + 2 * n + 1)
+            .bind(T0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2")
+            .bind(T0 + 90 * DAY_MS)
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        let counts = run_sweep(&pool, &deps, T0 + 97 * DAY_MS).await.unwrap();
+        assert_eq!(
+            counts.purged, MAX_PURGES_PER_PASS,
+            "at most 25 purges per pass; {counts:?}"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 2, "the rest wait for the next pass");
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_when_slug_names_another_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        seed_app(&pool, "app2", "pantry", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Mid-pass the slugs swap: app2 now holds "groceries". Deleting by
+        // the stale (app1, "groceries") pair must refuse, and the app now
+        // holding the slug must survive.
+        sqlx::query("UPDATE app SET slug = 'groceries-old' WHERE id = 'app1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE app SET slug = 'groceries' WHERE id = 'app2'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!deleted, "a slug now naming another app must not delete it");
+        let holder: Option<String> =
+            sqlx::query_scalar("SELECT id FROM app WHERE slug = 'groceries'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(holder.as_deref(), Some("app2"));
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_after_unban_without_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        sqlx::query("UPDATE user SET banned = 1 WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Mid-pass the owner is unbanned, so no delivered reminder exists
+        // and the sweep would only warn: the stale delete must refuse too.
+        sqlx::query("UPDATE user SET banned = 0 WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !deleted,
+            "an unbanned owner without a notice must keep the app"
+        );
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app1"));
+    }
+
+    #[tokio::test]
+    async fn stale_delete_is_refused_when_sweep_would_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool().await;
+        seed_user(&pool, "a1", "ana@example.com", "free").await;
+        seed_app(&pool, "app1", "groceries", "a1", T0).await;
+        sqlx::query("UPDATE app SET expired_at = ?1, inactivity_notices = ?2 WHERE id = 'app1'")
+            .bind(T0 + 90 * DAY_MS)
+            .bind(NOTICE_30D)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (sender, _) = capture();
+        let deps = sweep_deps(dir.path(), sender);
+        // Owner activity inside grace: the sweep would restore, never purge.
+        sqlx::query("UPDATE user SET lastActiveAt = ?1 WHERE id = 'a1'")
+            .bind(T0 + 91 * DAY_MS)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = crate::billing::downgrade::delete_retained(
+            &pool,
+            &deps.retention,
+            "app1",
+            "groceries",
+            Retention::Inactive {
+                now_ms: T0 + 97 * DAY_MS,
+                grace_ms: 7 * DAY_MS,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!deleted, "an app the sweep would restore must survive");
+        let kept: Option<String> = sqlx::query_scalar("SELECT id FROM app WHERE id = 'app1'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("app1"));
     }
 }
