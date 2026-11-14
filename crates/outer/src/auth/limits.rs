@@ -14,6 +14,12 @@ pub const RETENTION_MS: i64 = 86_400_000;
 /// limit, record this attempt and return `Ok(None)`. When the limit is hit,
 /// return `Ok(Some(retry_after_s))`: the seconds until the oldest event in
 /// the window ages out.
+///
+/// The count and the insert are ONE statement: SQLite takes the write lock
+/// before the statement reads, so concurrent callers serialize and at most
+/// `limit` of them are admitted. A separate count-then-insert let every
+/// request of a parallel burst read the same count and pass (audit O-1,
+/// 2026-11-14: 200 parallel sends to one address all went out).
 pub async fn check_and_record(
     pool: &SqlitePool,
     subject: &str,
@@ -22,11 +28,32 @@ pub async fn check_and_record(
     window_ms: i64,
     now: i64,
 ) -> anyhow::Result<Option<u64>> {
-    if let Some(retry_after_s) = check(pool, subject, action, limit, window_ms, now).await? {
-        return Ok(Some(retry_after_s));
+    debug_assert!(
+        window_ms <= RETENTION_MS,
+        "window wider than the daily prune keeps: bump RETENTION_MS"
+    );
+    let inserted = sqlx::query(
+        "INSERT INTO rate_limit_events (subject, action, created_at) \
+         SELECT ?1, ?2, ?3 WHERE (SELECT COUNT(*) FROM rate_limit_events \
+                                 WHERE subject = ?1 AND action = ?2 AND created_at > ?4) < ?5",
+    )
+    .bind(subject)
+    .bind(action)
+    .bind(now)
+    .bind(now - window_ms)
+    .bind(i64::from(limit))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(None);
     }
-    record(pool, subject, action, now).await?;
-    Ok(None)
+    // Refused: the read only computes the retry time.
+    Ok(Some(
+        check(pool, subject, action, limit, window_ms, now)
+            .await?
+            .unwrap_or(1),
+    ))
 }
 
 /// [`check_and_record`] without the record: for limits that count only some

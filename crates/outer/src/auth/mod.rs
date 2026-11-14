@@ -247,6 +247,13 @@ fn otp_identifier(email: &str) -> String {
     format!("email-verification:{email}")
 }
 
+/// Comparisons one emailed code allows before it burns.
+const OTP_MAX_ATTEMPTS: i64 = 5;
+
+/// Code verifications one client IP may attempt per hour, across every
+/// address.
+const OTP_VERIFY_IP_LIMIT: u32 = 30;
+
 /// Closed-beta gate: open signup, admin emails and allowlisted emails pass;
 /// anyone else needs a valid invite code (§6.5.1) or lands on the waitlist
 /// (counted) with the exact closed-beta user message. Idempotent: repeat
@@ -429,47 +436,80 @@ pub async fn verify_code_core(
     if review_login(cfg, &email).is_some() {
         return Err(password_required());
     }
+    // Every verify from one client counts, whatever the address: a client
+    // spraying codes across many emails stops here before any comparison.
+    if let Some(ip) = client_ip {
+        match limits::check_and_record(
+            pool,
+            &format!("ip:{ip}"),
+            "otp_verify",
+            OTP_VERIFY_IP_LIMIT,
+            3_600_000,
+            now,
+        )
+        .await
+        {
+            Ok(Some(retry_after_s)) => return Err(AuthError::rate_limited(retry_after_s)),
+            Ok(None) => {}
+            Err(err) => return Err(AuthError::new("db", format!("{err}"))),
+        }
+    }
     let identifier = otp_identifier(&email);
-    let row: Option<(String, i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT value, expiresAt, attempts, inviteCode FROM verification WHERE identifier = ?",
+    // Claim one attempt BEFORE comparing, in one statement: concurrent
+    // guesses serialize on SQLite's write lock, so a code is compared at
+    // most `OTP_MAX_ATTEMPTS` times however many requests race. Reading the
+    // count and writing it back separately let every guess of a parallel
+    // burst compare (audit O-1, 2026-11-14: 2000 of 2000 compared).
+    let claimed: Option<(String, i64, Option<String>)> = sqlx::query_as(
+        "UPDATE verification SET attempts = attempts + 1, updatedAt = ?2 \
+         WHERE identifier = ?1 AND attempts < ?3 AND expiresAt >= ?2 \
+         RETURNING value, attempts, inviteCode",
     )
     .bind(&identifier)
+    .bind(now)
+    .bind(OTP_MAX_ATTEMPTS)
     .fetch_optional(pool)
     .await
     .map_err(db)?;
-    let Some((code_hash, expires_at, attempts, carried_invite)) = row else {
-        return Err(AuthError::new(
-            "invalid_code",
-            "no pending code for this email".to_string(),
-        ));
-    };
-    if now > expires_at {
-        sqlx::query("DELETE FROM verification WHERE identifier = ?")
-            .bind(&identifier)
-            .execute(pool)
-            .await
-            .map_err(db)?;
-        return Err(AuthError::new(
-            "code_expired",
-            "the code expired, ask for a new one".to_string(),
-        ));
-    }
-    if attempts >= 5 {
-        sqlx::query("DELETE FROM verification WHERE identifier = ?")
-            .bind(&identifier)
-            .execute(pool)
-            .await
-            .map_err(db)?;
-        return Err(AuthError::new(
-            "too_many_attempts",
-            "too many wrong codes, ask for a new one".to_string(),
-        ));
-    }
-    if !tokens::ct_eq(&tokens::sha256_hex(code.trim()), &code_hash) {
-        let attempts = attempts + 1;
-        if attempts >= 5 {
-            sqlx::query("DELETE FROM verification WHERE identifier = ?")
+    let Some((code_hash, attempts, carried_invite)) = claimed else {
+        // Nothing claimable: no code, an expired one, or one out of attempts.
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT expiresAt FROM verification WHERE identifier = ?")
                 .bind(&identifier)
+                .fetch_optional(pool)
+                .await
+                .map_err(db)?;
+        let Some((expires_at,)) = row else {
+            return Err(AuthError::new(
+                "invalid_code",
+                "no pending code for this email".to_string(),
+            ));
+        };
+        sqlx::query("DELETE FROM verification WHERE identifier = ? AND expiresAt = ?")
+            .bind(&identifier)
+            .bind(expires_at)
+            .execute(pool)
+            .await
+            .map_err(db)?;
+        return Err(if now > expires_at {
+            AuthError::new(
+                "code_expired",
+                "the code expired, ask for a new one".to_string(),
+            )
+        } else {
+            AuthError::new(
+                "too_many_attempts",
+                "too many wrong codes, ask for a new one".to_string(),
+            )
+        });
+    };
+    if !tokens::ct_eq(&tokens::sha256_hex(code.trim()), &code_hash) {
+        if attempts >= OTP_MAX_ATTEMPTS {
+            // Burn this code only: a fresh code sent meanwhile has another
+            // value and survives.
+            sqlx::query("DELETE FROM verification WHERE identifier = ? AND value = ?")
+                .bind(&identifier)
+                .bind(&code_hash)
                 .execute(pool)
                 .await
                 .map_err(db)?;
@@ -478,23 +518,26 @@ pub async fn verify_code_core(
                 "too many wrong codes, ask for a new one".to_string(),
             ));
         }
-        sqlx::query("UPDATE verification SET attempts = ?, updatedAt = ? WHERE identifier = ?")
-            .bind(attempts)
-            .bind(now)
-            .bind(&identifier)
-            .execute(pool)
-            .await
-            .map_err(db)?;
         return Err(AuthError::new(
             "invalid_code",
             "that code doesn't match".to_string(),
         ));
     }
-    sqlx::query("DELETE FROM verification WHERE identifier = ?")
+    // Single use: of two concurrent correct guesses only the one whose
+    // delete removes the row signs in.
+    let consumed = sqlx::query("DELETE FROM verification WHERE identifier = ? AND value = ?")
         .bind(&identifier)
+        .bind(&code_hash)
         .execute(pool)
         .await
-        .map_err(db)?;
+        .map_err(db)?
+        .rows_affected();
+    if consumed != 1 {
+        return Err(AuthError::new(
+            "invalid_code",
+            "that code was already used".to_string(),
+        ));
+    }
     let account = match account_by_email(pool, &email)
         .await
         .map_err(|err| AuthError::new("db", format!("{err}")))?
