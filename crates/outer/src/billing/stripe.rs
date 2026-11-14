@@ -47,10 +47,17 @@ pub fn form_encode(raw: &str) -> String {
 /// email, Stripe Tax on, billing address required, and the launch coupon
 /// when one is passed (only while the promo runs in Stripe). Pure so tests
 /// pin the exact params against a fake Stripe instead of the network.
+///
+/// A stored `customer` reuses that Stripe customer so a second checkout can
+/// never open a second customer record; Stripe rejects `customer` and
+/// `customer_email` together
+/// (docs: <https://docs.stripe.com/api/checkout/sessions/create>), so the
+/// email rides along only when there is no customer yet.
 pub fn checkout_form(
     price: &str,
     account_id: &str,
     email: &str,
+    customer: Option<&str>,
     success_url: &str,
     coupon: Option<&str>,
 ) -> String {
@@ -60,11 +67,15 @@ pub fn checkout_form(
         ("line_items[0][quantity]", "1".to_string()),
         ("client_reference_id", account_id.to_string()),
         ("metadata[account_id]", account_id.to_string()),
-        ("customer_email", email.to_string()),
-        ("success_url", success_url.to_string()),
-        ("automatic_tax[enabled]", "true".to_string()),
-        ("billing_address_collection", "required".to_string()),
     ];
+    if let Some(customer) = customer {
+        pairs.push(("customer", customer.to_string()));
+    } else {
+        pairs.push(("customer_email", email.to_string()));
+    }
+    pairs.push(("success_url", success_url.to_string()));
+    pairs.push(("automatic_tax[enabled]", "true".to_string()));
+    pairs.push(("billing_address_collection", "required".to_string()));
     if let Some(coupon) = coupon {
         pairs.push(("discounts[0][coupon]", coupon.to_string()));
     }
@@ -302,12 +313,16 @@ impl StripeClient {
 
     /// One Pro subscription checkout for `account_id` (spec §14.2). The
     /// human finishes on Stripe's page and the webhook upgrades the account;
-    /// nothing here touches the `user` row. The launch coupon rides along
-    /// only while [`Self::launch_discount_active`] says the promo runs.
+    /// nothing here touches the `user` row. A stored `customer` reuses that
+    /// Stripe customer (Stripe rejects `customer` with `customer_email`,
+    /// so the email is only sent when there is no customer yet). The launch
+    /// coupon rides along only while [`Self::launch_discount_active`] says
+    /// the promo runs.
     pub async fn create_checkout_session(
         &self,
         account_id: &str,
         email: &str,
+        customer: Option<&str>,
         success_url: &str,
     ) -> anyhow::Result<CheckoutSession> {
         let coupon = if self.launch_discount_active().await {
@@ -315,7 +330,14 @@ impl StripeClient {
         } else {
             None
         };
-        let form = checkout_form(&self.price_pro, account_id, email, success_url, coupon);
+        let form = checkout_form(
+            &self.price_pro,
+            account_id,
+            email,
+            customer,
+            success_url,
+            coupon,
+        );
         session_url(&self.post("/v1/checkout/sessions", &form).await?)
     }
     /// One Customer Portal session for an existing subscriber.
@@ -419,6 +441,7 @@ mod tests {
             "price_pro",
             "acct-1",
             "me@example.com",
+            None,
             "https://outer.now/billing/done",
             Some("launch50"),
         );
@@ -444,11 +467,28 @@ mod tests {
             "price_pro",
             "acct-1",
             "me@example.com",
+            None,
             "https://outer.now/billing/done",
             None,
         );
         assert!(!form.contains("coupon"), "unexpected coupon in {form}");
         assert!(form.contains("automatic_tax%5Benabled%5D=true"), "{form}");
+    }
+    /// A stored customer reuses that Stripe customer instead of opening a
+    /// second one: `customer=` goes out and `customer_email` stays home
+    /// (Stripe rejects both together).
+    #[test]
+    fn checkout_form_reuses_a_stored_customer() {
+        let form = checkout_form(
+            "price_pro",
+            "acct-1",
+            "me@example.com",
+            Some("cus_1"),
+            "https://outer.now/billing/done",
+            None,
+        );
+        assert!(form.contains("customer=cus_1"), "{form}");
+        assert!(!form.contains("customer_email"), "{form}");
     }
 
     #[test]
@@ -716,7 +756,12 @@ mod tests {
         let fake = FakeStripe::start().await;
         let client = test_client(fake.base.clone(), Some("launch50"));
         let session = client
-            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .create_checkout_session(
+                "acct-1",
+                "me@example.com",
+                None,
+                "https://outer.now/billing/done",
+            )
             .await
             .unwrap();
         assert_eq!(session.url, "https://checkout.stripe.com/pay/cs_test_1");
@@ -753,7 +798,12 @@ mod tests {
         let fake = FakeStripe::start().await;
         let client = test_client(fake.base.clone(), None);
         client
-            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .create_checkout_session(
+                "acct-1",
+                "me@example.com",
+                None,
+                "https://outer.now/billing/done",
+            )
             .await
             .unwrap();
         let call = fake.only();
@@ -777,7 +827,12 @@ mod tests {
         let client = test_client(fake.base.clone(), Some("launch50"));
         assert!(client.launch_discount_active().await);
         let session = client
-            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .create_checkout_session(
+                "acct-1",
+                "me@example.com",
+                None,
+                "https://outer.now/billing/done",
+            )
             .await
             .unwrap();
         assert_eq!(session.url, "https://checkout.stripe.com/pay/cs_test_1");
@@ -806,7 +861,12 @@ mod tests {
         let client = test_client(fake.base.clone(), Some("launch50"));
         assert!(!client.launch_discount_active().await);
         let session = client
-            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .create_checkout_session(
+                "acct-1",
+                "me@example.com",
+                None,
+                "https://outer.now/billing/done",
+            )
             .await
             .unwrap();
         assert_eq!(session.url, "https://checkout.stripe.com/pay/cs_test_1");
@@ -830,7 +890,12 @@ mod tests {
         let client = test_client(fake.base.clone(), Some("launch50"));
         assert!(!client.launch_discount_active().await);
         client
-            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .create_checkout_session(
+                "acct-1",
+                "me@example.com",
+                None,
+                "https://outer.now/billing/done",
+            )
             .await
             .unwrap();
         let call = fake.only();
@@ -849,7 +914,12 @@ mod tests {
         let client = test_client(fake.base.clone(), Some("launch50"));
         assert!(!client.launch_discount_active().await);
         let session = client
-            .create_checkout_session("acct-1", "me@example.com", "https://outer.now/billing/done")
+            .create_checkout_session(
+                "acct-1",
+                "me@example.com",
+                None,
+                "https://outer.now/billing/done",
+            )
             .await
             .unwrap();
         assert_eq!(session.url, "https://checkout.stripe.com/pay/cs_test_1");
@@ -872,6 +942,7 @@ mod tests {
                 .create_checkout_session(
                     "acct-1",
                     "me@example.com",
+                    None,
                     "https://outer.now/billing/done",
                 )
                 .await
