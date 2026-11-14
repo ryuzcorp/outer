@@ -37,6 +37,28 @@ pub const DOWNGRADE_WARN_AFTER_SECS: i64 = 23 * 24 * 3600;
 /// Purge this long after the downgrade stop (spec §3: "kept for 30 days").
 pub const DOWNGRADE_PURGE_AFTER_SECS: i64 = 30 * 24 * 3600;
 
+/// A late warning pushes the purge out: the purge needs the warning to be
+/// this old, so a warning mailed after day 23 still buys its full week.
+pub const DOWNGRADE_WARN_CUSHION_SECS: i64 = DOWNGRADE_PURGE_AFTER_SECS - DOWNGRADE_WARN_AFTER_SECS;
+
+/// At most this many purges per pass per sweep. A pass that hits the cap
+/// logs at error level and leaves the rest for the next pass, so a
+/// mass deletion is noticed instead of silent.
+pub const MAX_PURGES_PER_PASS: usize = 25;
+
+/// What `delete_retained` must re-verify under the locks before it deletes:
+/// the pass's row list is stale by the time the locks are held, so each
+/// variant re-reads the row by id and re-evaluates its own predicate.
+#[derive(Debug, Clone, Copy)]
+pub enum Retention {
+    /// Inactivity purge: `expired_at` still set and past grace, the owner
+    /// still Free, no owner or app activity since the stamp, same slug.
+    Inactive { now_ms: i64, grace_ms: i64 },
+    /// Downgrade purge: the stop stamp still set, the owner still Free, the
+    /// warning old enough that the purge date holds, same slug.
+    Downgraded { now_secs: i64 },
+}
+
 /// Strip Pro extras from every app `owner_id` owns: custom hostnames go
 /// (spec §7.7: a downgrade deletes the custom hostname) and public apps go
 /// back to unlisted (public is Pro-only, so a stored `public` on a Free
@@ -92,7 +114,9 @@ pub struct RetentionDeps {
 }
 
 /// One retention pass over downgrade-stopped apps: warn once at day 23,
-/// purge at day 30 through the shared `delete_app` path. Apps whose owner
+/// purge at day 30 through the shared `delete_app` path — but only once the
+/// warning is a week old, so a late warning pushes the purge out instead of
+/// purging early. Apps whose owner
 /// is Pro again self-heal (the stamps clear; `set_pro` normally beats us
 /// to it). Returns `(warned, purged)`.
 pub async fn run_downgrade_retention(
@@ -141,17 +165,11 @@ pub async fn run_downgrade_retention(
             continue;
         }
         let age = now_secs.saturating_sub(stopped_at);
-        if age >= DOWNGRADE_PURGE_AFTER_SECS {
-            match delete_retained(pool, deps, &row.id, &row.slug).await {
-                Ok(true) => purged += 1,
-                Ok(false) => {}
-                Err(err) => tracing::warn!(
-                    slug = %row.slug,
-                    error = %format!("{err:#}"),
-                    "downgrade retention purge failed; the next tick retries"
-                ),
-            }
-        } else if age >= DOWNGRADE_WARN_AFTER_SECS && row.warned_at.is_none() {
+        // The warning comes first, even late: a missing warning is mailed
+        // now (the purge below waits out its week), so a failed send never
+        // settles into purge-without-warning.
+        let mut warned_at = row.warned_at;
+        if age >= DOWNGRADE_WARN_AFTER_SECS && warned_at.is_none() {
             let upgrade = billing.upgrade_url(&row.owner_id, now_secs);
             let text = format!(
                 "{slug} has been stopped since your account returned to Free and will be \
@@ -173,12 +191,49 @@ pub async fn run_downgrade_retention(
                         .bind(&row.id)
                         .execute(pool)
                         .await?;
+                    warned_at = Some(now_secs);
                     warned += 1;
                 }
                 Err(err) => tracing::warn!(
                     slug = %row.slug,
                     error = %format!("{err:#}"),
                     "downgrade retention warning failed; the next tick retries"
+                ),
+            }
+        }
+        if age >= DOWNGRADE_PURGE_AFTER_SECS {
+            if purged >= MAX_PURGES_PER_PASS {
+                tracing::error!(
+                    purged,
+                    "downgrade retention purge cap hit; the rest wait for the next pass"
+                );
+                break;
+            }
+            match warned_at {
+                Some(sent_at)
+                    if now_secs.saturating_sub(sent_at) >= DOWNGRADE_WARN_CUSHION_SECS =>
+                {
+                    match delete_retained(
+                        pool,
+                        deps,
+                        &row.id,
+                        &row.slug,
+                        Retention::Downgraded { now_secs },
+                    )
+                    .await
+                    {
+                        Ok(true) => purged += 1,
+                        Ok(false) => {}
+                        Err(err) => tracing::warn!(
+                            slug = %row.slug,
+                            error = %format!("{err:#}"),
+                            "downgrade retention purge failed; the next tick retries"
+                        ),
+                    }
+                }
+                _ => tracing::warn!(
+                    slug = %row.slug,
+                    "downgrade retention purge skipped: no delivered warning; the next pass retries"
                 ),
             }
         }
@@ -189,13 +244,17 @@ pub async fn run_downgrade_retention(
 /// Delete one retention-doomed app through the shared `delete_app` path:
 /// fleet stopped, bucket prefixes wiped, rows dropped (the slug is claimable
 /// again immediately), edge caches purged. Shared by the downgrade-retention
-/// pass and the inactivity sweep. Returns `false` when the row was
-/// already gone (a concurrent delete won).
+/// pass and the inactivity sweep. After taking the locks the row is re-read
+/// by id and the caller's `retention` predicate is re-evaluated, so a user
+/// who returned or resubscribed mid-pass, or a rename, is never deleted on
+/// a stale snapshot. Returns `false` when the row was already gone or the
+/// predicate no longer holds (a concurrent delete or a revival won).
 pub(crate) async fn delete_retained(
     pool: &SqlitePool,
     deps: &RetentionDeps,
     app_id: &str,
     slug: &str,
+    retention: Retention,
 ) -> anyhow::Result<bool> {
     let rollback = deps.rollback_locks.lock(app_id).await;
     let deploy = deps.deploys.app_lock(app_id).lock_owned().await;
@@ -206,6 +265,58 @@ pub(crate) async fn delete_retained(
         rollback: Some(&rollback),
         wake: Some(&wake),
     };
+    // Re-read under the locks: the pass's row list predates them, so the
+    // owner may have resubscribed, returned, or renamed since.
+    #[derive(sqlx::FromRow)]
+    struct Fresh {
+        slug: String,
+        plan: String,
+        last_activity_at: i64,
+        expired_at: Option<i64>,
+        downgraded_stopped_at: Option<i64>,
+        downgrade_purge_warned_at: Option<i64>,
+        #[sqlx(rename = "lastActiveAt")]
+        owner_last_active: i64,
+    }
+    let fresh: Option<Fresh> = sqlx::query_as(
+        "SELECT a.slug AS slug, u.plan AS plan, \
+                a.last_activity_at AS last_activity_at, a.expired_at AS expired_at, \
+                a.downgraded_stopped_at AS downgraded_stopped_at, \
+                a.downgrade_purge_warned_at AS downgrade_purge_warned_at, \
+                u.lastActiveAt AS lastActiveAt \
+         FROM app AS a JOIN user AS u ON u.id = a.owner_id WHERE a.id = ?1",
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(fresh) = fresh else {
+        return Ok(false);
+    };
+    let holds = match retention {
+        Retention::Inactive { now_ms, grace_ms } => match fresh.expired_at {
+            Some(stamped) => {
+                fresh.slug == slug
+                    && fresh.plan != "pro"
+                    && fresh.downgraded_stopped_at.is_none()
+                    && now_ms >= stamped.saturating_add(grace_ms)
+                    && fresh.last_activity_at.max(fresh.owner_last_active) <= stamped
+            }
+            None => false,
+        },
+        Retention::Downgraded { now_secs } => {
+            match (fresh.downgraded_stopped_at, fresh.downgrade_purge_warned_at) {
+                (Some(_), Some(warned_at)) => {
+                    fresh.slug == slug
+                        && fresh.plan != "pro"
+                        && now_secs.saturating_sub(warned_at) >= DOWNGRADE_WARN_CUSHION_SECS
+                }
+                _ => false,
+            }
+        }
+    };
+    if !holds {
+        return Ok(false);
+    }
     let delete_deps = DeleteDeps {
         pool,
         store: &deps.store,
