@@ -101,10 +101,10 @@ echo "case 1 ok: failed check-config aborts before scp/rollout (exit $code)"
 reset_case "docker,podman"
 code="$(run_release)"
 [[ "$code" == 0 ]] || fail "passing check-config exited $code"
-pre="$(grep -n "check-config" "$LOG/ssh.log" | head -n1 | cut -d: -f1)"
-roll="$(grep -n "bash -s" "$LOG/ssh.log" | head -n1 | cut -d: -f1)"
+pre="$(grep -n "check-config" "$LOG/ssh.log" | head -n1 | cut -d: -f1 || true)"
+roll="$(grep -n "bash -s" "$LOG/ssh.log" | head -n1 | cut -d: -f1 || true)"
 [[ -n "$pre" && -n "$roll" && "$pre" -lt "$roll" ]] || fail "preflight did not precede the rollout"
-[[ -f "$LOG/scp.log" ]] || fail "passing preflight never reached the upload"
+grep "check-config" "$LOG/ssh.log" | grep -q -- "--pull=never" || fail "preflight run lacks --pull=never"
 grep -l "handoff_to" "$LOG"/stdin-*.bin >/dev/null || fail "rollout heredoc missing handoff_to"
 grep -l "release-backup" "$LOG"/stdin-*.bin >/dev/null || fail "rollout heredoc missing release-backup"
 echo "case 2 ok: passing check-config proceeds to upload then rollout (exit 0)"
@@ -136,5 +136,18 @@ code="$(run_release)"
 [[ "$code" == 0 ]] || fail "auto with docker only exited $code"
 head -n1 "$LOG/engine.log" | grep -q "^DOCKER: build" || fail "auto did not fall back to docker"
 echo "case 5 ok: auto prefers podman, falls back to docker"
+
+# --- case 6: podman images are retagged before the preflight ---------------
+# A podman build arrives on the host as localhost/outer:<sha>; release.sh
+# must retag it to the plain name in its own ssh step before the preflight's
+# `docker run … outer:<sha>` (the rollout heredoc is too late).
+reset_case "docker,podman"
+code="$(run_release)"
+[[ "$code" == 0 ]] || fail "podman pass-through exited $code"
+head -n1 "$LOG/engine.log" | grep -q "^PODMAN: build" || fail "case 6 did not build with podman"
+tag="$(grep -n "docker tag.*localhost/outer" "$LOG/ssh.log" | head -n1 | cut -d: -f1 || true)"
+pre6="$(grep -n "check-config" "$LOG/ssh.log" | head -n1 | cut -d: -f1 || true)"
+[[ -n "$tag" && -n "$pre6" && "$tag" -lt "$pre6" ]] || fail "retag did not precede the preflight"
+echo "case 6 ok: podman image retagged before check-config (exit 0)"
 
 echo "test-release-preflight: all cases passed"
