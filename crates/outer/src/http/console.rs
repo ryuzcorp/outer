@@ -1728,7 +1728,11 @@ async fn sign_in_post(
                     redirect(&target, session)
                 }
                 Err(err) => page(
-                    StatusCode::BAD_REQUEST,
+                    if err.code == "rate_limited" {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
                     code_form(
                         &crate::auth::normalize_email(&email),
                         Some(crate::auth::pages::friendly_error(err.code)),

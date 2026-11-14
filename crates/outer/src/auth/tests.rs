@@ -2201,6 +2201,92 @@ async fn otp_attempts_expiry_and_limits() {
     assert_eq!(err.code, "rate_limited");
 }
 
+/// A parallel burst of wrong guesses must burn the code after five
+/// comparisons, exactly as five sequential ones do: the right code sent
+/// after the burst no longer signs in (audit O-1 brute force).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn otp_attempt_cap_holds_under_a_parallel_burst() {
+    let pool = test_pool().await;
+    let (config, codes) = test_config();
+    let config = Arc::new(config);
+    auth::send_code(&pool, &config, "burst@example.com", None, None)
+        .await
+        .unwrap();
+    let code = captured(&codes, "burst@example.com");
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    let guesses = (0..50).map(|_| {
+        let (pool, config) = (pool.clone(), config.clone());
+        tokio::spawn(async move {
+            auth::verify_code_core(&pool, &config, "burst@example.com", wrong, None).await
+        })
+    });
+    for guess in guesses.collect::<Vec<_>>() {
+        assert!(guess.await.unwrap().is_err());
+    }
+    let err = auth::verify_code_core(&pool, &config, "burst@example.com", &code, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "invalid_code", "the burst burned the code");
+}
+
+/// The per-email send limit admits exactly five of a parallel burst, and
+/// every refused send reads as `rate_limited` (never a database error), so
+/// a victim's inbox cannot be flooded past it (audit O-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn otp_send_limit_holds_under_a_parallel_burst() {
+    let pool = test_pool().await;
+    let (config, _codes) = test_config();
+    let config = Arc::new(config);
+    let sends = (0..50).map(|index| {
+        let (pool, config) = (pool.clone(), config.clone());
+        let ip = format!("198.51.100.{index}");
+        tokio::spawn(async move {
+            auth::send_code(&pool, &config, "inbox@example.com", None, Some(&ip)).await
+        })
+    });
+    let mut sent = 0;
+    for send in sends.collect::<Vec<_>>() {
+        match send.await.unwrap() {
+            Ok(_) => sent += 1,
+            Err(err) => assert_eq!(err.code, "rate_limited", "{}", err.message),
+        }
+    }
+    assert_eq!(sent, 5);
+}
+
+/// One client IP gets a fixed number of code checks per hour across every
+/// address, also when the checks arrive at once, so spraying guesses over
+/// many accounts stops there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn otp_verify_is_limited_per_ip() {
+    let pool = test_pool().await;
+    let (config, _codes) = test_config();
+    let config = Arc::new(config);
+    let checks = (0..60).map(|index| {
+        let (pool, config) = (pool.clone(), config.clone());
+        tokio::spawn(async move {
+            auth::verify_code_core(
+                &pool,
+                &config,
+                &format!("spray{index}@example.com"),
+                "000000",
+                Some("203.0.113.5"),
+            )
+            .await
+        })
+    });
+    let (mut compared, mut limited) = (0, 0);
+    for check in checks.collect::<Vec<_>>() {
+        let err = check.await.unwrap().unwrap_err();
+        match err.code {
+            "invalid_code" => compared += 1,
+            "rate_limited" => limited += 1,
+            other => panic!("unexpected {other}: {}", err.message),
+        }
+    }
+    assert_eq!((compared, limited), (30, 30));
+}
+
 #[tokio::test]
 async fn closed_beta_waitlists_by_default() {
     let pool = test_pool().await;

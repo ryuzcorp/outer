@@ -249,6 +249,9 @@ pub fn friendly_error(code: &str) -> &str {
         "invite_used" => "That invite code was just used.",
         "password_required" => "This account signs in with a password.",
         "invalid_credentials" => "Wrong email or password.",
+        "invalid_code" => "That code doesn't match. Check the latest email from Outer.",
+        "too_many_attempts" => "Too many wrong codes. Ask for a new one.",
+        "code_expired" => "That code expired. Ask for a new one.",
         _ => "Something went wrong signing in. Start over from the app.",
     }
 }
