@@ -116,14 +116,14 @@ async fn api_webhook(
         .and_then(|data| data.get("object"))
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    // Stripe does not guarantee webhook order: an older `updated` event can
-    // arrive after a newer one, so the payload may be stale. Refetch the
-    // live object (docs: https://docs.stripe.com/api/subscriptions/retrieve)
-    // and apply that instead. Before `apply_event` opens its transaction,
-    // so no network happens inside the DB lock. A fetch failure 500s with
-    // nothing recorded, and Stripe retries; events without an object id keep
-    // the payload.
+    // Stripe does not guarantee webhook order, so refetch the live object
+    // (docs: https://docs.stripe.com/api/subscriptions/retrieve) before
+    // `apply_event` opens its transaction (no network inside the DB lock).
+    // A fetch failure 500s with nothing recorded, and Stripe retries.
+    // `checkout.session.completed` carries no line items, so its session
+    // refetches the subscription separately for the O-5 price check.
     let mut object = object;
+    let mut checkout_subscription: Option<serde_json::Value> = None;
     if matches!(
         kind,
         "customer.subscription.created" | "customer.subscription.updated"
@@ -146,6 +146,25 @@ async fn api_webhook(
                 None => {}
             }
         }
+    } else if kind == "checkout.session.completed" {
+        if let Some(sub_id) = object
+            .get("subscription")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        {
+            match mcp.billing.retrieve_subscription(&sub_id).await {
+                Some(Ok(fresh)) => checkout_subscription = Some(fresh),
+                Some(Err(err)) => {
+                    tracing::warn!(event = %id, kind = %kind, "stripe webhook: checkout subscription refetch failed: {err:#}");
+                    return nostore_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "unavailable",
+                        "could not apply the event right now",
+                    );
+                }
+                None => {}
+            }
+        }
     }
     let ctx = WebhookCtx {
         pool: &mcp.pool,
@@ -156,7 +175,16 @@ async fn api_webhook(
         apps_domain: mcp.delete_cfg.apps_domain.clone(),
         egress: mcp.egress.clone(),
     };
-    match crate::billing::apply_event(&ctx, id, kind, &object, now_secs).await {
+    match crate::billing::apply_event(
+        &ctx,
+        id,
+        kind,
+        &object,
+        checkout_subscription.as_ref(),
+        now_secs,
+    )
+    .await
+    {
         Err(err) => {
             tracing::warn!(event = %id, kind = %kind, "stripe webhook: apply failed: {err:#}");
             nostore_json(
@@ -577,6 +605,7 @@ mod tests {
             Self::start_with(serde_json::json!({
                 "id": "sub_1", "customer": "cus_1", "status": "active",
                 "cancel_at_period_end": false,
+                "items": {"data": [{"price": {"id": "price_pro"}}]},
             }))
             .await
         }
@@ -728,6 +757,7 @@ mod tests {
         serde_json::json!({
             "id": "sub_1", "customer": "cus_1", "status": "active",
             "cancel_at_period_end": cancel_at_period_end,
+            "items": {"data": [{"price": {"id": "price_pro"}}]},
         })
     }
 
@@ -817,6 +847,109 @@ mod tests {
         );
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM stripe_event WHERE id = 'evt_boom'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    fn checkout_payload(event_id: &str, session: serde_json::Value) -> String {
+        serde_json::json!({
+            "id": event_id, "type": "checkout.session.completed",
+            "data": {"object": session},
+        })
+        .to_string()
+    }
+
+    fn checkout_session(
+        subscription: Option<&str>,
+        mode: &str,
+        payment_status: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": "cs_1", "mode": mode, "payment_status": payment_status,
+            "client_reference_id": "a1", "metadata": {"account_id": "a1"},
+            "customer": "cus_1", "subscription": subscription,
+        })
+    }
+
+    async fn stored_subscription(pool: &SqlitePool) -> Option<String> {
+        sqlx::query_scalar("SELECT stripeSubscriptionId FROM user WHERE id = 'a1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The normal path end to end: Outer's reference, subscription mode, a
+    /// paid status and a Pro-priced refetch, so the account goes Pro.
+    #[tokio::test]
+    async fn webhook_checkout_completed_upgrades_with_pro_price() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        let payload = checkout_payload(
+            "evt_cs_ok",
+            checkout_session(Some("sub_1"), "subscription", "paid"),
+        );
+        let res = post_signed_webhook(state, &payload).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            plan_status(&pool).await,
+            ("pro".to_string(), Some("active".to_string()))
+        );
+        assert_eq!(stored_subscription(&pool).await.as_deref(), Some("sub_1"));
+    }
+
+    /// O-5 end to end: the refetch bills a foreign price — acknowledged
+    /// (no retry), but nothing upgrades and no id is stored.
+    #[tokio::test]
+    async fn webhook_checkout_ignores_a_foreign_price() {
+        let fake = FakeStripe::start().await;
+        fake.set_subscription(serde_json::json!({
+            "id": "sub_9", "customer": "cus_1", "status": "active",
+            "items": {"data": [{"price": {"id": "price_other"}}]},
+        }));
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        let payload = checkout_payload(
+            "evt_cs_foreign",
+            checkout_session(Some("sub_9"), "subscription", "paid"),
+        );
+        let res = post_signed_webhook(state, &payload).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(plan_status(&pool).await, ("free".to_string(), None));
+        assert_eq!(stored_subscription(&pool).await, None);
+    }
+
+    /// O-5 end to end: a one-time payment session is acknowledged and
+    /// ignored — no refetch, no Pro.
+    #[tokio::test]
+    async fn webhook_checkout_ignores_payment_mode() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        let payload = checkout_payload("evt_cs_pay", checkout_session(None, "payment", "paid"));
+        let res = post_signed_webhook(state, &payload).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(plan_status(&pool).await, ("free".to_string(), None));
+    }
+
+    /// A failed checkout refetch 500s like the subscription-event path.
+    #[tokio::test]
+    async fn webhook_checkout_refetch_failure_retries_without_recording() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        fake.set_fail(true);
+        let payload = checkout_payload(
+            "evt_cs_boom",
+            checkout_session(Some("sub_1"), "subscription", "paid"),
+        );
+        let res = post_signed_webhook(state, &payload).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(plan_status(&pool).await, ("free".to_string(), None));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stripe_event WHERE id = 'evt_cs_boom'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();

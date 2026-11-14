@@ -223,6 +223,15 @@ impl BillingState {
             Self::Enabled { webhook_secret, .. } => Some(webhook_secret),
         }
     }
+    /// Outer's configured Pro price: `None` (disabled billing) fails
+    /// every upgrade closed.
+    pub fn pro_price(&self) -> Option<&str> {
+        match self {
+            Self::Disabled { .. } => None,
+            Self::Enabled { client, .. } => Some(client.price_pro()),
+        }
+    }
+
     /// The live subscription object for a webhook event, `None` when
     /// billing is disabled. The route fetches this before `apply_event`
     /// opens its transaction, so no network happens inside the DB lock.
@@ -377,15 +386,16 @@ impl Transition {
 /// `remove_all_for_app`'s "drop the row anyway"): a 5xx therefore always
 /// means nothing was applied and no side effect ran, and the retry
 /// re-runs the full transition including its side effects.
-/// Unknown types are recorded and ignored so a new Stripe event never 500s.
-/// Every handler resolves the account the same way: checkout objects carry
-/// the account id, subscription/invoice objects resolve through the stored
-/// customer/subscription ids.
+/// Checkout objects carry the account id from the session; the rest resolve
+/// through the stored customer/subscription ids. `checkout_subscription` is
+/// the live subscription the route refetched for the checkout (session
+/// payloads never carry line items); `None` fails the upgrade closed.
 pub async fn apply_event(
     ctx: &WebhookCtx<'_>,
     event_id: &str,
     event_type: &str,
     object: &serde_json::Value,
+    checkout_subscription: Option<&serde_json::Value>,
     now_secs: i64,
 ) -> anyhow::Result<ApplyOutcome> {
     let mut tx = ctx.pool.begin().await?;
@@ -404,10 +414,21 @@ pub async fn apply_event(
         return Ok(ApplyOutcome::Duplicate);
     }
     let mut pending = PendingEffects::default();
+    let pro_price = ctx.billing.pro_price();
     let transition = match event_type {
-        "checkout.session.completed" => apply_checkout_completed(&mut tx, object).await?,
+        "checkout.session.completed" => {
+            apply_checkout_completed(&mut tx, object, checkout_subscription, pro_price).await?
+        }
         "customer.subscription.created" | "customer.subscription.updated" => {
-            apply_subscription(&mut tx, &mut pending, &ctx.apps_domain, object, now_secs).await?
+            apply_subscription(
+                &mut tx,
+                &mut pending,
+                &ctx.apps_domain,
+                object,
+                pro_price,
+                now_secs,
+            )
+            .await?
         }
         "customer.subscription.deleted" => {
             apply_subscription_deleted(&mut tx, &mut pending, &ctx.apps_domain, object, now_secs)
@@ -416,6 +437,14 @@ pub async fn apply_event(
         "invoice.paid" => apply_invoice_paid(&mut tx, object).await?,
         "invoice.payment_failed" => {
             apply_payment_failed(&mut tx, &mut pending, object, now_secs).await?
+        }
+        // Outer's checkout never produces these: `checkout_form` passes no
+        // `payment_method_types`, so sessions take cards (immediate outcome
+        // — docs: <https://docs.stripe.com/payments/payment-methods>),
+        // never the delayed methods these events report on (docs:
+        // <https://docs.stripe.com/api/events/types>). Recorded + ignored.
+        "checkout.session.async_payment_succeeded" | "checkout.session.async_payment_failed" => {
+            Transition::kept(None)
         }
         _ => Transition::kept(None),
     };
@@ -579,20 +608,6 @@ fn object_str<'o>(object: &'o serde_json::Value, key: &str) -> Option<&'o str> {
     object.get(key).and_then(serde_json::Value::as_str)
 }
 
-async fn user_by_email(
-    conn: &mut sqlx::SqliteConnection,
-    email: &str,
-) -> anyhow::Result<Option<UserBilling>> {
-    let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId, \
-         (plan = 'free' AND planStatus = 'canceled') AS ended FROM user WHERE email = ?1",
-    )
-    .bind(email.to_ascii_lowercase())
-    .fetch_optional(conn)
-    .await?;
-    Ok(row.map(to_billing))
-}
-
 async fn user_by_subscription(
     conn: &mut sqlx::SqliteConnection,
     subscription: &str,
@@ -669,41 +684,89 @@ fn upgrade_is_stale(user: &UserBilling, event: Option<&str>) -> bool {
     }
 }
 
+/// Whether a subscription object bills the configured price: one of its
+/// items names it (`items.data[].price.id`, expanded or bare — docs:
+/// <https://docs.stripe.com/api/subscriptions/object>).
+fn subscription_has_price(subscription: &serde_json::Value, price: &str) -> bool {
+    subscription
+        .get("items")
+        .and_then(|items| items.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .any(|item| item.get("price").and_then(str_or_id) == Some(price))
+        })
+        .unwrap_or(false)
+}
+
+/// The upgrade half of the O-5 price gate: `active`/`trialing` (and
+/// `past_due`, which promotes into grace) apply only to Outer's Pro
+/// product. `None` price fails closed.
+fn is_pro_subscription(subscription: &serde_json::Value, pro_price: Option<&str>) -> bool {
+    pro_price
+        .map(|price| subscription_has_price(subscription, price))
+        .unwrap_or(false)
+}
+
+/// Promote on a genuine Outer checkout only (field docs:
+/// <https://docs.stripe.com/api/checkout/sessions/object>):
+/// `mode == "subscription"` (a one-time payment has no subscription to end
+/// it), `payment_status` of `paid` or `no_payment_required` ($0 first
+/// invoice, e.g. a 100%-off coupon), the account from `client_reference_id`
+/// or `metadata.account_id` (no customer/email fallback: customers are
+/// shared across every product in the Stripe account), and a session
+/// subscription whose live object — refetched by the route, since session
+/// payloads never carry line items — bills the configured Pro price.
+/// Anything else is recorded and ignored (200, so Stripe does not retry).
 async fn apply_checkout_completed(
     conn: &mut sqlx::SqliteConnection,
     object: &serde_json::Value,
+    checkout_subscription: Option<&serde_json::Value>,
+    pro_price: Option<&str>,
 ) -> anyhow::Result<Transition> {
-    let customer = object.get("customer").and_then(str_or_id);
-    let subscription = object.get("subscription").and_then(str_or_id);
+    if object_str(object, "mode") != Some("subscription") {
+        return Ok(Transition::kept(None));
+    }
+    if !matches!(
+        object_str(object, "payment_status"),
+        Some("paid") | Some("no_payment_required")
+    ) {
+        return Ok(Transition::kept(None));
+    }
     let account = object_str(object, "client_reference_id").or_else(|| {
         object
             .get("metadata")
             .and_then(|meta| object_str(meta, "account_id"))
     });
-    let user = match account {
-        Some(id) => user_by_id(&mut *conn, id).await?,
-        None => None,
-    };
-    let user = match user {
-        Some(user) => Some(user),
-        None => match customer {
-            Some(customer) => user_by_customer(&mut *conn, customer).await?,
-            None => None,
-        },
-    };
-    let user = match user {
-        Some(user) => Some(user),
-        None => match object_str(object, "customer_email") {
-            Some(email) => user_by_email(&mut *conn, email).await?,
-            None => None,
-        },
-    };
-    let Some(user) = user else {
+    let Some(account) = account else {
         return Ok(Transition::kept(None));
     };
-    // The resubscribe path: a new checkout for a new subscription upgrades
-    // unconditionally, so no staleness guard here.
-    set_pro(&mut *conn, &user.id, customer, subscription).await?;
+    let subscription_id = object.get("subscription").and_then(str_or_id);
+    let Some(checkout_subscription) = checkout_subscription else {
+        return Ok(Transition::kept(None));
+    };
+    // The refetch answers the session's subscription id; refuse a wiring
+    // mistake rather than upgrading on someone else's object.
+    if subscription_id.is_none_or(|id| {
+        checkout_subscription
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            != Some(id)
+    }) {
+        return Ok(Transition::kept(None));
+    }
+    let Some(pro_price) = pro_price else {
+        return Ok(Transition::kept(None));
+    };
+    if !subscription_has_price(checkout_subscription, pro_price) {
+        return Ok(Transition::kept(None));
+    }
+    let Some(user) = user_by_id(&mut *conn, account).await? else {
+        return Ok(Transition::kept(None));
+    };
+    let customer = object.get("customer").and_then(str_or_id);
+    set_pro(&mut *conn, &user.id, customer, subscription_id).await?;
     Ok(Transition::kept(Some(user.id)))
 }
 
@@ -712,6 +775,7 @@ async fn apply_subscription(
     pending: &mut PendingEffects,
     apps_domain: &str,
     object: &serde_json::Value,
+    pro_price: Option<&str>,
     now_secs: i64,
 ) -> anyhow::Result<Transition> {
     let id = object_str(object, "id").unwrap_or_default();
@@ -744,6 +808,11 @@ async fn apply_subscription(
     let mut stopped = Vec::new();
     match status {
         "active" | "trialing" => {
+            // O-5: only Outer's Pro product promotes; a foreign `active`
+            // on a shared customer changes nothing (no downgrade either).
+            if !is_pro_subscription(object, pro_price) {
+                return Ok(Transition::kept(Some(user.id)));
+            }
             if upgrade_is_stale(&user, event_sub) {
                 return Ok(Transition::kept(Some(user.id)));
             }
@@ -760,6 +829,10 @@ async fn apply_subscription(
             }
         }
         "past_due" => {
+            // O-5: `past_due` promotes into grace, so the same price gate.
+            if !is_pro_subscription(object, pro_price) {
+                return Ok(Transition::kept(Some(user.id)));
+            }
             if upgrade_is_stale(&user, event_sub) {
                 return Ok(Transition::kept(Some(user.id)));
             }
@@ -874,6 +947,15 @@ async fn apply_invoice_paid(
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
     let subscription = invoice_subscription(object);
+    // O-5: a one-off invoice has no subscription to end it, so it must
+    // never make Pro — ignore it even for a known customer.
+    if subscription.is_none() {
+        let user = match customer {
+            Some(customer) => user_by_customer(&mut *conn, customer).await?,
+            None => None,
+        };
+        return Ok(Transition::kept(user.map(|user| user.id)));
+    }
     let user = match customer {
         Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
@@ -903,6 +985,14 @@ async fn apply_payment_failed(
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
     let subscription = invoice_subscription(object);
+    // O-5, same as `invoice.paid`: a one-off failure must not start grace.
+    if subscription.is_none() {
+        let user = match customer {
+            Some(customer) => user_by_customer(&mut *conn, customer).await?,
+            None => None,
+        };
+        return Ok(Transition::kept(user.map(|user| user.id)));
+    }
     let user = match customer {
         Some(customer) => user_by_customer(&mut *conn, customer).await?,
         None => None,
@@ -996,16 +1086,18 @@ async fn plan_downgrade(
     expected_sub: Option<&str>,
     now_secs: i64,
 ) -> anyhow::Result<Vec<String>> {
+    // O-5: the downgrade belongs to the subscription the row names. A
+    // foreign subscription's change — including a delete for an account
+    // whose row names no subscription at all — must never touch the
+    // account: skip unless the stored id equals the event's.
     if let Some(expected) = expected_sub {
         let current: Option<Option<String>> =
             sqlx::query_scalar("SELECT stripeSubscriptionId FROM user WHERE id = ?1")
                 .bind(account_id)
                 .fetch_optional(&mut *conn)
                 .await?;
-        if let Some(Some(current)) = current {
-            if current != expected {
-                return Ok(Vec::new());
-            }
+        if current.flatten().as_deref() != Some(expected) {
+            return Ok(Vec::new());
         }
     }
     sqlx::query(
@@ -1376,9 +1468,59 @@ mod tests {
         kind: &str,
         object: serde_json::Value,
     ) -> ApplyOutcome {
-        apply_event(&ctx(pool, sender, billing), id, kind, &object, NOW)
+        apply_event(&ctx(pool, sender, billing), id, kind, &object, None, NOW)
             .await
             .unwrap()
+    }
+
+    /// A `checkout.session.completed` delivery with its refetched subscription.
+    async fn apply_checkout(
+        pool: &SqlitePool,
+        sender: &EmailSender,
+        billing: &BillingState,
+        id: &str,
+        session: serde_json::Value,
+        subscription: serde_json::Value,
+    ) -> ApplyOutcome {
+        apply_event(
+            &ctx(pool, sender, billing),
+            id,
+            "checkout.session.completed",
+            &session,
+            Some(&subscription),
+            NOW,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The refetched subscription shape the price gate reads (retrieve docs:
+    /// <https://docs.stripe.com/api/subscriptions/retrieve>).
+    fn pro_subscription(sub_id: &str, price: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": sub_id, "customer": "cus_1", "status": "active",
+            "items": {"data": [{"price": {"id": price}}]},
+        })
+    }
+
+    /// A checkout session the way Stripe delivers it (docs:
+    /// <https://docs.stripe.com/api/checkout/sessions/object>).
+    fn checkout_session(
+        account: Option<&str>,
+        mode: &str,
+        payment_status: &str,
+        subscription: Option<&str>,
+    ) -> serde_json::Value {
+        let mut session = serde_json::json!({
+            "id": "cs_1", "mode": mode, "payment_status": payment_status,
+            "customer": "cus_1", "subscription": subscription,
+            "metadata": {},
+        });
+        if let Some(account) = account {
+            session["client_reference_id"] = serde_json::Value::String(account.to_string());
+            session["metadata"] = serde_json::json!({"account_id": account});
+        }
+        session
     }
 
     #[tokio::test]
@@ -1387,18 +1529,14 @@ mod tests {
         let (sender, _) = capture();
         let billing = enabled_billing();
         seed_user(&pool, "a1", "a@example.com").await;
-        let object = serde_json::json!({
-            "id": "cs_1", "client_reference_id": "a1",
-            "customer": "cus_1", "subscription": "sub_1",
-            "customer_email": "a@example.com", "metadata": {"account_id": "a1"},
-        });
-        let outcome = apply(
+        let session = checkout_session(Some("a1"), "subscription", "paid", Some("sub_1"));
+        let outcome = apply_checkout(
             &pool,
             &sender,
             &billing,
             "evt_1",
-            "checkout.session.completed",
-            object,
+            session,
+            pro_subscription("sub_1", "price_pro"),
         )
         .await;
         assert!(matches!(
@@ -1423,25 +1561,308 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkout_completed_falls_back_to_email() {
+    async fn checkout_completed_without_reference_is_ignored() {
+        // O-5: no Outer reference — a foreign session naming our customer
+        // (or email). Recorded, no plan change.
         let pool = pool().await;
         let (sender, _) = capture();
         let billing = enabled_billing();
         seed_user(&pool, "a1", "a@example.com").await;
-        let object = serde_json::json!({
-            "id": "cs_2", "customer": "cus_9", "subscription": "sub_9",
-            "customer_email": "A@EXAMPLE.COM",
-        });
-        apply(
+        sqlx::query("UPDATE user SET stripeCustomerId = 'cus_1' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut session = checkout_session(None, "subscription", "paid", Some("sub_9"));
+        session["customer_email"] = serde_json::Value::String("a@example.com".to_string());
+        let outcome = apply_checkout(
             &pool,
             &sender,
             &billing,
             "evt_2",
-            "checkout.session.completed",
-            object,
+            session,
+            pro_subscription("sub_9", "price_pro"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Applied {
+                account_id: None,
+                ..
+            }
+        ));
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+        assert_eq!(sub_of(&pool, "a1").await, None);
+    }
+
+    /// O-5: a one-time payment (`mode == "payment"`) has no subscription
+    /// to end it, so it must never make Pro.
+    #[tokio::test]
+    async fn checkout_payment_mode_is_ignored() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        let session = checkout_session(Some("a1"), "payment", "paid", None);
+        let outcome = apply_checkout(
+            &pool,
+            &sender,
+            &billing,
+            "evt_pay",
+            session,
+            pro_subscription("sub_1", "price_pro"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Applied {
+                account_id: None,
+                ..
+            }
+        ));
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+    }
+
+    /// O-5: a foreign price (another product) fails the check: no Pro,
+    /// no stored id.
+    #[tokio::test]
+    async fn checkout_foreign_price_is_ignored() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        let session = checkout_session(Some("a1"), "subscription", "paid", Some("sub_9"));
+        let outcome = apply_checkout(
+            &pool,
+            &sender,
+            &billing,
+            "evt_foreign",
+            session,
+            pro_subscription("sub_9", "price_other"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Applied {
+                account_id: None,
+                ..
+            }
+        ));
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+        assert_eq!(sub_of(&pool, "a1").await, None);
+    }
+
+    /// O-5: an unpaid session (card declined) must not make Pro; the
+    /// `past_due`/`invoice.payment_failed` paths own grace.
+    #[tokio::test]
+    async fn checkout_unpaid_is_ignored() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        let session = checkout_session(Some("a1"), "subscription", "unpaid", Some("sub_1"));
+        let outcome = apply_checkout(
+            &pool,
+            &sender,
+            &billing,
+            "evt_unpaid",
+            session,
+            pro_subscription("sub_1", "price_pro"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Applied {
+                account_id: None,
+                ..
+            }
+        ));
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+    }
+
+    /// O-5: `metadata.account_id` alone resolves the account.
+    #[tokio::test]
+    async fn checkout_completed_promotes_by_metadata() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        let mut session = checkout_session(Some("a1"), "subscription", "paid", Some("sub_1"));
+        session
+            .as_object_mut()
+            .unwrap()
+            .remove("client_reference_id");
+        let outcome = apply_checkout(
+            &pool,
+            &sender,
+            &billing,
+            "evt_meta",
+            session,
+            pro_subscription("sub_1", "price_pro"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Applied {
+                account_id: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(plan_of(&pool, "a1").await.0, "pro");
+    }
+
+    /// O-5: a 100%-off coupon reports `no_payment_required` for the $0
+    /// first invoice; the subscription is still real and price-checked.
+    #[tokio::test]
+    async fn checkout_no_payment_required_promotes() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        let session = checkout_session(
+            Some("a1"),
+            "subscription",
+            "no_payment_required",
+            Some("sub_1"),
+        );
+        apply_checkout(
+            &pool,
+            &sender,
+            &billing,
+            "evt_coupon",
+            session,
+            pro_subscription("sub_1", "price_pro"),
         )
         .await;
         assert_eq!(plan_of(&pool, "a1").await.0, "pro");
+        assert_eq!(sub_of(&pool, "a1").await.as_deref(), Some("sub_1"));
+    }
+
+    /// O-5: a foreign `active` on a known customer changes nothing — no
+    /// Pro, no stored-id overwrite.
+    #[tokio::test]
+    async fn foreign_active_subscription_is_ignored() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query("UPDATE user SET stripeCustomerId = 'cus_1' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_foreign_active",
+            "customer.subscription.updated",
+            pro_subscription("sub_foreign", "price_other"),
+        )
+        .await;
+        assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+        assert_eq!(sub_of(&pool, "a1").await, None);
+    }
+
+    /// O-5: a foreign `deleted` never downgrades — even with no stored id.
+    #[tokio::test]
+    async fn foreign_deleted_without_stored_subscription_downgrades_nothing() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query("UPDATE user SET stripeCustomerId = 'cus_1' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_app(&pool, "app1", "one", "a1", 1).await;
+        seed_app(&pool, "app2", "two", "a1", 2).await;
+        seed_app(&pool, "app3", "three", "a1", 3).await;
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_foreign_deleted",
+            "customer.subscription.deleted",
+            serde_json::json!({"id": "sub_foreign", "customer": "cus_1"}),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Applied { stopped, .. } if stopped.is_empty()
+        ));
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+        let running: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE desired_state = 'running'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(running, 3, "no app stops on a foreign delete");
+    }
+
+    /// O-5: a one-off (non-subscription) invoice has no subscription to end
+    /// it, so neither `paid` nor `payment_failed` may move the plan.
+    #[tokio::test]
+    async fn one_off_invoices_are_ignored() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        sqlx::query("UPDATE user SET stripeCustomerId = 'cus_1' WHERE id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, kind) in [
+            ("evt_oneoff_paid", "invoice.paid"),
+            ("evt_oneoff_failed", "invoice.payment_failed"),
+        ] {
+            let outcome = apply(
+                &pool,
+                &sender,
+                &billing,
+                id,
+                kind,
+                serde_json::json!({"id": "in_9", "customer": "cus_1"}),
+            )
+            .await;
+            assert!(matches!(outcome, ApplyOutcome::Applied { .. }), "{kind}");
+        }
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
+        assert_eq!(sub_of(&pool, "a1").await, None);
+    }
+
+    /// O-5 §3: Outer's card-only checkout never produces delayed-payment
+    /// outcomes. They are recorded and ignored like any unknown type.
+    #[tokio::test]
+    async fn async_payment_events_are_ignored() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_user(&pool, "a1", "a@example.com").await;
+        for (id, kind) in [
+            ("evt_async_ok", "checkout.session.async_payment_succeeded"),
+            ("evt_async_fail", "checkout.session.async_payment_failed"),
+        ] {
+            let outcome = apply(
+                &pool,
+                &sender,
+                &billing,
+                id,
+                kind,
+                checkout_session(Some("a1"), "subscription", "paid", Some("sub_1")),
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    ApplyOutcome::Applied {
+                        account_id: None,
+                        ..
+                    }
+                ),
+                "{kind}"
+            );
+        }
+        assert_eq!(plan_of(&pool, "a1").await.0, "free");
     }
 
     #[tokio::test]
@@ -1574,6 +1995,7 @@ mod tests {
             "evt_31",
             "customer.subscription.deleted",
             &object,
+            None,
             NOW,
         )
         .await;
@@ -1685,16 +2107,13 @@ mod tests {
         .await;
         assert_eq!(plan_of(pool, "a1").await.0, "free");
         // A genuine resubscribe mints a new subscription through checkout.
-        apply(
+        apply_checkout(
             pool,
             sender,
             billing,
             "evt_41",
-            "checkout.session.completed",
-            serde_json::json!({
-                "id": "cs_9", "client_reference_id": "a1",
-                "customer": "cus_1", "subscription": "sub_2",
-            }),
+            checkout_session(Some("a1"), "subscription", "paid", Some("sub_2")),
+            pro_subscription("sub_2", "price_pro"),
         )
         .await;
         assert_eq!(plan_of(pool, "a1").await.0, "pro");
@@ -1723,7 +2142,9 @@ mod tests {
             &billing,
             "evt_42",
             "customer.subscription.updated",
-            serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "active"}),
+            // Outer's price: the price gate passes and the staleness guard
+            // below is what blocks the demotion.
+            pro_subscription("sub_1", "price_pro"),
         )
         .await;
         assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
@@ -1759,7 +2180,9 @@ mod tests {
             (
                 "evt_51",
                 "customer.subscription.updated",
-                serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "active"}),
+                // Outer's price: the price gate passes and the ended-account
+                // staleness guard below is what blocks the re-promotion.
+                pro_subscription("sub_1", "price_pro"),
             ),
             (
                 "evt_52",
@@ -1816,7 +2239,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let object = serde_json::json!({"id": "sub_1", "customer": "cus_1", "status": "past_due"});
+        let mut object = pro_subscription("sub_1", "price_pro");
+        object["status"] = serde_json::Value::String("past_due".to_string());
         apply(
             &pool,
             &sender,
@@ -1900,9 +2324,8 @@ mod tests {
         .await
         .unwrap();
         for (id, flag, expected) in [("evt_6", true, "canceled"), ("evt_7", false, "active")] {
-            let object = serde_json::json!({
-                "id": "sub_1", "customer": "cus_1", "status": "active", "cancel_at_period_end": flag,
-            });
+            let mut object = pro_subscription("sub_1", "price_pro");
+            object["cancel_at_period_end"] = serde_json::Value::Bool(flag);
             apply(
                 &pool,
                 &sender,
@@ -2385,6 +2808,7 @@ mod tests {
             "evt_22",
             "customer.subscription.deleted",
             &object,
+            None,
             NOW,
         )
         .await
@@ -2770,17 +3194,15 @@ mod tests {
             .unwrap();
         // Resubscribe: the stamps clear, the downgrade's stop restarts, and
         // the retention pass stays quiet.
-        let object = serde_json::json!({
-            "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
-            "customer_email": "a@example.com",
-        });
-        apply(
+        // Resubscribe through Outer's own checkout: account reference,
+        // subscription mode, paid status and a Pro-priced subscription.
+        apply_checkout(
             &pool,
             &sender,
             &billing,
             "evt_21",
-            "checkout.session.completed",
-            object,
+            checkout_session(Some("a1"), "subscription", "paid", Some("sub_2")),
+            pro_subscription("sub_2", "price_pro"),
         )
         .await;
         assert_eq!(app_state_of(&pool, "app2").await.2, None);
@@ -2836,17 +3258,13 @@ mod tests {
         );
         // A checkout that lands after the ban (old mailed link, Stripe
         // retry) must not hand service back.
-        let object = serde_json::json!({
-            "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
-            "customer_email": "a@example.com",
-        });
-        apply(
+        apply_checkout(
             &pool,
             &sender,
             &billing,
             "evt_late",
-            "checkout.session.completed",
-            object,
+            checkout_session(Some("a1"), "subscription", "paid", Some("sub_2")),
+            pro_subscription("sub_2", "price_pro"),
         )
         .await;
         assert_eq!(
@@ -2883,17 +3301,13 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let object = serde_json::json!({
-            "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
-            "customer_email": "a@example.com",
-        });
-        apply(
+        apply_checkout(
             &pool,
             &sender,
             &billing,
             "evt_banned",
-            "checkout.session.completed",
-            object,
+            checkout_session(Some("a1"), "subscription", "paid", Some("sub_2")),
+            pro_subscription("sub_2", "price_pro"),
         )
         .await;
         assert_eq!(app_state_of(&pool, "app2").await.0, "stopped");
@@ -2931,6 +3345,7 @@ mod tests {
             "evt_purge",
             "customer.subscription.deleted",
             &object,
+            None,
             NOW,
         )
         .await
@@ -3044,17 +3459,13 @@ mod tests {
             .unwrap();
         // Resubscribe: the inactivity stamps clear with the downgrade ones
         // (the owner is exempt while subscribed).
-        let object = serde_json::json!({
-            "id": "sub_2", "customer": "cus_1", "subscription": "sub_2",
-            "customer_email": "a@example.com",
-        });
-        apply(
+        apply_checkout(
             &pool,
             &sender,
             &billing,
             "evt_22",
-            "checkout.session.completed",
-            object,
+            checkout_session(Some("a1"), "subscription", "paid", Some("sub_2")),
+            pro_subscription("sub_2", "price_pro"),
         )
         .await;
         let row: (Option<i64>, i64) =
