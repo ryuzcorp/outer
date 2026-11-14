@@ -53,7 +53,8 @@ RUN bun add --exact oxfmt@${OXFMT_VERSION} \
  && bun /oxfmt/node_modules/oxfmt/dist/cli.js --version
 
 # --- outer binary -------------------------------------------------------------
-FROM docker.io/library/rust:1-bookworm AS build
+# Same Rust as rust-toolchain.toml (scripts/check-pins.sh refuses drift).
+FROM docker.io/library/rust:1.100.0-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # The whole crates/ tree: sources pull files in with include_str!/sqlx
