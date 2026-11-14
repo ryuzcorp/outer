@@ -156,6 +156,13 @@ async fn api_key_for(state: &McpState, email: &str) -> String {
         .key
 }
 
+/// A `tool_wait` no fake deploy can outlast, for tests that pin the tool's
+/// own inline completion arm (terminal fields computed by the tool from
+/// `kind` and the finished app, success-only summary text) instead of the
+/// rebuilt answer `call_and_await_outcome` returns. The fake always
+/// finishes, so the call returns as soon as it does; the cap never fires.
+const INLINE_WAIT: std::time::Duration = std::time::Duration::from_secs(86_400);
+
 /// Call a deploy-producing tool (`create_app`, `commit`, `ship`,
 /// `add_example`, `promote_preview`, `rollback`, `rename_app`) and return
 /// its response body with the deploy resolved to the terminal outcome —
@@ -5430,21 +5437,22 @@ async fn preview_commit_needs_pro_and_burns_nothing() {
 
 #[tokio::test]
 async fn preview_commit_promote_discard_round_trip() {
-    let (state, _) = setup().await;
+    let (mut state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
     make_pro(&state, "ana@example.com").await;
     create_app(&state, &token, "groceries").await;
 
     // Trial the change: same gate, fresh namespace, live untouched.
-    let (_, trialed) = call_and_await_outcome(
+    // The trial commit takes the tool's inline completion arm: the preview
+    // URL below is the one the tool itself derived from the deploy kind.
+    state.tool_wait = INLINE_WAIT;
+    let (_, trialed) = call(
         &state,
-        &token,
+        Some(&token),
         "commit",
         json!({"app": "groceries", "message": "trial",
                "writes": [{"path": "t.txt", "content": "t"}],
                "preview": true}),
-        "groceries",
-        true,
     )
     .await;
     let structured = &result(&trialed)["structuredContent"];
@@ -8549,24 +8557,22 @@ async fn add_example_wrong_template_is_refused() {
 
 #[tokio::test]
 async fn create_app_with_examples_makes_exactly_one_commit() {
-    let (state, _) = setup_apply().await;
+    let (mut state, _) = setup_apply().await;
+    // Inline completion arm: the success-only summary names the new route.
+    state.tool_wait = INLINE_WAIT;
     let token = api_key_for(&state, "ana@example.com").await;
-    let (_, created) = call_and_await_outcome(
+    let (_, created) = call(
         &state,
-        &token,
+        Some(&token),
         "create_app",
         json!({"slug": "familygram", "examples": ["photos"]}),
-        "familygram",
-        false,
     )
     .await;
     let body = result(&created);
     let text = body["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("with passkeys, photos"), "{text}");
-    // The `/photos` route sentence only renders on the success arm; under
-    // load the first answer can be `building`, whose summary names the
-    // examples without the route. The route itself stays pinned by the
-    // structured nav assert in `add_example_applies_requires_nav_bindings_and_deploys`.
+    assert!(text.contains("/photos"), "{text}");
+    assert_eq!(body["structuredContent"]["deploy"]["status"], "success");
     let structured = &body["structuredContent"];
     assert_eq!(structured["added"], json!(["passkeys", "photos"]));
     // One commit holds the seed and the examples together.
