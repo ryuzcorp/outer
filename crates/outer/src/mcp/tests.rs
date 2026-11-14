@@ -5018,7 +5018,7 @@ fn zip_map(bytes: Vec<u8>) -> std::collections::BTreeMap<String, Vec<u8>> {
         let mut file = archive.by_index(i).unwrap();
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut buf).unwrap();
-        out.insert(file.name().to_string(), buf);
+        out.insert(file.name().unwrap().into_owned(), buf);
     }
     out
 }
