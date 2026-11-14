@@ -23,7 +23,9 @@
 # Migrations are append-only within a release line: the newcomer runs them
 # at boot while the old container is still serving, so a release's
 # migrations must be additive (nullable columns, new tables). A destructive
-# migration needs an announced maintenance release, not this script.
+# migration needs an announced maintenance release, not this script. Every
+# release also files a pre-release copy of the platform snapshot before the
+# handoff (see below), the backstop when a migration misbehaves anyway.
 #
 # No secrets in args or logs (only image tags travel in release.env).
 
@@ -119,11 +121,18 @@ if ! nft list table inet outer_fw >/dev/null 2>&1; then
     /srv/outer/firewall.sh
 fi
 
-# shellcheck disable=SC1091
 source /srv/outer/handoff.sh
 # Whatever fails below, the heartbeat must not outlive the release: abort
 # clears the flag and removes outer-next only while a compose outer serves.
 trap 'handoff_abort' EXIT
+# Pre-release copy of the platform state (audit O-4): file
+# outer/state/history/release-<UTC timestamp>-<SHA>.sqlite.zst from the
+# bucket's live snapshot before the newcomer can migrate it, so a bad
+# migration reaching the live key can be restored from history. Skips
+# (exit 0) when the bucket holds no snapshot yet. SHA is hex (validated
+# above), so interpolating it into the docker args is safe.
+docker run --rm --env-file /srv/outer/outer.env -v /srv/outer/data:/data \
+    "outer:$SHA" state release-backup --sha "$SHA"
 handoff_to "outer:$SHA"
 trap - EXIT
 EOF

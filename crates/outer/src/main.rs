@@ -35,6 +35,7 @@ const USAGE: &str = "usage:
   outer app list
   outer oauth-client add --name NAME --redirect-uri URI [--redirect-uri URI…] [--auth client_secret_basic|client_secret_post]
   outer seed demo --owner EMAIL [--url URL]
+  outer state release-backup --sha SHA
   outer hash-password
   outer docs tools
   outer version";
@@ -63,6 +64,10 @@ async fn main() -> ExitCode {
         },
         ["templates", "sync", rest @ ..] => {
             run(|config| templates_sync(config, rest.to_vec())).await
+        }
+        ["state", "release-backup", rest @ ..] => {
+            let rest = rest.to_vec();
+            run(move |config| state_release_backup(config, rest)).await
         }
         ["app", "create", slug, rest @ ..] => {
             let (slug, rest) = (slug.to_string(), rest.to_vec());
@@ -382,6 +387,30 @@ async fn templates_sync(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
     let sha = flag(&flags, "--sha").unwrap_or(templates::TEMPLATES_SHA);
     let synced = templates::sync(&store, url, sha).await?;
     println!("{}", serde_json::to_string_pretty(&synced)?);
+    Ok(())
+}
+
+/// File the pre-release copy of the platform snapshot
+/// (`history/release-<UTC timestamp>-<SHA>`), which `deploy/release.sh`
+/// runs before the handoff so a bad migration can be restored. Skips
+/// (exit 0) when the bucket holds no snapshot yet.
+async fn state_release_backup(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
+    let flags = flags(&rest, &["--sha"])?;
+    let Some(sha) = flag(&flags, "--sha") else {
+        anyhow::bail!("state release-backup needs --sha SHA");
+    };
+    let store = build_store(&config)?;
+    let snapshot_cfg = store::snapshot::SnapshotConfig {
+        db_path: config.db_path(),
+        key_prefix: "outer/state".to_string(),
+        host_id: config.host_id.clone(),
+    };
+    match store::snapshot::release_copy(&store, &snapshot_cfg, sha, chrono::Utc::now()).await? {
+        Some(key) => println!("{{\"release_backup\": {key:?}}}"),
+        None => {
+            println!("{{\"release_backup\": null, \"note\": \"no snapshot in bucket; skipping\"}}");
+        }
+    }
     Ok(())
 }
 

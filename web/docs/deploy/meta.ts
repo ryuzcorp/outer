@@ -7,6 +7,7 @@ export default defineMeta({
   pages: [
     "how-deploys-work",
     "rollback",
+    "state-snapshots",
     "custom-domains",
     "keep-warm",
     "limits",

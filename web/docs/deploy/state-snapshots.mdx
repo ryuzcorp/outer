@@ -1,0 +1,29 @@
+---
+title: Platform state snapshots
+description: Lineage, hourly history, pre-release copies, and restore for the platform database.
+---
+
+Outer snapshots its platform database (accounts, plans, OAuth grants, app secrets) to the bucket as `outer/state/outer.sqlite.zst` whenever it changes — at most every 15 seconds after a 5-second settle, so worst-case loss is about 22 seconds. This page is the operator's view.
+
+## Lineage: the sidecar
+
+Each upload records the snapshot sha256 in the bucket meta object and in a local sidecar (`/data/outer.sqlite.snapshot-sha`, written atomically after the upload lands). Before every upload the host compares the bucket's sha against the sidecar: empty bucket uploads; a sha matching the sidecar (or the bytes just dumped, for the crash window) uploads; anything else — including a database with no sidecar facing a snapshot — **refuses loudly** (`refusing state snapshot upload`, naming bucket and key), keeps serving, and retries the check. Never overwrites.
+
+## When an upload refuses
+
+- Wrong bucket/prefix in `OUTER_R2_*`: fix the config and restart. If the bad boot already created a fresh local database, stop outer, delete that file (and its sidecar), and boot again — the restore downloads the real snapshot.
+- A second host claimed the same bucket: the newest claimant wins and the old one stops uploading. Give each install its own bucket.
+- There is no `--force`: every recovery goes through the restore below.
+
+## History and pre-release copies
+
+Each successful upload also files `outer/state/history/<UTC yyyy-mm-ddTHH>.sqlite.zst` (first copy per hour wins) and prunes: hourly copies past 48 h collapse to the first copy of each day, days past 30 d go, at most 10 deletions per pass. Release copies (`history/release-<UTC timestamp>-<git sha>.sqlite.zst`, filed by `deploy/release.sh` before the handoff) and anything the pruner doesn't recognize are never deleted, and neither is the live key.
+
+## Restore a snapshot
+
+Stop outer first. With any S3-capable client (bucket, endpoint and keys are the `OUTER_R2_*` values in `/srv/outer/outer.env`):
+
+1. Pick a history key and download it; unpack (`zstd -d`) and check it: `sqlite3 file "PRAGMA integrity_check;"` must print `ok`.
+2. Replace `/data/outer.sqlite` with the unpacked file and write its sidecar: `sha256sum /data/outer.sqlite | cut -d' ' -f1 > /data/outer.sqlite.snapshot-sha`.
+3. Upload the packed bytes back to the live key, and set the meta object's `sha256` to the sidecar's value (leave `generation` alone — the next boot continues it).
+4. Start outer: the lineage check passes, the bytes match so nothing re-uploads, and the next change snapshots normally.
