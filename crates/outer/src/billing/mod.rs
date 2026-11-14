@@ -151,11 +151,15 @@ impl BillingState {
     }
 
     /// Mint a live Checkout Session URL for the human to open (the MCP
-    /// `upgrade` tool and the console Plan card). `None` when disabled.
+    /// `upgrade` tool and the console Plan card). A stored `customer`
+    /// reuses that Stripe customer so the session cannot open a second
+    /// customer record; without one the `email` starts it. `None` when
+    /// disabled.
     pub async fn checkout_url(
         &self,
         account_id: &str,
         email: &str,
+        customer: Option<&str>,
     ) -> Option<anyhow::Result<stripe::CheckoutSession>> {
         match self {
             Self::Disabled { .. } => None,
@@ -163,10 +167,30 @@ impl BillingState {
                 let success_url = format!("{}/billing/done", self.platform_base());
                 Some(
                     client
-                        .create_checkout_session(account_id, email, &success_url)
+                        .create_checkout_session(account_id, email, customer, &success_url)
                         .await,
                 )
             }
+        }
+    }
+
+    /// The link the past-due mails carry: a per-account portal-starter
+    /// sibling of [`Self::upgrade_url`]. Portal session URLs are
+    /// short-lived, so the click verifies the signed token and mints a
+    /// fresh one, the way the checkout starter does. When billing is
+    /// disabled it is the console plan card.
+    pub fn portal_link_url(&self, account_id: &str, now_secs: i64) -> String {
+        match self {
+            Self::Disabled { platform_base } => format!("{platform_base}/console"),
+            Self::Enabled {
+                platform_base,
+                sign_key,
+                ..
+            } => format!(
+                "{}/billing/portal?t={}",
+                platform_base,
+                sign_portal_token(sign_key, account_id, now_secs + CHECKOUT_TOKEN_SECS)
+            ),
         }
     }
 
@@ -217,15 +241,54 @@ impl BillingState {
         let key = self.sign_key()?;
         verify_checkout_token(key, token, now_secs)
     }
+
+    /// Verify a `GET /billing/portal?t=` token back to its account.
+    pub fn verify_portal_token(&self, token: &str, now_secs: i64) -> Option<String> {
+        let key = self.sign_key()?;
+        verify_portal_token(key, token, now_secs)
+    }
+}
+
+/// Whether a new Checkout Session for this account would double-bill: the
+/// plan is Pro and Stripe still holds a live subscription for it. `active`,
+/// `past_due` and canceled-at-period-end (`canceled` while still Pro) all
+/// still bill or are still Pro, so these accounts go to the Customer Portal
+/// instead of a fresh checkout.
+pub fn has_live_subscription(plan: &str, subscription: Option<&str>) -> bool {
+    plan == "pro" && subscription.map(|sub| !sub.is_empty()).unwrap_or(false)
 }
 
 /// Sign `{account_id}.{exp}.{hmac}` for a checkout-starter link. The HMAC
 /// covers a domain-separated body so a token minted for one purpose never
 /// verifies as another (the alert unsubscribe tokens sign a different body).
 pub fn sign_checkout_token(sign_key: &[u8], account_id: &str, exp_secs: i64) -> String {
+    sign_link_token(b"billing-checkout-v1.", sign_key, account_id, exp_secs)
+}
+
+/// The reverse: the account the token was minted for, or `None` on any
+/// mismatch, malformed token or expiry.
+pub fn verify_checkout_token(sign_key: &[u8], token: &str, now_secs: i64) -> Option<String> {
+    verify_link_token(b"billing-checkout-v1.", sign_key, token, now_secs)
+}
+
+/// Sign `{account_id}.{exp}.{hmac}` for a portal-starter link: the same
+/// shape as the checkout starter, but a different domain so a checkout
+/// token never verifies as a portal token and back.
+pub fn sign_portal_token(sign_key: &[u8], account_id: &str, exp_secs: i64) -> String {
+    sign_link_token(b"billing-portal-v1.", sign_key, account_id, exp_secs)
+}
+
+/// The reverse: the account the portal token was minted for, or `None` on
+/// any mismatch, malformed token or expiry.
+pub fn verify_portal_token(sign_key: &[u8], token: &str, now_secs: i64) -> Option<String> {
+    verify_link_token(b"billing-portal-v1.", sign_key, token, now_secs)
+}
+
+/// One HMAC over a domain-separated body for both starter links.
+fn sign_link_token(domain: &[u8], sign_key: &[u8], account_id: &str, exp_secs: i64) -> String {
     let mut mac =
         Hmac::<sha2::Sha256>::new_from_slice(sign_key).expect("hmac takes any key length");
-    mac.update(b"billing-checkout-v1.");
+    mac.update(domain);
     mac.update(account_id.as_bytes());
     mac.update(b".");
     mac.update(exp_secs.to_string().as_bytes());
@@ -235,9 +298,9 @@ pub fn sign_checkout_token(sign_key: &[u8], account_id: &str, exp_secs: i64) -> 
     )
 }
 
-/// The reverse: the account the token was minted for, or `None` on any
-/// mismatch, malformed token or expiry.
-pub fn verify_checkout_token(sign_key: &[u8], token: &str, now_secs: i64) -> Option<String> {
+/// The reverse behind both verifiers: the account the token was minted
+/// for, or `None` on any mismatch, malformed token or expiry.
+fn verify_link_token(domain: &[u8], sign_key: &[u8], token: &str, now_secs: i64) -> Option<String> {
     let (account_id, rest) = token.split_once('.')?;
     let (exp, _) = rest.split_once('.')?;
     if account_id.is_empty() || account_id.len() > 200 {
@@ -247,7 +310,7 @@ pub fn verify_checkout_token(sign_key: &[u8], token: &str, now_secs: i64) -> Opt
     if exp_secs <= now_secs {
         return None;
     }
-    let expected = sign_checkout_token(sign_key, account_id, exp_secs);
+    let expected = sign_link_token(domain, sign_key, account_id, exp_secs);
     if constant_time_eq::constant_time_eq(token.as_bytes(), expected.as_bytes()) {
         Some(account_id.to_string())
     } else {
@@ -416,9 +479,9 @@ impl PendingEffects {
         if let Some((account_id, email)) = &self.past_due_mail {
             // Day-0 mail (spec §14.2): the send may fail and the plan
             // change stands, like the collaborator invite.
-            let upgrade = billing.upgrade_url(account_id, now_secs);
+            let portal = billing.portal_link_url(account_id, now_secs);
             let text = format!(
-                "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (20 apps, 1,000 changes a day): {upgrade}\n\nAfter 7 days your account returns to Free: every app but your two oldest stops, and Pro features pause until you resubscribe. An app access gate stays on until you turn it off. Your code and data stay."
+                "Your Outer Pro payment failed. Update your payment details within 7 days to keep Pro (20 apps, 1,000 changes a day): {portal}\n\nAfter 7 days your account returns to Free: every app but your two oldest stops, and Pro features pause until you resubscribe. An app access gate stays on until you turn it off. Your code and data stay."
             );
             if let Err(err) = sender
                 .send_text(email, "Outer Pro payment failed — 7 days to update", &text)
@@ -1127,9 +1190,9 @@ pub async fn run_grace_sweep(
                 tracing::warn!(account = %user.id, "downgrade email failed: {err:#}");
             }
         } else if remaining > REMINDER_LOW_SECS && remaining <= REMINDER_HIGH_SECS {
-            let upgrade = billing.upgrade_url(&user.id, now_secs);
+            let portal = billing.portal_link_url(&user.id, now_secs);
             let text = format!(
-                "Your Outer Pro payment is still failing — 2 days left before your account returns to Free. Update payment details: {upgrade}"
+                "Your Outer Pro payment is still failing — 2 days left before your account returns to Free. Update payment details: {portal}"
             );
             if let Err(err) = sender
                 .send_text(&user.email, "Outer Pro ends in 2 days", &text)
@@ -1917,9 +1980,10 @@ mod tests {
             .unwrap();
         assert!(mail.contains("7 days"), "{mail}");
         assert!(
-            mail.contains("https://outer.now/billing/checkout?t="),
+            mail.contains("https://outer.now/billing/portal?t="),
             "{mail}"
         );
+        assert!(!mail.contains("/billing/checkout"), "{mail}");
     }
 
     #[tokio::test]
@@ -2012,6 +2076,8 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(mail.contains("2 days"), "{mail}");
+        assert!(mail.contains("/billing/portal?t="), "{mail}");
+        assert!(!mail.contains("/billing/checkout"), "{mail}");
         // Past expiry the next tick downgrades.
         sqlx::query("UPDATE user SET graceUntil = ?1 WHERE id = 'a1'")
             .bind(NOW - 1)
@@ -2078,6 +2144,55 @@ mod tests {
             verify_checkout_token(key, &token, NOW + CHECKOUT_TOKEN_SECS + 1),
             None
         );
+    }
+
+    #[test]
+    fn portal_tokens_round_trip_expire_and_stay_domained() {
+        let key = b"test-sign-key";
+        let token = sign_portal_token(key, "a1", NOW + CHECKOUT_TOKEN_SECS);
+        assert_eq!(
+            verify_portal_token(key, &token, NOW),
+            Some("a1".to_string())
+        );
+        // Expired tokens never verify.
+        assert_eq!(
+            verify_portal_token(key, &token, NOW + CHECKOUT_TOKEN_SECS + 1),
+            None
+        );
+        // Domain separation: a checkout token is not a portal token.
+        let checkout = sign_checkout_token(key, "a1", NOW + CHECKOUT_TOKEN_SECS);
+        assert_eq!(verify_portal_token(key, &checkout, NOW), None);
+        assert_eq!(verify_checkout_token(key, &token, NOW), None);
+    }
+
+    #[test]
+    fn portal_link_points_at_the_portal_starter() {
+        let enabled = enabled_billing();
+        let url = enabled.portal_link_url("a1", NOW);
+        assert!(
+            url.starts_with("https://outer.now/billing/portal?t=a1."),
+            "{url}"
+        );
+        assert_eq!(
+            enabled.verify_portal_token(url.rsplit('=').next().unwrap_or(""), NOW),
+            Some("a1".to_string())
+        );
+        let disabled = BillingState::Disabled {
+            platform_base: "https://outer.now".to_string(),
+        };
+        assert_eq!(
+            disabled.portal_link_url("a1", NOW),
+            "https://outer.now/console"
+        );
+    }
+
+    #[test]
+    fn live_subscription_needs_pro_and_a_subscription() {
+        assert!(has_live_subscription("pro", Some("sub_1")));
+        assert!(!has_live_subscription("free", Some("sub_1")));
+        assert!(!has_live_subscription("pro", None));
+        assert!(!has_live_subscription("pro", Some("")));
+        assert!(!has_live_subscription("free", None));
     }
 
     #[test]

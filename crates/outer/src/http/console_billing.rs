@@ -30,9 +30,35 @@ pub fn routes() -> Router<super::AppState> {
     Router::new()
         .route("/webhooks/stripe", post(api_webhook))
         .route("/billing/checkout", get(billing_checkout))
+        .route("/billing/portal", get(billing_portal))
         .route("/billing/done", get(billing_done))
         .route("/api/console/billing/checkout", post(api_console_checkout))
         .route("/api/console/billing/portal", post(api_console_portal))
+}
+
+/// One `user` row as the billing starters read it: who pays, which plan,
+/// and the Stripe ids that decide between a fresh checkout and the portal.
+struct BillingAccount {
+    email: String,
+    plan: String,
+    customer: Option<String>,
+    subscription: Option<String>,
+}
+
+async fn billing_account(pool: &sqlx::SqlitePool, account_id: &str) -> Option<BillingAccount> {
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT email, plan, stripeCustomerId, stripeSubscriptionId FROM user WHERE id = ?1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    row.map(|(email, plan, customer, subscription)| BillingAccount {
+        email,
+        plan,
+        customer,
+        subscription,
+    })
 }
 
 /// `POST /webhooks/stripe` on the platform host (spec §14.2): verify
@@ -161,7 +187,10 @@ struct CheckoutQuery {
 /// `GET /billing/checkout?t=`: the link every refusal's `upgrade_url`
 /// carries. Verifies the signed token, mints a fresh Checkout Session for
 /// that account, and redirects to Stripe. Fresh per click, so the link
-/// never goes stale the way a stored `checkout.stripe.com` URL would.
+/// never goes stale the way a stored `checkout.stripe.com` URL would. A
+/// stored customer reuses their Stripe customer; an account with a live
+/// subscription goes to the Customer Portal instead, so the click can
+/// never open the second subscription that double-bills.
 async fn billing_checkout(
     State(state): State<super::AppState>,
     Query(query): Query<CheckoutQuery>,
@@ -179,18 +208,35 @@ async fn billing_checkout(
             "This checkout link is bad or expired. Ask your agent for a fresh upgrade link.",
         );
     };
-    let email: Option<String> = sqlx::query_scalar("SELECT email FROM user WHERE id = ?1")
-        .bind(&account_id)
-        .fetch_optional(&state.mcp.pool)
-        .await
-        .unwrap_or(None);
-    let Some(email) = email else {
+    let Some(account) = billing_account(&state.mcp.pool, &account_id).await else {
         return text(
             StatusCode::NOT_FOUND,
             "This account is gone. Ask your agent to sign you in again.",
         );
     };
-    match state.mcp.billing.checkout_url(&account_id, &email).await {
+    if state.mcp.billing.enabled()
+        && crate::billing::has_live_subscription(&account.plan, account.subscription.as_deref())
+    {
+        let Some(customer) = account.customer.as_deref() else {
+            return text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This account is already on Pro. Ask your agent for a billing link.",
+            );
+        };
+        return match state.mcp.billing.portal_url(customer).await {
+            Some(Ok(session)) => Redirect::to(&session.url).into_response(),
+            _ => text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The billing portal is unavailable right now; try again in a minute.",
+            ),
+        };
+    }
+    match state
+        .mcp
+        .billing
+        .checkout_url(&account_id, &account.email, account.customer.as_deref())
+        .await
+    {
         None => text(
             StatusCode::SERVICE_UNAVAILABLE,
             "Billing is not enabled on this host yet.",
@@ -203,6 +249,52 @@ async fn billing_checkout(
             )
         }
         Some(Ok(session)) => Redirect::to(&session.url).into_response(),
+    }
+}
+
+/// `GET /billing/portal?t=`: the link the past-due mails carry. Verifies
+/// the signed token, mints a fresh Customer Portal session for that
+/// account, and redirects to Stripe. Fresh per click, because portal
+/// session URLs are short-lived and a stored one would go stale.
+async fn billing_portal(
+    State(state): State<super::AppState>,
+    Query(query): Query<CheckoutQuery>,
+) -> Response {
+    let now_secs = chrono::Utc::now().timestamp();
+    let Some(token) = query.t.filter(|token| !token.is_empty()) else {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "This portal link is missing. Ask your agent for a fresh billing link.",
+        );
+    };
+    let Some(account_id) = state.mcp.billing.verify_portal_token(&token, now_secs) else {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "This portal link is bad or expired. Ask your agent for a fresh billing link.",
+        );
+    };
+    // Decode the nullable column as `Option`: sqlx reads a NULL into a bare
+    // `String` as "", which would mint a portal session for no customer.
+    let customer: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT stripeCustomerId FROM user WHERE id = ?1")
+            .bind(&account_id)
+            .fetch_optional(&state.mcp.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    let Some(customer) = customer else {
+        return text(
+            StatusCode::NOT_FOUND,
+            "This account has no billing history yet. Ask your agent for a fresh upgrade link.",
+        );
+    };
+    match state.mcp.billing.portal_url(&customer).await {
+        Some(Ok(session)) => Redirect::to(&session.url).into_response(),
+        _ => text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The billing portal is unavailable right now; try again in a minute.",
+        ),
     }
 }
 
@@ -226,7 +318,10 @@ fn text(status: StatusCode, body: &str) -> Response {
 
 /// `POST /api/console/billing/checkout`: the Plan card's Upgrade button.
 /// Same live session as the MCP `upgrade` tool, session-authed instead of
-/// token-authed. Audited as `upgrade` with client "Console".
+/// token-authed. Audited as `upgrade` with client "Console". An account
+/// with a live subscription is refused: the Upgrade button only shows for
+/// Free accounts, and a second Checkout Session would double-bill, so the
+/// UI must send these humans to Manage billing instead.
 async fn api_console_checkout(
     State(state): State<super::AppState>,
     headers: HeaderMap,
@@ -237,7 +332,31 @@ async fn api_console_checkout(
         Err(res) => return *res,
     };
     let started = now_ms();
-    match mcp.billing.checkout_url(&account.id, &account.email).await {
+    let stored = billing_account(&mcp.pool, &account.id).await;
+    let live = stored.as_ref().is_some_and(|row| {
+        crate::billing::has_live_subscription(&row.plan, row.subscription.as_deref())
+    });
+    if live && mcp.billing.enabled() {
+        record_account_action(
+            &mcp.pool,
+            &account.id,
+            "upgrade",
+            "upgrade",
+            "error",
+            Some("invalid_argument"),
+            started,
+        )
+        .await;
+        return tool_response(&ToolError::invalid_argument(
+            "this account already has an active Pro subscription; use Manage billing to update payment details",
+        ));
+    }
+    let customer = stored.and_then(|row| row.customer);
+    match mcp
+        .billing
+        .checkout_url(&account.id, &account.email, customer.as_deref())
+        .await
+    {
         None => {
             record_account_action(
                 &mcp.pool,
@@ -296,11 +415,13 @@ async fn api_console_portal(State(state): State<super::AppState>, headers: Heade
     };
     let started = now_ms();
     let customer: Option<String> =
-        sqlx::query_scalar("SELECT stripeCustomerId FROM user WHERE id = ?1")
+        sqlx::query_scalar::<_, Option<String>>("SELECT stripeCustomerId FROM user WHERE id = ?1")
             .bind(&account.id)
             .fetch_optional(&mcp.pool)
             .await
-            .unwrap_or(None);
+            .ok()
+            .flatten()
+            .flatten();
     let Some(customer) = customer else {
         record_account_action(
             &mcp.pool,
@@ -433,10 +554,13 @@ mod tests {
     /// A loopback double answering one canned Checkout Session, recording
     /// the raw form so the route test pins the spec params end to end. It
     /// also serves `GET /v1/subscriptions/{id}` from a settable object so
-    /// the webhook refetch tests control what is current.
+    /// the webhook refetch tests control what is current. Every POST path
+    /// is recorded so the double-checkout test can prove no new Checkout
+    /// Session was minted; portal POSTs answer a canned portal URL.
     struct FakeStripe {
         base: String,
         body: Arc<Mutex<Option<String>>>,
+        posts: Arc<Mutex<Vec<String>>>,
         sub: Arc<Mutex<serde_json::Value>>,
         fail_sub: Arc<Mutex<bool>>,
         task: tokio::task::JoinHandle<()>,
@@ -463,6 +587,8 @@ mod tests {
             let port = listener.local_addr().unwrap().port();
             let seen = Arc::new(Mutex::new(None));
             let body = seen.clone();
+            let posts = Arc::new(Mutex::new(Vec::new()));
+            let posted = posts.clone();
             let sub = Arc::new(Mutex::new(sub));
             let current = sub.clone();
             let fail_sub = Arc::new(Mutex::new(false));
@@ -473,6 +599,7 @@ mod tests {
                         return;
                     };
                     let seen = seen.clone();
+                    let posted = posted.clone();
                     let current = current.clone();
                     let failing = failing.clone();
                     tokio::spawn(async move {
@@ -520,7 +647,14 @@ mod tests {
                                 let sub = current.lock().unwrap().to_string();
                                 format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sub}", sub.len())
                             }
+                        } else if path.starts_with("/v1/billing_portal/sessions") {
+                            posted.lock().unwrap().push(path);
+                            *seen.lock().unwrap() =
+                                Some(String::from_utf8_lossy(&raw).into_owned());
+                            let session = "{\"id\":\"bps_test_9\",\"object\":\"billing_portal.session\",\"url\":\"https://billing.stripe.com/p/session/test_portal_9\"}";
+                            format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{session}", session.len())
                         } else {
+                            posted.lock().unwrap().push(path);
                             *seen.lock().unwrap() =
                                 Some(String::from_utf8_lossy(&raw).into_owned());
                             let session = "{\"id\":\"cs_test_9\",\"object\":\"checkout.session\",\"url\":\"https://checkout.stripe.com/pay/cs_test_9\"}";
@@ -534,6 +668,7 @@ mod tests {
             Self {
                 base: format!("http://127.0.0.1:{port}"),
                 body,
+                posts,
                 sub,
                 fail_sub,
                 task,
@@ -744,6 +879,10 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("client_reference_id=a1"), "{body}");
+        // The stored customer is reused: no second customer record, and no
+        // `customer_email` alongside it (Stripe rejects both together).
+        assert!(body.contains("customer=cus_1"), "{body}");
+        assert!(!body.contains("customer_email"), "{body}");
     }
 
     #[tokio::test]
@@ -754,5 +893,149 @@ mod tests {
             .unwrap();
         let res = super::super::router(state).oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A second checkout for an account with a live subscription must not
+    /// mint another Checkout Session (the first subscription keeps billing
+    /// and the portal would no longer show it): the starter sends the human
+    /// to the Customer Portal instead.
+    #[tokio::test]
+    async fn second_checkout_for_active_pro_lands_on_portal() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_pro_subscription(&pool).await;
+        let token = crate::billing::sign_checkout_token(
+            b"test-sign-key",
+            "a1",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        let req = Request::get(format!("/billing/checkout?t={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let location = res
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            location,
+            "https://billing.stripe.com/p/session/test_portal_9"
+        );
+        let posts = fake.posts.lock().unwrap();
+        assert!(
+            posts
+                .iter()
+                .any(|path| path == "/v1/billing_portal/sessions"),
+            "{posts:?}"
+        );
+        assert!(
+            !posts.iter().any(|path| path == "/v1/checkout/sessions"),
+            "{posts:?}"
+        );
+    }
+    /// The portal starter mints a fresh portal session for the stored
+    /// customer and redirects to it.
+    #[tokio::test]
+    async fn portal_starter_redirects_to_a_fresh_session() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        let token = crate::billing::sign_portal_token(
+            b"test-sign-key",
+            "a1",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        let req = Request::get(format!("/billing/portal?t={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let location = res
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            location,
+            "https://billing.stripe.com/p/session/test_portal_9"
+        );
+        let body = fake.body.lock().unwrap().clone().unwrap();
+        assert!(body.contains("customer=cus_1"), "{body}");
+    }
+
+    /// Bad or expired portal tokens, a checkout token on the portal route,
+    /// and an account with no customer all refuse in plain text.
+    #[tokio::test]
+    async fn portal_starter_refuses_bad_tokens_and_missing_customers() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        sqlx::query(
+            "INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) \
+             VALUES ('b1', 'b@example.com', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for token in [
+            "nope".to_string(),
+            crate::billing::sign_portal_token(b"test-sign-key", "a1", now - 1),
+            crate::billing::sign_checkout_token(b"test-sign-key", "a1", now + 60),
+        ] {
+            let req = Request::get(format!("/billing/portal?t={token}"))
+                .body(Body::empty())
+                .unwrap();
+            let res = super::super::router(state.clone())
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{token}");
+        }
+        let token = crate::billing::sign_portal_token(b"test-sign-key", "b1", now + 60);
+        let req = Request::get(format!("/billing/portal?t={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(
+            fake.posts.lock().unwrap().is_empty(),
+            "no Stripe call on refusal"
+        );
+    }
+
+    /// The console Upgrade button for an account with a live subscription
+    /// is refused instead of minting a second Checkout Session: the Upgrade
+    /// button only shows for non-Pro accounts, and the UI must send these
+    /// humans to Manage billing.
+    #[tokio::test]
+    async fn console_checkout_refuses_a_live_subscription() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_pro_subscription(&pool).await;
+        let id = crate::auth::create_session(&pool, "a1").await.unwrap();
+        let req = Request::post("/api/console/billing/checkout")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", format!("{}={id}", crate::auth::SESSION_COOKIE))
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "invalid_argument");
+        assert!(
+            fake.posts.lock().unwrap().is_empty(),
+            "no Checkout Session minted"
+        );
     }
 }
