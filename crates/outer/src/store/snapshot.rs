@@ -228,6 +228,78 @@ pub struct StateSync {
     lineage_refusals: Arc<AtomicU64>,
 }
 
+/// What `adopt_lineage` decided: the sidecar now names the bucket sha,
+/// or there was nothing to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptOutcome {
+    /// Sidecar written from the bucket meta sha.
+    Adopted,
+    /// A sidecar already exists: steady host, leave it alone.
+    AlreadyAdopted,
+}
+
+/// Marker on an expected adoption refusal (no local DB, no bucket
+/// snapshot, unreadable meta, foreign instance): the caller reports it
+/// and moves on, instead of failing like a transport error. Boot warns
+/// and continues; the CLI exits non-zero.
+#[derive(Debug, Clone, Copy)]
+struct AdoptSkip;
+
+impl std::fmt::Display for AdoptSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "adoption skipped")
+    }
+}
+
+impl std::error::Error for AdoptSkip {}
+
+/// Write the lineage sidecar from the bucket meta `sha256`, but only
+/// when the local database exists, no sidecar is present, and the meta
+/// `instance` equals `expect_instance` — proof the bucket lineage was
+/// written by the host whose data volume this is (a container id, which
+/// changes across a release handoff, so the caller passes the *running*
+/// container's hostname explicitly). Anything else is an error naming
+/// the reason, except a present sidecar, which is exit-0 `AlreadyAdopted`.
+/// Fsyncs like every other sidecar write.
+pub async fn adopt_lineage(
+    store: &Store,
+    cfg: &SnapshotConfig,
+    expect_instance: &str,
+) -> anyhow::Result<AdoptOutcome> {
+    if !cfg.db_path.exists() {
+        return Err(anyhow::anyhow!(
+            "no local database at {}; restore owns this case, nothing to adopt",
+            cfg.db_path.display()
+        )
+        .context(AdoptSkip));
+    }
+    if read_sidecar(&cfg.sidecar_path()).await.is_some() {
+        return Ok(AdoptOutcome::AlreadyAdopted);
+    }
+    let Some(bytes) = store.get(&cfg.meta_key()).await? else {
+        return Err(
+            anyhow::anyhow!("no snapshot in the bucket; nothing to adopt").context(AdoptSkip),
+        );
+    };
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let sha = v.get("sha256").and_then(|s| s.as_str());
+    let instance = v.get("instance").and_then(|s| s.as_str());
+    let (Some(sha), Some(instance)) = (sha, instance) else {
+        return Err(anyhow::anyhow!(
+            "bucket meta has no usable snapshot identity (missing sha256/instance); not adopting"
+        )
+        .context(AdoptSkip));
+    };
+    if instance != expect_instance {
+        return Err(anyhow::anyhow!(
+            "bucket snapshot was written by instance {instance:?}, expected {expect_instance:?}; refusing to adopt"
+        )
+        .context(AdoptSkip));
+    }
+    write_sidecar(&cfg.sidecar_path(), sha).await?;
+    Ok(AdoptOutcome::Adopted)
+}
+
 impl StateSync {
     pub fn new(host_id: impl Into<String>) -> Self {
         Self {
@@ -276,13 +348,14 @@ impl StateSync {
         }
     }
 
-    /// One-shot upgrade adoption, at boot only, before `claim`: when the
-    /// local database predates sidecars (exists, no sidecar file) and the
-    /// bucket meta names this host as the snapshot's author, the bucket's
-    /// sha is this host's lineage — record it and log loudly. Only when
-    /// the sidecar is absent, so a steady host never re-adopts; a meta
-    /// naming another instance is the takeover shape and refuses as now.
-    /// Returns true when it adopted.
+    /// One-shot upgrade adoption, at boot only, before `claim`: a same-host
+    /// restart whose database predates sidecars adopts via [`adopt_lineage`]
+    /// (this host's own id as the expected author). A container handoff
+    /// gets a new id, so `release.sh` adopts with the running container's
+    /// hostname instead (see `state adopt-lineage`). Expected refusals
+    /// (absent snapshot, unreadable meta, foreign instance) warn with the
+    /// reason and continue; transport errors fail the boot. Returns true
+    /// when it adopted.
     pub async fn adopt_sidecar_at_boot(
         &self,
         store: &Store,
@@ -294,26 +367,27 @@ impl StateSync {
         if read_sidecar(&cfg.sidecar_path()).await.is_some() {
             return Ok(false);
         }
-        let Some(bytes) = store.get(&cfg.meta_key()).await? else {
-            return Ok(false);
-        };
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        let sha = v.get("sha256").and_then(|s| s.as_str());
-        let instance = v.get("instance").and_then(|s| s.as_str());
-        let (Some(sha), Some(instance)) = (sha, instance) else {
-            return Ok(false);
-        };
-        if instance != self.instance.as_str() {
-            return Ok(false);
+        match adopt_lineage(store, cfg, self.instance.as_str()).await {
+            Ok(AdoptOutcome::Adopted) => {
+                tracing::warn!(
+                    bucket = store.bucket_label(),
+                    key = cfg.state_key(),
+                    "adopted snapshot sidecar from this host's bucket meta (upgrade without sidecar); uploads resume"
+                );
+                Ok(true)
+            }
+            Ok(AdoptOutcome::AlreadyAdopted) => Ok(false),
+            Err(e) if e.downcast_ref::<AdoptSkip>().is_some() => {
+                tracing::warn!(
+                    bucket = store.bucket_label(),
+                    key = cfg.state_key(),
+                    reason = format!("{e:#}"),
+                    "not adopting snapshot sidecar at boot"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
-        write_sidecar(&cfg.sidecar_path(), sha).await?;
-        tracing::warn!(
-            bucket = store.bucket_label(),
-            key = cfg.state_key(),
-            sha,
-            "adopted snapshot sidecar from this host's bucket meta (upgrade without sidecar); uploads resume"
-        );
-        Ok(true)
     }
 
     /// Claim the bucket state for this host (boot). Continues the stored
@@ -1573,6 +1647,72 @@ mod tests {
         );
         assert_eq!(live_bytes(&store, &seed_cfg).await, before);
         pool.close().await;
+    }
+
+    /// `adopt_lineage` writes the sidecar from the bucket meta when the
+    /// instance matches, refuses loudly on a mismatch or a missing database,
+    /// and no-ops when the sidecar already exists.
+    #[tokio::test]
+    async fn adopt_lineage_decisions() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        tokio::fs::remove_file(sidecar_path(&cfg))
+            .await
+            .expect("drop sidecar");
+
+        // Happy path: instance matches, sidecar written from the meta sha.
+        assert_eq!(
+            super::adopt_lineage(&store, &cfg, "host-1")
+                .await
+                .expect("adopt"),
+            super::AdoptOutcome::Adopted
+        );
+        assert_sidecar_matches_meta(&store, &cfg).await;
+
+        // Sidecar present: exit-0 no-op, never rewritten.
+        assert_eq!(
+            super::adopt_lineage(&store, &cfg, "host-1")
+                .await
+                .expect("no-op"),
+            super::AdoptOutcome::AlreadyAdopted
+        );
+
+        // Foreign instance: non-zero refusal naming both sides.
+        tokio::fs::remove_file(sidecar_path(&cfg))
+            .await
+            .expect("drop sidecar");
+        let err = super::adopt_lineage(&store, &cfg, "host-2")
+            .await
+            .expect_err("foreign instance must refuse");
+        assert!(format!("{err:#}").contains("host-2"), "unexpected: {err:#}");
+        assert!(!sidecar_path(&cfg).exists());
+
+        // No local database: non-zero refusal, restore owns this case.
+        let missing = test_cfg(std::path::Path::new("/nonexistent-dir-xyz"), "host-1");
+        let err = super::adopt_lineage(&store, &missing, "host-1")
+            .await
+            .expect_err("missing DB must refuse");
+        assert!(
+            format!("{err:#}").contains("no local database"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    /// Boot adoption with an empty bucket skips quietly: nothing to adopt,
+    /// and the first upload is allowed anyway.
+    #[tokio::test]
+    async fn boot_adoption_skips_empty_bucket() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = super::Store::memory();
+        let cfg = test_cfg(dir.path(), "host-1");
+        let pool = test_pool(&cfg.db_path).await;
+        pool.close().await;
+        let sync = super::StateSync::new("host-1");
+        assert!(!sync
+            .adopt_sidecar_at_boot(&store, &cfg)
+            .await
+            .expect("skip"));
+        assert!(!sidecar_path(&cfg).exists());
     }
 
     /// Takeover path: restore, modify, upload lands on the restored lineage,

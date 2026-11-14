@@ -13,8 +13,11 @@ Each upload records the snapshot sha256 in the bucket meta object and in a local
 
 - Wrong bucket/prefix in `OUTER_R2_*`: fix the config and restart. If the bad boot already created a fresh local database, stop outer, delete that file (and its sidecar), and boot again — the restore downloads the real snapshot.
 - A second host claimed the same bucket: the newest claimant wins and the old one stops uploading. Give each install its own bucket.
-- After upgrading to a version with lineage: the first boot adopts the sidecar automatically when the bucket meta names this host (`adopted snapshot sidecar ... uploads resume` in the log). A meta naming another host never adopts — that is the takeover shape, and it refuses as a wrong bucket.
 - There is no `--force`: every recovery goes through the restore below.
+
+- After upgrading to a version with lineage: the first boot adopts the sidecar automatically when the bucket meta names this host (`adopted snapshot sidecar ... uploads resume` in the log). A meta naming another host never adopts — that is the takeover shape, and it refuses as a wrong bucket.
+- Across a release handoff the container id changes, so boot-time adoption can never match: `deploy/release.sh` instead runs the new image's `outer state adopt-lineage --expect-instance <running-container-hostname>` before the handoff, while the data volume is still the old container's. Skipped when the sidecar already exists; any failure aborts the release. Manual equivalent for other setups: `outer state adopt-lineage --expect-instance <instance-named-in-the-bucket-meta>`.
+- Caveat: adoption keys off the author `instance` only, not the database bytes. A hand-placed different database under a matching container still adopts — then uploads it. Never drop files in place; use the restore below.
 
 ## Runbook: is this host backing up?
 

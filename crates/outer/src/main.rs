@@ -35,6 +35,7 @@ const USAGE: &str = "usage:
   outer app list
   outer oauth-client add --name NAME --redirect-uri URI [--redirect-uri URI…] [--auth client_secret_basic|client_secret_post]
   outer seed demo --owner EMAIL [--url URL]
+  outer state adopt-lineage --expect-instance ID
   outer state release-backup --sha SHA
   outer hash-password
   outer docs tools
@@ -64,6 +65,10 @@ async fn main() -> ExitCode {
         },
         ["templates", "sync", rest @ ..] => {
             run(|config| templates_sync(config, rest.to_vec())).await
+        }
+        ["state", "adopt-lineage", rest @ ..] => {
+            let rest = rest.to_vec();
+            run(move |config| state_adopt_lineage(config, rest)).await
         }
         ["state", "release-backup", rest @ ..] => {
             let rest = rest.to_vec();
@@ -409,6 +414,34 @@ async fn state_release_backup(config: Config, rest: Vec<&str>) -> anyhow::Result
         Some(key) => println!("{{\"release_backup\": {key:?}}}"),
         None => {
             println!("{{\"release_backup\": null, \"note\": \"no snapshot in bucket; skipping\"}}");
+        }
+    }
+    Ok(())
+}
+
+/// Adopt the bucket snapshot lineage into the local sidecar (`<db>.snapshot-sha`),
+/// proving the bucket lineage against an explicitly expected author instance.
+/// `deploy/release.sh` runs this with the running container's hostname before
+/// the handoff (a new container gets a new id, so boot-time adoption can never
+/// match after a handoff). Exit 0 with the outcome as JSON when the sidecar is
+/// written or already present; any other refusal exits non-zero naming it.
+async fn state_adopt_lineage(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
+    let flags = flags(&rest, &["--expect-instance"])?;
+    let Some(expect) = flag(&flags, "--expect-instance") else {
+        anyhow::bail!("state adopt-lineage needs --expect-instance ID");
+    };
+    let store = build_store(&config)?;
+    let snapshot_cfg = store::snapshot::SnapshotConfig {
+        db_path: config.db_path(),
+        key_prefix: "outer/state".to_string(),
+        host_id: config.host_id.clone(),
+    };
+    match store::snapshot::adopt_lineage(&store, &snapshot_cfg, expect).await? {
+        store::snapshot::AdoptOutcome::Adopted => println!("{{\"adopted\": true}}"),
+        store::snapshot::AdoptOutcome::AlreadyAdopted => {
+            println!(
+                "{{\"adopted\": false, \"note\": \"sidecar already present; nothing to do\"}}"
+            );
         }
     }
     Ok(())
