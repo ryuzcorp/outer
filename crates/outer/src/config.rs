@@ -956,6 +956,28 @@ impl Config {
         self.tls_cert.is_some() && self.tls_key.is_some() && self.origin_pull_ca.is_some()
     }
 
+    /// Boot-time file checks shared by `serve` and `check-config`: every file
+    /// the config points at that `serve` must read to listen (the TLS triple)
+    /// is read and parsed here first. Pure reads — no DB, no network, no
+    /// sockets — and every failure names the variable, never its value.
+    /// `validate` (above) already covers presence and consistency plus the
+    /// `OUTER_REVIEW_LOGINS_FILE` read; this covers readability, which used
+    /// to fail only at boot, after the old container was already stopping.
+    pub fn boot_file_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.tls_enabled() {
+            let files = crate::http::tls::TlsFiles {
+                cert: self.tls_cert.clone().expect("tls triple is set"),
+                key: self.tls_key.clone().expect("tls triple is set"),
+                ca: self.origin_pull_ca.clone().expect("tls triple is set"),
+            };
+            if let Err(err) = crate::http::tls::load_server_config(&files) {
+                problems.push(format!("{err:#}"));
+            }
+        }
+        problems
+    }
+
     /// True when the platform oxfmt binary exists and is executable.
     /// Formatting is skipped (commits still work) when this is false.
     pub fn oxfmt_available(&self) -> bool {
@@ -1844,5 +1866,146 @@ mod tests {
                 );
             }
         }
+    }
+    /// Minimal production vars: everything `validate` requires off localhost.
+    /// Every secret carries `NEVER-LEAK` so tests can assert errors name the
+    /// variable without echoing its value.
+    fn prod_vars(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut base = vec![
+            ("OUTER_DOMAIN", "prod.example"),
+            ("OUTER_STORE", "r2"),
+            (
+                "OUTER_R2_ENDPOINT",
+                "https://acct.eu.r2.cloudflarestorage.com",
+            ),
+            ("OUTER_R2_BUCKET", "outer"),
+            ("R2_ACCESS_KEY_ID", "r2-key-NEVER-LEAK-1"),
+            ("R2_SECRET_ACCESS_KEY", "r2-secret-NEVER-LEAK-2"),
+            ("CLOUDFLARE_ACCOUNT_ID", "cf-acct"),
+            ("CLOUDFLARE_API_TOKEN", "cf-token-NEVER-LEAK-3"),
+            ("STRIPE_SECRET_KEY", "sk-live-NEVER-LEAK-4"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec-NEVER-LEAK-5"),
+            ("STRIPE_PRICE_PRO", "price-NEVER-LEAK-6"),
+            ("OUTER_TERMS_VERSION", "2026-11-14"),
+            ("OUTER_SECRET", "outer-secret-NEVER-LEAK-7"),
+        ];
+        base.extend_from_slice(extra);
+        vars(&base)
+    }
+
+    fn assert_no_secrets(problems: &[String]) {
+        let shown = problems.join("\n");
+        assert!(
+            !shown.contains("NEVER-LEAK"),
+            "a secret value leaked: {shown}"
+        );
+        assert!(!shown.contains("$argon2"), "a hash leaked: {shown}");
+    }
+
+    #[test]
+    fn boot_files_accept_localhost_without_tls() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert!(cfg.boot_file_problems().is_empty());
+    }
+
+    #[test]
+    fn boot_files_refuse_missing_tls_files_without_echoing_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        let cfg = Config::from_vars(&prod_vars(&[
+            ("OUTER_TLS_CERT", missing("origin.pem").as_str()),
+            ("OUTER_TLS_KEY", missing("origin.key").as_str()),
+            (
+                "OUTER_ORIGIN_PULL_CA",
+                missing("origin-pull-ca.pem").as_str(),
+            ),
+        ]))
+        .unwrap();
+        let problems = cfg.boot_file_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("OUTER_TLS_CERT"), "{problems:?}");
+        assert_no_secrets(&problems);
+    }
+
+    #[test]
+    fn boot_files_refuse_garbage_tls_pem_without_echoing_values() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["origin.pem", "origin.key", "origin-pull-ca.pem"] {
+            std::fs::write(dir.path().join(name), "not pem at all\n").unwrap();
+        }
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        let cfg = Config::from_vars(&prod_vars(&[
+            ("OUTER_TLS_CERT", path("origin.pem").as_str()),
+            ("OUTER_TLS_KEY", path("origin.key").as_str()),
+            ("OUTER_ORIGIN_PULL_CA", path("origin-pull-ca.pem").as_str()),
+        ]))
+        .unwrap();
+        let problems = cfg.boot_file_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("OUTER_TLS_CERT"), "{problems:?}");
+        assert_no_secrets(&problems);
+    }
+
+    #[test]
+    fn boot_files_accept_a_valid_tls_triple() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["test CA".to_string()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let params = rcgen::CertificateParams::new(vec!["outer.test".to_string()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        let blobs = [
+            ("OUTER_TLS_CERT", "origin.pem", cert.pem().into_bytes()),
+            (
+                "OUTER_TLS_KEY",
+                "origin.key",
+                key.serialize_pem().into_bytes(),
+            ),
+            (
+                "OUTER_ORIGIN_PULL_CA",
+                "origin-pull-ca.pem",
+                ca_cert.pem().into_bytes(),
+            ),
+        ];
+        let mut map = prod_vars(&[]);
+        for (var, name, bytes) in &blobs {
+            let file = dir.path().join(name);
+            std::fs::write(&file, bytes).unwrap();
+            map.insert(var.to_string(), file.to_string_lossy().into_owned());
+        }
+        let cfg = Config::from_vars(&map).unwrap();
+        assert!(cfg.boot_file_problems().is_empty(), "{cfg:?}");
+    }
+
+    #[test]
+    fn config_errors_never_echo_secret_values() {
+        // Missing Stripe off localhost plus a malformed review-logins entry:
+        // every problem must name its variable while echoing no value.
+        let dir = tempfile::tempdir().unwrap();
+        let logins = dir.path().join("review-logins");
+        std::fs::write(&logins, "review@example.com:not-a-phc-NEVER-LEAK-8\n").unwrap();
+        let mut map = prod_vars(&[
+            ("OUTER_TLS_CERT", "/tls/origin.pem"),
+            ("OUTER_TLS_KEY", "/tls/origin.key"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+            (
+                "OUTER_REVIEW_LOGINS_FILE",
+                logins.to_string_lossy().as_ref(),
+            ),
+        ]);
+        map.remove("STRIPE_SECRET_KEY");
+        let err = Config::from_vars(&map).unwrap_err();
+        assert!(
+            err.iter().any(|p| p.contains("STRIPE_SECRET_KEY")),
+            "{err:?}"
+        );
+        assert!(
+            err.iter().any(|p| p.contains("OUTER_REVIEW_LOGINS_FILE")),
+            "{err:?}"
+        );
+        assert_no_secrets(&err);
     }
 }

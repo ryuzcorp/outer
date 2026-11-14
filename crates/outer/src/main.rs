@@ -57,9 +57,18 @@ async fn main() -> ExitCode {
             report(serve(config).await)
         }
         ["check-config"] => match load_config() {
-            Some(_) => {
-                println!("configuration ok");
-                ExitCode::SUCCESS
+            Some(config) => {
+                let problems = config.boot_file_problems();
+                if problems.is_empty() {
+                    println!("configuration ok");
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!("outer: invalid configuration:");
+                    for problem in problems {
+                        eprintln!("  - {problem}");
+                    }
+                    ExitCode::from(2)
+                }
             }
             None => ExitCode::from(2),
         },
@@ -725,6 +734,17 @@ async fn app_list(config: Config) -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
+    // The same file validation `check-config` runs (one shared function):
+    // refuse an unreadable TLS triple before touching the data dir, the
+    // bucket, or any socket. The triple is loaded again below, after the
+    // bind, to build the actual server config.
+    let file_problems = config.boot_file_problems();
+    if !file_problems.is_empty() {
+        for problem in &file_problems {
+            eprintln!("outer: invalid configuration:\n  - {problem}");
+        }
+        anyhow::bail!("invalid configuration ({} problem(s))", file_problems.len());
+    }
     std::fs::create_dir_all(&config.data_dir)?;
     if !config.oxfmt_available() {
         // An explicitly configured binary that isn't executable is a prod
