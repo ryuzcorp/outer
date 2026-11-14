@@ -5,13 +5,24 @@
 #
 #   deploy/release.sh <ssh-target>
 #
-# Refuses a dirty tree. Prefers podman, falls back to docker. Streams the
-# image with save|load (no registry), uploads compose.yaml + the firewall
-# files + handoff.sh to /srv/outer, then hands the new image out: the
-# newcomer shares 443 via SO_REUSEPORT while the old container drains
-# (refuses new deploys, exits once in-flight ones finish), and the compose
-# service is recreated last onto the same image. At no point is 443 without
-# a listener, and no in-flight deploy dies with its process.
+#   Engine: OUTER_ENGINE=docker|podman selects the local container engine for
+#   build and save. OUTER_ENGINE=auto (the default when unset or empty) keeps
+#   today's behaviour: prefer podman, fall back to docker. Any other value
+#   refuses at once. The VPS side always uses docker (provision.sh installs
+#   it; compose and `docker load` run there).
+#
+#   Refuses a dirty tree. Builds the image, streams it with save|load (no
+#   registry), then runs the new image's own `outer check-config` on the host
+#   — as a `docker run --rm` one-off with exactly the environment and mounts
+#   the compose `outer` service gets (`--env-file /srv/outer/outer.env`, the
+#   read-only /tls and /data mounts, same OUTER_HOST_ID handling) — BEFORE anything
+#   changes prod. A non-zero exit aborts the release here with prod untouched:
+#   no uploads, no backup, no handoff. Only then uploads compose.yaml + the
+#   firewall files + handoff.sh to /srv/outer, then hands the new image out:
+#   the newcomer shares 443 via SO_REUSEPORT while the old container drains
+#   (refuses new deploys, exits once in-flight ones finish), and the compose
+#   service is recreated last onto the same image. At no point is 443 without
+#   a listener, and no in-flight deploy dies with its process.
 #
 # Health check from the box: outer serves TLS with required client
 # certificates (mTLS), so no unauthenticated probe can pass the handshake —
@@ -70,17 +81,69 @@ while read -r version checksum; do
         exit 1
     }
 done <<<"$APPLIED"
+# Local container engine for build and save. OUTER_ENGINE=auto (the default
+# when unset or empty) keeps today's behaviour: prefer podman, fall back to
+# docker. An explicit engine must exist on PATH; anything else refuses.
+ENGINE="${OUTER_ENGINE:-auto}"
+case "$ENGINE" in
+auto)
+    if command -v podman >/dev/null 2>&1; then
+        ENGINE=podman
+    elif command -v docker >/dev/null 2>&1; then
+        ENGINE=docker
+    else
+        echo "release.sh: need podman or docker on PATH (or set OUTER_ENGINE)" >&2
+        exit 1
+    fi
+    ;;
+docker | podman) ;;
+*)
+    echo "release.sh: OUTER_ENGINE=$ENGINE is not one of: auto, docker, podman" >&2
+    exit 1
+    ;;
+esac
+if ! command -v "$ENGINE" >/dev/null 2>&1; then
+    echo "release.sh: OUTER_ENGINE=$ENGINE is not on PATH" >&2
+    exit 1
+fi
 IMAGE="outer:$SHA"
-if command -v podman >/dev/null 2>&1; then
+if [[ "$ENGINE" == "podman" ]]; then
     # podman names unqualified tags localhost/outer:<sha>, and docker load
-    # keeps that name; the remote script retags it to the plain name.
+    # keeps that name. Require the retag to the plain name here, before the
+    # preflight and the rollout consume it: a failed retag aborts (set -e),
+    # never letting a stale outer:$SHA pass the preflight. Retagging changes
+    # nothing that is running.
+    # SHA is hex-validated above; expanding it here on the workstation is
+    # intended, same as the rollout heredoc below.
     podman build --format docker -t "$IMAGE" -f docker/Dockerfile .
     podman save "$IMAGE" | ssh "$TARGET" docker load
-elif command -v docker >/dev/null 2>&1; then
+    # shellcheck disable=SC2029
+    ssh "$TARGET" docker tag "localhost/outer:$SHA" "outer:$SHA"
+    # shellcheck disable=SC2029
+    ssh "$TARGET" docker rmi "localhost/outer:$SHA" >/dev/null
+else
     docker build -t "$IMAGE" -f docker/Dockerfile .
     docker save "$IMAGE" | ssh "$TARGET" docker load
-else
-    echo "release.sh: need podman or docker on PATH" >&2
+fi
+
+# Preflight: the new image proves it accepts the live config BEFORE anything
+# changes prod (no uploads, no backup, no handoff below). Same environment
+# and mounts the compose `outer` service gets: --env-file carries
+# /srv/outer/outer.env (including OUTER_HOST_ID when the operator set it;
+# otherwise outer defaults to the container hostname on both paths), and
+# every compose volume read-only: /tls (OUTER_REVIEW_LOGINS_FILE and the TLS
+# triple resolve under it) and /data (the live DB dir; check-config never
+# opens it, and read-only keeps even a buggy validation from touching prod).
+# check-config has no side effects (no DB, no network, no sockets) and names
+# variables, never values. --pull=never: a missing local image must fail
+# here, never pull a same-named registry image and run it with the
+# production env. A non-zero exit aborts the release here with prod
+# untouched: past aborts this must catch are a malformed OUTER_REVIEW_LOGINS
+# PHC, a review-logins path missing its /tls mount, and STRIPE_* missing off
+# localhost.
+if ! ssh "$TARGET" docker run --rm --pull=never --env-file /srv/outer/outer.env \
+    -v /srv/outer/tls:/tls:ro -v /srv/outer/data:/data:ro "$IMAGE" check-config; then
+    echo "release.sh: preflight check-config on $IMAGE failed; release aborted, prod untouched (fix the config or the image, then release again)" >&2
     exit 1
 fi
 
@@ -95,11 +158,6 @@ ssh "$TARGET" bash -s -- "$SHA" <<'EOF'
 set -euo pipefail
 SHA="$1"
 cd /srv/outer
-
-if docker image inspect "localhost/outer:$SHA" >/dev/null 2>&1; then
-    docker tag "localhost/outer:$SHA" "outer:$SHA"
-    docker rmi "localhost/outer:$SHA" >/dev/null
-fi
 
 [[ -f /srv/outer/outer.env ]] || {
     echo "remote: /srv/outer/outer.env missing (copy deploy/outer.env.example and fill it)" >&2
@@ -138,9 +196,9 @@ trap 'handoff_abort' EXIT
 # (exit 0) when the bucket holds no snapshot yet. SHA is hex (validated
 # above), so interpolating it into the docker args is safe. No data mount:
 # the subcommand only reads config env and the bucket, never the local DB.
-# The tls mount (read-only, like the compose service) is required: config
 # validation reads files under /tls (e.g. OUTER_REVIEW_LOGINS_FILE).
-docker run --rm --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
+# --pull=never: the image is local-only (same as the preflight above).
+docker run --rm --pull=never --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
     "outer:$SHA" state release-backup --sha "$SHA"
 handoff_to "outer:$SHA"
 trap - EXIT

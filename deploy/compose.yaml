@@ -18,6 +18,10 @@ services:
   outer:
     image: ${OUTER_IMAGE:?set OUTER_IMAGE in /srv/outer/release.env (deploy/release.sh writes it)}
     restart: unless-stopped
+    # The image is local-only (deploy/release.sh streams it in with
+    # save|load): never pull, so a missing image fails closed instead of
+    # running a same-named registry image with the production env.
+    pull_policy: never
     network_mode: host
     # Above outer's stop budget: on SIGTERM outer refuses new deploys and
     # waits out the in-flight ones (a release handoff drains this way), and
