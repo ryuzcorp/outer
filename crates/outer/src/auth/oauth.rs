@@ -610,7 +610,11 @@ async fn authorize_post(
                     )
                 }
                 Err(err) => html(
-                    StatusCode::BAD_REQUEST,
+                    if err.code == "rate_limited" {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
                     pages::code_page(
                         &super::normalize_email(&email),
                         &pending.id,

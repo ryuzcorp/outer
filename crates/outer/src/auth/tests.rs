@@ -2229,8 +2229,9 @@ async fn otp_attempt_cap_holds_under_a_parallel_burst() {
     assert_eq!(err.code, "invalid_code", "the burst burned the code");
 }
 
-/// The per-email send limit admits exactly five of a parallel burst, so a
-/// victim's inbox cannot be flooded past it (audit O-1).
+/// The per-email send limit admits exactly five of a parallel burst, and
+/// every refused send reads as `rate_limited` (never a database error), so
+/// a victim's inbox cannot be flooded past it (audit O-1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn otp_send_limit_holds_under_a_parallel_burst() {
     let pool = test_pool().await;
@@ -2245,41 +2246,45 @@ async fn otp_send_limit_holds_under_a_parallel_burst() {
     });
     let mut sent = 0;
     for send in sends.collect::<Vec<_>>() {
-        if send.await.unwrap().is_ok() {
-            sent += 1;
+        match send.await.unwrap() {
+            Ok(_) => sent += 1,
+            Err(err) => assert_eq!(err.code, "rate_limited", "{}", err.message),
         }
     }
     assert_eq!(sent, 5);
 }
 
 /// One client IP gets a fixed number of code checks per hour across every
-/// address, so spraying guesses over many accounts stops there.
-#[tokio::test]
+/// address, also when the checks arrive at once, so spraying guesses over
+/// many accounts stops there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn otp_verify_is_limited_per_ip() {
     let pool = test_pool().await;
     let (config, _codes) = test_config();
-    for index in 0..30 {
-        let err = auth::verify_code_core(
-            &pool,
-            &config,
-            &format!("spray{index}@example.com"),
-            "000000",
-            Some("203.0.113.5"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.code, "invalid_code");
+    let config = Arc::new(config);
+    let checks = (0..60).map(|index| {
+        let (pool, config) = (pool.clone(), config.clone());
+        tokio::spawn(async move {
+            auth::verify_code_core(
+                &pool,
+                &config,
+                &format!("spray{index}@example.com"),
+                "000000",
+                Some("203.0.113.5"),
+            )
+            .await
+        })
+    });
+    let (mut compared, mut limited) = (0, 0);
+    for check in checks.collect::<Vec<_>>() {
+        let err = check.await.unwrap().unwrap_err();
+        match err.code {
+            "invalid_code" => compared += 1,
+            "rate_limited" => limited += 1,
+            other => panic!("unexpected {other}: {}", err.message),
+        }
     }
-    let err = auth::verify_code_core(
-        &pool,
-        &config,
-        "spray-last@example.com",
-        "000000",
-        Some("203.0.113.5"),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.code, "rate_limited");
+    assert_eq!((compared, limited), (30, 30));
 }
 
 #[tokio::test]

@@ -459,7 +459,9 @@ pub async fn verify_code_core(
     // guesses serialize on SQLite's write lock, so a code is compared at
     // most `OTP_MAX_ATTEMPTS` times however many requests race. Reading the
     // count and writing it back separately let every guess of a parallel
-    // burst compare (audit O-1, 2026-11-14: 2000 of 2000 compared).
+    // burst compare (audit O-1, 2026-11-14: 2000 of 2000 compared). A guess
+    // that lands after a re-send counts against the new code; that costs the
+    // guesser, never more than five comparisons per code.
     let claimed: Option<(String, i64, Option<String>)> = sqlx::query_as(
         "UPDATE verification SET attempts = attempts + 1, updatedAt = ?2 \
          WHERE identifier = ?1 AND attempts < ?3 AND expiresAt >= ?2 \
@@ -473,24 +475,25 @@ pub async fn verify_code_core(
     .map_err(db)?;
     let Some((code_hash, attempts, carried_invite)) = claimed else {
         // Nothing claimable: no code, an expired one, or one out of attempts.
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT expiresAt FROM verification WHERE identifier = ?")
-                .bind(&identifier)
-                .fetch_optional(pool)
-                .await
-                .map_err(db)?;
-        let Some((expires_at,)) = row else {
+        // The delete re-checks "dead" in the same statement, so a code re-sent
+        // since the claim (fresh expiry, attempts reset) is never removed.
+        let dead: Option<(i64,)> = sqlx::query_as(
+            "DELETE FROM verification \
+             WHERE identifier = ?1 AND (expiresAt < ?2 OR attempts >= ?3) \
+             RETURNING expiresAt",
+        )
+        .bind(&identifier)
+        .bind(now)
+        .bind(OTP_MAX_ATTEMPTS)
+        .fetch_optional(pool)
+        .await
+        .map_err(db)?;
+        let Some((expires_at,)) = dead else {
             return Err(AuthError::new(
                 "invalid_code",
                 "no pending code for this email".to_string(),
             ));
         };
-        sqlx::query("DELETE FROM verification WHERE identifier = ? AND expiresAt = ?")
-            .bind(&identifier)
-            .bind(expires_at)
-            .execute(pool)
-            .await
-            .map_err(db)?;
         return Err(if now > expires_at {
             AuthError::new(
                 "code_expired",
