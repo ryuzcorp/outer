@@ -473,10 +473,7 @@ fn line_starts(src: &str) -> Vec<usize> {
 /// specifier, URL, path or CSS class list.
 fn is_copy_like(s: &str) -> bool {
     let t = s.trim();
-    if !has_word2(t) || looks_like_url(t) || looks_like_path(t) || looks_like_class_list(t) {
-        return false;
-    }
-    true
+    has_word2(t) && !looks_like_url(t) && !looks_like_path(t) && !looks_like_class_list(t)
 }
 
 fn has_word2(s: &str) -> bool {
