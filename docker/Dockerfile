@@ -16,8 +16,8 @@
 # of the pin: a bump changes these values (the tag, then the digest from
 # the fork's publish summary). Upstream celld ships only security fixes
 # from 0.6.x on, so the fork carries the patches.
-ARG CELLD_VERSION=0.6.3-ryuzcorp.11
-ARG CELLD_DIGEST=sha256:8ba3aa091438f13d513e16977d42fcdc1aee40f74c0d3671cc28eb3d95162eb8
+ARG CELLD_VERSION=0.6.3-ryuzcorp.12
+ARG CELLD_DIGEST=sha256:01c9da9e41e4db13c31b31a7a5815e07d03deb6f3557ce3d6f536ea6df4efc50
 ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
 ARG ESBUILD_VERSION=0.28.2
 # Pinned formatter for agent commits. Keep in step with the template's
