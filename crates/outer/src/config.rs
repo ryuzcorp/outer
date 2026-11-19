@@ -427,33 +427,8 @@ impl Config {
     pub fn from_vars(vars: &BTreeMap<String, String>) -> Result<Config, Vec<String>> {
         let get = |name: &str| vars.get(name).map(|v| v.trim()).filter(|v| !v.is_empty());
         let mut problems = Vec::new();
-        // Cello 0.1.0 renamed every `CELLD_*` variable to `CELLO_*` (and
-        // `OUTER_CELLD_BIN` to `OUTER_CELLO_BIN`), with no aliases: cello
-        // refuses to start with any `CELLD_*` set, and Outer no longer
-        // emits any. A carried-over setting is dead config at best, so fail
-        // here, in both `serve` and `check-config` (the release preflight
-        // runs the latter against prod's env file): the release aborts
-        // before prod is touched, naming the exact rename.
-        {
-            let mut renamed: Vec<(&String, String)> = vars
-                .keys()
-                .filter_map(|name| {
-                    if let Some(suffix) = name.strip_prefix("CELLD_") {
-                        Some((name, format!("CELLO_{suffix}")))
-                    } else if name == "OUTER_CELLD_BIN" {
-                        Some((name, "OUTER_CELLO_BIN".to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            renamed.sort();
-            for (old, new) in renamed {
-                problems.push(format!(
-                    "{old} was renamed to {new}: set {new} instead of {old} (stale pre-Cello names fail closed)"
-                ));
-            }
-        }
+        // No rename shims: production restarts from a wiped database and a
+        // fresh `outer.env`, so there are no carried-over names to catch.
 
         let domain = get("OUTER_DOMAIN")
             .unwrap_or(DEFAULT_DOMAIN)
@@ -1647,37 +1622,21 @@ mod tests {
     }
 
     #[test]
-    fn stale_celld_env_refuses_with_the_cello_spelling() {
-        let err = Config::from_vars(&vars(&[
+    fn stale_celld_names_are_ignored_after_the_wipe() {
+        // No rename shims: a carried-over `CELLD_*` or `OUTER_CELLD_BIN`
+        // is dead config, not a refusal. (The runtime still refuses to
+        // start a fleet with `CELLD_*` set; that reservation lives in
+        // `fleet::sandbox`, not here.)
+        // Compare against the same config without the stale names: an
+        // installed /usr/local/bin/cello resolves either way.
+        let base = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        let cfg = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
             ("CELLD_OPERATOR_TOKEN", "stale"),
-            ("CELLD_DURABILITY", "bucket"),
-        ]))
-        .unwrap_err();
-        assert!(
-            err.iter()
-                .any(|p| p.contains("CELLD_OPERATOR_TOKEN was renamed to CELLO_OPERATOR_TOKEN")),
-            "missing operator-token rename: {err:?}"
-        );
-        assert!(
-            err.iter()
-                .any(|p| p.contains("CELLD_DURABILITY was renamed to CELLO_DURABILITY")),
-            "missing durability rename: {err:?}"
-        );
-    }
-
-    #[test]
-    fn stale_outer_celld_bin_refuses_with_the_cello_spelling() {
-        let err = Config::from_vars(&vars(&[
-            ("OUTER_STORE", "memory"),
             ("OUTER_CELLD_BIN", "celld"),
         ]))
-        .unwrap_err();
-        assert!(
-            err.iter()
-                .any(|p| p.contains("OUTER_CELLD_BIN was renamed to OUTER_CELLO_BIN")),
-            "missing bin rename: {err:?}"
-        );
+        .unwrap();
+        assert_eq!(cfg.runtime.cello_bin, base.runtime.cello_bin);
     }
 
     #[test]

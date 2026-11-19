@@ -1640,10 +1640,10 @@ impl Deployer {
         Ok((DeployRoot { root, config }, crons, out))
     }
 
-    /// Whether this `cello` writes Worker maps: the Cello fork's `deploy --sourcemap`
-    /// (0.6.3-ryuzcorp.8+). Best-effort `deploy --help` probe, so machines on
-    /// upstream celld keep deploying without maps instead of failing on an
-    /// unknown flag. No credentials, no side effects — one help print.
+    /// Whether this `cello` writes Worker maps: `deploy --sourcemap`.
+    /// Best-effort `deploy --help` probe, so a runtime without the flag
+    /// keeps deploying without maps instead of failing on an unknown flag.
+    /// No credentials, no side effects — one help print.
     async fn cello_sourcemap_support(&self) -> bool {
         let out = tokio::process::Command::new(&self.settings.cello_bin)
             .arg("deploy")
@@ -1664,13 +1664,13 @@ impl Deployer {
     /// The `cello deploy <root> ... --json` upload; returns
     /// (output, version, map read). Bucket credentials come from the
     /// per-prefix cache when fresh (minted on a miss), so the step env never
-    /// carries the parent keys. The fork confines project reads to the
-    /// config's directory (a `dist/` deploy root can no longer pull a
-    /// root-level Dockerfile or hoisted packages), so the upload names the
-    /// checkout with `--read-root` and deploys keep building exactly what
-    /// upstream celld accepted. With the Cello fork, `--sourcemap` collects
-    /// the Worker map into the work dir (outside the deploy root, so it can
-    /// never enter the bundle); the caller stores it per deploy sha.
+    /// carries the parent keys. Cello confines project reads to the config's
+    /// directory (a `dist/` deploy root can no longer pull a root-level
+    /// Dockerfile or hoisted packages), so the upload names the checkout
+    /// with `--read-root` and deploys keep building exactly the same tree
+    /// as before. Cello's `--sourcemap` collects the Worker map into the
+    /// work dir (outside the deploy root, so it can never enter the
+    /// bundle); the caller stores it per deploy sha.
     async fn cello_deploy(
         &self,
         app: &App,
@@ -1697,10 +1697,10 @@ impl Deployer {
         if let Some(esbuild) = &self.settings.esbuild_bin {
             env.push(("CELLO_ESBUILD".to_string(), esbuild.clone()));
         }
-        // The fork admits build inputs from beyond the config's directory
+        // Cello admits build inputs from beyond the config's directory
         // only through `--read-root`: name the checkout, so a `dist/`
         // deploy root still builds against hoisted packages and a
-        // root-level Dockerfile exactly as upstream celld did.
+        // root-level Dockerfile exactly as before.
         let mut args = vec![
             "deploy".to_string(),
             deploy_root.root.to_string_lossy().into_owned(),
@@ -2111,7 +2111,7 @@ impl Deployer {
     /// credentials (the same grant shape `cello deploy` uses: cello reads
     /// the fleet's shared secret from the bucket, so it needs the prefix
     /// grant, never the parent keys).
-    /// No `--` before the positionals on purpose: celld 0.6.2's leaf parsers
+    /// No `--` before the positionals on purpose: Cello's leaf parsers
     /// honor neither `--help` nor `--` (`migrations list -- foo` still
     /// reports "needs a database name"), so a `--` would break the call
     /// instead of protecting it. Option injection is closed one layer up:
@@ -4696,9 +4696,9 @@ exit 0
     }
 
     /// The `cello deploy` upload names the checkout with `--read-root`:
-    /// the fork confines project reads to the config's directory, so a
+    /// Cello confines project reads to the config's directory, so a
     /// `dist/` deploy root needs the checkout admitted for build inputs
-    /// (hoisted packages, a root-level Dockerfile) that upstream celld
+    /// (hoisted packages, a root-level Dockerfile) that older runtimes
     /// resolved without a flag.
     #[tokio::test]
     async fn deploy_names_the_checkout_as_cello_read_root() {

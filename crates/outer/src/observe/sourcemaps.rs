@@ -43,8 +43,8 @@ pub const MAX_MAP_BYTES: u64 = 8 * 1024 * 1024;
 /// older than this still render — with their raw, unsymbolicated stacks.
 pub const KEEP_DEPLOY_SHAS: usize = 10;
 
-/// The Worker bundle's report names: upstream celld serves the entry as
-/// `worker.js`, the Cello fork as its `index.js` module name — workerd
+/// The Worker bundle's report names: the pre-rename runtime serves the entry as
+/// `worker.js`, Cello as its `index.js` module name — workerd
 /// prints the entry bare in both cases, never an app path. Only these two
 /// names map:
 /// the token lookup is purely positional (greatest-lower-bound), so any

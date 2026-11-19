@@ -34,6 +34,7 @@ if [ ! -t 0 ]; then cat >"$STUB_LOG/stdin-$n.bin"; else : >"$STUB_LOG/stdin-$n.b
 printf 'SSH: %s\n' "$*" >>"$STUB_LOG/ssh.log"
 case "$*" in
 *sqlite3*) exit 0 ;;
+*outer.sqlite*) exit "${STUB_DB_EXISTS:-1}" ;;
 *check-config*) exit "${STUB_CHECK_CONFIG_EXIT:-0}" ;;
 *docker\ tag\ localhost*) exit "${STUB_RETAG_EXIT:-0}" ;;
 *) exit 0 ;;
@@ -81,14 +82,16 @@ reset_case() {
     chmod +x "$BIN/ssh" "$BIN/scp" "$BIN/docker"
     [[ -f "$BIN/podman" ]] && chmod +x "$BIN/podman" || true
     unset OUTER_ENGINE || true
-    export STUB_CHECK_CONFIG_EXIT=0 STUB_RETAG_EXIT=0
+    export STUB_CHECK_CONFIG_EXIT=0 STUB_RETAG_EXIT=0 STUB_DB_EXISTS=1
 }
 
 run_release() {
     (cd "$FIX" && bash "$RELEASE_SH" fake-target </dev/null >"$LOG/out.log" 2>"$LOG/err.log"; echo "$?")
 }
 
-# --- case 1: failing check-config aborts before any prod-changing step -----
+run_release_fresh() {
+    (cd "$FIX" && bash "$RELEASE_SH" fake-target --fresh-install </dev/null >"$LOG/out.log" 2>"$LOG/err.log"; echo "$?")
+}
 reset_case "docker,podman"
 export STUB_CHECK_CONFIG_EXIT=1
 code="$(run_release)"
@@ -177,5 +180,52 @@ preflight_vols="$(echo "$preflight_line" | grep -o -- '-v /srv/outer/[^ ]*' | se
 [[ "$compose_vols" == "$preflight_vols" ]] || fail "compose volumes != preflight mounts: [$compose_vols] vs [$preflight_vols]"
 if echo "$preflight_line" | grep -o -- '-v /srv/outer/[^ ]*' | grep -vq ':ro$'; then fail "a preflight mount is not read-only"; fi
 echo "case 8 ok: compose and preflight agree on service identity and mounts"
+# --- case 9: --fresh-install refuses when the remote DB exists --------------
+# A fresh release over live state would orphan it: the DB-absent gate is the
+# whole point of the flag, so it runs before any build output matters and
+# aborts before scp or the rollout.
+reset_case "docker,podman"
+export STUB_DB_EXISTS=0
+code="$(run_release_fresh)"
+[[ "$code" != 0 ]] || fail "fresh-install over an existing DB exited 0 (expected refuse)"
+grep -q "outer.sqlite exists" "$LOG/err.log" || fail "fresh-install refusal names no DB path"
+[[ ! -f "$LOG/scp.log" ]] || fail "scp upload ran after a refused fresh-install"
+if grep -q "bash -s" "$LOG/ssh.log"; then fail "rollout ran after a refused fresh-install"; fi
+echo "case 9 ok: --fresh-install refuses when the remote DB exists (exit $code)"
+
+# --- case 10: --fresh-install proceeds on a wiped box, skipping the gate ----
+# No migration query runs (there is no DB to read); the preflight still
+# runs, uploads still happen, and the rollout brings compose up directly
+# instead of a handoff (no old container to drain).
+reset_case "docker,podman"
+export STUB_DB_EXISTS=1
+code="$(run_release_fresh)"
+[[ "$code" == 0 ]] || fail "fresh-install on a wiped box exited $code"
+if grep -q "sqlite3" "$LOG/ssh.log"; then fail "migration gate ran on --fresh-install"; fi
+grep -q "check-config" "$LOG/ssh.log" || fail "preflight check-config never ran on --fresh-install"
+[[ -f "$LOG/scp.log" ]] || fail "uploads never ran on --fresh-install"
+fresh_rollout="$(grep -l "FRESH_INSTALL" "$LOG"/stdin-*.bin 2>/dev/null || true)"
+[[ -n "$fresh_rollout" ]] || fail "rollout heredoc missing on --fresh-install"
+fresh_line="$(grep -n 'FRESH_INSTALL" == 1' "$fresh_rollout" | head -n1 | cut -d: -f1 || true)"
+up_line="$(grep -n "compose.yaml up -d" "$fresh_rollout" | head -n1 | cut -d: -f1 || true)"
+hand_line="$(grep -n 'handoff_to "outer' "$fresh_rollout" | head -n1 | cut -d: -f1 || true)"
+[[ -n "$fresh_line" && -n "$up_line" && -n "$hand_line" && "$fresh_line" -lt "$up_line" && "$up_line" -lt "$hand_line" ]] \
+    || fail "rollout does not compose-up first on the fresh branch (fresh=$fresh_line up=$up_line handoff=$hand_line)"
+# The fresh branch must record the new image before compose reads release.env.
+rec_line=""
+while IFS=: read -r n _; do
+    if (( n > fresh_line )); then rec_line="$n"; break; fi
+done < <(grep -n 'record_image "outer:' "$fresh_rollout")
+[[ -n "$rec_line" && "$rec_line" -lt "$up_line" ]] \
+    || fail "fresh branch starts compose before recording the new image (record=$rec_line up=$up_line)"
+echo "case 10 ok: --fresh-install skips the gate and composes up directly (exit 0)"
+
+# --- case 11: an unknown second arg refuses ---------------------------------
+reset_case "docker"
+code="$(cd "$FIX" && bash "$RELEASE_SH" fake-target --bogus </dev/null >"$LOG/out.log" 2>"$LOG/err.log"; echo "$?")"
+[[ "$code" != 0 ]] || fail "unknown flag exited 0 (expected refuse)"
+grep -q "usage:" "$LOG/err.log" || fail "unknown flag prints no usage"
+[[ ! -f "$LOG/ssh.log" ]] || fail "ssh ran after an unknown flag"
+echo "case 11 ok: unknown second arg refuses before any ssh (exit $code)"
 
 echo "test-release-preflight: all cases passed"
