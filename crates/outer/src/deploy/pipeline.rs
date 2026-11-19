@@ -3526,7 +3526,7 @@ mod tests {
     }
     #[test]
     fn astro_website_config_passes_key_validation() {
-        // The shape the website template's `celld-config` integration derives
+        // The shape the website template's `cello-config` integration derives
         // into `dist/wrangler.json` from the Cloudflare adapter's
         // `dist/server/wrangler.json` (verbatim from a real `bun run build`):
         // `main` rewrites to `server/…`, assets to `client`, `vars` to `{}`.

@@ -1622,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_celld_names_are_ignored_after_the_wipe() {
+    fn stale_tenant_names_are_ignored_after_the_wipe() {
         // No rename shims: a carried-over `CELLD_*` or `OUTER_CELLD_BIN`
         // is dead config, not a refusal. (The runtime still refuses to
         // start a fleet with `CELLD_*` set; that reservation lives in
