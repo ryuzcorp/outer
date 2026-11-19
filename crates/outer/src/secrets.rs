@@ -51,8 +51,10 @@ impl SecretsKey {
         Self(key)
     }
 
-    /// The shared non-production key for unit, MCP and pipeline tests.
-    /// Never leaves a test binary: production always derives from config.
+    /// The shared non-production key for unit tests. `#[cfg(test)]` keeps
+    /// it out of production binaries: production always derives from config.
+    /// Every production path that needs a key takes it as a parameter.
+    #[cfg(test)]
     pub fn test_key() -> Self {
         Self::derive("outer-test-secret (never production)")
     }
