@@ -31,11 +31,11 @@ fi
 version=$(sed -n 's/^ARG CELLO_VERSION=\(.*\)$/\1/p' docker/Dockerfile)
 digest=$(sed -n 's/^ARG CELLO_DIGEST=\(.*\)$/\1/p' docker/Dockerfile)
 imageref=$(sed -n 's|^ARG CELLO_IMAGE=\(.*\)$|\1|p' docker/Dockerfile)
-case "$version" in
-  [0-9]*.[0-9]*.[0-9]*) ;;
-  *) echo "docker/Dockerfile CELLO_VERSION '$version' is not a semver pin" >&2; status=1 ;;
-esac
-# Exactly 64 lowercase hex after the prefix (a `?` glob would accept any byte).
+# Anchored regexes: a shell glob's `*` would accept any trailing bytes.
+if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+  echo "docker/Dockerfile CELLO_VERSION '$version' is not a semver pin" >&2
+  status=1
+fi
 if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
   echo "docker/Dockerfile CELLO_DIGEST '$digest' is not a sha256 pin" >&2
   status=1
