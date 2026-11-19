@@ -1,9 +1,9 @@
 //! D1 migrations for the deploy pipeline (spec §10.1 steps 6-7).
 //!
 //! After the gate passes, the pipeline applies pending
-//! `NNNN_description.sql` files with `celld d1 migrations apply` under the
+//! `NNNN_description.sql` files with `cello d1 migrations apply` under the
 //! app's scoped credentials. When the live version declares every database
-//! being migrated, the apply runs BEFORE the `celld deploy` upload: celld
+//! being migrated, the apply runs BEFORE the `cello deploy` upload: cello
 //! offers no staged upload (the upload publishes `deploy/current.json` and
 //! every fleet adopts it on its own poll), so ordering is the only gate —
 //! when the new pointer becomes visible the schema is already ready, and a
@@ -23,7 +23,7 @@
 //! unmigrated existing app IS served (the pointer moved), so the deploy
 //! fails at `migrate` with an error that says the new version is live
 //! without the migrations, and the app's live pointer moves anyway.
-//! celld reads the files relative to the deploy root, orders them by
+//! cello reads the files relative to the deploy root, orders them by
 //! numeric prefix, and records applied files by name in the app's own
 //! `d1_migrations` table (the same table and columns `wrangler d1
 //! migrations` uses, so the two never re-apply each other's files). Outer
@@ -31,26 +31,27 @@
 //! after it was applied fails the deploy instead of silently drifting from
 //! what the database runs.
 //!
-//! Security model: everything celld reads or Outer copies here is
+//! Security model: everything cello reads or Outer copies here is
 //! attacker-influenced (the app's built config and build output are written
 //! by the app uid). The reviewed source of truth is the worktree at the
 //! deployed sha; `stage_migrations` copies from there into the deploy root
-//! because celld reads migration files relative to the deploy root, and
+//! because cello reads migration files relative to the deploy root, and
 //! prunes any other `*.sql` the build may have planted. `dir` values are
 //! validated to plain relative segments, symlinks are refused, and joins
 //! are contained under their base, so a hostile config cannot make Outer
 //! read or write outside the deploy root.
 //!
-//! Cross-app reachability (verified against celld 0.6.2 `d1 --help` and
-//! https://celld.dev/docs/services/d1): `celld d1 migrations apply` finds a
+//! Cross-app reachability (verified against `d1 --help` under celld 0.6.2;
+//! the flags are unchanged in Cello 0.1.0, see
+//! https://celld.dev/docs/services/d1): `cello d1 migrations apply` finds a
 //! node through the *bucket's* node leases and signs each request with the
 //! fleet's shared secret read from the bucket. Outer passes
 //! `--bucket s3://{bucket}/fleets/{slug}` with R2 temporary credentials
-//! scoped to `fleets/{slug}/` (see `store::credentials`), so celld only
+//! scoped to `fleets/{slug}/` (see `store::credentials`), so cello only
 //! ever sees this app's leases, secret, and D1 files: another app's
 //! database is unreachable (its leases are invisible from this prefix and
 //! its nodes would reject our fleet secret). Database names are therefore
-//! per-fleet namespaces, as celld documents ("Two Workers that name one
+//! per-fleet namespaces, as cello documents ("Two Workers that name one
 //! identity reach one database" — within one fleet; a typo opens an empty
 //! database in *this* fleet, never another app's). No per-app registry: the
 //! declared names in the built config are the apply set. Localhost dev
@@ -83,8 +84,8 @@ pub const MAX_DATABASE_NAME_LEN: usize = 64;
 pub const MAX_DATABASE_ID_LEN: usize = 256;
 
 /// One `d1_databases` entry of the built wrangler config. `database_id` is
-/// the stable identity celld uses when the declaration has one (otherwise
-/// celld uses `database_name`); Outer keys `d1_migration` by the same
+/// the stable identity cello uses when the declaration has one (otherwise
+/// cello uses `database_name`); Outer keys `d1_migration` by the same
 /// effective identity, so swapping the id with the same name re-applies to
 /// the new (empty) database instead of skipping as "already applied".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,8 +97,8 @@ pub struct D1Database {
 }
 
 impl D1Database {
-    /// The database celld resolves: `database_id` when declared, else
-    /// `database_name` (matches `celld d1 --help` and the D1 docs).
+    /// The database cello resolves: `database_id` when declared, else
+    /// `database_name` (matches `cello d1 --help` and the D1 docs).
     pub fn effective_identity(&self) -> &str {
         self.database_id.as_deref().unwrap_or(&self.database_name)
     }
@@ -107,7 +108,7 @@ impl D1Database {
 /// string `binding` or `database_name` fail the step naming the entry, as do
 /// option-shaped `database_name` values and escaping `migrations_dir` values
 /// (both come from the app's built config, so both are validated here before
-/// anything is staged or passed to celld).
+/// anything is staged or passed to cello).
 pub fn d1_databases(value: &serde_json::Value) -> anyhow::Result<Vec<D1Database>> {
     let Some(list) = value.get("d1_databases") else {
         return Ok(Vec::new());
@@ -160,17 +161,17 @@ pub fn d1_databases(value: &serde_json::Value) -> anyhow::Result<Vec<D1Database>
         .collect()
 }
 
-/// The directory celld reads an entry's files from, relative to the deploy
-/// root. celld's own default is `migrations`.
+/// The directory cello reads an entry's files from, relative to the deploy
+/// root. cello's own default is `migrations`.
 pub fn migrations_dir_name(entry: &D1Database) -> &str {
     entry.migrations_dir.as_deref().unwrap_or("migrations")
 }
 
 /// A `database_name` is passed positionally to
-/// `celld d1 migrations apply`, so it must never parse as an option: only
+/// `cello d1 migrations apply`, so it must never parse as an option: only
 /// letters, digits, `_` and `-`, 1–64 characters, never starting with `-`.
 /// (Argv is passed without a shell, so spaces and metacharacters are inert;
-/// the leading-dash rule closes option injection. No `--` separator: celld
+/// the leading-dash rule closes option injection. No `--` separator: cello
 /// 0.6.2's leaf parsers don't honor `--help`, let alone `--`, so there is
 /// no `--` contract to rely on — `list -- foo` still reports "needs a
 /// database name".)
@@ -193,7 +194,7 @@ pub fn validate_database_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `database_id` never reaches argv (celld resolves it from the wrangler
+/// A `database_id` never reaches argv (cello resolves it from the wrangler
 /// config in the deploy root, which Outer hands over as PROJECT) and is
 /// only ever a bound SQLite value, so it needs no option-shape charset —
 /// just non-empty and bounded, so a typo'd id is a loud deploy failure
@@ -296,7 +297,7 @@ pub struct MigrationFile {
 }
 
 /// Sorted `*.sql` files in `dir`, with content hashes. The extension matches
-/// ASCII case-insensitively, like celld does (`celld d1 --help`: "The `sql`
+/// ASCII case-insensitively, like cello does (`cello d1 --help`: "The `sql`
 /// extension is ASCII case-insensitive"). Only a missing dir holds no files:
 /// any other discovery failure — an unreadable dir, a bad entry, a
 /// non-UTF-8 name, a stat or read error — fails, so the deploy can never
@@ -398,7 +399,7 @@ fn open_no_follow(path: &Path) -> anyhow::Result<std::fs::File> {
         .map_err(|e| anyhow::anyhow!("cannot open migration file {}: {e:#}", path.display()))
 }
 
-/// Outer stages as root under the sandbox's `077` umask, but `celld d1
+/// Outer stages as root under the sandbox's `077` umask, but `cello d1
 /// migrations apply` runs as the app uid and must read what was staged:
 /// set `mode` on the open fd (never through a path that could be swapped).
 /// Read-only for the app: it can't rewrite reviewed bytes after hashing.
@@ -445,9 +446,9 @@ fn traversable_by_app(root: &Path, target: &Path) -> anyhow::Result<()> {
 /// Where an entry's files come from: the first conventional repo dir that
 /// holds `*.sql` — `<work>/<dir>`, then Void's `db/migrations` when
 /// `dir == "migrations"`. The winner is copied into `<root>/<dir>` because
-/// celld reads migration files relative to the deploy root, and any other
+/// cello reads migration files relative to the deploy root, and any other
 /// `*.sql` already staged there (unreviewed build output) is removed first,
-/// so only reviewed worktree bytes reach celld. Build output is never a
+/// so only reviewed worktree bytes reach cello. Build output is never a
 /// source: files that exist only under `<root>/<dir>` are ignored, not
 /// applied. Returns `None` when no files exist anywhere.
 pub fn stage_migrations(
@@ -495,7 +496,7 @@ pub fn stage_migrations(
         }
         traversable_by_app(root, &target)?;
         // The target itself is re-checked after the copy: a swapped-in
-        // symlink fails the step before celld ever reads through it.
+        // symlink fails the step before cello ever reads through it.
         // (Component swaps above the target remain a residual TOCTOU; the
         // build that could plant them no longer runs by this point.)
         if std::fs::symlink_metadata(&target)
@@ -514,7 +515,7 @@ pub fn stage_migrations(
 
 /// Make `target` a real directory Outer just verified, then delete any
 /// `*.sql` in it that the reviewed source set does not contain: those are
-/// unreviewed build output (or planted files) that celld would otherwise
+/// unreviewed build output (or planted files) that cello would otherwise
 /// read and apply. Refuses when `target` itself is a symlink, a
 /// non-directory, or holds a subdirectory shaped like a migration.
 fn prepare_target(target: &Path, files: &[MigrationFile]) -> anyhow::Result<()> {
@@ -557,9 +558,9 @@ fn prepare_target(target: &Path, files: &[MigrationFile]) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// The migration file a failed `celld d1 migrations apply` complains about:
+/// The migration file a failed `cello d1 migrations apply` complains about:
 /// the last whitespace-separated token shaped like `NNNN_anything.sql`.
-/// celld applies in order and stops at the failure, so the failing file is
+/// cello applies in order and stops at the failure, so the failing file is
 /// the last one its output names; when the output names none, this is `None`
 /// and the caller falls back to the raw output.
 pub fn failing_file(output: &str) -> Option<String> {
@@ -595,15 +596,15 @@ pub async fn applied_sha(
 }
 
 /// Record every file of a successful apply (upsert: a file that somehow
-/// reached celld twice keeps the newest hash, which equals the old one),
-/// keyed by the effective identity celld applied to. `database_name` is
+/// reached cello twice keeps the newest hash, which equals the old one),
+/// keyed by the effective identity cello applied to. `database_name` is
 /// kept alongside for humans; the conflict key is the identity, so a
 /// changed `database_id` under the same name starts clean against the new
 /// (empty) database instead of skipping as "already applied".
 /// Renaming a file evades the edited-after-apply refusal by construction —
-/// a new name is a new migration to both celld and this table — which is
+/// a new name is a new migration to both cello and this table — which is
 /// inherent to name-keyed bookkeeping, not a bypass: the renamed file still
-/// runs through celld in numeric-prefix order under review.
+/// runs through cello in numeric-prefix order under review.
 pub async fn record_applied(
     pool: &SqlitePool,
     app_id: &str,
@@ -845,7 +846,7 @@ mod tests {
         )
         .unwrap();
 
-        // Conventional Void layout stages into the deploy root for celld.
+        // Conventional Void layout stages into the deploy root for cello.
         let staged = stage_migrations(root.path(), work.path(), "migrations")
             .unwrap()
             .expect("files exist");
@@ -856,7 +857,7 @@ mod tests {
                 .join("migrations")
                 .join("0001_init.sql")
                 .is_file(),
-            "celld reads them from the deploy root"
+            "cello reads them from the deploy root"
         );
 
         // Build output never wins: the reviewed worktree copy overwrites it.
@@ -910,13 +911,13 @@ mod tests {
                 .join("migrations")
                 .join("9999_evil.sql")
                 .exists(),
-            "planted SQL never reaches celld"
+            "planted SQL never reaches cello"
         );
     }
 
-    /// Outer stages as root under a `077` umask while celld applies as the
+    /// Outer stages as root under a `077` umask while cello applies as the
     /// app uid: staged dirs Outer owns and the copied files end up readable
-    /// (and not writable) by others, or celld reports "no migrations
+    /// (and not writable) by others, or cello reports "no migrations
     /// directory" — the live failure of 2026-10-24.
     #[test]
     fn staged_migrations_are_readable_by_the_app_uid() {
@@ -1104,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn failing_file_picks_the_migration_out_of_celld_output() {
+    fn failing_file_picks_the_migration_out_of_cello_output() {
         let out =
             "applying 0001_init.sql\nerror applying 0002_add_users.sql: near \"X\": syntax error";
         assert_eq!(

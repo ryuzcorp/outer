@@ -1,4 +1,4 @@
-//! The live manifest celld publishes per upload: `deploy/current.json`
+//! The live manifest cello publishes per upload: `deploy/current.json`
 //! carries the versioned `prefix`, and the authoritative deployed config is
 //! the manifest at `fleets/{slug}/{prefix}/manifest.json`. There is no
 //! `fleets/{slug}/wrangler.json` in the bucket, and the worktree
@@ -62,9 +62,9 @@ pub async fn deployed_manifest(
 /// `database_name`/`database_id` → identity. Other binding types are ignored.
 /// `vars` — which may carry injected secret values — is never read here and
 /// never lands in the synthesized cwd config, so secrets can't leak through
-/// the materialized project dir or the fake-celld-style logs that read it.
+/// the materialized project dir or the fake-cello-style logs that read it.
 ///
-/// An asset-only live version (no `main_module`) declares nothing: celld
+/// An asset-only live version (no `main_module`) declares nothing: cello
 /// serves it without a worker, so there is no live code that could reach a
 /// database, and migrations must not wait on it.
 pub fn manifest_dbs(manifest: &serde_json::Value) -> anyhow::Result<Vec<D1Database>> {
@@ -125,7 +125,7 @@ pub fn manifest_dbs(manifest: &serde_json::Value) -> anyhow::Result<Vec<D1Databa
 }
 
 /// The `database_name`s in `wanted` the live version does not declare, by
-/// name. The pipeline migrates by name (that is what reaches celld's argv),
+/// name. The pipeline migrates by name (that is what reaches cello's argv),
 /// so the order decision is by name too: any name here means the live fleet
 /// cannot reach that database and the upload must go first.
 pub fn missing_from_live(live: &[D1Database], wanted: &[String]) -> Vec<String> {
