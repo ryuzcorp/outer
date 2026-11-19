@@ -1240,7 +1240,7 @@ mod tests {
         assert_eq!(seen, ring, "no line falls behind the cursor");
     }
 
-    /// (captured from a real fleet on the VPS under celld 0.6.2; the prefix shape is unchanged in Cello 0.1.0): a Worker's
+    /// (captured from a real Cello 0.1.0 fleet on the VPS): a Worker's
     /// uncaught `JSON.parse` failure arrives as tracing INFO under
     /// `cell_console`, the console level as the first word, then V8 frames.
     #[test]

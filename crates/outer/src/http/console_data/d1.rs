@@ -505,7 +505,7 @@ pub fn build_delete_keys(
         .to_string())
 }
 
-/// Most `UNION ALL` terms one `cello d1 execute` takes. Prod celld 0.6.2
+/// Most `UNION ALL` terms one `cello d1 execute` takes. Cello
 /// refuses 6+ terms (`D1_EXEC_ERROR: too many terms in compound SELECT`;
 /// without a trailing semicolon it misleadingly says "incomplete
 /// statement"), so counts for more tables run as several execs. Found live:
@@ -772,7 +772,7 @@ async fn deployed_state(ctx: &D1Ctx, slug: &str) -> Result<DeployedState, D1Erro
 /// (`database_id` when declared) from the synthesized cwd config. Only the
 /// name reaches argv because only the name is validated against option
 /// injection (`migrate::validate_database_name` refuses a leading `-`); a
-/// `database_id` is app-authored and merely length-checked, and celld 0.6.2
+/// `database_id` is app-authored and merely length-checked, and Cello
 /// honors no `--` separator.
 fn identity_for(dbs: &[D1Database], binding: &str) -> Result<String, D1Error> {
     dbs.iter()

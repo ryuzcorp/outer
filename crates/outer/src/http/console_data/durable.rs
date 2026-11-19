@@ -113,7 +113,7 @@ pub fn durable_objects(value: &serde_json::Value) -> anyhow::Result<Vec<DoBindin
 
 /// A binding name or class name: JS-identifier shape, bounded. Class names
 /// reach `cello cell list` positionally, so the leading-dash rule closes
-/// option injection (no `--` separator: celld 0.6.2 leaf parsers honor
+/// option injection (no `--` separator: Cello leaf parsers honor
 /// neither `--` nor `--help` for positional parsing).
 pub(crate) fn validate_do_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 64 {

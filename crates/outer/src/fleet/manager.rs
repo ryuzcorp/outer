@@ -143,11 +143,11 @@ impl FleetStorage {
     }
 
     /// The deployment artifacts a running fleet only reads: the pointer,
-    /// named pointers, manifests, bundles, queue consumer attachments
-    /// (`deploy/`), asset bodies (`deploy-blobs/`), and container image
-    /// tars (`deploy/images/`). Minted read-only, so a credential copied out
-    /// of a fleet's environment can serve a deployment but never publish
-    /// one.
+    /// named pointers, manifests, bundles, queue consumer attachments and
+    /// container image tars (`deploy/`, including `deploy/images/`), and
+    /// asset bodies (`deploy-blobs/`). Minted read-only, so a credential
+    /// copied out of a fleet's environment can serve a deployment but never
+    /// publish one.
     pub fn deploy_read_prefixes(slug: &str) -> Vec<String> {
         ["deploy/", "deploy-blobs/"]
             .into_iter()

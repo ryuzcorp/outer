@@ -230,7 +230,7 @@ pub fn r2_decode(stored: &str) -> String {
 /// A key the browser may write or delete: 1..=1024 bytes, no absolute path
 /// and no `..` segment, no control character, and never starting with `-`.
 /// A trailing `/` is legal — it is the folder marker. Keys travel
-/// positionally to `cello r2 put` / `cello r2 delete`, and celld 0.6.2
+/// positionally to `cello r2 put` / `cello r2 delete`, and Cello
 /// honors no `--` separator, so the leading-dash rule closes option
 /// injection there.
 pub fn r2_key_ok(key: &str) -> bool {
@@ -1121,7 +1121,7 @@ async fn delete_inner(
 mod tests {
     use super::*;
 
-    /// Stored forms captured from celld 0.6.1 (the key form is unchanged in Cello 0.1.0): `cello r2 put` for each key,
+    /// Stored forms (the key form Cello 0.1.0 writes): `cello r2 put` for each key,
     /// then a raw `ListObjectsV2`. The encoder must reproduce them byte for
     /// byte, and the decoder must bring them back — a browser that lists S3
     /// directly depends on both. (Vectors from Noite @ 58a977a.)
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn write_keys_reject_leading_dash_option_injection() {
         // Keys travel positionally to `cello r2 put` / `cello r2 delete`
-        // (celld 0.6.2 honors no `--` separator): a leading `-` would parse
+        // (Cello honors no `--` separator): a leading `-` would parse
         // as an option. Dashes elsewhere are inert and stay legal.
         assert!(!r2_key_ok("-evil"));
         assert!(!r2_key_ok("-"));

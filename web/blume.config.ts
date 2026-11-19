@@ -62,8 +62,6 @@ export default defineConfig({
     { from: "/guides/ilha", to: "/agents/frontend/ilha", status: 301 },
     { from: "/guides/void", to: "/agents/frontend/void", status: 301 },
     { from: "/guides/website", to: "/agents/frontend/website", status: 301 },
-    { from: "/guides/celld", to: "/agents/platform/cello", status: 301 },
-    { from: "/agents/platform/celld", to: "/agents/platform/cello", status: 301 },
     { from: "/guides/limits", to: "/agents/platform/limits", status: 301 },
     { from: "/guides/storage", to: "/agents/backend/files", status: 301 },
     { from: "/guides/export", to: "/agents/deploy/export", status: 301 },

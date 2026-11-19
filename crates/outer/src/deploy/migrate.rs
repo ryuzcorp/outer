@@ -41,8 +41,7 @@
 //! are contained under their base, so a hostile config cannot make Outer
 //! read or write outside the deploy root.
 //!
-//! Cross-app reachability (verified against `d1 --help` under celld 0.6.2;
-//! the flags are unchanged in Cello 0.1.0, see
+//! Cross-app reachability (verified against `d1 --help` under Cello 0.1.0, see
 //! https://celld.dev/docs/services/d1): `cello d1 migrations apply` finds a
 //! node through the *bucket's* node leases and signs each request with the
 //! fleet's shared secret read from the bucket. Outer passes
