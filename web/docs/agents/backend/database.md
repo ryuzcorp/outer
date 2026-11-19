@@ -13,7 +13,7 @@ The template ships with D1 on by default. Copy `pages/index.server.ts`: a loader
 d1_databases: [{ binding: "DB", database_name: "app-db" }],
 ```
 
-One D1 database and one R2 bucket per app: a second `d1_databases` entry fails the deploy at validation ("Outer apps can have one D1 database and one R2 bucket for now; merge the extra ones"). The built `dist/wrangler.json` carries the binding to celld, which creates the database on first use. Celld keys the database by name, so a typo opens a silent empty database. Double-check the name.
+One D1 database and one R2 bucket per app: a second `d1_databases` entry fails the deploy at validation ("Outer apps can have one D1 database and one R2 bucket for now; merge the extra ones"). The built `dist/wrangler.json` carries the binding to Cello, which creates the database on first use. Cello keys the database by name, so a typo opens a silent empty database. Double-check the name.
 
 ## Ship schema as migrations
 
@@ -29,7 +29,7 @@ Migration order depends on deploy state:
 | App with a live version | Migrations run before the upload; the old code keeps serving, and a migrate failure uploads nothing |
 | First deploy | Upload first, then migrate; the proxy returns 503 (building page) until the first deploy succeeds, so no race is possible |
 
-Files apply in numeric-prefix order under the app's scoped storage credentials. Already-applied files are skipped, never re-applied. A file edited after it was applied fails the deploy. Write a new migration instead. A failing migration fails the deploy and names the file; the previous version keeps serving (first deploys stay not-live, "Your app isn't live yet"), with celld's error in the log tail. The step runs only when the built config declares `d1_databases` and the repo holds migration files; no files means the step is skipped.
+Files apply in numeric-prefix order under the app's scoped storage credentials. Already-applied files are skipped, never re-applied. A file edited after it was applied fails the deploy. Write a new migration instead. A failing migration fails the deploy and names the file; the previous version keeps serving (first deploys stay not-live, "Your app isn't live yet"), with Cello's error in the log tail. The step runs only when the built config declares `d1_databases` and the repo holds migration files; no files means the step is skipped.
 
 Expand first, contract later: the migration runs while the old code still serves, so prefer additive changes (new tables, nullable columns). Dropping a column the live code still reads serves errors until the new version takes over.
 

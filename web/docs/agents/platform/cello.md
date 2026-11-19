@@ -1,6 +1,6 @@
 ---
-title: Run inside the celld runtime
-description: Follow celld fetch, state, binding, network, and memory rules.
+title: Run inside the Cello runtime
+description: Follow Cello fetch, state, binding, network, and memory rules.
 ---
 
 ## Obey the runtime contract

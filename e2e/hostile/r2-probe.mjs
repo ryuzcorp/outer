@@ -12,7 +12,7 @@
 // - the *state* credential (HOSTILE_S3_KEY/SECRET): read-write over the
 //   state prefixes and NOT over `deploy/` or `deploy-blobs/`;
 // - the *deploy* credential (HOSTILE_S3_DEPLOY_KEY/SECRET): read-only over
-//   `deploy/` and `deploy-blobs/` (the node's CELLD_DEPLOY_AWS_* grant).
+//   `deploy/` and `deploy-blobs/` (the node's CELLO_DEPLOY_AWS_* grant).
 // So the state positive control round-trips inside a state prefix and a
 // write to the deployment pointer must be refused, while the deploy grant
 // reads `deploy/` and a write with it is refused too.
@@ -40,7 +40,7 @@ const token = process.env.HOSTILE_S3_TOKEN ?? "";
 const ownPrefix = need("HOSTILE_S3_PREFIX").replace(/^\//, "");
 const siblingPrefix = (process.env.HOSTILE_S3_SIBLING ?? "fleets/hostile-neighbour/").replace(/^\//, "");
 const dataPrefix = (process.env.HOSTILE_S3_DATA_PREFIX ?? `${ownPrefix}cells/`).replace(/^\//, "");
-// The node's read-only deployment grant (`CELLD_DEPLOY_AWS_*`): it must
+// The node's read-only deployment grant (`CELLO_DEPLOY_AWS_*`): it must
 // read `deploy/` and `deploy-blobs/` but can never publish. The object the
 // GET probe reads is uploaded by the integrator with the bucket root keys.
 const deployAccess = need("HOSTILE_S3_DEPLOY_KEY");
@@ -113,7 +113,7 @@ try {
 }
 
 // The deployment artifacts are read-only for a fleet: the node's
-// `CELLD_DEPLOY_AWS_*` grant must list and get `deploy/` and can never
+// `CELLO_DEPLOY_AWS_*` grant must list and get `deploy/` and can never
 // publish. The positive read proves the grant is the deploy one, not a
 // state key; the refused write is the boundary under test.
 try {

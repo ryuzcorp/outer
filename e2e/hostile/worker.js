@@ -1,9 +1,9 @@
-// Hostile app worker (celld): serves its build/r2 probe results as JSON and
+// Hostile app worker (cello): serves its build/r2 probe results as JSON and
 // runs the Worker-side network probes live. Every probe must fail except
 // internet egress. Borrowed from Noite's apps/noite/test/hostile/index.js:
 // Outer drops the Caddy/runner/control-port targets and aims at Outer's own
 // loopback surface instead (neighbour fleet ports, outer's proxy port, the
-// celld internal listener). Query: /probes?neighbour=<port>&platform=<port>.
+// cello internal listener). Query: /probes?neighbour=<port>&platform=<port>.
 import buildProbes from "./dist/probe.json";
 import releaseProbes from "./dist/release-probe.json";
 
@@ -36,7 +36,7 @@ export default {
       );
       worker[n1] = v1;
 
-      // Outer's own loopback surface (proxy port, celld internal listener):
+      // Outer's own loopback surface (proxy port, cello internal listener):
       // unreachable from a tenant uid under the nft policy.
       const [n2, v2] = await attempt("fetch:platform-internal", () =>
         timedFetch(`http://127.0.0.1:${platform}/`)

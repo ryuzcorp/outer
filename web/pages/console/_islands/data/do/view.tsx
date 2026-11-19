@@ -4,7 +4,7 @@
 // Outer differences: fetches go through the registered data-do actions,
 // the probe runs on selection (not embedded per row — a class with many
 // instances lists fast while the fleet still answers each probe
-// best-effort), and the empty copy states that celld has no generic DO
+// best-effort), and the empty copy states that Cello has no generic DO
 // storage API: apps opt in to previews by implementing `?read=1`.
 
 import { atom, watch } from "ilha";
@@ -147,7 +147,7 @@ function DoInstancePanel({
       </p>
       {body}
       <p class="m-0 mt-auto text-xs opacity-60">
-        Read-only. celld keeps an instance's storage in its cell; this preview
+        Read-only. Cello keeps an instance's storage in its cell; this preview
         is the app's own <code>?read=1</code> response.
       </p>
     </DetailPanel>
@@ -360,7 +360,7 @@ function DoBrowser({ slug, binding }: { slug: string; binding: DoBinding }) {
         )}
       </div>
       <p class="border-base-300 m-0 border-t px-3 py-2 text-xs opacity-60">
-        Durable Object storage has no generic read API in celld. This viewer
+        Durable Object storage has no generic read API in Cello. This viewer
         lists instances and shows each app's own <code>?read=1</code>{" "}
         response — implement that read-only branch to preview state.
       </p>

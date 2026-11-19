@@ -225,7 +225,7 @@ for planted in "OUTER_SECRET planted" "STRIPE_SECRET_KEY planted" "AWS_SECRET_AC
     set -- $planted
     case "$1" in
         PORT|HOST|NODE_OPTIONS) continue ;;
-        AWS_*|S3_*|CELLD_*|OUTER_*|CLOUDFLARE_*|R2_*|STRIPE_*|RESEND_*|JEV_*|LD_*|BUN_*)
+        AWS_*|S3_*|CELLD_*|CELLO_*|OUTER_*|CLOUDFLARE_*|R2_*|STRIPE_*|RESEND_*|JEV_*|LD_*|BUN_*)
             [ "$1" = "BUN_INSTALL_CACHE_DIR" ] || continue ;;
     esac
     putenv "$1" "$2"

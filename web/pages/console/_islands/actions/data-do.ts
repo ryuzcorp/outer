@@ -1,5 +1,5 @@
 // Durable Objects viewer actions: one registered entry per query the DO
-// panel performs. Read-only end to end — celld exposes no generic storage
+// panel performs. Read-only end to end — Cello exposes no generic storage
 // read for a DO instance, so the preview is the app's own `?read=1`
 // response and stays blank when the fleet is asleep or the object has no
 // read handler.
@@ -71,7 +71,7 @@ const doListInstances: ConsoleAction<{ slug: string; class: string }, DoInstance
   name: "do_list_instances",
   title: "List Durable Object instances",
   description:
-    "List the instances of one Durable Object class (id + scope) via `celld cell list`. Reserved celld-internal classes are skipped. Works while the fleet is asleep.",
+    "List the instances of one Durable Object class (id + scope) via `cello cell list`. Reserved cello-internal classes are skipped. Works while the fleet is asleep.",
   inputSchema: {
     type: "object",
     properties: {

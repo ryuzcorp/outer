@@ -15,7 +15,7 @@
 //!   cgroupfs delegation, the nft table, a JS runtime, scoped R2 creds) is
 //!   absent, so a dev machine never passes vacuously.
 //!
-//! The worker fixture (`e2e/hostile/worker.js`) needs a live celld fleet
+//! The worker fixture (`e2e/hostile/worker.js`) needs a live cello fleet
 //! with a deployed app, which no test here can conjure without a bucket; it
 //! runs as a documented manual step in `scripts/hostile-suite.sh`.
 
@@ -225,10 +225,10 @@ fn hostile_fleet_grants_cannot_publish_a_deployment() {
     let [(data_permission, data), (deploy_permission, deploy)] = grants;
     assert_eq!(data_permission, Permission::ReadWrite);
     assert_eq!(deploy_permission, Permission::ReadOnly);
-    // The exact state namespaces, a cross-repo contract with celld: any
+    // The exact state namespaces, a cross-repo contract with cello: any
     // runtime write outside these is a failed write, and any list wider
     // than this (in particular anything covering `deploy/`) is a publish
-    // hole. `node-cells/` and the non-terminated `wake-` are celld's dead
+    // hole. `node-cells/` and the non-terminated `wake-` are cello's dead
     // node GC and legacy wake guard.
     assert_eq!(
         data,
@@ -290,7 +290,7 @@ fn hostile_platform_env_never_reaches_apps() {
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "S3_ENDPOINT",
-        "CELLD_WATCH",
+        "CELLO_WATCH",
         "OUTER_SECRET",
         "OUTER_R2_BUCKET",
         "CLOUDFLARE_API_TOKEN",
@@ -316,7 +316,7 @@ fn hostile_platform_env_never_reaches_apps() {
 }
 
 /// The fleet command binds loopback only and drops reserved names from app
-/// env: a worker that fetches the celld internal listener or another fleet's
+/// env: a worker that fetches the cello internal listener or another fleet's
 /// port from its own environment finds nothing to aim at, and the platform
 /// secrets the supervisor holds never enter the fleet's environment.
 #[test]
@@ -346,7 +346,7 @@ fn hostile_fleet_command_is_loopback_only_and_scoped() {
         ],
     };
     let opts = outer::fleet::supervisor::FleetOpts {
-        celld_bin: "celld".to_string(),
+        cello_bin: "cello".to_string(),
         state_dir: PathBuf::from("/data/fleets/hostile"),
         shutdown_total_ms: 5000,
         idle_evict_secs: 60,
@@ -354,7 +354,7 @@ fn hostile_fleet_command_is_loopback_only_and_scoped() {
         asset_cache_mb: 256,
     };
     let (program, args, env) = outer::fleet::supervisor::fleet_command(&spec, &opts);
-    assert_eq!(program, "celld");
+    assert_eq!(program, "cello");
     for flag in ["--listen", "--internal-listen"] {
         let at = args.iter().position(|arg| arg == flag).expect(flag);
         let addr = &args[at + 1];
@@ -816,7 +816,7 @@ async fn hostile_build_probes_are_contained() {
 /// round-trips inside one and must be refused (403/401, never 404 or a
 /// transport error) on a sibling prefix, the bucket root, and the deploy
 /// pointer (`deploy/current.json`), because the node reads deployments with
-/// its separate read-only `CELLD_DEPLOY_AWS_*` grant. The probe then uses
+/// its separate read-only `CELLO_DEPLOY_AWS_*` grant. The probe then uses
 /// that deploy grant (`HOSTILE_S3_DEPLOY_*`) to LIST and GET under
 /// `deploy/` (must succeed) and to PUT there (must be refused). Needs
 /// `HOSTILE_S3_*` env with both grants, minted by the integrator on the VPS

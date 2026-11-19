@@ -7,7 +7,7 @@ description: Code-execution sandboxes are not available on Outer — do not ship
 
 ## Know why it cannot run
 
-Void sandboxes (`getSandbox(id)`, `sandbox.run/files/fetch`) are isolated Linux containers fronted by a Durable Object. They need Cloudflare Containers: a container runtime on every machine that can start the app's image. Outer runs each app as a celld worker fleet: plain processes under cgroup and network isolation, no Docker/Podman daemon on the app host. A sandbox has nowhere to start. The `containers` wrangler key passes Outer's deploy validation, so the failure would come at runtime, not at deploy. Do not ship sandbox code expecting the deploy gate to catch it.
+Void sandboxes (`getSandbox(id)`, `sandbox.run/files/fetch`) are isolated Linux containers fronted by a Durable Object. They need Cloudflare Containers: a container runtime on every machine that can start the app's image. Outer runs each app as a Cello worker fleet: plain processes under cgroup and network isolation, no Docker/Podman daemon on the app host. A sandbox has nowhere to start. The `containers` wrangler key passes Outer's deploy validation, so the failure would come at runtime, not at deploy. Do not ship sandbox code expecting the deploy gate to catch it.
 
 ## Do this instead
 

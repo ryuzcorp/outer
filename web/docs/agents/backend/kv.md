@@ -15,7 +15,7 @@ cloudflare: {
 },
 ```
 
-`kv_namespaces` is an accepted deploy key, so the namespace deploys on every account. Binding keys are validated at deploy time. See [Store uploaded files](/backend/files-storage). Celld creates the namespace on first use; a typo opens a silent empty namespace, so double-check the id.
+`kv_namespaces` is an accepted deploy key, so the namespace deploys on every account. Binding keys are validated at deploy time. See [Store uploaded files](/backend/files-storage). Cello creates the namespace on first use; a typo opens a silent empty namespace, so double-check the id.
 
 ## Use it
 
