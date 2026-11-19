@@ -4,12 +4,12 @@
 //! (Apache-2.0): the `r2_encode`/`r2_decode` key form, the key/header
 //! validators, and the read/write split are verbatim. Adapted to Outer:
 //! reads use Outer's [`crate::store::s3::S3Backend`] with per-request scoped
-//! credentials (`fleets/{slug}/`), writes and deletes shell out to `celld r2
-//! put` / `celld r2 delete` with the same scoped env the deploy pipeline
+//! credentials (`fleets/{slug}/`), writes and deletes shell out to `cello r2
+//! put` / `cello r2 delete` with the same scoped env the deploy pipeline
 //! uses, and the bucket allowlist comes from the app's declared
 //! `r2_buckets` instead of the runner's app registry.
 //!
-//! Reads work on a sleeping fleet (S3 + bucket-direct celld calls need no
+//! Reads work on a sleeping fleet (S3 + bucket-direct cello calls need no
 //! running node). Every write is audited (`r2_put`, `r2_delete`).
 
 use std::time::Duration;
@@ -23,7 +23,7 @@ use axum::Router;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use super::{celld_env, console_app, run_celld, scoped_creds, scoped_s3};
+use super::{cello_env, console_app, run_cello, scoped_creds, scoped_s3};
 
 /// R2's own key bound (1..=1024 bytes).
 const R2_MAX_KEY_BYTES: usize = 1024;
@@ -42,10 +42,10 @@ const R2_PREVIEW_CAP: usize = 262_144;
 const R2_HEAD_CONCURRENCY: usize = 8;
 /// Largest upload the browser may send (spooled, never buffered twice).
 const R2_UPLOAD_CAP: usize = 67_108_864;
-/// `celld r2 put` gets a generous timeout: a full 64 MiB upload on a slow
+/// `cello r2 put` gets a generous timeout: a full 64 MiB upload on a slow
 /// link must fail on stall, not on a fixed wall.
-const CELLD_PUT_TIMEOUT: Duration = Duration::from_secs(300);
-const CELLD_TIMEOUT: Duration = Duration::from_secs(60);
+const CELLO_PUT_TIMEOUT: Duration = Duration::from_secs(300);
+const CELLO_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Content types a browser renders as a document: served inline like the
 /// rest, but under a sandbox, so a direct visit to the raw URL cannot run
@@ -128,7 +128,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// `true` for a byte celld escapes when it stores a key.
+/// `true` for a byte cello escapes when it stores a key.
 fn r2_escapable(byte: u8) -> bool {
     if byte < 0x20 || byte == 0x7F || byte >= 0x80 {
         return true;
@@ -190,7 +190,7 @@ pub fn r2_encode_prefix(prefix: &str) -> String {
 }
 
 /// One stored segment back to its key bytes. A lone `%` is the empty
-/// segment celld wrote; a malformed escape (a key another tool wrote) is
+/// segment cello wrote; a malformed escape (a key another tool wrote) is
 /// kept literally rather than failing the whole page.
 fn r2_decode_segment(segment: &str) -> String {
     let bytes = segment.as_bytes();
@@ -230,7 +230,7 @@ pub fn r2_decode(stored: &str) -> String {
 /// A key the browser may write or delete: 1..=1024 bytes, no absolute path
 /// and no `..` segment, no control character, and never starting with `-`.
 /// A trailing `/` is legal — it is the folder marker. Keys travel
-/// positionally to `celld r2 put` / `celld r2 delete`, and celld 0.6.2
+/// positionally to `cello r2 put` / `cello r2 delete`, and celld 0.6.2
 /// honors no `--` separator, so the leading-dash rule closes option
 /// injection there.
 pub fn r2_key_ok(key: &str) -> bool {
@@ -267,8 +267,8 @@ fn normalize_prefix(prefix: &str) -> String {
 /// Parse `r2_buckets` from the built wrangler config. Entries need a string
 /// `binding` and `bucket_name`; both come from the app's own config, but
 /// both are validated here before anything is listed through or passed to
-/// celld — a `bucket_name` starting with `-` would otherwise parse as a
-/// celld option.
+/// cello — a `bucket_name` starting with `-` would otherwise parse as a
+/// cello option.
 pub fn r2_buckets(value: &serde_json::Value) -> anyhow::Result<Vec<R2Bucket>> {
     let Some(list) = value.get("r2_buckets") else {
         return Ok(Vec::new());
@@ -315,7 +315,7 @@ pub(crate) fn validate_binding(binding: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An R2 bucket name is passed positionally to `celld r2`, so it must never
+/// An R2 bucket name is passed positionally to `cello r2`, so it must never
 /// parse as an option: lowercase letters, digits, dots and hyphens,
 /// 1–63 characters, never starting with `-`.
 pub(crate) fn validate_bucket_name(bucket: &str) -> anyhow::Result<()> {
@@ -355,7 +355,7 @@ pub fn object_key(slug: &str, bucket: &R2Bucket, key: &str) -> anyhow::Result<St
 }
 
 /// Look up the declared bucket behind a request bucket name. Anything not
-/// declared is refused before a credential or celld ever sees it.
+/// declared is refused before a credential or cello ever sees it.
 pub fn find_bucket<'a>(buckets: &'a [R2Bucket], name: &str) -> anyhow::Result<&'a R2Bucket> {
     buckets
         .iter()
@@ -363,10 +363,10 @@ pub fn find_bucket<'a>(buckets: &'a [R2Bucket], name: &str) -> anyhow::Result<&'
         .ok_or_else(|| anyhow::anyhow!("unknown R2 bucket {name:?}"))
 }
 
-/// The exact argv for `celld r2 put`, built pure so tests pin it: key and
+/// The exact argv for `cello r2 put`, built pure so tests pin it: key and
 /// bucket travel positionally (both pre-validated, never starting with
 /// `-`), and `--bucket` carries the fleet bucket URL.
-pub fn celld_put_argv(
+pub fn cello_put_argv(
     bucket_url: &str,
     endpoint: &str,
     region: &str,
@@ -398,8 +398,8 @@ pub fn celld_put_argv(
     args
 }
 
-/// The exact argv for `celld r2 delete`, built pure so tests pin it.
-pub fn celld_delete_argv(
+/// The exact argv for `cello r2 delete`, built pure so tests pin it.
+pub fn cello_delete_argv(
     bucket_url: &str,
     endpoint: &str,
     region: &str,
@@ -504,7 +504,7 @@ fn raw_response(content_type: Option<&str>, filename: &str, bytes: Vec<u8>) -> R
 
 /// R2 bindings from the deployed manifest's `raw_metadata.bindings`: entries
 /// shaped `{"type": "r2_bucket", "name": <binding>, "bucket_name": <bucket>}`
-/// (celld's record of the built wrangler config; the `name`/`bucket_name`
+/// (cello's record of the built wrangler config; the `name`/`bucket_name`
 /// fallbacks cover the `binding`/`bucket` spellings). Anything else —
 /// D1, assets, vars, unknown types — is skipped, never failed: one unknown
 /// entry must not hide the buckets that parse. In particular `vars` (which
@@ -561,7 +561,7 @@ async fn declared_buckets(state: &super::AppState, slug: &str) -> anyhow::Result
     r2_buckets(&value)
 }
 
-/// Backend failures (S3/celld) answer 500 with the failure's detail in
+/// Backend failures (S3/cello) answer 500 with the failure's detail in
 /// `message` for the owner to act on, but `user_message` stays the friendly
 /// constant the caller passes: raw store XML must never reach the UI.
 fn status_for(msg: &str, user_message: &str) -> Response {
@@ -880,7 +880,7 @@ pub(crate) async fn adjust_r2_measured(pool: &sqlx::SqlitePool, app_id: &str, de
     }
 }
 
-/// Forget the stored R2 measurement after a delete (celld reports no freed
+/// Forget the stored R2 measurement after a delete (cello reports no freed
 /// bytes): the next upload gate re-sizes live instead of refusing against a
 /// stale-high number. Best effort.
 pub(crate) async fn clear_r2_measured(pool: &sqlx::SqlitePool, app_id: &str) {
@@ -997,7 +997,7 @@ async fn put_inner(
 ) -> anyhow::Result<usize> {
     let buckets = declared_buckets(state, slug).await?;
     let bucket = find_bucket(&buckets, &query.bucket)?;
-    // Validated before anything is staged or passed to celld.
+    // Validated before anything is staged or passed to cello.
     let _full = object_key(slug, bucket, &query.key)?;
     if let Some(ct) = content_type {
         if !r2_header_ok(ct) {
@@ -1005,7 +1005,7 @@ async fn put_inner(
         }
     }
     let size = bytes.len();
-    // Spool to a file: `celld r2 put` reads `--path`, and the body must not
+    // Spool to a file: `cello r2 put` reads `--path`, and the body must not
     // sit buffered twice for a 64 MiB upload.
     let spool = tempfile::NamedTempFile::new()?;
     tokio::fs::write(spool.path(), bytes).await?;
@@ -1013,7 +1013,7 @@ async fn put_inner(
     let settings = super::deploy_settings(state)?;
     let storage = &settings.storage;
     let creds = scoped_creds(state, slug).await?;
-    let args = celld_put_argv(
+    let args = cello_put_argv(
         &storage.bucket_url(slug),
         &storage.endpoint,
         &storage.region,
@@ -1022,7 +1022,7 @@ async fn put_inner(
         &spool_path,
         content_type,
     );
-    run_celld(state, &args, &celld_env(storage, &creds), CELLD_PUT_TIMEOUT).await?;
+    run_cello(state, &args, &cello_env(storage, &creds), CELLO_PUT_TIMEOUT).await?;
     Ok(size)
 }
 
@@ -1038,7 +1038,7 @@ async fn api_delete(
     };
     match delete_inner(&state, &app.slug, &body).await {
         Ok(count) => {
-            // The stored measurement no longer reflects reality (celld does
+            // The stored measurement no longer reflects reality (cello does
             // not report freed bytes): clear it so the next upload re-sizes
             // live instead of refusing against a stale-high number. Best
             // effort, like the put-side adjustment.
@@ -1106,14 +1106,14 @@ async fn delete_inner(
     let settings = super::deploy_settings(state)?;
     let storage = &settings.storage;
     let creds = scoped_creds(state, slug).await?;
-    let args = celld_delete_argv(
+    let args = cello_delete_argv(
         &storage.bucket_url(slug),
         &storage.endpoint,
         &storage.region,
         &bucket.bucket,
         &body.keys,
     );
-    run_celld(state, &args, &celld_env(storage, &creds), CELLD_TIMEOUT).await?;
+    run_cello(state, &args, &cello_env(storage, &creds), CELLO_TIMEOUT).await?;
     Ok(body.keys.len())
 }
 
@@ -1121,7 +1121,7 @@ async fn delete_inner(
 mod tests {
     use super::*;
 
-    /// Stored forms captured from celld 0.6.1: `celld r2 put` for each key,
+    /// Stored forms captured from celld 0.6.1 (the key form is unchanged in Cello 0.1.0): `cello r2 put` for each key,
     /// then a raw `ListObjectsV2`. The encoder must reproduce them byte for
     /// byte, and the decoder must bring them back — a browser that lists S3
     /// directly depends on both. (Vectors from Noite @ 58a977a.)
@@ -1145,7 +1145,7 @@ mod tests {
         ("star*", "star%2A"),
         ("tilde~x", "tilde%7Ex"),
         ("deep/nested/x.txt", "deep/nested/x.txt"),
-        // Left literal by celld.
+        // Left literal by cello.
         ("sp ace.txt", "sp ace.txt"),
         ("plus+sign", "plus+sign"),
         ("amp&and", "amp&and"),
@@ -1159,7 +1159,7 @@ mod tests {
     ];
 
     #[test]
-    fn keys_encode_and_decode_the_way_celld_stores_them() {
+    fn keys_encode_and_decode_the_way_cello_stores_them() {
         for (key, stored) in VECTORS {
             assert_eq!(r2_encode(key), stored, "encode {key}");
             assert_eq!(r2_decode(stored), key, "decode {stored}");
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn malformed_escapes_stay_literal() {
-        // Another tool wrote an object under a key celld cannot name; the page
+        // Another tool wrote an object under a key cello cannot name; the page
         // still renders instead of failing.
         assert_eq!(r2_decode_segment("a%ZZ"), "a%ZZ");
         assert_eq!(r2_decode_segment("50%"), "50%");
@@ -1204,7 +1204,7 @@ mod tests {
     }
     #[test]
     fn write_keys_reject_leading_dash_option_injection() {
-        // Keys travel positionally to `celld r2 put` / `celld r2 delete`
+        // Keys travel positionally to `cello r2 put` / `cello r2 delete`
         // (celld 0.6.2 honors no `--` separator): a leading `-` would parse
         // as an option. Dashes elsewhere are inert and stay legal.
         assert!(!r2_key_ok("-evil"));
@@ -1326,8 +1326,8 @@ mod tests {
     }
 
     #[test]
-    fn celld_argv_pins_bucket_url_and_positions() {
-        let put = celld_put_argv(
+    fn cello_argv_pins_bucket_url_and_positions() {
+        let put = cello_put_argv(
             "s3://bucket/fleets/my-app",
             "https://ep",
             "auto",
@@ -1355,7 +1355,7 @@ mod tests {
                 "auto",
             ]
         );
-        let delete = celld_delete_argv(
+        let delete = cello_delete_argv(
             "s3://bucket/fleets/my-app",
             "https://ep",
             "auto",

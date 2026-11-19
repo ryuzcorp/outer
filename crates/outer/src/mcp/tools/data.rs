@@ -1,9 +1,9 @@
 //! The data tools: `app_metrics` (traffic, errors and latency from the
 //! same `metric_minute`/`path_hour`/`visitor_day` rows the Console metrics
 //! tab reads) and `db_query` (read-only SQL over the app's live D1 through
-//! the same celld path as the Console D1 panel).
+//! the same cello path as the Console D1 panel).
 //!
-//! `db_query` reads go through the celld path, never the migration path, so
+//! `db_query` reads go through the cello path, never the migration path, so
 //! the storage-freeze rules don't apply to them: reads stay allowed while
 //! the app is frozen, exactly like the Console grid. Writes stay with
 //! migrations and `restore_backup`; the read-only refusal says so.
@@ -122,7 +122,7 @@ const MAX_QUERY_ROWS: usize = 200;
 /// Longest string value kept per cell (characters); longer values are cut.
 const MAX_VALUE_CHARS: usize = 5000;
 /// The rows JSON stays under this many bytes; trailing rows drop first.
-/// (`celld d1 execute` kills the child past
+/// (`cello d1 execute` kills the child past
 /// [`crate::http::console_data::d1::D1_TIMEOUT`], so a runaway query always
 /// answers in time.)
 const MAX_RESULT_BYTES: usize = 250_000;
@@ -470,9 +470,9 @@ fn map_d1(err: crate::http::console_data::d1::D1Error) -> ToolError {
             ToolError::invalid_argument(format!("unknown database {binding:?}"))
         }
         // The child ran and refused the statement — a missing table, a bad
-        // column — so the query, not the platform, is at fault. celld
+        // column — so the query, not the platform, is at fault. cello
         // prints engine errors, bounded to a few lines.
-        D1Error::Celld(detail) => {
+        D1Error::Cello(detail) => {
             ToolError::invalid_argument(format!("the database refused the query: {detail}"))
         }
         D1Error::AppStarting => {
@@ -500,14 +500,14 @@ pub async fn db_query(input: DbQueryInput, ctx: &Ctx<'_>) -> Result<Value, ToolE
             "the query is too long (20 000 characters max)",
         ));
     }
-    // The read-only gate runs before any celld call: a refused shape never
+    // The read-only gate runs before any cello call: a refused shape never
     // reaches the database.
     let toks = check_read_only(sql)?;
     let params = input.params.unwrap_or_default();
     let final_sql = substitute(sql, &toks, &params)?;
     // The declared bindings come from the live manifest — the same source
     // as Console → Data → D1 — so a typo'd binding fails here, before any
-    // celld call.
+    // cello call.
     let bindings = crate::http::console_data::d1::database_bindings(&ctx.state.store, &app.slug)
         .await
         .map_err(super::internal)?;
@@ -532,11 +532,11 @@ pub async fn db_query(input: DbQueryInput, ctx: &Ctx<'_>) -> Result<Value, ToolE
         }
     };
     // Same path as the Console panel: wake the fleet, resolve the binding
-    // to its celld identity, run one `celld d1 execute` with the shared
+    // to its cello identity, run one `cello d1 execute` with the shared
     // 30 s budget. Reads only — the storage-freeze write guard that the
     // Console grid and commit path check does not apply here.
     let d1ctx = crate::http::console_data::d1::D1Ctx {
-        celld_bin: ctx.state.fleets.celld_bin(),
+        cello_bin: ctx.state.fleets.cello_bin(),
         storage: ctx.state.fleets.storage().clone(),
         pool: ctx.state.pool.clone(),
         store: ctx.state.store.clone(),

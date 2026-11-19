@@ -14,7 +14,7 @@ use crate::mcp::docs;
 use crate::mcp::error::ToolError;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DocsInput {
-    /// Which agent guide to read: quickstart, templates, ilha, void, website, celld, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look.
+    /// Which agent guide to read: quickstart, templates, ilha, void, website, cello, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look.
     pub topic: String,
 }
 

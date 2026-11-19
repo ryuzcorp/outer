@@ -1440,7 +1440,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // the fleet, leaking app content and waking the fleet for anonymous
     // requests. Internal health checks go direct to loopback, like the
     // platform `/health` route (`ok`).
-    if req.uri().path() == "/.well-known/celld/health" {
+    if req.uri().path() == "/.well-known/cello/health" {
         return Response::builder()
             .status(StatusCode::OK)
             .header("cache-control", "no-store")
@@ -1540,10 +1540,10 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    // Outer's own traffic is never app usage: the celld health gate the
+    // Outer's own traffic is never app usage: the cello health gate the
     // wake path probes directly is excluded even when it arrives here.
     let raw_path = parts.uri.path();
-    let metered = raw_path != "/.well-known/celld/health";
+    let metered = raw_path != "/.well-known/cello/health";
     // Recorded iff forwarded: only requests that reach the fleet's port
     // (or fail connecting to it) count. Outer's synthetic answers above
     // return before this closure can run.
@@ -1728,15 +1728,15 @@ mod tests {
         hits: Arc<AtomicUsize>,
     }
 
-    /// Tiny axum app as the fake fleet: healthy at the celld gate (so the
-    /// manager's pre-start probe passes and no celld spawns), echoing the
+    /// Tiny axum app as the fake fleet: healthy at the cello gate (so the
+    /// manager's pre-start probe passes and no cello spawns), echoing the
     /// request as JSON everywhere else.
     async fn start_fake_fleet() -> FakeFleet {
         let hits = Arc::new(AtomicUsize::new(0));
         let echoed = hits.clone();
         let app = Router::new()
             .route(
-                "/.well-known/celld/health",
+                "/.well-known/cello/health",
                 axum::routing::get(|| async { "ok" }),
             )
             .route(
@@ -2019,7 +2019,7 @@ mod tests {
     fn manager(data: &std::path::Path) -> FleetManager {
         FleetManager::new(crate::fleet::manager::ManagerSettings {
             data_dir: data.to_path_buf(),
-            celld_bin: "celld".to_string(),
+            cello_bin: "cello".to_string(),
             storage: crate::fleet::manager::FleetStorage {
                 endpoint: "https://example.com".to_string(),
                 region: "auto".to_string(),
@@ -2754,7 +2754,7 @@ mod tests {
             let before = fleet.hits.load(Ordering::SeqCst);
             let req = visitor(
                 Request::builder()
-                    .uri("/.well-known/celld/health")
+                    .uri("/.well-known/cello/health")
                     .header("host", host)
                     .body(Body::empty())
                     .unwrap(),
@@ -2780,7 +2780,7 @@ mod tests {
         lock_app(&fix.pool, "app-dead", "pin", "1234").await;
         let req = visitor(
             Request::builder()
-                .uri("/.well-known/celld/health")
+                .uri("/.well-known/cello/health")
                 .header("host", "dead.outer.test")
                 .body(Body::empty())
                 .unwrap(),
@@ -3367,7 +3367,7 @@ mod tests {
             fix.pool.clone(),
             FleetManager::new(crate::fleet::manager::ManagerSettings {
                 data_dir: fix._dir.path().to_path_buf(),
-                celld_bin: "/nonexistent/celld".to_string(),
+                cello_bin: "/nonexistent/cello".to_string(),
                 storage: crate::fleet::manager::FleetStorage {
                     endpoint: "https://example.com".to_string(),
                     region: "auto".to_string(),
@@ -3628,9 +3628,9 @@ mod tests {
             let (status, _) = get(&state, "metered.outer.test", "/items/42").await;
             assert_eq!(status, StatusCode::OK);
         }
-        // Excluded from metrics: the celld health gate, the unlisted
+        // Excluded from metrics: the cello health gate, the unlisted
         // robots override Outer serves itself, and unknown hosts.
-        let (status, _) = get(&state, "metered.outer.test", "/.well-known/celld/health").await;
+        let (status, _) = get(&state, "metered.outer.test", "/.well-known/cello/health").await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = get(&state, "quiet2.outer.test", "/robots.txt").await;
         assert_eq!(status, StatusCode::OK);

@@ -67,8 +67,8 @@ fn tool_error(err: D1Error) -> ToolError {
         D1Error::AppStarting => {
             ToolError::internal("the app is still starting; retry in a few seconds")
         }
-        D1Error::Celld(detail) => ToolError::internal(format!("celld d1 failed: {detail}")),
-        D1Error::Timeout => ToolError::internal("celld d1 timed out"),
+        D1Error::Cello(detail) => ToolError::internal(format!("cello d1 failed: {detail}")),
+        D1Error::Timeout => ToolError::internal("cello d1 timed out"),
         D1Error::TooLarge(detail) => ToolError::internal(format!("backup too large: {detail}")),
         D1Error::Unavailable(_) => {
             ToolError::internal("couldn't reach the database right now; try again in a minute")
@@ -78,7 +78,7 @@ fn tool_error(err: D1Error) -> ToolError {
 
 fn backup_ctx(ctx: &Ctx<'_>) -> D1Ctx {
     D1Ctx {
-        celld_bin: ctx.state.fleets.celld_bin(),
+        cello_bin: ctx.state.fleets.cello_bin(),
         storage: ctx.state.fleets.storage().clone(),
         pool: ctx.state.pool.clone(),
         store: ctx.state.store.clone(),

@@ -196,7 +196,7 @@ pub async fn expired_previews(
 /// Preview D1 migrations check their edited-after-apply pins against the
 /// live pins, but are never recorded (see `Deployer::migrate`'s `record`
 /// flag): the preview database is disposable (fresh prefix per preview
-/// lineage), celld's own `d1_migrations` journal in the preview database
+/// lineage), cello's own `d1_migrations` journal in the preview database
 /// makes repeat applies idempotent, and the live gate still refuses an
 /// edited migration on the next live deploy.
 ///
@@ -462,7 +462,7 @@ mod tests {
         let fleets =
             crate::fleet::manager::FleetManager::new(crate::fleet::manager::ManagerSettings {
                 data_dir: dir.path().join("data"),
-                celld_bin: "celld".to_string(),
+                cello_bin: "cello".to_string(),
                 storage: crate::fleet::manager::FleetStorage {
                     endpoint: "http://127.0.0.1:1".to_string(),
                     region: "test".to_string(),
@@ -551,7 +551,7 @@ mod tests {
         let fleets =
             crate::fleet::manager::FleetManager::new(crate::fleet::manager::ManagerSettings {
                 data_dir: dir.path().join("data"),
-                celld_bin: "celld".to_string(),
+                cello_bin: "cello".to_string(),
                 storage: crate::fleet::manager::FleetStorage {
                     endpoint: "http://127.0.0.1:1".to_string(),
                     region: "test".to_string(),

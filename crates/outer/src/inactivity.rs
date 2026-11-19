@@ -541,7 +541,7 @@ mod tests {
                 fleets: crate::fleet::manager::FleetManager::new(
                     crate::fleet::manager::ManagerSettings {
                         data_dir: data_dir.clone(),
-                        celld_bin: "celld".to_string(),
+                        cello_bin: "cello".to_string(),
                         storage: crate::fleet::manager::FleetStorage {
                             endpoint: "http://127.0.0.1:1".to_string(),
                             region: "us-east-1".to_string(),

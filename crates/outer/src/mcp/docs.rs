@@ -28,8 +28,8 @@ pub const TOPICS: &[(&str, &str)] = &[
         include_str!("../../../../web/docs/agents/frontend/website.md"),
     ),
     (
-        "celld",
-        include_str!("../../../../web/docs/agents/platform/celld.md"),
+        "cello",
+        include_str!("../../../../web/docs/agents/platform/cello.md"),
     ),
     (
         "d1",

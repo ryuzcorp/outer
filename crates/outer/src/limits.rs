@@ -473,7 +473,7 @@ pub async fn check_requests_caps(
 /// apps back under. The owner email fires only on the freeze transition.
 ///
 /// What counts: D1 is the newest dump per binding (`d1_bytes_used`); R2 is
-/// the bytes under `fleets/{slug}/r2/`. App code writes through celld with
+/// the bytes under `fleets/{slug}/r2/`. App code writes through cello with
 /// scoped credentials, so Outer cannot refuse an in-runtime write at the
 /// call — the sweep flips the flag within the hour and the Console, commit
 /// and upload paths refuse while it is set. The Console R2 upload path
