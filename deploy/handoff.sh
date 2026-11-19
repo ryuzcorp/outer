@@ -184,43 +184,21 @@ handoff_to() {
         handoff_abort
         return 1
     }
-    if ! wait_for_listening outer-next "$image"; then
-        # First-handoff fallback: an old container that predates SO_REUSEPORT
-        # cannot share 443, so the newcomer bind fails with EADDRINUSE.
-        # Stop/start once (seconds of blackout; the idle wait above keeps
-        # in-flight deploys off the old build) — every later handoff
-        # overlaps.
-        if docker logs outer-next 2>&1 | grep -qi "address already in use" \
-            && [[ "$(docker inspect -f '{{.State.Running}}' "$old")" == "true" ]]; then
-            echo "remote: old container predates SO_REUSEPORT; one-time stop/start fallback" >&2
-            docker stop -t 60 "$old"
-            docker rm "$old"
-            docker start outer-next >/dev/null
-            wait_for_listening outer-next "$image" || {
-                handoff_abort
-                return 1
-            }
-            old=""
-        else
-            handoff_abort
-            return 1
-        fi
-    fi
+    wait_for_listening outer-next "$image" || {
+        handoff_abort
+        return 1
+    }
     # Drain the old container: SIGTERM refuses new deploys and the process
     # exits once in-flight ones finish. -t 900 bounds a wedged deploy with
     # SIGKILL; the newcomer's handoff catch-up closes whatever is left.
-    # (Skipped on the fallback path above: the old container is already
-    # gone.)
-    if [[ -n "$old" ]]; then
-        docker stop -t 900 "$old" || {
-            handoff_abort
-            return 1
-        }
-        docker rm "$old" || {
-            handoff_abort
-            return 1
-        }
-    fi
+    docker stop -t 900 "$old" || {
+        handoff_abort
+        return 1
+    }
+    docker rm "$old" || {
+        handoff_abort
+        return 1
+    }
     record_image "$image"
     # Recreate the compose service onto the same image: it overlaps the
     # newcomer via SO_REUSEPORT (same-version, no schema skew), then the

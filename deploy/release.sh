@@ -3,7 +3,14 @@
 # Outer release: build the image from the current HEAD and roll it out with
 # no downtime (deploy/handoff.sh).
 #
-#   deploy/release.sh <ssh-target>
+#   deploy/release.sh <ssh-target> [--fresh-install]
+#
+#   `--fresh-install` is the documented fresh path for a wiped box (see
+#   deploy/WIPE.md): the migration-checksum gate below cannot read a prod DB
+#   that does not exist, so the flag skips it — and refuses when the remote
+#   DB is present, so a fresh release can never run over live state. The
+#   rollout then brings the compose service up directly instead of a
+#   handoff (there is no old container to drain).
 #
 #   Engine: OUTER_ENGINE=docker|podman selects the local container engine for
 #   build and save. OUTER_ENGINE=auto (the default when unset or empty) keeps
@@ -41,8 +48,14 @@
 # No secrets in args or logs (only image tags travel in release.env).
 
 set -euo pipefail
-
-TARGET="${1:?usage: deploy/release.sh <ssh-target>}"
+TARGET="${1:?usage: deploy/release.sh <ssh-target> [--fresh-install]}"
+FRESH_INSTALL=0
+if [[ "${2:-}" == "--fresh-install" ]]; then
+    FRESH_INSTALL=1
+elif [[ -n "${2:-}" ]]; then
+    echo "release.sh: usage: deploy/release.sh <ssh-target> [--fresh-install]" >&2
+    exit 1
+fi
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
@@ -61,26 +74,36 @@ SHA="$(git rev-parse --short HEAD)"
 # SHA-384 of the file), and by then the old container is already stopped.
 # So before building: every migration the production database has applied
 # must exist here with the same SHA-384. New, unapplied files are fine.
+# On `--fresh-install` the gate is skipped instead: a wiped box has no DB
+# to read, and the missing DB is required (a surviving DB refuses below,
+# so a fresh release can never run over live state).
 MIGRATIONS="crates/outer/migrations"
-APPLIED="$(ssh "$TARGET" "sqlite3 -separator ' ' /srv/outer/data/outer.sqlite \
-    'SELECT version, lower(hex(checksum)) FROM _sqlx_migrations ORDER BY version'" 2>/dev/null)" || {
-    echo "release.sh: cannot read prod migrations from $TARGET (is outer up?)" >&2
-    exit 1
-}
-while read -r version checksum; do
-    [[ -n "$version" ]] || continue
-    file="$(printf '%s/%04d_' "$MIGRATIONS" "$version")"
-    matches=("$file"*.sql)
-    [[ -f "${matches[0]}" ]] || {
-        echo "release.sh: migration $version is applied on $TARGET but missing from this tree" >&2
+if [[ "$FRESH_INSTALL" == 1 ]]; then
+    if ssh "$TARGET" "test -e /srv/outer/data/outer.sqlite" 2>/dev/null; then
+        echo "release.sh: --fresh-install refuses: /srv/outer/data/outer.sqlite exists on $TARGET (run a normal release)" >&2
+        exit 1
+    fi
+else
+    APPLIED="$(ssh "$TARGET" "sqlite3 -separator ' ' /srv/outer/data/outer.sqlite \
+        'SELECT version, lower(hex(checksum)) FROM _sqlx_migrations ORDER BY version'" 2>/dev/null)" || {
+        echo "release.sh: cannot read prod migrations from $TARGET (is outer up?)" >&2
         exit 1
     }
-    local_sum="$(sha384sum "${matches[0]}" | cut -d' ' -f1)"
-    [[ "$local_sum" == "$checksum" ]] || {
-        echo "release.sh: ${matches[0]} differs from the copy applied on $TARGET; migrations are append-only (restore it byte-for-byte)" >&2
-        exit 1
-    }
-done <<<"$APPLIED"
+    while read -r version checksum; do
+        [[ -n "$version" ]] || continue
+        file="$(printf '%s/%04d_' "$MIGRATIONS" "$version")"
+        matches=("$file"*.sql)
+        [[ -f "${matches[0]}" ]] || {
+            echo "release.sh: migration $version is applied on $TARGET but missing from this tree" >&2
+            exit 1
+        }
+        local_sum="$(sha384sum "${matches[0]}" | cut -d' ' -f1)"
+        [[ "$local_sum" == "$checksum" ]] || {
+            echo "release.sh: ${matches[0]} differs from the copy applied on $TARGET; migrations are append-only (restore it byte-for-byte)" >&2
+            exit 1
+        }
+    done <<<"$APPLIED"
+fi
 # Local container engine for build and save. OUTER_ENGINE=auto (the default
 # when unset or empty) keeps today's behaviour: prefer podman, fall back to
 # docker. An explicit engine must exist on PATH; anything else refuses.
@@ -153,10 +176,12 @@ scp deploy/compose.yaml deploy/handoff.sh deploy/firewall.sh deploy/firewall.ser
     "$TARGET:/srv/outer/"
 
 # Remote rollout. SHA is hex (validated above), so interpolating it into the
-# remote script is safe; the heredoc is otherwise quoted.
-ssh "$TARGET" bash -s -- "$SHA" <<'EOF'
+# remote script is safe; the heredoc is otherwise quoted. FRESH_INSTALL is
+# 0/1 from this script's own flag parsing, never operator input.
+ssh "$TARGET" bash -s -- "$SHA" "$FRESH_INSTALL" <<'EOF'
 set -euo pipefail
 SHA="$1"
+FRESH_INSTALL="${2:-0}"
 cd /srv/outer
 
 [[ -f /srv/outer/outer.env ]] || {
@@ -180,9 +205,6 @@ if ! nft list table inet outer_fw >/dev/null 2>&1; then
 fi
 
 source /srv/outer/handoff.sh
-# Whatever fails below, the heartbeat must not outlive the release: abort
-# clears the flag and removes outer-next only while a compose outer serves.
-trap 'handoff_abort' EXIT
 # Lineage across the handoff needs no release-time step: the upload gate
 # adopts a pre-lineage bucket meta naming this host on every attempt
 # (re-applied while the bucket meta stays legacy, so the old container's
@@ -193,15 +215,29 @@ trap 'handoff_abort' EXIT
 # outer/state/history/release-<UTC timestamp>-<SHA>.sqlite.zst from the
 # bucket's live snapshot before the newcomer can migrate it, so a bad
 # migration reaching the live key can be restored from history. Skips
-# (exit 0) when the bucket holds no snapshot yet. SHA is hex (validated
+# (exit 0) when the bucket holds no snapshot yet — the fresh-box case — so
+# this step runs on both paths. SHA is hex (validated
 # above), so interpolating it into the docker args is safe. No data mount:
 # the subcommand only reads config env and the bucket, never the local DB.
 # validation reads files under /tls (e.g. OUTER_REVIEW_LOGINS_FILE).
 # --pull=never: the image is local-only (same as the preflight above).
 docker run --rm --pull=never --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
     "outer:$SHA" state release-backup --sha "$SHA"
-handoff_to "outer:$SHA"
-trap - EXIT
+if [[ "$FRESH_INSTALL" == 1 ]]; then
+    # Fresh box: no old container to drain and no handoff heartbeat — the
+    # DB-absent gate above already refused a non-wiped box. Bring the
+    # compose service up directly on the new image.
+    docker compose --env-file /srv/outer/release.env \
+        -f /srv/outer/compose.yaml up -d
+    record_image "outer:$SHA"
+    wait_for_listening outer-outer-1 "outer:$SHA"
+else
+    # Whatever fails below, the heartbeat must not outlive the release: abort
+    # clears the flag and removes outer-next only while a compose outer serves.
+    trap 'handoff_abort' EXIT
+    handoff_to "outer:$SHA"
+    trap - EXIT
+fi
 EOF
 
 echo "released $IMAGE to $TARGET"
