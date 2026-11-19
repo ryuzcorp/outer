@@ -232,9 +232,12 @@ if [[ "$FRESH_INSTALL" == 1 ]]; then
         echo "release.sh: --fresh-install refuses: /srv/outer/data/outer.sqlite appeared during the release" >&2
         exit 1
     fi
+    # Record first: compose reads OUTER_IMAGE from release.env, which the
+    # wipe keeps, so starting before recording would boot the pre-wipe image
+    # on the empty data dir.
+    record_image "outer:$SHA"
     docker compose --env-file /srv/outer/release.env \
         -f /srv/outer/compose.yaml up -d
-    record_image "outer:$SHA"
     wait_for_listening outer-outer-1 "outer:$SHA"
 else
     # Whatever fails below, the heartbeat must not outlive the release: abort

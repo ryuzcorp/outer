@@ -1627,13 +1627,16 @@ mod tests {
         // is dead config, not a refusal. (The runtime still refuses to
         // start a fleet with `CELLD_*` set; that reservation lives in
         // `fleet::sandbox`, not here.)
+        // Compare against the same config without the stale names: an
+        // installed /usr/local/bin/cello resolves either way.
+        let base = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
             ("CELLD_OPERATOR_TOKEN", "stale"),
             ("OUTER_CELLD_BIN", "celld"),
         ]))
         .unwrap();
-        assert_eq!(cfg.runtime.cello_bin, "cello");
+        assert_eq!(cfg.runtime.cello_bin, base.runtime.cello_bin);
     }
 
     #[test]

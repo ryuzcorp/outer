@@ -211,6 +211,13 @@ up_line="$(grep -n "compose.yaml up -d" "$fresh_rollout" | head -n1 | cut -d: -f
 hand_line="$(grep -n 'handoff_to "outer' "$fresh_rollout" | head -n1 | cut -d: -f1 || true)"
 [[ -n "$fresh_line" && -n "$up_line" && -n "$hand_line" && "$fresh_line" -lt "$up_line" && "$up_line" -lt "$hand_line" ]] \
     || fail "rollout does not compose-up first on the fresh branch (fresh=$fresh_line up=$up_line handoff=$hand_line)"
+# The fresh branch must record the new image before compose reads release.env.
+rec_line=""
+while IFS=: read -r n _; do
+    if (( n > fresh_line )); then rec_line="$n"; break; fi
+done < <(grep -n 'record_image "outer:' "$fresh_rollout")
+[[ -n "$rec_line" && "$rec_line" -lt "$up_line" ]] \
+    || fail "fresh branch starts compose before recording the new image (record=$rec_line up=$up_line)"
 echo "case 10 ok: --fresh-install skips the gate and composes up directly (exit 0)"
 
 # --- case 11: an unknown second arg refuses ---------------------------------

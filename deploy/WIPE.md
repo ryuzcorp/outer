@@ -52,9 +52,15 @@ Kept untouched:
 2. Safety copy (off-box, optional): 
    `sqlite3 /srv/outer/data/outer.sqlite ".backup '/root/outer-prewipe-$(date +%F).sqlite'"`.
    Keep until the new prod has snapshotted + backed up once.
-3. Stop the world: `docker compose -f /srv/outer/compose.yaml stop outer`
-   (or `docker stop -t 900 outer`). Confirm no fleet processes remain
-   (`ps aux | grep cello` shows none; each fleet ran as its app uid).
+3. Stop the world. Stop the compose service, and also `outer-next`, which a
+   failed earlier handoff can leave running with the data mount and bucket
+   access. Stop here if any command fails:
+   ```
+   docker compose --env-file /srv/outer/release.env -f /srv/outer/compose.yaml stop -t 900 outer
+   docker stop -t 900 outer-next 2>/dev/null || true
+   docker ps --filter name=outer --format '{{.Names}}'   # must print nothing
+   ps aux | grep '[c]ello'                               # must print nothing
+   ```
 4. Wipe the bucket (`outer`, via the S3-compatible endpoint in
    `OUTER_R2_ENDPOINT`; `EP` = that endpoint, credentials from the
    matching `OUTER_R2_*` keys):
