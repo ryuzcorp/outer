@@ -35,10 +35,11 @@ case "$version" in
   [0-9]*.[0-9]*.[0-9]*) ;;
   *) echo "docker/Dockerfile CELLO_VERSION '$version' is not a semver pin" >&2; status=1 ;;
 esac
-case "$digest" in
-  sha256:????????????????????????????????????????????????????????????????) ;;
-  *) echo "docker/Dockerfile CELLO_DIGEST '$digest' is not a sha256 pin" >&2; status=1 ;;
-esac
+# Exactly 64 lowercase hex after the prefix (a `?` glob would accept any byte).
+if ! printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+  echo "docker/Dockerfile CELLO_DIGEST '$digest' is not a sha256 pin" >&2
+  status=1
+fi
 # The Dockerfile holds the unexpanded form literally.
 # shellcheck disable=SC2016
 if [ "$imageref" != 'ghcr.io/ryuzcorp/cello:${CELLO_VERSION}@${CELLO_DIGEST}' ]; then
