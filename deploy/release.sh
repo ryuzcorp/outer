@@ -224,9 +224,14 @@ source /srv/outer/handoff.sh
 docker run --rm --pull=never --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
     "outer:$SHA" state release-backup --sha "$SHA"
 if [[ "$FRESH_INSTALL" == 1 ]]; then
-    # Fresh box: no old container to drain and no handoff heartbeat — the
-    # DB-absent gate above already refused a non-wiped box. Bring the
-    # compose service up directly on the new image.
+    # Fresh box: no old container to drain and no handoff heartbeat. Re-check
+    # the DB is still absent right before starting (the local gate ran
+    # minutes earlier, before the build), then bring the compose service up
+    # directly on the new image.
+    if test -e /srv/outer/data/outer.sqlite; then
+        echo "release.sh: --fresh-install refuses: /srv/outer/data/outer.sqlite appeared during the release" >&2
+        exit 1
+    fi
     docker compose --env-file /srv/outer/release.env \
         -f /srv/outer/compose.yaml up -d
     record_image "outer:$SHA"

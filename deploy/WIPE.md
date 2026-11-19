@@ -37,8 +37,9 @@ Live state (verified against `config.rs`, `compose.yaml`, `store/*`):
 Kept untouched:
 
 - `/srv/outer/outer.env` — replaced beforehand with a FRESH copy from
-  `deploy/outer.env.example` (fill blanks, `chmod 600`). The runtime
-  refuses to start with any `CELLD_*` set, so never carry one over.
+  `deploy/outer.env.example` (fill blanks, `chmod 600`). Outer no longer
+  reads any `CELLD_*` or `OUTER_CELLD_BIN` key; a fresh copy keeps the
+  file free of dead config.
 - `/srv/outer/release.env`, `/srv/outer/tls/` (`origin.pem`,
   `origin.key`, `origin-pull-ca.pem`), the firewall units/table
   (`inet outer_fw`).
@@ -63,10 +64,14 @@ Kept untouched:
      aws s3 ls --endpoint-url "$EP" "s3://outer/$p"  # must list nothing
    done
    ```
-5. Wipe host state:
+5. Wipe host state. Everything under `/srv/outer/data` is state or derived
+   from it: the DB, the handoff flag, `fleets/`, `work/`, `cache/`, `git/`
+   (repo mirrors), `maps/` (tenant sourcemaps), `checks/` (build scratch),
+   `examples/`, and `secret-sidecars/` (transient plaintext secret files).
+   Empty the directory itself; TLS and env live outside it:
    ```
-   rm -f /srv/outer/data/outer.sqlite* /srv/outer/data/handoff
-   rm -rf /srv/outer/data/fleets /srv/outer/data/work /srv/outer/data/cache /srv/outer/data/git-mirrors
+   find /srv/outer/data -mindepth 1 -delete
+   ls -A /srv/outer/data   # must print nothing
    ```
 
 6. Cut the code: from a clean tree at the renamed commit,
