@@ -3,29 +3,26 @@
 # (under tini) and owns every other process:
 #
 #   outer (uid 0)       MCP, OAuth, app proxy, deploys, supervision
-#   ├── celld × N       one fleet per awake app, each as the app's own uid
+#   ├── cello × N       one fleet per awake app, each as the app's own uid
 #   └── bun / sh        builds, as the app's uid
 #
 # outer terminates TLS itself (rustls) on OUTER_LISTEN: the Cloudflare
 # Origin CA certificate plus Authenticated Origin Pulls (mTLS).
-# celld comes from the ryuzcorp/celld fork: upstream denoland/celld at
-# 0.6.3 plus the fork's patches (Void framework compatibility, sandbox
-# containers/exec, D1/R2 fixes, deploy project-read confinement with
-# `--read-root`), published as `<version>-ryuzcorp.<level>` with SLSA
-# provenance attestations. The two ARG lines below are the single source
-# of the pin: a bump changes these values (the tag, then the digest from
-# the fork's publish summary). Upstream celld ships only security fixes
-# from 0.6.x on, so the fork carries the patches.
-ARG CELLD_VERSION=0.6.3-ryuzcorp.12
-ARG CELLD_DIGEST=sha256:01c9da9e41e4db13c31b31a7a5815e07d03deb6f3557ce3d6f536ea6df4efc50
-ARG CELLD_IMAGE=ghcr.io/ryuzcorp/celld:${CELLD_VERSION}@${CELLD_DIGEST}
+# cello is the renamed celld continuation (ryuzcorp/cello): the same code
+# and formats as celld `0.6.3-ryuzcorp.13`, new names, published as semver
+# with SLSA provenance attestations. The two ARG lines below are the
+# single source of the pin: a bump changes these values (the tag, then the
+# digest from the release's publish summary).
+ARG CELLO_VERSION=0.1.0
+ARG CELLO_DIGEST=sha256:3d6943b69b2201f8980f73178d3530c4b7f558c2bcb3cbb99badbc67deb87689
+ARG CELLO_IMAGE=ghcr.io/ryuzcorp/cello:${CELLO_VERSION}@${CELLO_DIGEST}
 ARG ESBUILD_VERSION=0.28.2
 # Pinned formatter for agent commits. Keep in step with the template's
 # `oxfmt` devDependency, `.github/workflows/ci.yml`, and the extension list
 # in `crates/outer/src/git/format.rs`.
 ARG OXFMT_VERSION=0.74.0
 
-FROM ${CELLD_IMAGE} AS celld
+FROM ${CELLO_IMAGE} AS cello
 
 # --- web site (Blume) -----------------------------------------------------------
 # The platform host serves this static build for humans and agents; the MCP
@@ -72,10 +69,10 @@ RUN --mount=type=cache,id=outer-cargo-registry,target=/usr/local/cargo/registry,
 
 # --- runtime ------------------------------------------------------------------
 # bun runs app installs and builds. git backs each app's repo. nftables
-# enforces the egress policy. esbuild is what celld bundles Worker code with.
+# enforces the egress policy. esbuild is what cello bundles Worker code with.
 FROM docker.io/oven/bun:1.4-slim AS outer
 ARG ESBUILD_VERSION
-ARG CELLD_VERSION
+ARG CELLO_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tini ca-certificates curl git nftables \
   && rm -rf /var/lib/apt/lists/* \
@@ -98,7 +95,7 @@ RUN for uid in $(seq 200000 201023); do \
       echo "app-${uid}:x:${uid}:" >> /etc/group; \
     done \
   && mkdir -p /data
-COPY --from=celld /usr/local/bin/celld /usr/local/bin/celld
+COPY --from=cello /usr/local/bin/cello /usr/local/bin/cello
 COPY --from=build /out/outer /usr/local/bin/outer
 # The built web site, served on the platform host from OUTER_SITE_DIR.
 COPY --from=site /site/web/dist /usr/share/outer/site
@@ -115,8 +112,8 @@ WORKDIR /data
 ENV OUTER_DATA=/data \
     OUTER_LISTEN=[::]:443 \
     OUTER_SITE_DIR=/usr/share/outer/site \
-    CELLD_ESBUILD=/usr/local/bin/esbuild \
-    CELLD_VERSION="${CELLD_VERSION}"
+    CELLO_ESBUILD=/usr/local/bin/esbuild \
+    CELLO_VERSION="${CELLO_VERSION}"
 VOLUME /data
 EXPOSE 443
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/outer"]

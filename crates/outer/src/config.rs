@@ -381,8 +381,8 @@ pub struct RuntimeConfig {
     pub app_uid_range: (u32, u32),
     /// Idle time before an app's fleet is stopped (`OUTER_SLEEP_AFTER_S`).
     pub sleep_after_secs: u64,
-    /// `OUTER_CELLD_BIN`, `OUTER_BUN_BIN`, `OUTER_ESBUILD_BIN` (passed to celld).
-    pub celld_bin: String,
+    /// `OUTER_CELLO_BIN`, `OUTER_BUN_BIN`, `OUTER_ESBUILD_BIN` (passed to cello).
+    pub cello_bin: String,
     pub bun_bin: String,
     pub esbuild_bin: Option<String>,
     /// Global build slots (`OUTER_BUILD_CONCURRENCY`, default half the CPUs).
@@ -427,6 +427,25 @@ impl Config {
     pub fn from_vars(vars: &BTreeMap<String, String>) -> Result<Config, Vec<String>> {
         let get = |name: &str| vars.get(name).map(|v| v.trim()).filter(|v| !v.is_empty());
         let mut problems = Vec::new();
+        // Cello 0.1.0 renamed every `CELLD_*` variable to `CELLO_*` and
+        // refuses to start with any `CELLD_*` set — and Outer no longer
+        // emits any. A carried-over setting is dead config at best, so fail
+        // here, in both `serve` and `check-config` (the release preflight
+        // runs the latter against prod's env file): the release aborts
+        // before prod is touched, naming the exact rename.
+        {
+            let mut renamed: Vec<(&String, String)> = vars
+                .keys()
+                .filter(|name| name.starts_with("CELLD_"))
+                .map(|name| (name, format!("CELLO_{}", &name["CELLD_".len()..])))
+                .collect();
+            renamed.sort();
+            for (old, new) in renamed {
+                problems.push(format!(
+                    "{old} was renamed to {new}: set {new} instead of {old} (Cello 0.1.0 refuses to start with any CELLD_* variable set)"
+                ));
+            }
+        }
 
         let domain = get("OUTER_DOMAIN")
             .unwrap_or(DEFAULT_DOMAIN)
@@ -628,8 +647,17 @@ impl Config {
                 1800,
                 &mut problems,
             ),
-            celld_bin: resolve_bin(
-                get("OUTER_CELLD_BIN").unwrap_or("celld"),
+            cello_bin: resolve_bin(
+                get("OUTER_CELLO_BIN")
+                    .or_else(|| {
+                        // Deprecated pre-Cello name: honored so a carried-over
+                        // production env keeps booting. The bare old default
+                        // means "whatever the image carries", so it follows
+                        // the rename; an explicit path keeps working.
+                        let old = get("OUTER_CELLD_BIN")?;
+                        (old != "celld").then_some(old)
+                    })
+                    .unwrap_or("cello"),
                 vars.get("PATH").map(String::as_str).unwrap_or(""),
             ),
             bun_bin: resolve_bin(
@@ -1615,8 +1643,55 @@ mod tests {
         assert_eq!(cfg.runtime.bun_bin, fake.to_string_lossy().into_owned());
         // Missing tools and explicit paths keep their raw names: config load
         // (and check-config) never depends on installed tools.
-        assert_eq!(cfg.runtime.celld_bin, "celld");
+        assert_eq!(cfg.runtime.cello_bin, "cello");
         assert_eq!(cfg.runtime.esbuild_bin.as_deref(), Some("/opt/esbuild"));
+    }
+
+    #[test]
+    fn stale_celld_env_refuses_with_the_cello_spelling() {
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("CELLD_OPERATOR_TOKEN", "stale"),
+            ("CELLD_DURABILITY", "bucket"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.contains("CELLD_OPERATOR_TOKEN was renamed to CELLO_OPERATOR_TOKEN")),
+            "missing operator-token rename: {err:?}"
+        );
+        assert!(
+            err.iter()
+                .any(|p| p.contains("CELLD_DURABILITY was renamed to CELLO_DURABILITY")),
+            "missing durability rename: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cello_bin_defaults_and_honors_the_deprecated_name() {
+        // Fresh env: the new name and the new default.
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert_eq!(cfg.runtime.cello_bin, "cello");
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_CELLO_BIN", "/opt/cello"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.runtime.cello_bin, "/opt/cello");
+        // Carried-over production env keeps booting: an explicit old path
+        // is honored, while the bare old default follows the rename.
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_CELLD_BIN", "/opt/celld"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.runtime.cello_bin, "/opt/celld");
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_CELLD_BIN", "celld"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.runtime.cello_bin, "cello");
     }
 
     #[test]
