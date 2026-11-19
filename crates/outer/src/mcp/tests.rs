@@ -2379,7 +2379,12 @@ async fn action_rows(state: &McpState, slug: &str) -> Vec<crate::mcp::actions::A
 
 #[tokio::test]
 async fn agent_action_commit_logged_with_redacted_summary() {
-    let (state, _) = setup().await;
+    let (mut state, _) = setup().await;
+    // The rows below assert terminal outcomes, so pin the tool's own inline
+    // completion arm: under parallel load the fake deploy can outlast the
+    // 200 ms test `tool_wait`, and the dispatch-time row would stay
+    // `building` (see `slow_deploys_return_in_progress` for that path).
+    state.tool_wait = INLINE_WAIT;
     let token = api_key_for(&state, "ana@example.com").await;
     create_app(&state, &token, "groceries").await;
 

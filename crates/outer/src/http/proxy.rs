@@ -3354,14 +3354,14 @@ mod tests {
     #[tokio::test]
     async fn failed_wake_is_a_503_with_retry_after() {
         let fix = fixture().await;
-        // A closed loopback port: nothing answers, and the binary does not
-        // exist, so the wake fails without touching the network.
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // A held-but-silent loopback listener, and a binary that does not
+        // exist, so the wake fails without touching the network. Holding
+        // the socket (rather than binding and dropping it) keeps the port
+        // out of the ephemeral pool: under parallel load another test's
+        // fake fleet could otherwise bind the freed port and answer the
+        // wake probe, flaking the expected 503 into a proxied 200.
+        let _held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = _held.local_addr().unwrap().port();
         insert_app(&fix.pool, "app-down", "down", closed, "public").await;
         let state = ProxyState::new(
             fix.pool.clone(),

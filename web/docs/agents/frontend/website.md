@@ -44,7 +44,7 @@ export const POST: APIRoute = async () => {
 
 ## Ship config and schema the Cello way
 
-1. Edit `astro.config.mjs` (`celld-config` integration), never hand-write `dist/wrangler.json`.
+1. Edit `astro.config.mjs` (`cello-config` integration), never hand-write `dist/wrangler.json`.
 2. Read derived keys from `dist/wrangler.json` after `bun run build`.
 3. Commit migration files under `db/migrations/`; never edit an applied migration.
 4. Keep the route's `CREATE TABLE IF NOT EXISTS` as a local-dev backstop matching the migration.

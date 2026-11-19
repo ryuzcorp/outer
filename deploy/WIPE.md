@@ -91,7 +91,7 @@ Kept untouched:
 7. Verify empty:
    - `/health` + `/ready` (200 once the fresh DB and bucket answer; the
      first snapshot writes a fresh `owner.json` claim under `outer/state/`).
-   - `docs` tool lists `cello`, not `celld`; `outer check-config` clean.
+   - `docs` tool lists the `cello` spellings throughout; `outer check-config` clean.
    - Create one scratch app, deploy, `GET /.well-known/cello/health`
      (synthetic, no wake), stop the fleet, delete the app (exercises the
      `fleets/`, `git/`, `outer/backups/`, `outer/exports/` delete paths),
