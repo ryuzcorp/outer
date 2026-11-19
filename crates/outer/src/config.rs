@@ -1682,7 +1682,12 @@ mod tests {
 
     #[test]
     fn cello_bin_defaults_to_cello() {
-        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        // An empty PATH: without one, resolve_bin falls back to the system
+        // PATH and finds an installed /usr/local/bin/cello.
+        let empty = tempfile::tempdir().unwrap();
+        let path = empty.path().to_string_lossy().into_owned();
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory"), ("PATH", path.as_str())]))
+            .unwrap();
         assert_eq!(cfg.runtime.cello_bin, "cello");
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
