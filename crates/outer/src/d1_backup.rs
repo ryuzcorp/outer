@@ -777,7 +777,18 @@ pub async fn backup_due_apps(pool: &SqlitePool, now_ms: i64) -> anyhow::Result<V
 /// each touched app to its plan's retention even when nothing was due (a
 /// downgrade shortens retention). One app's failure warns and the sweep
 /// continues with the next.
-pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> anyhow::Result<()> {
+///
+/// `secrets_key` is the server's real key (derived from config): the sweep
+/// derives the same fleet operator token the fleet itself was started with,
+/// so `cello d1` calls authenticate. A wrong key here fails every backup
+/// with an auth error, which is why this is a parameter and never a
+/// test-only constant.
+pub async fn tick(
+    pool: &SqlitePool,
+    store: &Store,
+    fleets: &FleetManager,
+    secrets_key: &crate::secrets::SecretsKey,
+) -> anyhow::Result<()> {
     let now = crate::apps::now_ms();
     for app in backup_due_apps(pool, now).await? {
         let bindings = match d1::database_bindings(store, &app.slug).await {
@@ -799,7 +810,7 @@ pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> an
             storage: fleets.storage().clone(),
             pool: pool.clone(),
             store: store.clone(),
-            secrets_key: crate::secrets::SecretsKey::test_key(),
+            secrets_key: secrets_key.clone(),
             wake: Some(fleets.clone()),
         };
         let plan = match owner_plan(pool, &app.owner_id).await {
@@ -850,13 +861,21 @@ pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> an
 }
 
 /// A tokio interval loop for the daily backups. Failures log and the loop
-/// continues on the next tick.
-pub fn spawn_backup_task(pool: SqlitePool, store: Store, fleets: FleetManager, every: Duration) {
+/// continues on the next tick. Takes the server's real key (derived from
+/// config in `serve`): the sweep must derive the fleet's operator token
+/// with the same key the fleet was started with.
+pub fn spawn_backup_task(
+    pool: SqlitePool,
+    store: Store,
+    fleets: FleetManager,
+    secrets_key: crate::secrets::SecretsKey,
+    every: Duration,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(every);
         loop {
             interval.tick().await;
-            if let Err(err) = tick(&pool, &store, &fleets).await {
+            if let Err(err) = tick(&pool, &store, &fleets, &secrets_key).await {
                 tracing::warn!(error = %format!("{err:#}"), "d1 backup sweep failed");
             }
         }
@@ -1472,8 +1491,132 @@ exit 0
             always_on_max: 0,
             preview_max: 0,
         });
-        tick(&pool, &store, &fleets).await.unwrap();
+        tick(
+            &pool,
+            &store,
+            &fleets,
+            &crate::secrets::SecretsKey::test_key(),
+        )
+        .await
+        .unwrap();
         assert!(backups_for(&pool, "app-bad").await.unwrap().is_empty());
+    }
+
+    /// A wrapper around the fake `cello` that enforces the fleet's operator
+    /// token: every invocation must carry the `CELLO_OPERATOR_TOKEN` derived
+    /// from the server's key, else it fails the way a guarded fleet listener
+    /// does (401). Catches the sweep deriving its token with the wrong key.
+    fn install_authed_cello(
+        state: &std::path::Path,
+        inner: &std::path::Path,
+        expected_token: &str,
+    ) -> std::path::PathBuf {
+        let script = state.join("fake-cello-authed");
+        let tmp = script.with_extension("tmp");
+        std::fs::write(
+            &tmp,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$CELLO_OPERATOR_TOKEN\" != \"{expected_token}\" ]; then\n\
+                   echo \"401 unauthorized: bad operator token\" >&2\n\
+                   exit 1\n\
+                 fi\n\
+                 exec \"{inner}\" \"$@\"\n",
+                inner = inner.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::rename(&tmp, &script).unwrap();
+        script
+    }
+
+    /// A stub fleet health gate: answers 200 on every connection so
+    /// `ensure_awake`'s pre-spawn probe counts the fleet awake and no fleet
+    /// ever spawns. Each test takes its own ephemeral port.
+    async fn stub_fleet_health() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    /// The sweep backs up with the server's real key: the token-checking
+    /// fleet answers and a dump lands in the store. With the old code the
+    /// sweep derived its token from a test-only key, every `cello d1` call
+    /// 401d, and the sweep stored nothing.
+    #[tokio::test]
+    async fn tick_backs_up_with_the_servers_real_key() {
+        let pool = test_pool().await;
+        let state = tempfile::tempdir().unwrap();
+        // A real, non-test key: `derive`, never `test_key`. The fleet and
+        // the sweep must agree on it.
+        let secrets_key =
+            crate::secrets::SecretsKey::derive("outer-backup-sweep key (never production)");
+        let expected = crate::secrets::operator_token(&secrets_key, "acme");
+        let inner = install_fake_cello(state.path());
+        let script = install_authed_cello(state.path(), &inner, &expected);
+        let store = Store::memory();
+        let now = crate::apps::now_ms();
+        seed_backup_app(&pool, &store, now).await;
+        let (port, _health) = stub_fleet_health().await;
+        sqlx::query("UPDATE app SET port = ?1, internal_port = ?2 WHERE slug = 'acme'")
+            .bind(port as i64)
+            .bind(port as i64 + 1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fleets = FleetManager::new(crate::fleet::manager::ManagerSettings {
+            data_dir: state.path().join("data"),
+            cello_bin: script.to_string_lossy().into_owned(),
+            storage: FleetStorage {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                region: "test-region".to_string(),
+                bucket: state.path().to_string_lossy().into_owned(),
+                credentials: crate::store::credentials::CredentialSource::Static {
+                    access_key_id: "outeraccess".to_string(),
+                    secret_access_key: "outersecretoutersecretoutersecret12".to_string(),
+                },
+            },
+            cgroups: None,
+            memory_max_bytes: 0,
+            cpu_max: "MAX 100000".to_string(),
+            sleep_after: Duration::from_secs(3600),
+            credential_refresh_after: Duration::from_secs(86400 * 30),
+            wake_timeout: Duration::from_secs(1),
+            wake_concurrency: 1,
+            secrets_key: secrets_key.clone(),
+            always_on_max: 0,
+            preview_max: 0,
+        });
+        tick(&pool, &store, &fleets, &secrets_key).await.unwrap();
+        let rows = backups_for(&pool, "app-acme").await.unwrap();
+        assert_eq!(rows.len(), 1, "the sweep stored one dump: {rows:?}");
+        let dump = store.get(&rows[0].store_key).await.unwrap();
+        assert!(
+            dump.is_some_and(|bytes| !bytes.is_empty()),
+            "the stored dump is non-empty"
+        );
     }
 
     #[tokio::test]

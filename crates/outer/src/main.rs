@@ -944,7 +944,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         },
         purges: purges.clone(),
         egress: egress.clone(),
-        secrets_key,
+        secrets_key: secrets_key.clone(),
         unsub_key: config.outer_secret.as_bytes().to_vec(),
         billing: outer::billing::BillingState::from_config(
             &config.stripe,
@@ -986,6 +986,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         let sweep_pool = pool.clone();
         let sweep_store = store.clone();
         let sweep_fleets = fleets.clone();
+        let sweep_secrets = secrets_key.clone();
         let sweep_git = git.clone();
         let sweep_sync = git_sync.clone();
         let sweep_billing = mcp.billing.clone();
@@ -1046,6 +1047,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 sweep_pool.clone(),
                 sweep_store.clone(),
                 sweep_fleets.clone(),
+                sweep_secrets.clone(),
                 outer::d1_backup::TICK_EVERY,
             );
             // Past-due grace (spec §14.2): day-5 reminders and the downgrade
