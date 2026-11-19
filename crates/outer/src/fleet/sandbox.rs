@@ -48,13 +48,16 @@ pub fn base_env(cache_root: &Path) -> Vec<(String, String)> {
 /// Reserved prefixes/names the platform owns: app secrets with these names
 /// are dropped (logged) rather than injected into build/fleet env.
 /// `OUTER_*` replaces Noite's `NOITE_*`/`RUNNER_*`; jup/npm/pnpm/yarn
-/// specifics are gone with the package managers.
+/// specifics are gone with the package managers. `CELLD_*` stays reserved
+/// next to `CELLO_*`: a carried-over app `CELLD_*` would make cello refuse
+/// to start, so it must never reach the child either.
 pub fn is_reserved_env_name(name: &str) -> bool {
     name == "PORT"
         || name == "HOST"
         || name.starts_with("AWS_")
         || name.starts_with("S3_")
         || name.starts_with("CELLD_")
+        || name.starts_with("CELLO_")
         || name.starts_with("OUTER_")
         || name.starts_with("CLOUDFLARE_")
         || name.starts_with("R2_")
@@ -78,7 +81,7 @@ pub fn is_reserved_env_name(name: &str) -> bool {
 /// plus the process group), so a shared leaf would kill sibling steps.
 ///
 /// Two env lists: `platform_env` is set by outer itself (PATH, the bucket
-/// credentials `celld deploy` needs) and reaches the child as given; `env`
+/// credentials `cello deploy` needs) and reaches the child as given; `env`
 /// carries app-supplied values (secrets) and goes through
 /// [`is_reserved_env_name`], so an app can never set `LD_PRELOAD`, `AWS_*` or
 /// any platform name.
@@ -635,7 +638,7 @@ mod tests {
             "HOST",
             "AWS_SECRET_ACCESS_KEY",
             "S3_ENDPOINT",
-            "CELLD_WATCH",
+            "CELLO_WATCH",
             "OUTER_SECRET",
             "CLOUDFLARE_API_TOKEN",
             "R2_ACCESS_KEY_ID",

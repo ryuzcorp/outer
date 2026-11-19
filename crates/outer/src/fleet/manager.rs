@@ -1,4 +1,4 @@
-//! One celld fleet per app, started on demand and slept when idle.
+//! One cello fleet per app, started on demand and slept when idle.
 //!
 //! `FleetManager` keeps the running fleets: `ensure_awake` starts the fleet
 //! for an app (coalesced per slug, bounded across slugs), `sleep_idle` stops
@@ -27,8 +27,8 @@ use crate::store::credentials::Permission;
 pub struct ManagerSettings {
     /// `{data}`: fleet state lives at `{data}/fleets/{slug}`.
     pub data_dir: PathBuf,
-    /// Celld binary (`celld` on `PATH` in production).
-    pub celld_bin: String,
+    /// Cello binary (`cello` on `PATH` in production).
+    pub cello_bin: String,
     /// Bucket and creds the fleet pulls its deploys from.
     pub storage: FleetStorage,
     /// Cgroup anchor when containment is active, else `None` (dev).
@@ -43,7 +43,7 @@ pub struct ManagerSettings {
     /// minted credentials (prod: 6 days for a 7-day TTL). Applies to fleets
     /// that are not being put to sleep this sweep tick.
     pub credential_refresh_after: Duration,
-    /// How long a wake waits for `/.well-known/celld/health`.
+    /// How long a wake waits for `/.well-known/cello/health`.
     pub wake_timeout: Duration,
     /// AES-256-GCM key for app secrets; the manager derives each fleet's
     /// internal-listener token from it (never stored, never a Worker var).
@@ -90,13 +90,13 @@ impl FleetStorage {
         format!("fleets/{slug}/")
     }
 
-    /// The state namespaces a running celld node writes, as read-write
+    /// The state namespaces a running cello node writes, as read-write
     /// credential prefixes. **Cross-repo contract:** this list must name
-    /// every key the celld fork touches at runtime. A new namespace in a
-    /// celld release is a failed write (and usually a failed wake) until
+    /// every key the cello fork touches at runtime. A new namespace in a
+    /// cello release is a failed write (and usually a failed wake) until
     /// this list names it; that is deliberate, because the alternative is a
     /// grant wide enough to publish deployments. Each prefix names the
-    /// celld file that reads or writes it (`crates/celld/` unless noted):
+    /// cello file that reads or writes it (`crates/cello/` unless noted):
     ///
     /// - `cells/` — Durable Object state, ownership records, LTX replicas
     ///   (`cell_cli.rs`, `control_plane.rs`)
@@ -119,8 +119,8 @@ impl FleetStorage {
     /// - `kv/` — KV large-value blobs (`crates/logic/kv.rs`)
     /// - `r2/` — R2 bindings (`r2/<bucket_name>/`, `r2_store.rs`)
     /// - `probe/` — the startup conditional-write and range probes, and
-    ///   `celld diagnose` (`bucket.rs`)
-    /// - `telemetry/` — OTel parquet, only with `CELLD_OTEL` set
+    ///   `cello diagnose` (`bucket.rs`)
+    /// - `telemetry/` — OTel parquet, only with `CELLO_OTEL` set
     ///   (`telemetry.rs`)
     pub fn fleet_data_prefixes(slug: &str) -> Vec<String> {
         [
@@ -181,7 +181,7 @@ impl FleetStorage {
 
 struct Inner {
     data_dir: PathBuf,
-    celld_bin: String,
+    cello_bin: String,
     storage: FleetStorage,
     secrets_key: crate::secrets::SecretsKey,
     cgroups: Option<PathBuf>,
@@ -269,7 +269,7 @@ impl FleetManager {
     pub fn new(settings: ManagerSettings) -> Self {
         let inner = Inner {
             data_dir: settings.data_dir,
-            celld_bin: settings.celld_bin,
+            cello_bin: settings.cello_bin,
             storage: settings.storage,
             secrets_key: settings.secrets_key,
             cgroups: settings.cgroups,
@@ -300,11 +300,11 @@ impl FleetManager {
         self.inner.egress.read().expect("egress lock").clone()
     }
 
-    /// The celld binary console data panels shell out to (`celld d1 …`,
-    /// `celld cell …`). Cloned out so `console_data` can build its argv
+    /// The cello binary console data panels shell out to (`cello d1 …`,
+    /// `cello cell …`). Cloned out so `console_data` can build its argv
     /// without reaching into the manager's internals.
-    pub fn celld_bin(&self) -> String {
-        self.inner.celld_bin.clone()
+    pub fn cello_bin(&self) -> String {
+        self.inner.cello_bin.clone()
     }
 
     /// Bucket coordinates and the per-prefix credential source the data
@@ -453,7 +453,7 @@ impl FleetManager {
             )),
         };
         let opts = FleetOpts {
-            celld_bin: self.inner.celld_bin.clone(),
+            cello_bin: self.inner.cello_bin.clone(),
             state_dir,
             shutdown_total_ms: 20_000,
             idle_evict_secs: 120,
@@ -622,7 +622,7 @@ impl FleetManager {
             .map_err(|err| anyhow::anyhow!("wake semaphore closed: {err}"))?;
         // A fleet can outlive outer: the child reparents on restart and
         // keeps serving while the new process's map is empty. Starting a
-        // second celld would collide on the port, so one probe comes first;
+        // second cello would collide on the port, so one probe comes first;
         // a healthy port means awake. `wait_healthy` tries once before its
         // first sleep, so a zero timeout is a single probe, not a skip.
         if health::wait_healthy("127.0.0.1", app.port, Duration::ZERO).await {
@@ -873,10 +873,10 @@ impl FleetManager {
     /// [`crate::apps::serving::decide`]. Free apps keep sleeping as before,
     /// and a stopped or held app is not woken.
     ///
-    /// `ensure_awake` covers the sleeping case (a booted celld adopts the
+    /// `ensure_awake` covers the sleeping case (a booted cello adopts the
     /// deployment pointer and arms the new generation's cron schedule) and
     /// is a no-op for a tracked fleet. The one warm-up request then drives
-    /// a real visitor path into the fleet: celld's health gate and
+    /// a real visitor path into the fleet: cello's health gate and
     /// `/reload` both answer without running the Worker, so only a request
     /// proves the deployed version serves. Neither step fails a deploy; the
     /// caller logs an error and the keep-warm sweep retries.
@@ -1396,7 +1396,7 @@ mod tests {
             .unwrap();
         let manager = FleetManager::new(ManagerSettings {
             data_dir: dir.path().to_path_buf(),
-            celld_bin: "/nonexistent/celld".to_string(),
+            cello_bin: "/nonexistent/cello".to_string(),
             storage: FleetStorage {
                 endpoint: "https://example.com".to_string(),
                 region: "auto".to_string(),
@@ -1430,7 +1430,7 @@ mod tests {
     }
 
     /// A wake counts as activity: `ensure_awake` against an already-healthy
-    /// port touches `last_request_at` without spawning celld. Uses a fake
+    /// port touches `last_request_at` without spawning cello. Uses a fake
     /// health endpoint, no fleet involved.
     #[tokio::test]
     async fn wake_marks_activity_without_spawning() {
@@ -1477,7 +1477,7 @@ mod tests {
         let before = apps::now_ms();
         let manager = FleetManager::new(ManagerSettings {
             data_dir: dir.path().to_path_buf(),
-            celld_bin: "/nonexistent/celld".to_string(),
+            cello_bin: "/nonexistent/cello".to_string(),
             storage: FleetStorage {
                 endpoint: "https://example.com".to_string(),
                 region: "auto".to_string(),
@@ -1593,12 +1593,12 @@ mod tests {
         pool.close().await;
     }
 
-    /// Needs a real celld binary and an S3-compatible bucket (RustFS, with
+    /// Needs a real cello binary and an S3-compatible bucket (RustFS, with
     /// OUTER_TEST_S3_* set as in tests/store_live.rs): deploys a minimal
     /// worker, then starts the fleet for an app row and waits for its health
     /// gate.
     #[tokio::test]
-    #[ignore = "needs celld + RustFS"]
+    #[ignore = "needs cello + RustFS"]
     async fn wake_starts_a_real_fleet() {
         fn test_env(name: &str, fallback: &str) -> String {
             std::env::var(name).unwrap_or_else(|_| fallback.to_string())
@@ -1607,7 +1607,7 @@ mod tests {
         let bucket = test_env("OUTER_TEST_S3_BUCKET", "outer-dev");
         let access_key = test_env("OUTER_TEST_S3_KEY", "outeraccess");
         let secret_key = test_env("OUTER_TEST_S3_SECRET", "outersecretoutersecret12");
-        let celld = test_env("CELLD_BIN", "celld");
+        let cello = test_env("CELLO_BIN", "cello");
         // A minimal worker so the fleet has something to serve.
         let proj = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1620,7 +1620,7 @@ mod tests {
             "{\"name\": \"real\", \"main\": \"index.js\", \"compatibility_date\": \"2026-09-01\"}",
         )
         .unwrap();
-        let deploy = tokio::process::Command::new(&celld)
+        let deploy = tokio::process::Command::new(&cello)
             .arg("deploy")
             .arg(proj.path())
             .arg("--bucket")
@@ -1635,15 +1635,15 @@ mod tests {
             .env("AWS_EC2_METADATA_DISABLED", "true")
             .env("S3_ENDPOINT", &endpoint)
             .env(
-                "CELLD_ESBUILD",
-                test_env("CELLD_ESBUILD", "/usr/local/bin/esbuild"),
+                "CELLO_ESBUILD",
+                test_env("CELLO_ESBUILD", "/usr/local/bin/esbuild"),
             )
             .output()
             .await
-            .expect("celld deploy runs");
+            .expect("cello deploy runs");
         assert!(
             deploy.status.success(),
-            "celld deploy failed: {}",
+            "cello deploy failed: {}",
             String::from_utf8_lossy(&deploy.stderr)
         );
         let dir = tempfile::tempdir().unwrap();
@@ -1663,7 +1663,7 @@ mod tests {
         .unwrap();
         let manager = FleetManager::new(ManagerSettings {
             data_dir: dir.path().to_path_buf(),
-            celld_bin: test_env("CELLD_BIN", "celld"),
+            cello_bin: test_env("CELLO_BIN", "cello"),
             storage: FleetStorage {
                 endpoint,
                 region: "auto".to_string(),
@@ -1690,9 +1690,9 @@ mod tests {
         manager.stop_all().await;
     }
 
-    /// Keep-warm rig: a fake celld (a script that sleeps) plus a fake
+    /// Keep-warm rig: a fake cello (a script that sleeps) plus a fake
     /// healthy port, so `ensure_awake` tracks a live fleet with no real
-    /// celld and no network.
+    /// cello and no network.
     struct WarmRig {
         _dir: tempfile::TempDir,
         pool: SqlitePool,
@@ -1703,7 +1703,7 @@ mod tests {
     impl WarmRig {
         async fn new(always_on_max: usize) -> Self {
             let dir = tempfile::tempdir().unwrap();
-            Self::with_celld(
+            Self::with_cello(
                 dir,
                 always_on_max,
                 "#!/bin/sh\nexec sleep 120\n",
@@ -1724,15 +1724,15 @@ mod tests {
                 log.display()
             );
             (
-                Self::with_celld(dir, always_on_max, &script, Duration::from_secs(2)).await,
+                Self::with_cello(dir, always_on_max, &script, Duration::from_secs(2)).await,
                 log,
             )
         }
 
-        async fn with_celld(
+        async fn with_cello(
             dir: tempfile::TempDir,
             always_on_max: usize,
-            celld_script: &str,
+            cello_script: &str,
             wake_timeout: Duration,
         ) -> Self {
             let pool = crate::db::open(&dir.path().join("outer.sqlite"))
@@ -1740,16 +1740,16 @@ mod tests {
                 .unwrap();
             // A fleet binary that stays alive and ignores its argv: the
             // health gate is answered by the fake listener below.
-            let celld = dir.path().join("celld");
-            std::fs::write(&celld, celld_script).unwrap();
+            let cello = dir.path().join("cello");
+            std::fs::write(&cello, cello_script).unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&celld, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::set_permissions(&cello, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let manager = FleetManager::new(ManagerSettings {
                 data_dir: dir.path().to_path_buf(),
-                celld_bin: celld.to_string_lossy().into_owned(),
+                cello_bin: cello.to_string_lossy().into_owned(),
                 storage: FleetStorage {
                     endpoint: "https://example.com".to_string(),
                     region: "auto".to_string(),
@@ -1890,7 +1890,7 @@ mod tests {
         /// A listener that answers 200 to every request and records each
         /// request line, so a test can prove a request reached the fleet.
         /// The health gate is answered too, so `ensure_awake` adopts the
-        /// port without spawning a celld.
+        /// port without spawning a cello.
         async fn recording_port(&mut self) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1952,7 +1952,7 @@ mod tests {
         /// parallel test claims the number and the bind fails. The port
         /// answers 503 until the wake is in flight: the zero-timeout probe
         /// can never mistake it for an already-healthy fleet, so
-        /// `ensure_awake` always spawns (and tracks) the fake celld.
+        /// `ensure_awake` always spawns (and tracks) the fake cello.
         async fn wake_then_idle(
             &self,
             listener: tokio::net::TcpListener,
@@ -1984,7 +1984,7 @@ mod tests {
             let manager = self.manager.clone();
             let pool = self.pool.clone();
             let wake = tokio::spawn(async move { manager.ensure_awake(&pool, &app).await });
-            // Let the spawn land (the fake celld starts instantly), then
+            // Let the spawn land (the fake cello starts instantly), then
             // answer the health gate.
             tokio::time::sleep(Duration::from_millis(500)).await;
             ready.store(true, Ordering::SeqCst);
@@ -2271,7 +2271,7 @@ mod tests {
     /// The 2026-11-06 incident: a successful deploy left an always-on app
     /// asleep. `alive` is process liveness and the deploy's `/reload` never
     /// reaches a sleeping fleet, so the deploy step itself must wake the app
-    /// AND send one visitor request: celld's health gate answers without
+    /// AND send one visitor request: cello's health gate answers without
     /// running the deployed Worker.
     #[tokio::test]
     async fn post_deploy_wakes_and_warms_an_always_on_app() {

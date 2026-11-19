@@ -18,7 +18,7 @@ pub struct NftConfig {
     pub free_uids: Vec<u32>,
     pub pro_uids: Vec<u32>,
     /// Each app uid's own loopback ports (live and preview, public and
-    /// internal). Its celld dials its own node there, e.g. `celld d1
+    /// internal). Its cello dials its own node there, e.g. `cello d1
     /// migrations apply` at deploy, so exactly these stay reachable for that
     /// uid ahead of the loopback reject; every other fleet's port stays
     /// closed.
@@ -78,7 +78,7 @@ pub fn ruleset(cfg: &NftConfig) -> String {
     rules.push(format!(
         "    meta skuid {id} meta l4proto {{ tcp, udp }} ct original proto-dst 53 accept"
     ));
-    // The app's own celld needs the object store, which may sit on a private
+    // The app's own cello needs the object store, which may sit on a private
     // address: allow exactly those addresses and port, ahead of the
     // private-range rejects.
     let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) =
@@ -250,7 +250,7 @@ mod tests {
         }
     }
 
-    /// An app reaches its own fleet's loopback ports (its celld dials its
+    /// An app reaches its own fleet's loopback ports (its cello dials its
     /// node at deploy) but no other fleet's: the allowance names the uid and
     /// its ports, and sorts before the loopback reject.
     #[test]
