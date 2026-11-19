@@ -8,10 +8,10 @@
 //! newest 3 dumps per binding, Pro the newest 30 (spec §3, owner-set
 //! 2026-10-26).
 //!
-//! `celld d1 export` dumps the live database as SQL — schema beside data,
+//! `cello d1 export` dumps the live database as SQL — schema beside data,
 //! read under one transaction on the owning node, so the dump is a single
 //! snapshot even while the database takes writes. The dump names exactly
-//! the visible tables (`--table`, repeatable): celld's `d1_migrations`
+//! the visible tables (`--table`, repeatable): cello's `d1_migrations`
 //! bookkeeping and the runtime's internal tables stay out, the chosen
 //! tables' indexes, triggers and AUTOINCREMENT counters ride along, and the
 //! visible views (which belong to no table, so a filtered export leaves
@@ -19,11 +19,11 @@
 //! statement stays under the 100,000-byte D1 statement limit
 //! (<https://celld.dev/docs/services/d1>), and the dump holds no
 //! `BEGIN`/`COMMIT` (application SQL may not use them): each restore batch
-//! runs inside celld's own transaction instead.
+//! runs inside cello's own transaction instead.
 //!
 //! Restore replays a dump into the same database (drop the user tables,
 //! replay in batches) after taking a fresh backup first, so a bad restore
-//! is itself restorable. `d1_migrations` — celld's migration bookkeeping,
+//! is itself restorable. `d1_migrations` — cello's migration bookkeeping,
 //! written by `migrations apply` — is neither dumped nor dropped, so a
 //! restore never confuses a later apply.
 
@@ -96,7 +96,7 @@ pub const D1_STATEMENT_LIMIT: usize = 100_000;
 /// daily sweep on one app.
 pub const MAX_DUMP_BYTES: usize = 32 * 1024 * 1024;
 
-/// Restore applies the dump in batches of at most this many bytes. celld
+/// Restore applies the dump in batches of at most this many bytes. cello
 /// brackets each multi-statement exec in its own transaction, so a batch is
 /// all-or-nothing while the whole restore stays resumable statement-wise.
 pub const RESTORE_BATCH_BYTES: usize = 80_000;
@@ -231,7 +231,7 @@ pub async fn prune_app(
 // Dump
 // ---------------------------------------------------------------------------
 
-/// One `celld d1 execute --json` against the app's fleet, through the backup
+/// One `cello d1 execute --json` against the app's fleet, through the backup
 /// entry point. A free function (not a closure) so the borrow checker sees
 /// each call's borrows independently.
 async fn exec_one(
@@ -317,10 +317,10 @@ async fn visible_view_stmts(
     Ok(stmts)
 }
 
-/// Dump one binding to SQL text: one `celld d1 export` over the visible
+/// Dump one binding to SQL text: one `cello d1 export` over the visible
 /// tables, plus the visible views and their triggers (a filtered export
 /// leaves both out — neither belongs to a table). The `--table` allowlist
-/// keeps celld's `d1_migrations` bookkeeping and the runtime's internal
+/// keeps cello's `d1_migrations` bookkeeping and the runtime's internal
 /// tables out of the dump, so restore never sees them; the chosen tables'
 /// indexes, triggers and AUTOINCREMENT counters ride along. The export is
 /// one snapshot even while the database takes writes — a daily sweep cost,
@@ -356,7 +356,7 @@ pub async fn dump_database(ctx: &D1Ctx, app: &App, binding: &str) -> Result<Stri
         }
     };
     // A single statement bigger than D1's statement limit can never be
-    // restored (the replay batch would fail at the celld limit after the
+    // restored (the replay batch would fail at the cello limit after the
     // tables were already dropped), so the backup fails here and stores
     // nothing.
     if let Some(big) = stmts.iter().find(|s| s.len() > D1_STATEMENT_LIMIT) {
@@ -530,7 +530,7 @@ fn split_sql(dump: &str) -> Vec<String> {
 
 /// Restore one binding from SQL text: drop the current user tables and
 /// views, then replay the statements in [`RESTORE_BATCH_BYTES`] batches.
-/// Each batch is one `celld d1 execute`, which brackets it in its own
+/// Each batch is one `cello d1 execute`, which brackets it in its own
 /// transaction — all-or-nothing per batch, resumable across batches.
 pub async fn restore_database(
     ctx: &D1Ctx,
@@ -583,7 +583,7 @@ pub async fn restore_database(
         // D1 enforces foreign keys by default, so dropping a populated
         // parent before its child fails. `PRAGMA defer_foreign_keys` cannot
         // be changed mid-transaction by user queries — D1 runs every query
-        // in an implicit transaction — but celld brackets this whole exec
+        // in an implicit transaction — but cello brackets this whole exec
         // in its own transaction, so deferring at its start covers every
         // drop in the batch (<https://developers.cloudflare.com/d1/sql-api/foreign-keys/>).
         let drop_sql = format!("PRAGMA defer_foreign_keys = ON;\n{}", drops.join(";\n"));
@@ -727,7 +727,7 @@ pub async fn restore_binding(
         )));
     };
     let sql = std::string::String::from_utf8(bytes)
-        .map_err(|_| D1Error::Celld(format!("backup {} is not valid UTF-8", row.id)))?;
+        .map_err(|_| D1Error::Cello(format!("backup {} is not valid UTF-8", row.id)))?;
     let mut report = restore_database(ctx, app, binding, &sql).await?;
     report.fresh_backup_id = fresh.id.clone();
     Ok((fresh, report))
@@ -795,7 +795,7 @@ pub async fn tick(pool: &SqlitePool, store: &Store, fleets: &FleetManager) -> an
             continue;
         }
         let ctx = D1Ctx {
-            celld_bin: fleets.celld_bin(),
+            cello_bin: fleets.cello_bin(),
             storage: fleets.storage().clone(),
             pool: pool.clone(),
             store: store.clone(),
@@ -941,18 +941,18 @@ mod tests {
         assert!(stmts[0].contains("\"we;ird\""));
     }
 
-    // --- fake celld ------------------------------------------------------
+    // --- fake cello ------------------------------------------------------
 
     use crate::auth::test_support::test_pool;
     use crate::fleet::manager::FleetStorage;
 
-    /// A fake `celld` answering the backup engine's exact queries: the
+    /// A fake `cello` answering the backup engine's exact queries: the
     /// `d1 export` dump over the allowlisted tables, the dump's and the
     /// restore's view reads, the restore's table/count reads, and (by
     /// logging + `exit 0`) every drop/replay batch. The state dir is baked
     /// into the script, so parallel tests never share it.
-    fn install_fake_celld(state: &std::path::Path) -> std::path::PathBuf {
-        let script = state.join("fake-celld");
+    fn install_fake_cello(state: &std::path::Path) -> std::path::PathBuf {
+        let script = state.join("fake-cello");
         let tmp = script.with_extension("tmp");
         let log = state.join("calls.log").to_string_lossy().into_owned();
         std::fs::write(
@@ -1020,7 +1020,7 @@ exit 0
         store: Store,
     ) -> D1Ctx {
         D1Ctx {
-            celld_bin: script.to_string_lossy().into_owned(),
+            cello_bin: script.to_string_lossy().into_owned(),
             storage: FleetStorage {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 region: "test-region".to_string(),
@@ -1094,7 +1094,7 @@ exit 0
     async fn dump_exports_allowlisted_tables_and_appends_views() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         let now = crate::apps::now_ms();
         seed_backup_app(&pool, &store, now).await;
@@ -1175,10 +1175,10 @@ exit 0
         assert_eq!(lists, 2, "{calls}");
     }
 
-    /// A fake `celld` whose table list never settles: every listing
+    /// A fake `cello` whose table list never settles: every listing
     /// alternates, so the drift check retries and then gives up.
-    fn install_drifting_celld(state: &std::path::Path) -> std::path::PathBuf {
-        let script = state.join("fake-celld-drift");
+    fn install_drifting_cello(state: &std::path::Path) -> std::path::PathBuf {
+        let script = state.join("fake-cello-drift");
         let tmp = script.with_extension("tmp");
         let log = state.join("calls.log").to_string_lossy().into_owned();
         let counter = state.join("drift-n").to_string_lossy().into_owned();
@@ -1231,7 +1231,7 @@ exit 0
     async fn dump_retries_a_schema_that_changes_mid_dump() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_drifting_celld(state.path());
+        let script = install_drifting_cello(state.path());
         let store = Store::memory();
         let now = crate::apps::now_ms();
         seed_backup_app(&pool, &store, now).await;
@@ -1254,7 +1254,7 @@ exit 0
     async fn restore_replays_drops_then_dump_after_a_fresh_backup() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         let now = crate::apps::now_ms();
         seed_backup_app(&pool, &store, now).await;
@@ -1306,10 +1306,10 @@ exit 0
         assert_eq!(backups_for(&pool, &app.id).await.unwrap().len(), 2);
     }
 
-    /// A fake `celld` whose export carries one statement bigger than the
+    /// A fake `cello` whose export carries one statement bigger than the
     /// D1 statement limit: the dump must refuse it at backup time.
-    fn install_huge_row_celld(state: &std::path::Path) -> std::path::PathBuf {
-        let script = state.join("fake-celld-huge");
+    fn install_huge_row_cello(state: &std::path::Path) -> std::path::PathBuf {
+        let script = state.join("fake-cello-huge");
         let tmp = script.with_extension("tmp");
         let log = state.join("calls.log").to_string_lossy().into_owned();
         std::fs::write(
@@ -1356,7 +1356,7 @@ exit 0
     async fn dump_rejects_a_row_bigger_than_the_d1_statement_limit() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_huge_row_celld(state.path());
+        let script = install_huge_row_cello(state.path());
         let store = Store::memory();
         let now = crate::apps::now_ms();
         seed_backup_app(&pool, &store, now).await;
@@ -1374,7 +1374,7 @@ exit 0
     async fn restore_rejects_an_oversized_statement_before_dropping_anything() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         let now = crate::apps::now_ms();
         seed_backup_app(&pool, &store, now).await;
@@ -1400,7 +1400,7 @@ exit 0
     async fn tick_skips_an_app_whose_manifest_wont_parse() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         let now = crate::apps::now_ms();
         // A due app whose deployed manifest has non-array bindings: reading
@@ -1451,7 +1451,7 @@ exit 0
             .unwrap();
         let fleets = FleetManager::new(crate::fleet::manager::ManagerSettings {
             data_dir: state.path().join("data"),
-            celld_bin: script.to_string_lossy().into_owned(),
+            cello_bin: script.to_string_lossy().into_owned(),
             storage: FleetStorage {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 region: "test-region".to_string(),

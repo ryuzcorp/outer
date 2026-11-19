@@ -1,6 +1,6 @@
 //! End-to-end MCP tests: JSON-RPC envelope, lazy auth, every tool group.
 //! Deterministic: memory store, temp dirs, fake deploys, captured email
-//! codes — no celld, no network.
+//! codes — no cello, no network.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -7011,16 +7011,16 @@ async fn tools_show_deletes_at_on_free_and_hide_it_on_pro() {
 // --- app_metrics / db_query (M3 data tools) --------------------------------
 //
 // app_metrics reads the same metric_minute/path_hour/visitor_day rows as the
-// Console metrics tab; db_query runs through the same celld path as the
-// Console D1 panel. The fake celld below answers `d1 execute` with canned
+// Console metrics tab; db_query runs through the same cello path as the
+// Console D1 panel. The fake cello below answers `d1 execute` with canned
 // JSON per `--command` marker, and a stub health server makes `ensure_awake`
 // count the fleet awake so no real fleet ever spawns.
 
-/// A fake `celld` for db_query tests: answers `d1 execute` with canned JSON
+/// A fake `cello` for db_query tests: answers `d1 execute` with canned JSON
 /// rows, recording argv under the state dir derived from
 /// `--bucket s3://<dir>/fleets/<slug>`.
-fn install_fake_query_celld(state: &std::path::Path) -> PathBuf {
-    let script = state.join("fake-celld");
+fn install_fake_query_cello(state: &std::path::Path) -> PathBuf {
+    let script = state.join("fake-cello");
     let tmp = script.with_extension("tmp");
     std::fs::write(
         &tmp,
@@ -7075,7 +7075,7 @@ exit 0
     script
 }
 
-/// The live manifest celld published for the app: D1 bindings only, in the
+/// The live manifest cello published for the app: D1 bindings only, in the
 /// layout `deployed_manifest` reads.
 async fn seed_query_manifest(store: &Store, slug: &str, bindings: &[(&str, &str)]) {
     let prefix = "deploy/outer-app/abcd1234";
@@ -7113,7 +7113,7 @@ async fn seed_query_manifest(store: &Store, slug: &str, bindings: &[(&str, &str)
 }
 
 /// A stub fleet health gate: answers 200 on every connection so
-/// `ensure_awake`'s pre-spawn probe counts the fleet awake and no `celld`
+/// `ensure_awake`'s pre-spawn probe counts the fleet awake and no `cello`
 /// spawn ever runs. Loopback-only; the task dies with the test.
 async fn stub_query_health() -> (u16, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7139,7 +7139,7 @@ async fn stub_query_health() -> (u16, tokio::task::JoinHandle<()>) {
 }
 
 /// db_query test app: real app row plus seeded manifest, the fleet pointed
-/// at the fake celld and the stub health server. Guards keep the temp dirs
+/// at the fake cello and the stub health server. Guards keep the temp dirs
 /// and the stub alive; `McpState` only holds path copies.
 struct QueryApp {
     state: McpState,
@@ -7163,7 +7163,7 @@ async fn query_setup(slug: &str, bindings: &[(&str, &str)]) -> QueryApp {
         .await
         .unwrap();
     let statedir = tempfile::tempdir().unwrap();
-    let script = install_fake_query_celld(statedir.path());
+    let script = install_fake_query_cello(statedir.path());
     let mut storage = state.fleets.storage().clone();
     storage.bucket = statedir.path().to_string_lossy().into_owned();
     let data_dir = tempfile::tempdir().unwrap();
@@ -7171,7 +7171,7 @@ async fn query_setup(slug: &str, bindings: &[(&str, &str)]) -> QueryApp {
     std::mem::forget(data_dir);
     state.fleets = FleetManager::new(ManagerSettings {
         data_dir: data_path,
-        celld_bin: script.to_string_lossy().into_owned(),
+        cello_bin: script.to_string_lossy().into_owned(),
         storage,
         cgroups: None,
         memory_max_bytes: 512 * 1024 * 1024,
@@ -7348,7 +7348,7 @@ async fn db_query_reads_rows_through_the_console_path() {
     assert_eq!(sc["truncated"], false);
     assert_eq!(sc["rows"][0]["name"], "ada");
     assert_eq!(sc["columns"].as_array().unwrap().len(), 2);
-    // One `celld d1 execute` with the scoped bucket, JSON output, and the
+    // One `cello d1 execute` with the scoped bucket, JSON output, and the
     // app's database identity.
     let calls = query_calls(&q);
     assert!(calls.contains("d1 execute app-db"), "{calls}");
@@ -7412,7 +7412,7 @@ async fn db_query_caps_rows_values_and_bytes() {
 }
 
 #[tokio::test]
-async fn db_query_refuses_writes_before_touching_celld() {
+async fn db_query_refuses_writes_before_touching_cello() {
     let q = query_setup("groceries", &[("DB", "app-db")]).await;
     for sql in [
         "DELETE FROM users",
@@ -7438,7 +7438,7 @@ async fn db_query_refuses_writes_before_touching_celld() {
         assert!(message.contains("migrations"), "{sql}: {message}");
         assert!(message.contains("restore_backup"), "{sql}: {message}");
     }
-    // No refused shape ever reached celld.
+    // No refused shape ever reached cello.
     assert!(!q.statedir.path().join("calls.log").exists());
     // An engine refusal (missing table) is still the caller's bug.
     let (_, out) = call(
@@ -7539,7 +7539,7 @@ async fn db_query_resolves_the_default_binding() {
     )
     .await;
     assert!(result(&out).get("isError").is_none(), "{out}");
-    // An unknown binding names the problem before any celld call.
+    // An unknown binding names the problem before any cello call.
     let (_, out) = call(
         &q.state,
         Some(&q.token),
@@ -7567,7 +7567,7 @@ async fn db_query_resolves_the_default_binding() {
     assert_eq!(err["error"], "invalid_argument");
     assert!(err["message"].as_str().unwrap().contains("binding"));
 
-    // An app with no deployed D1 binding fails before any celld call.
+    // An app with no deployed D1 binding fails before any cello call.
     create_app(&q2.state, &q2.token, "plain").await;
     let (_, out) = call(
         &q2.state,

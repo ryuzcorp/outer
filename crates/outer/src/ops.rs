@@ -217,9 +217,9 @@ mod tests {
         )
         .await;
 
-        // A fake celld that answers the upload; no other step runs celld.
+        // A fake cello that answers the upload; no other step runs cello.
         let state = tempfile::tempdir().unwrap();
-        let script = state.path().join("fake-celld");
+        let script = state.path().join("fake-cello");
         let tmp = script.with_extension("tmp");
         std::fs::write(
             &tmp,
@@ -236,7 +236,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let settings = DeploySettings {
             data_dir: data.path().to_path_buf(),
-            celld_bin: script.to_string_lossy().into_owned(),
+            cello_bin: script.to_string_lossy().into_owned(),
             esbuild_bin: None,
             bun_bin: "/bin/true".to_string(),
             storage: FleetStorage {

@@ -1,4 +1,4 @@
-//! One celld fleet per app: sandboxed builds, cgroup leaves, nft egress,
+//! One cello fleet per app: sandboxed builds, cgroup leaves, nft egress,
 //! supervision and health.
 
 pub mod cgroups;

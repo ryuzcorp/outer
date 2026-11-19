@@ -1,6 +1,6 @@
 ---
 title: Follow the deploy pipeline
-description: Move commits through queue, build, gate, migrations, and celld deploy.
+description: Move commits through queue, build, gate, migrations, and Cello deploy.
 ---
 
 ## Move through each pipeline step
@@ -11,7 +11,7 @@ description: Move commits through queue, build, gate, migrations, and celld depl
 4. Run `bun run build`; wrangler validation rejects unknown config keys by name (full list: [Accepted config keys](/agents/platform/config-keys)).
 5. Pass the moderation gate; nothing uploads before it passes.
 6. Apply D1 migrations scoped by key: before upload when a live version exists, otherwise upload, wake, then migrate.
-7. Deploy with celld, then poll fleet health; a failed step or health check keeps the previous version serving.
+7. Deploy with Cello, then poll fleet health; a failed step or health check keeps the previous version serving.
 8. Expect wiped worktrees: sleep, failed builds, and deletes remove everything except `node_modules`.
 
 ## Watch a deploy to its terminal state

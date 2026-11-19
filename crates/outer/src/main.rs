@@ -217,7 +217,7 @@ fn build_store(config: &Config) -> anyhow::Result<Store> {
     }
 }
 
-/// What fleets and `celld deploy` use to reach the bucket. celld only speaks
+/// What fleets and `cello deploy` use to reach the bucket. cello only speaks
 /// S3, so apps can't run on the memory store.
 ///
 /// With the Cloudflare pair set, fleets and deploys mint scoped R2 temporary
@@ -226,7 +226,7 @@ fn build_store(config: &Config) -> anyhow::Result<Store> {
 fn fleet_storage(config: &Config) -> anyhow::Result<FleetStorage> {
     let StoreKind::R2(r2) = &config.store else {
         anyhow::bail!(
-            "apps need an S3-compatible bucket (celld has no in-memory store); set OUTER_STORE=r2"
+            "apps need an S3-compatible bucket (cello has no in-memory store); set OUTER_STORE=r2"
         );
     };
     let credentials = match &config.cloudflare {
@@ -345,7 +345,7 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
     let deployer = Deployer::new(
         DeploySettings {
             data_dir: config.data_dir.clone(),
-            celld_bin: rt.celld_bin.clone(),
+            cello_bin: rt.cello_bin.clone(),
             esbuild_bin: rt.esbuild_bin.clone(),
             bun_bin: rt.bun_bin.clone(),
             storage,
@@ -859,7 +859,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let secrets_key = outer::secrets::SecretsKey::derive(&config.outer_secret);
     let fleets = FleetManager::new(ManagerSettings {
         data_dir: config.data_dir.clone(),
-        celld_bin: rt.celld_bin.clone(),
+        cello_bin: rt.cello_bin.clone(),
         storage: storage.clone(),
         cgroups: cgroups(),
         memory_max_bytes: rt.fleet_memory_mb * 1024 * 1024,
@@ -891,7 +891,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let deployer = outer::deploy::Deployer::new(
         outer::deploy::DeploySettings {
             data_dir: config.data_dir.clone(),
-            celld_bin: rt.celld_bin.clone(),
+            cello_bin: rt.cello_bin.clone(),
             esbuild_bin: rt.esbuild_bin.clone(),
             bun_bin: rt.bun_bin.clone(),
             storage,
@@ -901,7 +901,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             cache_purge: cache_purge(&config),
             jev: jev.clone(),
             // The migrate step wakes a sleeping fleet before applying D1
-            // migrations (`celld d1` reaches the database through a node).
+            // migrations (`cello d1` reaches the database through a node).
             wake: Some(fleets.clone()),
             secrets_key: secrets_key.clone(),
         },

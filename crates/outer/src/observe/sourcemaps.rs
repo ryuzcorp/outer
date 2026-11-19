@@ -1,9 +1,9 @@
 //! Per-deploy Worker source maps for error symbolication.
 //!
-//! The deploy passes `--sourcemap <path>` to `celld deploy` (the fork writes
+//! The deploy passes `--sourcemap <path>` to `cello deploy` (the fork writes
 //! the bundled Worker's external map, or the `no_bundle` entry's sibling
 //! map, with project-root-relative sources; the deployed bytes are identical
-//! with or without it). What celld wrote lands under
+//! with or without it). What cello wrote lands under
 //! `maps/<slug>/<sha>/worker.js.map` next to a `manifest.json`, so app
 //! delete/rename carry the maps with no extra path, and retention follows
 //! the deploy rows: after a successful deploy, sha dirs outside the recent
@@ -37,15 +37,16 @@ const MANIFEST_FILE: &str = "manifest.json";
 pub const WORKER_MAP_FILE: &str = "worker.js.map";
 /// One map file is telemetry-scale, not bundle-scale: refuse anything bigger
 /// (a corrupt or hostile map must not blow the read path's memory). Matches
-/// the fork's own 64 MiB ceiling from below: celld never writes more.
+/// the fork's own 64 MiB ceiling from below: cello never writes more.
 pub const MAX_MAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Deploy sha dirs kept per app besides the just-finished one. Occurrences
 /// older than this still render — with their raw, unsymbolicated stacks.
 pub const KEEP_DEPLOY_SHAS: usize = 10;
 
 /// The Worker bundle's report names: upstream celld serves the entry as
-/// `worker.js`, the fork as its `index.js` module name — workerd prints the
-/// entry bare in both cases, never an app path. Only these two names map:
+/// `worker.js`, the Cello fork as its `index.js` module name — workerd
+/// prints the entry bare in both cases, never an app path. Only these two
+/// names map:
 /// the token lookup is purely positional (greatest-lower-bound), so any
 /// other bare frame (`node:events:1:1`, a stray `events:1:1`) would map to
 /// an unrelated app position instead of missing. Unknown names render raw.
@@ -125,8 +126,8 @@ pub fn sha_for_ts(shas: &[(String, i64)], ts_secs: i64) -> Option<&str> {
 /// What the deploy's temp map path held when the upload finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapRead {
-    /// Nothing there: celld had nothing to map (asset-only or Python
-    /// projects, and entries without a sibling map — celld warns and writes
+    /// Nothing there: cello had nothing to map (asset-only or Python
+    /// projects, and entries without a sibling map — cello warns and writes
     /// nothing), or the file vanished. Not an error: there is simply no map.
     Absent,
     /// A map, but over [`MAX_MAP_BYTES`]: refused before parsing, so a
@@ -137,7 +138,7 @@ pub enum MapRead {
 }
 
 /// Read one temp map the deploy step passed `--sourcemap`: the worktree
-/// belongs to the app uid, which can replace the path while celld runs, so
+/// belongs to the app uid, which can replace the path while cello runs, so
 /// the open refuses symlinks (`O_NOFOLLOW`), refuses non-regular files
 /// (FIFOs would block the deploy; directories, sockets and devices are not
 /// maps), and reads at most [`MAX_MAP_BYTES`] + 1 (over-cap surfaces as
@@ -200,7 +201,7 @@ pub async fn store_worker_map(
 ) -> String {
     let bytes = match read {
         MapRead::Absent => {
-            return "sourcemaps: no worker map (celld had nothing to map)".to_string();
+            return "sourcemaps: no worker map (cello had nothing to map)".to_string();
         }
         MapRead::OverCap => {
             return "sourcemaps: skipped storing the worker map (over the size cap)".to_string();
@@ -571,7 +572,7 @@ mod tests {
     async fn store_refuses_bad_inputs_without_failing() {
         let data = tempfile::tempdir().unwrap();
         let keep: Vec<(String, i64)> = vec![];
-        // No bytes: celld had nothing to map (asset-only, Python, missing
+        // No bytes: cello had nothing to map (asset-only, Python, missing
         // sibling) — storing nothing is the answer, not an error.
         let note =
             store_worker_map(data.path(), "s", &"aa".repeat(32), MapRead::Absent, &keep).await;

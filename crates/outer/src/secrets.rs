@@ -236,13 +236,13 @@ pub fn operator_token(key: &SecretsKey, slug: &str) -> String {
     hex::encode(token)
 }
 
-/// The (`CELLD_OPERATOR_TOKEN`, token) pair for a celld invocation or
-/// fleet env. `CELLD_*` names are platform-reserved: users cannot set or
+/// The (`CELLO_OPERATOR_TOKEN`, token) pair for a cello invocation or
+/// fleet env. `CELLO_*` names are platform-reserved: users cannot set or
 /// see this, and secret injection skips it, so it never reaches Worker
 /// vars.
 pub fn operator_token_env(key: &SecretsKey, slug: &str) -> (String, String) {
     (
-        "CELLD_OPERATOR_TOKEN".to_string(),
+        "CELLO_OPERATOR_TOKEN".to_string(),
         operator_token(key, slug),
     )
 }
@@ -561,7 +561,7 @@ mod tests {
     fn operator_token_is_stable_per_slug_and_scoped() {
         let key = SecretsKey::test_key();
         let (name, token) = operator_token_env(&key, "grocery");
-        assert_eq!(name, "CELLD_OPERATOR_TOKEN");
+        assert_eq!(name, "CELLO_OPERATOR_TOKEN");
         assert_eq!(token, operator_token(&key, "grocery"));
         assert_eq!(token.len(), 64);
         assert_ne!(token, operator_token(&key, "other"));

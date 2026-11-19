@@ -1,6 +1,6 @@
 # Outer: agent working agreement
 
-Outer is a personal software forge for AI agents. An agent talks MCP to Outer, Outer builds the user's Ilha + Void app and runs it on [celld](https://celld.dev), and serves it at `https://<slug>.outer.now`.
+Outer is a personal software forge for AI agents. An agent talks MCP to Outer, Outer builds the user's Ilha + Void app and runs it on [Cello](https://cello.ryuz.eu), and serves it at `https://<slug>.outer.now`.
 
 - **Design record:** the maintainer's spec at `~/Developer/vault/outer/spec.md` (not in this repo). Read it before changing behavior, and say so when a change departs from it.
 - **Status:** live at `outer.now` (M0 done); milestone M1 (owner alpha) in progress.
@@ -45,7 +45,7 @@ is `crates/outer/tests/hostile.rs`, in two layers:
   and the harness refuses to pass unless the installed `inet outer` table
   covers the probe uid.
 
-The `worker.js` `/probes` check needs a live celld fleet with a deployed app
+The `worker.js` `/probes` check needs a live Cello fleet with a deployed app
 and stays a manual VPS step (see the script header). A PR that changes escape
 relevant behavior adds a fixture probe first, then the containment.
 
@@ -59,7 +59,7 @@ relevant behavior adds a fixture probe first, then the containment.
 | `crates/outer/src/http/` | Axum router: operator probes on the platform host, app proxy fallback for app hosts |
 | `crates/outer/src/store/` | `Store` (R2 over S3, or in-memory) and the SQLite snapshot to the bucket |
 | `crates/outer/src/git/` | Each app's repo: a bucket WAL (tip bundle + `MANIFEST.json`) and worktree-free commits |
-| `crates/outer/src/fleet/` | Sandboxed processes, cgroup v2 leaves, nft egress rules, the celld supervisor |
+| `crates/outer/src/fleet/` | Sandboxed processes, cgroup v2 leaves, nft egress rules, the Cello supervisor |
 | `e2e/hostile/`, `crates/outer/tests/hostile.rs` | Hostile suite (§12.7): fixtures, manifest, two-layer harness |
 | `scripts/hostile-suite.sh` | Integrator entry for the privileged hostile layer (VPS) |
 ## Rules

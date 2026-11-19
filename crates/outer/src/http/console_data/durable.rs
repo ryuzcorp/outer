@@ -2,8 +2,8 @@
 //! plus a best-effort storage preview.
 //!
 //! Ported from Noite `apps/runner/src/host/storage/durable.rs` @ 58a977a
-//! (Apache-2.0): `celld cell list --json` walks the fleet bucket directly
-//! (no live node needed), reserved celld-internal classes are skipped, and
+//! (Apache-2.0): `cello cell list --json` walks the fleet bucket directly
+//! (no live node needed), reserved cello-internal classes are skipped, and
 //! each instance is additionally probed with `GET /do/{scope}?read=1` — the
 //! app's own handler decides what the preview says. Adapted to Outer: scoped
 //! credentials from [`super::scoped_creds`], the class allowlist from the
@@ -11,7 +11,7 @@
 //! endpoint so a class with many instances lists fast (Noite embeds one
 //! probe per row; the probe stays best-effort either way).
 //!
-//! There is no write path: celld exposes no generic storage API for a DO
+//! There is no write path: cello exposes no generic storage API for a DO
 //! instance. The UI says so in its empty and help copy.
 
 use std::time::Duration;
@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{console_app, ok, scoped_creds, unavailable};
 
-/// `celld cell list` reads the bucket directly; 30 s like Noite's.
-const CELLD_TIMEOUT: Duration = Duration::from_secs(30);
+/// `cello cell list` reads the bucket directly; 30 s like Noite's.
+const CELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// The app's own `?read=1` handler gets 5 s; anything slower or absent
 /// leaves the preview blank rather than failing the list.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,9 +72,9 @@ struct ProbeQuery {
 }
 
 /// Parse `durable_objects` from the built wrangler config: an object with a
-/// `bindings` array of `{name, class_name}`. Both travel to `celld cell
+/// `bindings` array of `{name, class_name}`. Both travel to `cello cell
 /// list` (the class positionally), so both are validated here — anything
-/// starting with `-` would otherwise parse as a celld option.
+/// starting with `-` would otherwise parse as a cello option.
 pub fn durable_objects(value: &serde_json::Value) -> anyhow::Result<Vec<DoBinding>> {
     let Some(obj) = value.get("durable_objects") else {
         return Ok(Vec::new());
@@ -112,7 +112,7 @@ pub fn durable_objects(value: &serde_json::Value) -> anyhow::Result<Vec<DoBindin
 }
 
 /// A binding name or class name: JS-identifier shape, bounded. Class names
-/// reach `celld cell list` positionally, so the leading-dash rule closes
+/// reach `cello cell list` positionally, so the leading-dash rule closes
 /// option injection (no `--` separator: celld 0.6.2 leaf parsers honor
 /// neither `--` nor `--help` for positional parsing).
 pub(crate) fn validate_do_name(name: &str) -> anyhow::Result<()> {
@@ -134,7 +134,7 @@ pub(crate) fn validate_do_name(name: &str) -> anyhow::Result<()> {
 }
 
 /// Look up the declared class behind a request class name. Anything not
-/// declared is refused before celld ever sees it.
+/// declared is refused before cello ever sees it.
 pub fn find_class<'a>(bindings: &'a [DoBinding], class: &str) -> anyhow::Result<&'a DoBinding> {
     bindings
         .iter()
@@ -142,7 +142,7 @@ pub fn find_class<'a>(bindings: &'a [DoBinding], class: &str) -> anyhow::Result<
         .ok_or_else(|| anyhow::anyhow!("unknown Durable Object class {class:?}"))
 }
 
-/// The exact argv for `celld cell list`, built pure so tests pin it.
+/// The exact argv for `cello cell list`, built pure so tests pin it.
 pub fn cell_list_argv(bucket_url: &str, endpoint: &str, region: &str, class: &str) -> Vec<String> {
     vec![
         "cell".to_string(),
@@ -158,8 +158,8 @@ pub fn cell_list_argv(bucket_url: &str, endpoint: &str, region: &str, class: &st
     ]
 }
 
-/// Parse `celld cell list --json` output: one JSON object per line. Reserved
-/// celld-internal classes (D1, KV, queues, …) are skipped — a user class
+/// Parse `cello cell list --json` output: one JSON object per line. Reserved
+/// cello-internal classes (D1, KV, queues, …) are skipped — a user class
 /// never collides with one, but a collision must not surface internals.
 /// Rows without an id are skipped; the scope defaults to the id.
 pub fn parse_cell_list(output: &str) -> Vec<DoInstance> {
@@ -192,7 +192,7 @@ pub fn parse_cell_list(output: &str) -> Vec<DoInstance> {
 
 /// Durable Object classes from the deployed manifest's top-level
 /// `do_classes`/`sqlite_classes` lists. Entries are class names as strings
-/// (objects with a `class_name` are accepted too); celld-internal classes
+/// (objects with a `class_name` are accepted too); cello-internal classes
 /// (`__D1Database` and any `__`-prefixed name) are skipped — a user class
 /// never collides with one, but a collision must not surface internals.
 /// The manifest carries no binding names, so `name` is the class: the UI
@@ -302,14 +302,14 @@ async fn instances_inner(
         &storage.region,
         &binding.class,
     );
-    let output = super::run_celld(
+    let output = super::run_cello(
         state,
         &args,
-        &super::celld_env(storage, &creds),
-        CELLD_TIMEOUT,
+        &super::cello_env(storage, &creds),
+        CELLO_TIMEOUT,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("celld cell list failed: {e:#}"))?;
+    .map_err(|e| anyhow::anyhow!("cello cell list failed: {e:#}"))?;
     Ok(parse_cell_list(&output))
 }
 
@@ -400,7 +400,7 @@ mod tests {
         });
         let bindings = parse_manifest_do(&manifest);
         // Strings and class_name objects parse; duplicates collapse;
-        // celld-internal `__` classes and invalid names are skipped.
+        // cello-internal `__` classes and invalid names are skipped.
         // The manifest carries no binding names, so `name` is the class.
         assert_eq!(
             bindings,

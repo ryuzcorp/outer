@@ -1,6 +1,6 @@
 // Derived from noite apps/runner/src/host/supervisor.rs @ 58a977a (Apache-2.0)
 // and host/logs.rs @ 58a977a (Apache-2.0).
-// Outer change: one celld fleet per app, no environment fleets, no control
+// Outer change: one cello fleet per app, no environment fleets, no control
 // fleet, no reconcile; logs are a per-app bounded ring with sequence numbers
 // and timestamps; no OTel/telemetry env (outer reads logs from stdout).
 
@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// One celld fleet per app. `Debug` redacts the minted secret, the session
+/// One cello fleet per app. `Debug` redacts the minted secret, the session
 /// token and `extra_env` values.
 #[derive(Clone)]
 pub struct FleetSpec {
@@ -28,7 +28,7 @@ pub struct FleetSpec {
     pub secret_access_key: String,
     pub session_token: Option<String>,
     /// Read-only over the deployment artifacts (`fleets/{slug}/deploy/`,
-    /// `fleets/{slug}/deploy-blobs/`), passed as `CELLD_DEPLOY_AWS_*`. A
+    /// `fleets/{slug}/deploy-blobs/`), passed as `CELLO_DEPLOY_AWS_*`. A
     /// credential copied out of the fleet's environment can serve the
     /// deployment it runs but never publish one.
     pub deploy_access_key_id: String,
@@ -41,7 +41,7 @@ pub struct FleetSpec {
     /// (dev machines) only warns.
     pub cgroups_active: bool,
     pub extra_env: Vec<(String, String)>,
-    /// Derived operator token for this slug (`CELLD_OPERATOR_TOKEN`):
+    /// Derived operator token for this slug (`CELLO_OPERATOR_TOKEN`):
     /// `None` is today's open listener (mixed states stay working).
     pub operator_token: Option<String>,
 }
@@ -87,10 +87,10 @@ impl std::fmt::Debug for FleetSpec {
     }
 }
 
-/// Tunables for the celld invocation that are not per-app identity.
+/// Tunables for the cello invocation that are not per-app identity.
 #[derive(Debug, Clone)]
 pub struct FleetOpts {
-    pub celld_bin: String,
+    pub cello_bin: String,
     pub state_dir: PathBuf,
     pub shutdown_total_ms: u64,
     pub idle_evict_secs: u64,
@@ -98,12 +98,12 @@ pub struct FleetOpts {
     pub asset_cache_mb: u64,
 }
 
-/// Pure construction of the celld invocation: (program, argv, env). The
-/// command line and `CELLD_*` env mirror Noite's tenant fleets: listeners,
-/// `CELLD_DURABILITY=bucket`, the shutdown budget, and the asset-cache and
+/// Pure construction of the cello invocation: (program, argv, env). The
+/// command line and `CELLO_*` env mirror Noite's tenant fleets: listeners,
+/// `CELLO_DURABILITY=bucket`, the shutdown budget, and the asset-cache and
 /// deploy-poll bounds. The state creds ride `AWS_*` plus
 /// `AWS_SESSION_TOKEN`; the read-only deployment creds ride
-/// `CELLD_DEPLOY_AWS_*` (celld `0052`), so the node reads `deploy/` and
+/// `CELLO_DEPLOY_AWS_*` (cello `0052`), so the node reads `deploy/` and
 /// `deploy-blobs/` with a credential that cannot publish. Reserved names in
 /// `extra_env` are dropped (logged), never injected.
 pub fn fleet_command(
@@ -122,7 +122,7 @@ pub fn fleet_command(
         format!("127.0.0.1:{}", spec.public_port),
         // Advertise on loopback: a fleet is a single node, and outer already
         // reaches it at 127.0.0.1:{internal} (reload). A hostname advertise
-        // would not resolve and breaks celld node discovery.
+        // would not resolve and breaks cello node discovery.
         "--internal-listen".to_string(),
         internal.clone(),
         "--advertise".to_string(),
@@ -138,45 +138,45 @@ pub fn fleet_command(
         ("AWS_REGION".to_string(), spec.s3_region.clone()),
         ("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string()),
         ("S3_ENDPOINT".to_string(), spec.s3_endpoint.clone()),
-        ("CELLD_WATCH".to_string(), state_dir.clone()),
-        ("CELLD_DURABILITY".to_string(), "bucket".to_string()),
-        // Inside outer's stop budget, so celld seals its node log before
+        ("CELLO_WATCH".to_string(), state_dir.clone()),
+        ("CELLO_DURABILITY".to_string(), "bucket".to_string()),
+        // Inside outer's stop budget, so cello seals its node log before
         // outer's own SIGKILL fallback.
         (
-            "CELLD_SHUTDOWN_TOTAL_MS".to_string(),
+            "CELLO_SHUTDOWN_TOTAL_MS".to_string(),
             opts.shutdown_total_ms.to_string(),
         ),
         // Bounds: idle eviction returns memory when an app goes quiet.
         (
-            "CELLD_IDLE_EVICT_S".to_string(),
+            "CELLO_IDLE_EVICT_S".to_string(),
             opts.idle_evict_secs.to_string(),
         ),
         // Outer POSTs /reload after every deploy, so the fleet's own poll
         // only covers a missed reload.
         (
-            "CELLD_DEPLOY_POLL_S".to_string(),
+            "CELLO_DEPLOY_POLL_S".to_string(),
             opts.deploy_poll_secs.to_string(),
         ),
         // Bound the per-fleet on-disk asset cache.
         (
-            "CELLD_ASSET_CACHE_BYTES".to_string(),
+            "CELLO_ASSET_CACHE_BYTES".to_string(),
             (opts.asset_cache_mb * 1024 * 1024).to_string(),
         ),
-        // In the fleet's own state dir: celld's default is one directory for
+        // In the fleet's own state dir: cello's default is one directory for
         // every node, created 0700 by whichever starts first, so a fleet
         // serving as its own uid crash-looped on EACCES there.
         (
-            "CELLD_ASSET_CACHE_DIR".to_string(),
+            "CELLO_ASSET_CACHE_DIR".to_string(),
             format!("{state_dir}/asset-cache"),
         ),
-        ("CELLD_TRUST_FORWARDED_HEADERS".to_string(), "1".to_string()),
+        ("CELLO_TRUST_FORWARDED_HEADERS".to_string(), "1".to_string()),
         // Fleets run as host processes under their own uid, not inside
         // containers: read memory pressure from the process itself.
-        ("CELLD_MEMORY_SCOPE".to_string(), "self".to_string()),
+        ("CELLO_MEMORY_SCOPE".to_string(), "self".to_string()),
         // Every app is a one-node fleet: there is no fleet capacity to wait
-        // for, and celld's default first-readiness gate (120 s cap) holds a
+        // for, and cello's default first-readiness gate (120 s cap) holds a
         // cold wake for about a second locally and ~3 s on the VPS.
-        ("CELLD_READY_FLEET_GATE_MS".to_string(), "0".to_string()),
+        ("CELLO_READY_FLEET_GATE_MS".to_string(), "0".to_string()),
     ];
     if let Some(token) = &spec.session_token {
         env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
@@ -185,21 +185,21 @@ pub fn fleet_command(
     // reads `deploy/` and `deploy-blobs/` with this one, never with the
     // state grant above.
     env.push((
-        "CELLD_DEPLOY_AWS_ACCESS_KEY_ID".to_string(),
+        "CELLO_DEPLOY_AWS_ACCESS_KEY_ID".to_string(),
         spec.deploy_access_key_id.clone(),
     ));
     env.push((
-        "CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY".to_string(),
+        "CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY".to_string(),
         spec.deploy_secret_access_key.clone(),
     ));
     if let Some(token) = &spec.deploy_session_token {
-        env.push(("CELLD_DEPLOY_AWS_SESSION_TOKEN".to_string(), token.clone()));
+        env.push(("CELLO_DEPLOY_AWS_SESSION_TOKEN".to_string(), token.clone()));
     }
     // The derived per-slug token guards the internal listener; the manager
     // fills it, never user input (`extra_env` reserved names are skipped
     // below, so this cannot arrive any other way).
     if let Some(token) = &spec.operator_token {
-        env.push(("CELLD_OPERATOR_TOKEN".to_string(), token.clone()));
+        env.push(("CELLO_OPERATOR_TOKEN".to_string(), token.clone()));
     }
     for (key, value) in &spec.extra_env {
         if super::sandbox::is_reserved_env_name(key) {
@@ -208,7 +208,7 @@ pub fn fleet_command(
         }
         env.push((key.clone(), value.clone()));
     }
-    (opts.celld_bin.clone(), args, env)
+    (opts.cello_bin.clone(), args, env)
 }
 
 /// Which side a captured line came from.
@@ -311,7 +311,7 @@ pub fn new_log_ring_from(next: u64) -> SharedLogRing {
 }
 
 /// How long a fleet stop waits for graceful exit (SIGTERM) and then for the
-/// SIGKILL reaping before giving up. celld shuts down gracefully on
+/// SIGKILL reaping before giving up. cello shuts down gracefully on
 /// SIGTERM/SIGINT (cancel work, prove durability, seal the node log);
 /// SIGKILL is only a bounded fallback, delivered to the whole process group
 /// so an orphaned worker can never keep the fleet's port into the next spawn.
@@ -421,7 +421,7 @@ where
     });
 }
 
-/// Start one celld fleet: state dir, uid drop, its own process group, its own
+/// Start one cello fleet: state dir, uid drop, its own process group, its own
 /// cgroup leaf, and stdout/stderr captured line by line into a fresh ring.
 /// `log_seq_start` is the ring's first sequence number: the caller passes
 /// the persisted `MAX(seq) + 1` for the app, so seqs stay global per app
@@ -436,7 +436,7 @@ pub async fn start(
     tokio::fs::create_dir_all(&opts.state_dir)
         .await
         .with_context(|| format!("create {}", opts.state_dir.display()))?;
-    // celld runs as the app user: the state dir outer created must be its
+    // cello runs as the app user: the state dir outer created must be its
     // own. A zero gid means "same as the uid". Only the dir itself: a
     // recursive walk as root over an app-writable tree is a symlink race,
     // and contents already belong to the app user from previous runs.
@@ -536,7 +536,7 @@ pub async fn start(
     if let Some(err) = child.stderr.take() {
         spawn_capture(err, LogStream::Stderr, logs.clone());
     }
-    tracing::info!(fleet = %spec.slug, listen = spec.public_port, internal = spec.internal_port, "started celld");
+    tracing::info!(fleet = %spec.slug, listen = spec.public_port, internal = spec.internal_port, "started cello");
     Ok(RunningFleet {
         slug: spec.slug.clone(),
         internal_port: spec.internal_port,
@@ -635,7 +635,7 @@ mod tests {
             operator_token: Some("tok-test".to_string()),
         };
         let opts = FleetOpts {
-            celld_bin: "/usr/bin/celld".to_string(),
+            cello_bin: "/usr/bin/cello".to_string(),
             state_dir: state.join("fleets").join("grocery"),
             shutdown_total_ms: 8000,
             idle_evict_secs: 300,
@@ -650,7 +650,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (spec, opts) = test_spec(dir.path());
         let (program, args, env) = fleet_command(&spec, &opts);
-        assert_eq!(program, "/usr/bin/celld");
+        assert_eq!(program, "/usr/bin/cello");
         let argv = args.join(" ");
         assert!(
             argv.contains("--bucket s3://outer/fleets/grocery"),
@@ -665,18 +665,18 @@ mod tests {
         assert!(argv.contains("--internal-listen 127.0.0.1:23001"), "{argv}");
         assert!(argv.contains("--advertise 127.0.0.1:23001"), "{argv}");
         let env: std::collections::HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(env["CELLD_DURABILITY"], "bucket");
-        assert_eq!(env["CELLD_SHUTDOWN_TOTAL_MS"], "8000");
-        assert_eq!(env["CELLD_IDLE_EVICT_S"], "300");
-        assert_eq!(env["CELLD_DEPLOY_POLL_S"], "300");
+        assert_eq!(env["CELLO_DURABILITY"], "bucket");
+        assert_eq!(env["CELLO_SHUTDOWN_TOTAL_MS"], "8000");
+        assert_eq!(env["CELLO_IDLE_EVICT_S"], "300");
+        assert_eq!(env["CELLO_DEPLOY_POLL_S"], "300");
         assert_eq!(
-            env["CELLD_ASSET_CACHE_BYTES"],
+            env["CELLO_ASSET_CACHE_BYTES"],
             (512u64 * 1024 * 1024).to_string()
         );
-        assert_eq!(env["CELLD_TRUST_FORWARDED_HEADERS"], "1");
-        assert_eq!(env["CELLD_MEMORY_SCOPE"], "self");
+        assert_eq!(env["CELLO_TRUST_FORWARDED_HEADERS"], "1");
+        assert_eq!(env["CELLO_MEMORY_SCOPE"], "self");
         assert_eq!(
-            env["CELLD_READY_FLEET_GATE_MS"], "0",
+            env["CELLO_READY_FLEET_GATE_MS"], "0",
             "single-node fleets skip the fleet gate"
         );
         assert_eq!(env["AWS_ACCESS_KEY_ID"], "key");
@@ -684,14 +684,14 @@ mod tests {
         assert_eq!(env["AWS_SESSION_TOKEN"], "token");
         // The deployment read credential rides its own names, so the node
         // never reads `deploy/` with the state grant.
-        assert_eq!(env["CELLD_DEPLOY_AWS_ACCESS_KEY_ID"], "deploy-key");
-        assert_eq!(env["CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"], "deploy-secret");
-        assert_eq!(env["CELLD_DEPLOY_AWS_SESSION_TOKEN"], "deploy-token");
+        assert_eq!(env["CELLO_DEPLOY_AWS_ACCESS_KEY_ID"], "deploy-key");
+        assert_eq!(env["CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY"], "deploy-secret");
+        assert_eq!(env["CELLO_DEPLOY_AWS_SESSION_TOKEN"], "deploy-token");
         assert_eq!(env["AWS_REGION"], "auto");
         assert_eq!(env["AWS_EC2_METADATA_DISABLED"], "true");
         assert_eq!(env["GROCERY"], "milk");
         // The derived token guards the internal listener.
-        assert_eq!(env["CELLD_OPERATOR_TOKEN"], "tok-test");
+        assert_eq!(env["CELLO_OPERATOR_TOKEN"], "tok-test");
         // Reserved names never reach a fleet.
         assert!(
             !env.contains_key("OUTER_SECRET"),
@@ -722,11 +722,11 @@ mod tests {
         let (_, _, env) = fleet_command(&spec, &opts);
         let env: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert!(!env.contains_key("AWS_SESSION_TOKEN"));
-        assert!(!env.contains_key("CELLD_DEPLOY_AWS_SESSION_TOKEN"));
+        assert!(!env.contains_key("CELLO_DEPLOY_AWS_SESSION_TOKEN"));
         // The deploy access key and secret are never optional: an unset
         // token must not turn the pair off.
-        assert_eq!(env["CELLD_DEPLOY_AWS_ACCESS_KEY_ID"], "deploy-key");
-        assert_eq!(env["CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"], "deploy-secret");
+        assert_eq!(env["CELLO_DEPLOY_AWS_ACCESS_KEY_ID"], "deploy-key");
+        assert_eq!(env["CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY"], "deploy-secret");
     }
 
     #[test]
@@ -750,18 +750,18 @@ mod tests {
         assert_eq!(ring.since(0).len(), 3);
     }
 
-    /// Lifecycle without celld: a shell script that ignores its args stands
+    /// Lifecycle without cello: a shell script that ignores its args
     /// in for the binary, so start/stop/is_alive run for real.
     #[tokio::test]
     async fn start_stop_and_liveness() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_celld(&dir, "#!/bin/sh\nsleep 30\n");
+        let bin = fake_cello(&dir, "#!/bin/sh\nsleep 30\n");
         let (mut spec, mut opts) = test_spec(dir.path());
-        opts.celld_bin = bin;
+        opts.cello_bin = bin;
         spec.cgroup_leaf = dir.path().to_path_buf();
         let mut fleet = start(&spec, &opts, 0).await.unwrap();
         assert!(fleet.is_alive());
-        // Captured output drains into the ring (the fake celld is silent).
+        // Captured output drains into the ring (the fake cello is silent).
         assert!(fleet.logs.lock().await.is_empty());
         fleet
             .stop(StopGrace {
@@ -774,8 +774,8 @@ mod tests {
 
     /// Atomically installed: a child exec racing a direct write fails
     /// ETXTBSY, so every fake binary appears via rename, never mid-write.
-    fn fake_celld(dir: &tempfile::TempDir, script: &str) -> String {
-        let bin = dir.path().join("celld");
+    fn fake_cello(dir: &tempfile::TempDir, script: &str) -> String {
+        let bin = dir.path().join("cello");
         let tmp = bin.with_extension("tmp");
         std::fs::write(&tmp, script).unwrap();
         #[cfg(unix)]
@@ -793,7 +793,7 @@ mod tests {
     async fn refused_move_fails_the_start_when_cgroups_are_active() {
         let dir = tempfile::tempdir().unwrap();
         let (mut spec, mut opts) = test_spec(dir.path());
-        opts.celld_bin = fake_celld(&dir, "#!/bin/sh\nsleep 30\n");
+        opts.cello_bin = fake_cello(&dir, "#!/bin/sh\nsleep 30\n");
         // Nowhere to move into: the write is refused (ENOENT).
         spec.cgroup_leaf = dir.path().join("no-such-leaf");
         spec.cgroups_active = true;
@@ -812,7 +812,7 @@ mod tests {
     async fn refused_move_warns_only_when_cgroups_are_inactive() {
         let dir = tempfile::tempdir().unwrap();
         let (mut spec, mut opts) = test_spec(dir.path());
-        opts.celld_bin = fake_celld(&dir, "#!/bin/sh\nsleep 30\n");
+        opts.cello_bin = fake_cello(&dir, "#!/bin/sh\nsleep 30\n");
         spec.cgroup_leaf = dir.path().join("no-such-leaf");
         spec.cgroups_active = false;
         let mut fleet = start(&spec, &opts, 0).await.unwrap();
@@ -833,7 +833,7 @@ mod tests {
     async fn capture_bounds_a_newline_less_flood() {
         let dir = tempfile::tempdir().unwrap();
         let (mut spec, mut opts) = test_spec(dir.path());
-        opts.celld_bin = fake_celld(
+        opts.cello_bin = fake_cello(
             &dir,
             "#!/bin/sh\nhead -c 1048576 /dev/zero | tr '\\0' 'x'; echo; echo hello; sleep 30\n",
         );
@@ -916,7 +916,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut spec, mut opts) = test_spec(dir.path());
         // The leader exits at once, leaving a group member behind.
-        opts.celld_bin = fake_celld(&dir, &format!("#!/bin/sh\nsleep {marker} &\n"));
+        opts.cello_bin = fake_cello(&dir, &format!("#!/bin/sh\nsleep {marker} &\n"));
         spec.cgroup_leaf = dir.path().to_path_buf();
         let mut fleet = start(&spec, &opts, 0).await.unwrap();
         assert_eq!(fleet.pgid, fleet.child.id().unwrap_or(fleet.pgid));
@@ -924,7 +924,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while fleet.is_alive() {
             if std::time::Instant::now() >= deadline {
-                panic!("fake celld never exited");
+                panic!("fake cello never exited");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

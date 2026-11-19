@@ -51,7 +51,7 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// How the MCP layer runs deploys. Production wraps the real pipeline;
 /// tests substitute a fake that writes terminal deploy rows without
-/// touching celld or the network.
+/// touching cello or the network.
 #[derive(Clone)]
 pub struct Deploys {
     inner: Arc<DeploysInner>,
@@ -164,7 +164,7 @@ impl Deploys {
     }
 
     /// The live pipeline's settings, for the console data panels (scoped
-    /// storage reads, celld calls, work-dir config reads). `None` for the
+    /// storage reads, cello calls, work-dir config reads). `None` for the
     /// test fake, which has no pipeline — those endpoints answer
     /// "unavailable" there.
     pub(crate) fn deploy_settings(&self) -> Option<&crate::deploy::pipeline::DeploySettings> {
@@ -658,7 +658,7 @@ impl McpState {
         std::mem::forget(dir);
         let fleets = FleetManager::new(crate::fleet::manager::ManagerSettings {
             data_dir: data_dir.clone(),
-            celld_bin: "celld".to_string(),
+            cello_bin: "cello".to_string(),
             storage: crate::fleet::manager::FleetStorage {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 region: "us-east-1".to_string(),

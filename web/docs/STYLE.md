@@ -41,7 +41,7 @@ One term per concept. Left column wins everywhere.
 | plan (Free / Pro) | tier, subscription (as plan name) | Capitalized plan names. |
 | quota | limit (for counted resources) | Code changes, apps, collaborators. `limits` only for the Deploy page title and hard technical caps. |
 | preview deploy | staging, branch deploy | One per app, Pro, at `<slug>--preview.outer.now`. |
-| fleet | server, container, instance | The celld worker pool an app runs on. |
+| fleet | server, container, instance | The Cello worker pool an app runs on. |
 | binding | integration, env (for config) | `d1_databases`, `kv_namespaces`, declared in `void.config.ts`. |
 | secret | env var, token (for stored keys) | Set outside code, read as `env.MY_KEY`. |
 | agent | bot, assistant (for the builder) | The AI building the app over MCP. |

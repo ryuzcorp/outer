@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-/// Poll the fleet's health route until celld's ready gate opens: 200 on
-/// `/.well-known/celld/health`, every 250 ms, each attempt capped at 2 s.
+/// Poll the fleet's health route until cello's ready gate opens: 200 on
+/// `/.well-known/cello/health`, every 250 ms, each attempt capped at 2 s.
 /// Returns false once `timeout` runs out.
 pub async fn wait_healthy(host: &str, port: u16, timeout: Duration) -> bool {
     static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
@@ -15,7 +15,7 @@ pub async fn wait_healthy(host: &str, port: u16, timeout: Duration) -> bool {
             .build()
             .unwrap_or_default()
     });
-    let url = format!("http://{host}:{port}/.well-known/celld/health");
+    let url = format!("http://{host}:{port}/.well-known/cello/health");
     let deadline = tokio::time::Instant::now() + timeout;
     let started = tokio::time::Instant::now();
     loop {
@@ -51,8 +51,8 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Minimal celld health gate: 503 for the first `flaps` requests, then
-    /// 200 on `/.well-known/celld/health`.
+    /// Minimal cello health gate: 503 for the first `flaps` requests, then
+    /// 200 on `/.well-known/cello/health`.
     async fn serve_health(listener: tokio::net::TcpListener, flaps: usize) -> u16 {
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(AtomicUsize::new(0));

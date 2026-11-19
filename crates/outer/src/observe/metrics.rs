@@ -52,7 +52,7 @@
 //! - **Recorded iff forwarded:** only requests that reach the fleet's port
 //!   (an upstream response, or the 502 when the connect fails). Outer's own
 //!   synthetic answers — unknown-host 404s, 431s, wake-failure 503s, the
-//!   unlisted `robots.txt` override — and the celld health gate path are
+//!   unlisted `robots.txt` override — and the cello health gate path are
 //!   never counted.
 //! - **Retention:** [`prune`] deletes `metric_minute`, `path_hour` and
 //!   `visitor_day` rows older than 24 h for Free apps and 30 d for Pro,

@@ -4,7 +4,7 @@
 //! `{data}/work/{slug}`, runs `bun install` (skipped when the lockfile hash
 //! is unchanged) and `bun run build`, validates the wrangler config at the
 //! deploy root, applies pending D1 migrations and uploads with
-//! `celld deploy`, and reloads the fleet. Install, build, deploy and
+//! `cello deploy`, and reloads the fleet. Install, build, deploy and
 //! migrate run sandboxed as the app's uid through `run_sandboxed`; the
 //! worktree and deploy-root steps run as outer (they only touch git
 //! metadata and read files).
@@ -51,9 +51,9 @@ use crate::store::Store;
 pub struct DeploySettings {
     /// Worktrees at `{data}/work/{slug}`, caches at `{data}/cache/{slug}`.
     pub data_dir: PathBuf,
-    /// `celld` binary (`celld` on PATH, or an absolute path).
-    pub celld_bin: String,
-    /// Passed to celld as `CELLD_ESBUILD` when set.
+    /// `cello` binary (`cello` on PATH, or an absolute path).
+    pub cello_bin: String,
+    /// Passed to cello as `CELLO_ESBUILD` when set.
     pub esbuild_bin: Option<String>,
     /// `bun` binary (`bun` on PATH, or an absolute path).
     pub bun_bin: String,
@@ -73,13 +73,13 @@ pub struct DeploySettings {
     /// gate always classifies there.
     pub jev: Option<JevClient>,
     /// Wakes a sleeping fleet before the migrate step applies D1 migrations:
-    /// `celld d1` reaches the database through a running node. `Some` in
+    /// `cello d1` reaches the database through a running node. `Some` in
     /// `serve` (the fleet manager lives there); `None` in the operator CLI
-    /// and in tests with a fake `celld`, where no fleet can be woken and the
+    /// and in tests with a fake `cello`, where no fleet can be woken and the
     /// apply fails loudly when no fleet serves the app.
     pub wake: Option<crate::fleet::manager::FleetManager>,
     /// AES-256-GCM key for app secrets, derived from `OUTER_SECRET` at boot.
-    /// Secrets are decrypted only for the `celld deploy` step and injected
+    /// Secrets are decrypted only for the `cello deploy` step and injected
     /// into the deploy-root config `vars`; builds never see them.
     pub secrets_key: crate::secrets::SecretsKey,
 }
@@ -119,7 +119,7 @@ pub struct DeployOutcome {
     pub reloaded: bool,
 }
 
-/// What the deploy-root step selected: the directory celld deploys and
+/// What the deploy-root step selected: the directory cello deploys and
 /// reads migrations from, plus the exact wrangler file that won discovery
 /// (`dist/wrangler.json`, else `wrangler.jsonc`, else `wrangler.json`).
 /// The migrate step takes this instead of re-deciding, so upload and D1
@@ -133,7 +133,7 @@ pub struct DeployRoot {
 /// original bytes plus their mode, for a byte-identical restore once the
 /// upload has the file. Plaintext lives only between `inject_secrets` and
 /// the guard's drop, plus the uploaded copy under `fleets/<slug>/`, where
-/// celld needs it to serve `env.*`.
+/// cello needs it to serve `env.*`.
 ///
 /// RAII: [`Drop`] restores best-effort (warn, never panic), so a panic or
 /// an early return in the upload window still scrubs the worktree. A
@@ -314,7 +314,7 @@ fn atomic_replace_no_follow(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Res
                 path.display(),
                 std::io::Error::last_os_error()
             )));
-        } // Keep the original's owner: `celld deploy` runs as the app uid and
+        } // Keep the original's owner: `cello deploy` runs as the app uid and
           // must still read the file, while Outer (root in production) created
           // the temp. `fchown` on the fd, never through the path.
         if let Ok(meta) = std::fs::symlink_metadata(path) {
@@ -360,7 +360,7 @@ impl DeployKind {
         matches!(self, DeployKind::Preview)
     }
 }
-/// Where the D1 migrate step runs relative to the `celld deploy` upload.
+/// Where the D1 migrate step runs relative to the `cello deploy` upload.
 /// For an app with a live version the default is before the upload: when
 /// the new pointer becomes visible the schema is already ready, and a
 /// migrate failure uploads nothing. The upload goes first when there is no
@@ -462,7 +462,7 @@ const BUILD_LEAF_MEMORY_MAX: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const BINDING_CAP_MESSAGE: &str =
     "Outer apps can have one D1 database and one R2 bucket for now; merge the extra ones";
 
-/// Top-level wrangler keys celld accepts. Anything else fails `deploy-root`.
+/// Top-level wrangler keys cello accepts. Anything else fails `deploy-root`.
 const ACCEPTED_CONFIG_KEYS: &[&str] = &[
     "$schema",
     "name",
@@ -703,8 +703,8 @@ impl Deployer {
     }
 
     /// The settings this deployer runs with (bucket, credentials, dirs,
-    /// celld binary). The console data panels reuse them for scoped storage
-    /// reads and celld calls, so they never mint their own credentials.
+    /// cello binary). The console data panels reuse them for scoped storage
+    /// reads and cello calls, so they never mint their own credentials.
     pub(crate) fn settings(&self) -> &DeploySettings {
         &self.settings
     }
@@ -1059,12 +1059,12 @@ impl Deployer {
     }
 
     /// Rows run in order; the first failure stops the pipeline. `Ok` carries
-    /// the celld version and the validated cron schedules on success. The
+    /// the cello version and the validated cron schedules on success. The
     /// review runs before `deploy-root`, and before migrations, so a blocked
     /// deploy never touches the app's data or uploads anything. For an app
     /// whose live version declares every database being migrated, migrations
     /// run before the upload, so no fleet can ever serve new code against an
-    /// unmigrated schema; otherwise the upload runs first because `celld d1`
+    /// unmigrated schema; otherwise the upload runs first because `cello d1`
     /// needs a running fleet and there is nothing to start one from yet
     /// (first deploy) or the live fleet cannot reach the database (the live
     /// version does not declare it).
@@ -1200,9 +1200,9 @@ impl Deployer {
             }
         };
 
-        // 6+7. D1 migrations and the `celld deploy` upload. For an app whose
+        // 6+7. D1 migrations and the `cello deploy` upload. For an app whose
         // live version declares every database being migrated, the migrate
-        // step runs before the upload: celld offers no staged or invisible
+        // step runs before the upload: cello offers no staged or invisible
         // upload (the upload publishes `deploy/current.json` and every fleet
         // adopts it on its own poll), so ordering is the only gate: when the
         // new pointer becomes visible the schema is already ready, and a
@@ -1213,7 +1213,7 @@ impl Deployer {
         // Otherwise the upload goes first, then the wake (now possible),
         // then the migrations. That is the first-deploy case
         // (`last_deploy_sha` is NULL: no successful deploy yet, so
-        // `celld d1 migrations apply` has no fleet to reach through the
+        // `cello d1 migrations apply` has no fleet to reach through the
         // bucket's node leases), and the live-lacks-the-database case: the
         // live manifest does not declare a database this deploy migrates
         // (an asset-only live version, a first D1, a renamed database), so
@@ -1329,7 +1329,7 @@ impl Deployer {
         }
     }
 
-    /// The `celld deploy <root> ... --json` upload; returns the version.
+    /// The `cello deploy <root> ... --json` upload; returns the version.
     /// The upload publishes `deploy/current.json`, which every fleet adopts
     /// on its own poll — so it runs after the migrate step when the live
     /// version declares every database being migrated (a migrate failure
@@ -1379,7 +1379,7 @@ impl Deployer {
             .inject_secrets(pool, app, deploy_root)
             .await
             .map_err(|e| StepEnd::Failed(StepFailed::plain("deploy", &e)))?;
-        let outcome = self.celld_deploy(app, deploy_id, deploy_root).await;
+        let outcome = self.cello_deploy(app, deploy_id, deploy_root).await;
         // The patched config held plaintext: dropping the guard restores it
         // byte-identically, pass or fail — and would too on panic, since the
         // restore lives in `Drop`, not in a manual call.
@@ -1640,17 +1640,17 @@ impl Deployer {
         Ok((DeployRoot { root, config }, crons, out))
     }
 
-    /// Whether this `celld` writes Worker maps: the fork's `deploy --sourcemap`
+    /// Whether this `cello` writes Worker maps: the Cello fork's `deploy --sourcemap`
     /// (0.6.3-ryuzcorp.8+). Best-effort `deploy --help` probe, so machines on
     /// upstream celld keep deploying without maps instead of failing on an
     /// unknown flag. No credentials, no side effects — one help print.
-    async fn celld_sourcemap_support(&self) -> bool {
-        let out = tokio::process::Command::new(&self.settings.celld_bin)
+    async fn cello_sourcemap_support(&self) -> bool {
+        let out = tokio::process::Command::new(&self.settings.cello_bin)
             .arg("deploy")
             .arg("--help")
             // No inherited environment: this probe needs no credential, and
             // a help print must never see the server's AWS_* or
-            // CELLD_DEPLOY_AWS_* values.
+            // CELLO_DEPLOY_AWS_* values.
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .output()
@@ -1661,17 +1661,17 @@ impl Deployer {
         .unwrap_or(false)
     }
 
-    /// The `celld deploy <root> ... --json` upload; returns
+    /// The `cello deploy <root> ... --json` upload; returns
     /// (output, version, map read). Bucket credentials come from the
     /// per-prefix cache when fresh (minted on a miss), so the step env never
     /// carries the parent keys. The fork confines project reads to the
     /// config's directory (a `dist/` deploy root can no longer pull a
     /// root-level Dockerfile or hoisted packages), so the upload names the
     /// checkout with `--read-root` and deploys keep building exactly what
-    /// upstream celld accepted. With a fork celld, `--sourcemap` collects
+    /// upstream celld accepted. With the Cello fork, `--sourcemap` collects
     /// the Worker map into the work dir (outside the deploy root, so it can
     /// never enter the bundle); the caller stores it per deploy sha.
-    async fn celld_deploy(
+    async fn cello_deploy(
         &self,
         app: &App,
         deploy_id: &str,
@@ -1693,9 +1693,9 @@ impl Deployer {
         let bucket = self.settings.storage.bucket_url(&app.slug);
         let endpoint = self.settings.storage.endpoint.clone();
         let region = self.settings.storage.region.clone();
-        let mut env = Self::celld_grant_env(&region, &endpoint, &creds);
+        let mut env = Self::cello_grant_env(&region, &endpoint, &creds);
         if let Some(esbuild) = &self.settings.esbuild_bin {
-            env.push(("CELLD_ESBUILD".to_string(), esbuild.clone()));
+            env.push(("CELLO_ESBUILD".to_string(), esbuild.clone()));
         }
         // The fork admits build inputs from beyond the config's directory
         // only through `--read-root`: name the checkout, so a `dist/`
@@ -1722,7 +1722,7 @@ impl Deployer {
         let work = self.work_dir(&app.slug);
         sweep_stale_maps(&work).await;
         let map_path = work.join(format!(".sourcemap-{deploy_id}.map"));
-        if self.celld_sourcemap_support().await {
+        if self.cello_sourcemap_support().await {
             args.push("--sourcemap".to_string());
             args.push(map_path.to_string_lossy().into_owned());
         }
@@ -1731,7 +1731,7 @@ impl Deployer {
                 app,
                 deploy_id,
                 "deploy",
-                &self.settings.celld_bin,
+                &self.settings.cello_bin,
                 &args,
                 env,
             )
@@ -1740,12 +1740,12 @@ impl Deployer {
         // path: a failed upload stores nothing, and no temp map may linger
         // into the next deploy's worktree. The read refuses symlinks and
         // non-regular files and caps the bytes (the worktree belongs to the
-        // app uid, which can replace the path while celld runs).
+        // app uid, which can replace the path while cello runs).
         let map_read = crate::observe::sourcemaps::read_map_file(&map_path).await;
         let _ = tokio::fs::remove_file(&map_path).await;
         let out = out?;
         let parsed: serde_json::Value = serde_json::from_str(out.trim())
-            .map_err(|e| anyhow::anyhow!("celld printed non-JSON output: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cello printed non-JSON output: {e}"))?;
         let version = parsed
             .get("version")
             .and_then(|v| v.as_str())
@@ -1761,7 +1761,7 @@ impl Deployer {
     /// Code-defined `vars` keys lose to same-named secrets; the overwrite is
     /// journaled by name (names are public via `list_secrets`, values never
     /// are). The patched file is `0o600` while it holds plaintext; the
-    /// upload carries it to `fleets/<slug>/`, where celld needs it.
+    /// upload carries it to `fleets/<slug>/`, where cello needs it.
     ///
     /// Rows whose names are platform-reserved or fail the name shape are
     /// skipped with a warning: the sink re-checks because pre-existing or
@@ -1839,11 +1839,11 @@ impl Deployer {
     /// Returns `(skipped, journal)`: skipped when the built config declares
     /// no D1 databases or the repo holds no migration files, in which case a
     /// sleeping fleet is never woken. Otherwise the fleet is woken first
-    /// (`celld d1` reaches the database through a running node), pending
+    /// (`cello d1` reaches the database through a running node), pending
     /// files apply in numeric-prefix order under the app's scoped
     /// credentials, and every file present is recorded in `d1_migration` so
     /// a later edit of an applied file fails the deploy instead of drifting.
-    /// A failure names the migration file when celld's output identifies it
+    /// A failure names the migration file when cello's output identifies it
     /// and carries an agent-facing line. When the step runs before the
     /// upload, the fleet is never reloaded and an existing app keeps serving
     /// its previous version; when it runs after the upload, the new version
@@ -1902,10 +1902,10 @@ impl Deployer {
             ));
         }
         // An applied file edited afterwards is a new migration pretending to
-        // be an old one: fail naming it instead of letting celld silently
-        // skip it (celld tracks names only) and drifting from the database.
+        // be an old one: fail naming it instead of letting cello silently
+        // skip it (cello tracks names only) and drifting from the database.
         // Files with no recorded hash are pending; when every file is
-        // already recorded there is nothing for celld to do, and no reason
+        // already recorded there is nothing for cello to do, and no reason
         // to wake a sleeping fleet.
         // A first deploy that never went live has no previous version: say
         // the app isn't live yet instead of naming one that keeps serving.
@@ -1934,7 +1934,7 @@ impl Deployer {
                 match recorded {
                     Some(sha) if sha != file.sha256 => {
                         // After the upload the refusal still means the new
-                        // version is live: celld never ran, so it serves
+                        // version is live: cello never ran, so it serves
                         // without this deploy's migration content.
                         let (error, user_message) = if published {
                             (
@@ -1977,7 +1977,7 @@ impl Deployer {
         // A preview database is disposable (fresh prefix per preview
         // lineage), so "all already applied" against the live pins must not
         // skip the apply: the preview database may never have seen these
-        // files. Preview applies are idempotent (celld's own `d1_migrations`
+        // files. Preview applies are idempotent (cello's own `d1_migrations`
         // journal) and never recorded.
         if !any_pending && !kind.is_preview() {
             let total: usize = staged.iter().map(|(_, files)| files.len()).sum();
@@ -2006,15 +2006,15 @@ impl Deployer {
                 continue;
             }
             let out = self
-                .celld_migrate(app, deploy_id, root, &db.database_name)
+                .cello_migrate(app, deploy_id, root, &db.database_name)
                 .await
                 .map_err(|e| {
                     let text = format!("{e:#}");
                     // The operator CLI runs no fleet manager (`wake: None`):
-                    // a first deploy can never have a fleet for `celld d1`
+                    // a first deploy can never have a fleet for `cello d1`
                     // to reach, so the lease error it returns means the
                     // deploy must go through the server instead. Say so
-                    // instead of surfacing celld's lease internals. (With a
+                    // instead of surfacing cello's lease internals. (With a
                     // fleet manager the wake above runs first, so a lease
                     // error there is a real failure, not this hint.)
                     if order == MigrateOrder::AfterUploadFirstDeploy
@@ -2024,7 +2024,7 @@ impl Deployer {
                         return StepFailed::migration(
                             format!(
                                 "first deploy with D1 migrations needs the server; deploy through MCP \
-                                 (celld d1 needs a running fleet and none serves {} yet): {}",
+                                 (cello d1 needs a running fleet and none serves {} yet): {}",
                                 app.slug,
                                 first_output_line(&text)
                             ),
@@ -2107,8 +2107,8 @@ impl Deployer {
         ))
     }
 
-    /// One `celld d1 migrations apply` under the app's scoped storage
-    /// credentials (the same grant shape `celld deploy` uses: celld reads
+    /// One `cello d1 migrations apply` under the app's scoped storage
+    /// credentials (the same grant shape `cello deploy` uses: cello reads
     /// the fleet's shared secret from the bucket, so it needs the prefix
     /// grant, never the parent keys).
     /// No `--` before the positionals on purpose: celld 0.6.2's leaf parsers
@@ -2117,7 +2117,7 @@ impl Deployer {
     /// instead of protecting it. Option injection is closed one layer up:
     /// `migrate::d1_databases` only accepts names that cannot parse as flags
     /// (and argv never passes through a shell).
-    async fn celld_migrate(
+    async fn cello_migrate(
         &self,
         app: &App,
         deploy_id: &str,
@@ -2140,8 +2140,8 @@ impl Deployer {
         let bucket = self.settings.storage.bucket_url(&app.slug);
         let endpoint = self.settings.storage.endpoint.clone();
         let region = self.settings.storage.region.clone();
-        let mut env = Self::celld_grant_env(&region, &endpoint, &creds);
-        // `celld d1` reaches the database through a fleet node, and the
+        let mut env = Self::cello_grant_env(&region, &endpoint, &creds);
+        // `cello d1` reaches the database through a fleet node, and the
         // internal listener requires the fleet's token once the fleet sets
         // it — same slug the fleet runs under (the preview app carries the
         // preview key), so main and preview migrates alike authenticate.
@@ -2166,20 +2166,20 @@ impl Deployer {
             app,
             deploy_id,
             "migrate",
-            &self.settings.celld_bin,
+            &self.settings.cello_bin,
             &args,
             env,
         )
         .await
     }
 
-    /// The bucket environment for a celld child that holds the
-    /// whole-fleet-prefix read-write grant: `AWS_*` only. `CELLD_DEPLOY_AWS_*`
+    /// The bucket environment for a cello child that holds the
+    /// whole-fleet-prefix read-write grant: `AWS_*` only. `CELLO_DEPLOY_AWS_*`
     /// is the fleet's read-only deployment credential (`fleet::supervisor`);
     /// a deploy or migrate child publishes through the `AWS_*` grant and
     /// must never be handed that narrower credential, so this builder emits
     /// none (and [`Deployer::run_sandboxed_step`] refuses one).
-    fn celld_grant_env(
+    fn cello_grant_env(
         region: &str,
         endpoint: &str,
         creds: &crate::store::credentials::ScopedCredentials,
@@ -2215,11 +2215,11 @@ impl Deployer {
     ) -> anyhow::Result<String> {
         // Fail closed: no deploy/migrate child may carry the fleet's
         // read-only deployment credential. Those steps publish through the
-        // whole-prefix `AWS_*` grant, and a copied `CELLD_DEPLOY_AWS_*`
+        // whole-prefix `AWS_*` grant, and a copied `CELLO_DEPLOY_AWS_*`
         // would either break the upload or hint at the wrong grant shape.
         if let Some((name, _)) = extra_env
             .iter()
-            .find(|(name, _)| name.starts_with("CELLD_DEPLOY_AWS_"))
+            .find(|(name, _)| name.starts_with("CELLO_DEPLOY_AWS_"))
         {
             anyhow::bail!(
                 "sandboxed step env must not carry {name}: deploy and migrate use the whole-prefix AWS_* grant"
@@ -2542,7 +2542,7 @@ fn tail_cap(log: &str) -> String {
 }
 
 /// Stray temp maps a crashed deploy left in the work dir: same shape as the
-/// path [`Deployer::celld_deploy`] passes `--sourcemap` (a dotfile only the
+/// path [`Deployer::cello_deploy`] passes `--sourcemap` (a dotfile only the
 /// deploy step writes), never an app file. Best-effort: a leftover is one
 /// small inert file, and the sweep must never fail the deploy.
 async fn sweep_stale_maps(work: &Path) {
@@ -2637,7 +2637,7 @@ fn first_output_line(text: &str) -> &str {
 }
 
 /// The output line naming the failed migration, when one does; otherwise the
-/// first meaningful line. celld prints progress lines for applied files
+/// first meaningful line. cello prints progress lines for applied files
 /// before the error, so the first line would name the wrong file.
 fn error_detail<'a>(text: &'a str, failed: Option<&str>) -> &'a str {
     let Some(name) = failed else {
@@ -3465,11 +3465,11 @@ mod tests {
         assert_eq!(parsed["b"], serde_json::json!([1, 2]));
     }
 
-    /// `celld deploy` and `celld d1 migrations apply` hold the whole-prefix
+    /// `cello deploy` and `cello d1 migrations apply` hold the whole-prefix
     /// read-write grant through `AWS_*`; the fleet's read-only deployment
-    /// credential (`CELLD_DEPLOY_AWS_*`) must never enter those children.
+    /// credential (`CELLO_DEPLOY_AWS_*`) must never enter those children.
     #[test]
-    fn celld_grant_env_carries_no_deploy_credentials() {
+    fn cello_grant_env_carries_no_deploy_credentials() {
         let creds = crate::store::credentials::ScopedCredentials {
             access_key_id: "whole-key".to_string(),
             secret_access_key: "whole-secret".to_string(),
@@ -3478,7 +3478,7 @@ mod tests {
             reused: false,
         };
         let env =
-            Deployer::celld_grant_env("auto", "https://acct.r2.cloudflarestorage.com", &creds);
+            Deployer::cello_grant_env("auto", "https://acct.r2.cloudflarestorage.com", &creds);
         let map: HashMap<_, _> = env.iter().cloned().collect();
         assert_eq!(map["AWS_ACCESS_KEY_ID"], "whole-key");
         assert_eq!(map["AWS_SECRET_ACCESS_KEY"], "whole-secret");
@@ -3487,7 +3487,7 @@ mod tests {
         assert_eq!(map["S3_ENDPOINT"], "https://acct.r2.cloudflarestorage.com");
         assert!(
             env.iter()
-                .all(|(name, _)| !name.starts_with("CELLD_DEPLOY_AWS_")),
+                .all(|(name, _)| !name.starts_with("CELLO_DEPLOY_AWS_")),
             "deploy/migrate env names only the whole-prefix grant: {env:?}"
         );
     }
@@ -3563,7 +3563,7 @@ mod tests {
     async fn astro_website_layout_selects_dist_and_stages_migrations() {
         // The website template's build output layout: `dist/wrangler.json`
         // wins discovery (over a root config, of which there is none), and
-        // the repo's `db/migrations` stages into the deploy root for celld.
+        // the repo's `db/migrations` stages into the deploy root for cello.
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
         let app = test_app(10013);
@@ -3812,7 +3812,7 @@ mod tests {
     fn test_settings(data_dir: PathBuf) -> DeploySettings {
         DeploySettings {
             data_dir,
-            celld_bin: "celld".to_string(),
+            cello_bin: "cello".to_string(),
             esbuild_bin: None,
             bun_bin: "bun".to_string(),
             storage: FleetStorage {
@@ -4289,7 +4289,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let mut settings = purge_settings(&data, &purge);
         settings.bun_bin = "/bin/true".to_string();
-        settings.celld_bin = "/nonexistent/celld-binary".to_string();
+        settings.cello_bin = "/nonexistent/cello-binary".to_string();
         settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer
@@ -4307,7 +4307,7 @@ mod tests {
     #[tokio::test]
     async fn blocked_deploy_never_reaches_the_deploy_step() {
         // A profane JSX line with a valid deploy-root config behind it.
-        // Install and build are no-op `true`; `celld` is missing, so a
+        // Install and build are no-op `true`; `cello` is missing, so a
         // pass-through would fail at `deploy`: `blocked` proves the gate
         // stopped the pipeline, with nothing uploaded.
         let dir = tempfile::tempdir().unwrap();
@@ -4368,13 +4368,13 @@ mod tests {
 
         // Jev flags profanity: `blocked` proves the gate stopped the
         // pipeline, with nothing uploaded. Install and build are no-op
-        // `true`; `celld` is missing, so a pass-through would fail at
+        // `true`; `cello` is missing, so a pass-through would fail at
         // `deploy` instead.
         let fake = FakeJev::start(block_responder()).await;
         let data = tempfile::tempdir().unwrap();
         let mut settings = test_settings(data.path().to_path_buf());
         settings.bun_bin = "/bin/true".to_string();
-        settings.celld_bin = "/nonexistent/celld-binary".to_string();
+        settings.cello_bin = "/nonexistent/cello-binary".to_string();
         settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer
@@ -4497,7 +4497,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let mut settings = test_settings(data.path().to_path_buf());
         settings.bun_bin = "/bin/true".to_string();
-        settings.celld_bin = "/nonexistent/celld-binary".to_string();
+        settings.cello_bin = "/nonexistent/cello-binary".to_string();
         settings.jev = Some(jev_client(&fake.base_url));
         let deployer = Deployer::new(settings, 1);
         let outcome = deployer
@@ -4549,15 +4549,15 @@ mod tests {
         assert_eq!(checks, 0, "nothing is recorded");
     }
 
-    /// A fake `celld` for migrate tests: answers `deploy` with JSON and
+    /// A fake `cello` for migrate tests: answers `deploy` with JSON and
     /// simulates `d1 migrations apply` by walking `<root>/migrations`
     /// in order. A `<root>/.fake-fail` file names the migration that must
     /// fail, like a syntax error would. Bucket-shaped state never leaves the
     /// test: the fake treats `--bucket s3://<dir>/fleets/<slug>` as a state
     /// dir (`<dir>` is a tempdir), recording calls and env there, so counts
     /// survive the worktree wipe between deploys.
-    fn install_fake_celld(state: &Path) -> PathBuf {
-        let script = state.join("fake-celld");
+    fn install_fake_cello(state: &Path) -> PathBuf {
+        let script = state.join("fake-cello");
         let tmp = script.with_extension("tmp");
         std::fs::write(
             &tmp,
@@ -4617,7 +4617,7 @@ exit 0
     /// step's env (builds run untrusted code), so the test greps this log.
     fn install_fake_bun(state: &Path) -> PathBuf {
         let script = state.join("fake-bun");
-        // Atomic install like the celld fake above: execs must never catch
+        // Atomic install like the cello fake above: execs must never catch
         // the script mid-write (ETXTBSY under the parallel suite).
         let tmp = script.with_extension("tmp");
         std::fs::write(
@@ -4640,7 +4640,7 @@ exit 0
 
     fn migrate_settings(data: &tempfile::TempDir, state: &Path, script: &Path) -> DeploySettings {
         let mut settings = test_settings(data.path().to_path_buf());
-        settings.celld_bin = script.to_string_lossy().into_owned();
+        settings.cello_bin = script.to_string_lossy().into_owned();
         settings.bun_bin = "/bin/true".to_string();
         // The fake reads its state dir back out of the bucket URL.
         settings.storage.bucket = state.to_string_lossy().into_owned();
@@ -4659,7 +4659,7 @@ exit 0
             .count()
     }
 
-    /// How many `celld deploy` uploads the fake saw.
+    /// How many `cello deploy` uploads the fake saw.
     fn upload_calls(state: &Path) -> usize {
         let log = state.join("calls.log");
         if !log.is_file() {
@@ -4672,7 +4672,7 @@ exit 0
             .count()
     }
 
-    /// The fake-celld subcommand sequence: `deploy` for an upload,
+    /// The fake-cello subcommand sequence: `deploy` for an upload,
     /// `apply` for a `d1 migrations apply`. The fake logs one line per
     /// invocation in order, so this pins migrate-vs-upload ordering.
     fn call_kinds(state: &Path) -> Vec<&'static str> {
@@ -4695,13 +4695,13 @@ exit 0
             .collect()
     }
 
-    /// The `celld deploy` upload names the checkout with `--read-root`:
+    /// The `cello deploy` upload names the checkout with `--read-root`:
     /// the fork confines project reads to the config's directory, so a
     /// `dist/` deploy root needs the checkout admitted for build inputs
     /// (hoisted packages, a root-level Dockerfile) that upstream celld
     /// resolved without a flag.
     #[tokio::test]
-    async fn deploy_names_the_checkout_as_celld_read_root() {
+    async fn deploy_names_the_checkout_as_cello_read_root() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
@@ -4715,7 +4715,7 @@ exit 0
         let app = test_app(10124);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer
@@ -4736,19 +4736,19 @@ exit 0
         );
     }
 
-    /// A fake fork `celld` for the sourcemap path: `deploy --help`
+    /// A fake fork `cello` for the sourcemap path: `deploy --help`
     /// advertises `--sourcemap`, and `deploy` writes a canned v3 map to the
     /// flag's path before answering JSON. State stays in the baked-in dir,
     /// like [`install_fake_bun`].
-    fn install_fake_celld_sourcemap(state: &Path) -> PathBuf {
-        let script = state.join("fake-celld-sourcemap");
+    fn install_fake_cello_sourcemap(state: &Path) -> PathBuf {
+        let script = state.join("fake-cello-sourcemap");
         let tmp = script.with_extension("tmp");
         std::fs::write(
             &tmp,
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = \"deploy\" ] && [ \"$2\" = \"--help\" ]; then\n\
-                   printf 'celld deploy -- build a Worker\\n  --sourcemap PATH  write the Worker source map to a local file\\n'\n\
+                 printf 'cello deploy -- build a Worker\n  --sourcemap PATH  write the Worker source map to a local file\n'\
                    exit 0\n\
                  fi\n\
                  printf '%s\\n' \"$*\" >> \"{}/calls.log\"\n\
@@ -4776,12 +4776,12 @@ exit 0
         script
     }
 
-    /// A fork `celld` writes the Worker map when asked: the probe sees
+    /// A fork `cello` writes the Worker map when asked: the probe sees
     /// `--sourcemap` in `deploy --help`, the upload carries the flag, and
-    /// the deploy stores what celld wrote under `maps/<slug>/<sha>/` —
+    /// the deploy stores what cello wrote under `maps/<slug>/<sha>/` —
     /// with the temp path gone from the worktree afterwards.
     #[tokio::test]
-    async fn deploy_stores_the_worker_map_a_fork_celld_writes() {
+    async fn deploy_stores_the_worker_map_a_fork_cello_writes() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
@@ -4795,7 +4795,7 @@ exit 0
         let app = test_app(10125);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld_sourcemap(state.path());
+        let script = install_fake_cello_sourcemap(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer
@@ -4928,7 +4928,7 @@ exit 0
         let app = test_app(10101);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer
@@ -4937,7 +4937,7 @@ exit 0
             .unwrap();
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         // A first deploy (`last_deploy_sha` NULL) uploads before it
-        // migrates: `celld d1` needs a running fleet and nothing is
+        // migrates: `cello d1` needs a running fleet and nothing is
         // published yet.
         let names: Vec<&str> = outcome.steps.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -4959,7 +4959,7 @@ exit 0
         assert!(
             outcome.log_tail.contains("applied 0001_init.sql")
                 && outcome.log_tail.contains("applied 0002_add_owner.sql"),
-            "the celld output is journaled: {}",
+            "the cello output is journaled: {}",
             outcome.log_tail
         );
 
@@ -5046,7 +5046,7 @@ exit 0
             assert!(!capped, "{name} fits");
         }
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let bun = install_fake_bun(state.path());
         let data = tempfile::tempdir().unwrap();
         let mut settings = migrate_settings(&data, state.path(), &script);
@@ -5215,7 +5215,7 @@ exit 0
     }
 
     #[cfg(unix)]
-    /// `celld deploy` runs as the app uid: the replaced config must keep the
+    /// `cello deploy` runs as the app uid: the replaced config must keep the
     /// original's owner, or the upload can't read it (found live: EACCES on
     /// a root-owned 0600 `dist/wrangler.json`). Needs root to chown.
     #[test]
@@ -5392,7 +5392,7 @@ exit 0
         let app = test_app(10110);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -5499,7 +5499,7 @@ exit 0
         let app = test_app(10111);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -5576,9 +5576,9 @@ exit 0
         assert_eq!(count, 1, "a failed apply records nothing new");
     }
 
-    /// The live manifest celld published for `slug`: `deploy/current.json`
+    /// The live manifest cello published for `slug`: `deploy/current.json`
     /// pointing at a versioned prefix plus the manifest there, in the layout
-    /// `deploy::manifest::deployed_manifest` reads. The fake celld never
+    /// `deploy::manifest::deployed_manifest` reads. The fake cello never
     /// writes these (it has no store handle), so tests seed them directly.
     async fn seed_live_manifest(store: &Store, slug: &str, manifest: serde_json::Value) {
         let prefix = "deploy/outer-app/abcd1234";
@@ -5646,7 +5646,7 @@ exit 0
         let app = test_app(10120);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -5655,7 +5655,7 @@ exit 0
             .unwrap();
         assert_eq!(first.status, "success", "error: {:?}", first.error);
 
-        // The live version celld published: an asset-only manifest with no
+        // The live version cello published: an asset-only manifest with no
         // worker module and no bindings declares nothing.
         seed_live_manifest(
             &store,
@@ -5775,7 +5775,7 @@ exit 0
         let app = test_app(10121);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -5909,7 +5909,7 @@ exit 0
         let app = test_app(10122);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -6015,7 +6015,7 @@ exit 0
         let app = test_app(10123);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -6123,7 +6123,7 @@ exit 0
         let app = test_app(10102);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -6148,13 +6148,13 @@ exit 0
         assert_eq!(
             apply_calls(state.path()),
             1,
-            "no celld call when nothing is pending"
+            "no cello call when nothing is pending"
         );
     }
 
     #[tokio::test]
     async fn migrate_skips_without_d1_or_files() {
-        // No `d1_databases` declared: the step skips without touching celld.
+        // No `d1_databases` declared: the step skips without touching cello.
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
@@ -6193,7 +6193,7 @@ exit 0
         let app = test_app(10103);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer
@@ -6212,7 +6212,7 @@ exit 0
             "the journal says why: {}",
             outcome.log_tail
         );
-        assert_eq!(apply_calls(state.path()), 0, "celld never runs");
+        assert_eq!(apply_calls(state.path()), 0, "cello never runs");
     }
 
     #[tokio::test]
@@ -6230,7 +6230,7 @@ exit 0
         let app = test_app(10104);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer
@@ -6244,7 +6244,7 @@ exit 0
             .find(|s| s.name == "migrate")
             .expect("the migrate step is journaled");
         assert!(migrate.skipped);
-        assert_eq!(apply_calls(state.path()), 0, "celld never runs");
+        assert_eq!(apply_calls(state.path()), 0, "cello never runs");
     }
 
     #[tokio::test]
@@ -6276,7 +6276,7 @@ exit 0
         let app = test_app(10105);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer
@@ -6313,7 +6313,7 @@ exit 0
                 .await
                 .unwrap();
         assert_eq!(last_sha, None, "a failed first deploy never goes live");
-        // The upload ran first (the fleet must exist before `celld d1` can
+        // The upload ran first (the fleet must exist before `cello d1` can
         // reach it); the failure is in the migrate step that followed it.
         assert_eq!(upload_calls(state.path()), 1);
         assert_eq!(
@@ -6364,7 +6364,7 @@ exit 0
         let app = test_app(10112);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let failed = deployer
@@ -6375,7 +6375,7 @@ exit 0
         assert_eq!(failed.failed_step.as_deref(), Some("migrate"));
         // Still no successful deploy, so the retry is a first deploy too:
         // it uploads before it migrates again — and this time succeeds.
-        // (celld skips already-applied files on its own; the failed apply
+        // (cello skips already-applied files on its own; the failed apply
         // recorded nothing, so both files apply fresh here.)
         let sha_b = commit::commit(
             &store,
@@ -6460,7 +6460,7 @@ exit 0
         let app = test_app(10106);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -6470,7 +6470,7 @@ exit 0
         assert_eq!(first.status, "success", "error: {:?}", first.error);
         assert_eq!(apply_calls(state.path()), 1);
 
-        // Same name, new content: the deploy fails before celld runs again.
+        // Same name, new content: the deploy fails before cello runs again.
         let sha_b = commit::commit(
             &store,
             &cfg,
@@ -6516,7 +6516,7 @@ exit 0
         assert_eq!(
             apply_calls(state.path()),
             1,
-            "an edited file never reaches celld again"
+            "an edited file never reaches cello again"
         );
         assert_eq!(
             upload_calls(state.path()),
@@ -6535,7 +6535,7 @@ exit 0
     #[tokio::test]
     async fn blocked_gate_never_migrates() {
         // A profane page with a valid deploy root and migration files: the
-        // gate blocks, and celld (deploy and migrate alike) never runs.
+        // gate blocks, and cello (deploy and migrate alike) never runs.
         let dir = tempfile::tempdir().unwrap();
         let cfg = GitConfig::new(dir.path().join("git"), None);
         let store = Store::memory();
@@ -6566,7 +6566,7 @@ exit 0
         insert_test_app(&pool, &app).await;
         let fake = FakeJev::start(block_responder()).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let mut settings = migrate_settings(&data, state.path(), &script);
         settings.bun_bin = "/bin/true".to_string();
@@ -6584,7 +6584,7 @@ exit 0
         );
         assert!(
             !state.path().join("calls.log").is_file(),
-            "celld never runs at all: the deploy step is never reached"
+            "cello never runs at all: the deploy step is never reached"
         );
     }
 
@@ -6622,7 +6622,7 @@ exit 0
         let app = test_app(10108);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let outcome = deployer
@@ -6695,7 +6695,7 @@ exit 0
         let app = test_app(10109);
         insert_test_app(&pool, &app).await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(migrate_settings(&data, state.path(), &script), 1);
         let first = deployer
@@ -6705,7 +6705,7 @@ exit 0
         assert_eq!(first.status, "success", "error: {:?}", first.error);
         assert_eq!(apply_calls(state.path()), 1);
 
-        // Same name, new id: celld sees a new (empty) database, so the same
+        // Same name, new id: cello sees a new (empty) database, so the same
         // files are pending again and apply a second time.
         let sha_b = commit::commit(
             &store,
@@ -6747,7 +6747,7 @@ exit 0
         );
     }
 
-    /// The real `celld d1 migrations` contract the pipeline depends on:
+    /// The real `cello d1 migrations` contract the pipeline depends on:
     /// `apply` is idempotent (a second run is a no-op success) and `list`
     /// shows the applied file. Needs a live fleet, so it runs only when the
     /// integrator sets it up at merge time:
@@ -6755,11 +6755,11 @@ exit 0
     /// `OUTER_LIVE_D1_PROJECT` (a dir with the app's wrangler config and a
     /// `migrations/` dir holding `0001_outer_smoke.sql`), `OUTER_LIVE_D1_DB`
     /// (the `database_name`), plus the bucket credentials in the env and a
-    /// fleet serving that app. Uses the real `celld` on PATH, unsandboxed:
+    /// fleet serving that app. Uses the real `cello` on PATH, unsandboxed:
     /// it pins the CLI surface, not the pipeline (the fake covers that).
     #[tokio::test]
     #[ignore = "needs a live fleet: OUTER_LIVE_D1_BUCKET, OUTER_LIVE_D1_PROJECT, OUTER_LIVE_D1_DB"]
-    async fn live_celld_migrations_apply_is_idempotent() {
+    async fn live_cello_migrations_apply_is_idempotent() {
         let bucket = std::env::var("OUTER_LIVE_D1_BUCKET")
             .expect("OUTER_LIVE_D1_BUCKET must be set (e.g. s3://outer/fleets/pwa-check)");
         let project = std::env::var("OUTER_LIVE_D1_PROJECT")
@@ -6780,12 +6780,12 @@ exit 0
             let extra = extra.clone();
             let bucket = bucket.clone();
             async move {
-                let mut cmd = tokio::process::Command::new("celld");
+                let mut cmd = tokio::process::Command::new("cello");
                 cmd.args(["d1", "migrations"]);
                 cmd.args(&args);
                 cmd.args(["--bucket", bucket.as_str()]);
                 cmd.args(&extra);
-                cmd.output().await.expect("celld must be on PATH")
+                cmd.output().await.expect("cello must be on PATH")
             }
         };
         let project_arg = project.clone();
@@ -6802,7 +6802,7 @@ exit 0
             "a second apply is a no-op success: {}",
             String::from_utf8_lossy(&second.stderr)
         );
-        let mut list = tokio::process::Command::new("celld");
+        let mut list = tokio::process::Command::new("cello");
         list.args([
             "d1",
             "migrations",
@@ -6813,7 +6813,7 @@ exit 0
             bucket.as_str(),
         ]);
         list.args(&extra);
-        let list = list.output().await.expect("celld must be on PATH");
+        let list = list.output().await.expect("cello must be on PATH");
         assert!(
             list.status.success(),
             "list must succeed: {}",
@@ -6903,7 +6903,7 @@ exit 0
         .unwrap();
 
         // No package.json: install and build skip without binaries, and the
-        // bad cron stops the deploy at deploy-root, before celld runs.
+        // bad cron stops the deploy at deploy-root, before cello runs.
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
         let outcome = deployer
@@ -6970,7 +6970,7 @@ exit 0
 
         // No package.json: install and build skip without binaries, and the
         // second database stops the deploy at deploy-root with the cap
-        // message, before migrations or celld run.
+        // message, before migrations or cello run.
         let data = tempfile::tempdir().unwrap();
         let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
         let outcome = deployer
@@ -7071,7 +7071,7 @@ exit 0
     }
 
     #[tokio::test]
-    #[ignore = "needs bun and celld"]
+    #[ignore = "needs bun and cello"]
     async fn end_to_end_synthetic_app_against_rustfs() {
         let endpoint =
             std::env::var("OUTER_TEST_S3_ENDPOINT").expect("OUTER_TEST_S3_ENDPOINT must be set");
@@ -7081,7 +7081,7 @@ exit 0
         let bucket =
             std::env::var("OUTER_TEST_S3_BUCKET").unwrap_or_else(|_| "outer-live-test".to_string());
         let search = std::env::var("PATH").unwrap_or_default();
-        for bin in ["bun", "celld"] {
+        for bin in ["bun", "cello"] {
             assert!(
                 std::env::split_paths(&search).any(|dir| dir.join(bin).is_file()),
                 "{bin} must be on PATH for the live deploy test"
@@ -7089,7 +7089,7 @@ exit 0
         }
 
         // A minimal app: install is a no-op (no deps), build copies the root
-        // wrangler.json into dist/, celld deploys dist/ to RustFS.
+        // wrangler.json into dist/, cello deploys dist/ to RustFS.
         let src = tempfile::tempdir().unwrap();
         std::fs::write(
             src.path().join("package.json"),
@@ -7158,8 +7158,8 @@ exit 0
         let data = tempfile::tempdir().unwrap();
         let settings = DeploySettings {
             data_dir: data.path().to_path_buf(),
-            celld_bin: "celld".to_string(),
-            esbuild_bin: std::env::var("CELLD_ESBUILD").ok(),
+            cello_bin: "cello".to_string(),
+            esbuild_bin: std::env::var("CELLO_ESBUILD").ok(),
             bun_bin: "bun".to_string(),
             storage: FleetStorage {
                 endpoint,
@@ -7186,7 +7186,7 @@ exit 0
         assert_eq!(outcome.status, "success", "error: {:?}", outcome.error);
         assert!(
             outcome.version.is_some(),
-            "celld version parsed from --json output"
+            "cello version parsed from --json output"
         );
         let (last_sha,): (Option<String>,) =
             sqlx::query_as("SELECT last_deploy_sha FROM app WHERE id = 'app1'")

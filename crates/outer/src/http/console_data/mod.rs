@@ -10,7 +10,7 @@
 //! bucket names are validated against the app's declared bindings; a typo'd
 //! name opens an empty namespace in *this* fleet, never another app's data
 //! (see `deploy::migrate` for the same argument). R2 writes go through
-//! celld (never plain S3 PUT) and are recorded in `agent_action` via
+//! cello (never plain S3 PUT) and are recorded in `agent_action` via
 //! `mcp::actions::record_console` with both ids NULL (client "Console").
 
 pub mod backups;
@@ -185,7 +185,7 @@ pub(crate) fn deploy_settings(
 }
 
 /// The single live-manifest reader (see `deploy::manifest`): the deploy
-/// pointer celld publishes per upload plus the manifest it points at. R2, DO
+/// pointer cello publishes per upload plus the manifest it points at. R2, DO
 /// and D1 parse their own binding sections out of it; the pipeline reads the
 /// live D1 declarations out of it for the migrate/upload order.
 pub(crate) use crate::deploy::manifest::deployed_manifest;
@@ -226,7 +226,7 @@ pub(crate) async fn scoped_s3(
     })
 }
 
-pub(crate) fn celld_env(
+pub(crate) fn cello_env(
     storage: &crate::fleet::manager::FleetStorage,
     creds: &crate::store::credentials::ScopedCredentials,
 ) -> Vec<(String, String)> {
@@ -258,18 +258,18 @@ pub(crate) async fn scoped_creds(
         .await
 }
 
-/// Run one `celld` storage subcommand against the fleet's own bucket.
+/// Run one `cello` storage subcommand against the fleet's own bucket.
 /// `args` after the binary; `env` carries the scoped grant. Request-scoped
 /// with a short timeout — no fleet wake, no sandboxing: the credential
 /// prefix (`fleets/{slug}/`) is the isolation.
-pub(crate) async fn run_celld(
+pub(crate) async fn run_cello(
     state: &super::AppState,
     args: &[String],
     env: &[(String, String)],
     timeout: Duration,
 ) -> anyhow::Result<String> {
-    let celld_bin = deploy_settings(state)?.celld_bin.clone();
-    let mut cmd = tokio::process::Command::new(&celld_bin);
+    let cello_bin = deploy_settings(state)?.cello_bin.clone();
+    let mut cmd = tokio::process::Command::new(&cello_bin);
     cmd.args(args);
     // Like `d1.rs` and the fleet supervisor: start from an empty env so the
     // server's own environment (parent bucket keys included) never reaches
@@ -284,15 +284,15 @@ pub(crate) async fn run_celld(
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "celld {} timed out",
+                "cello {} timed out",
                 args.first().map(String::as_str).unwrap_or("?")
             )
         })?
-        .map_err(|e| anyhow::anyhow!("running celld: {e:#}"))?;
+        .map_err(|e| anyhow::anyhow!("running cello: {e:#}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let tail: String = stderr.lines().rev().take(5).collect::<Vec<_>>().join(" | ");
-        anyhow::bail!("celld failed: {tail}");
+        anyhow::bail!("cello failed: {tail}");
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -303,7 +303,7 @@ pub(crate) async fn run_celld(
 //
 // Error shape for data endpoints: `{error, message, user_message}` per the
 // console-actions contract. `message` carries the detail the owner needs to
-// act on (validation failures and celld/S3 failure tails — env values and
+// act on (validation failures and cello/S3 failure tails — env values and
 // credentials never enter them); `user_message` is a friendly constant on
 // backend failures (see `unavailable_friendly`), so raw store XML never
 // reaches the UI. The shorthands below delegate to [`data_error`] /
@@ -315,7 +315,7 @@ pub(crate) fn bad_request(message: impl Into<String>) -> Response {
     data_error(StatusCode::BAD_REQUEST, "bad_request", message.into(), None)
 }
 
-/// A 500 for a celld/S3 failure: the message carries the failure's tail
+/// A 500 for a cello/S3 failure: the message carries the failure's tail
 /// (never credentials — env values never enter it).
 pub(crate) fn unavailable(message: impl Into<String>) -> Response {
     unavailable_friendly(message, "Couldn't reach the bucket right now. Try again.")
@@ -393,11 +393,11 @@ mod tests {
             .header("cookie", cookie)
     }
 
-    /// Live deploys with a fake `celld` and static credentials: guard and
+    /// Live deploys with a fake `cello` and static credentials: guard and
     /// allowlist paths run fully; only S3 reads would touch the network,
     /// and no test below reaches them.
     async fn test_state(
-        celld_bin: &str,
+        cello_bin: &str,
     ) -> (
         axum::Router,
         sqlx::SqlitePool,
@@ -418,7 +418,7 @@ mod tests {
         mcp.deploys = Deploys::live(Deployer::new(
             DeploySettings {
                 data_dir: data_dir.clone(),
-                celld_bin: celld_bin.to_string(),
+                cello_bin: cello_bin.to_string(),
                 esbuild_bin: None,
                 bun_bin: "bun".to_string(),
                 storage: FleetStorage {
@@ -489,9 +489,9 @@ mod tests {
         format!("__Host-outer_sid={id}")
     }
 
-    fn fake_celld(exit: i32) -> std::path::PathBuf {
+    fn fake_cello(exit: i32) -> std::path::PathBuf {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("celld");
+        let bin = dir.path().join("cello");
         // Atomic install (write tmp, chmod, rename): an exec racing a direct
         // write fails ETXTBSY under the parallel suite.
         let tmp = bin.with_extension("tmp");
@@ -549,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_endpoints_need_session_and_same_origin() {
-        let (app, pool, _, _) = test_state("celld").await;
+        let (app, pool, _, _) = test_state("cello").await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         let cookie = login(&pool, "ana@example.com").await;
@@ -578,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_endpoints_hide_foreign_apps() {
-        let (app, pool, _, _) = test_state("celld").await;
+        let (app, pool, _, _) = test_state("cello").await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         seed_app(&pool, "bob@example.com", "bakery", now).await;
@@ -597,7 +597,7 @@ mod tests {
     }
     #[tokio::test]
     async fn data_panels_stay_owner_only_for_collaborators() {
-        let (app, pool, _, _) = test_state("celld").await;
+        let (app, pool, _, _) = test_state("cello").await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         // Collaborators count only while the owner is Pro (spec §7.4): the
@@ -655,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn r2_buckets_come_from_the_manifest_then_the_local_config() {
-        let (app, pool, data_dir, store) = test_state("celld").await;
+        let (app, pool, data_dir, store) = test_state("cello").await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         let cookie = login(&pool, "ana@example.com").await;
@@ -718,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn r2_undeclared_bucket_is_404_and_bad_keys_are_400() {
-        let (app, pool, _, store) = test_state("celld").await;
+        let (app, pool, _, store) = test_state("cello").await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         let cookie = login(&pool, "ana@example.com").await;
@@ -737,7 +737,7 @@ mod tests {
         let body: serde_json::Value = body.parse().unwrap();
         assert_eq!(body["error"], "not_found");
         assert!(body["user_message"].is_string());
-        // A traversal key never reaches celld: 400.
+        // A traversal key never reaches cello: 400.
         let (status, _, _) = send(
             &app,
             authed(
@@ -749,8 +749,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        // A leading-dash key would parse as a celld option: 400 with a
-        // user_message, before any credential or celld call.
+        // A leading-dash key would parse as a cello option: 400 with a
+        // user_message, before any credential or cello call.
         let (status, _, body) = send(
             &app,
             authed(
@@ -769,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn r2_put_and_delete_audit_console_rows() {
-        let bin = fake_celld(0);
+        let bin = fake_cello(0);
         let (app, pool, _, store) = test_state(bin.to_str().unwrap()).await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
@@ -815,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn r2_delete_rejects_empty_and_oversized_key_lists() {
-        let bin = fake_celld(0);
+        let bin = fake_cello(0);
         let (app, pool, _, store) = test_state(bin.to_str().unwrap()).await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
@@ -824,7 +824,7 @@ mod tests {
         for payload in [
             r#"{"bucket":"files","keys":[]}"#,
             r#"{"bucket":"files","keys":["a/../b"]}"#,
-            // A leading-dash key would parse as a celld option.
+            // A leading-dash key would parse as a cello option.
             r#"{"bucket":"files","keys":["-evil"]}"#,
         ] {
             let (status, _, _) = send(
@@ -850,7 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn do_classes_list_and_unknown_class_is_400() {
-        let (app, pool, _, store) = test_state("celld").await;
+        let (app, pool, _, store) = test_state("cello").await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         let cookie = login(&pool, "ana@example.com").await;
@@ -881,8 +881,8 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let body: serde_json::Value = body.parse().unwrap();
         assert!(body["user_message"].is_string());
-        // A leading-dash class would parse as a celld option: refused
-        // before any credential or celld call.
+        // A leading-dash class would parse as a cello option: refused
+        // before any credential or cello call.
         let (status, _, _) = send(
             &app,
             authed(
@@ -898,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn do_probe_is_best_effort_null() {
-        let (app, pool, _, _) = test_state("celld").await;
+        let (app, pool, _, _) = test_state("cello").await;
         let now = crate::auth::now_ms();
         seed_app(&pool, "ana@example.com", "groceries", now).await;
         let cookie = login(&pool, "ana@example.com").await;
@@ -921,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn celld_env_carries_the_scoped_grant() {
+    fn cello_env_carries_the_scoped_grant() {
         let storage = FleetStorage {
             endpoint: "https://ep".to_string(),
             region: "auto".to_string(),
@@ -938,7 +938,7 @@ mod tests {
             minted_at: None,
             reused: false,
         };
-        let env = celld_env(&storage, &creds);
+        let env = cello_env(&storage, &creds);
         let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
         assert_eq!(get("AWS_ACCESS_KEY_ID").as_deref(), Some("scoped-id"));
         assert_eq!(get("S3_ENDPOINT").as_deref(), Some("https://ep"));

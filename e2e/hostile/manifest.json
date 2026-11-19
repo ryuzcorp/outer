@@ -16,7 +16,7 @@
     { "id": "fetch:loopback-target", "phase": "build", "category": "blocked-egress", "must": "fail", "desc": "Build cannot reach a live loopback listener (fail-closed: the harness proves it serves)" },
     { "id": "fetch:internet", "phase": "build", "category": "blocked-egress", "must": "succeed", "desc": "Positive control: ordinary internet egress still works" },
     { "id": "fetch:neighbour-fleet", "phase": "worker", "category": "fleet-ports", "must": "fail", "desc": "Worker cannot fetch another fleet's public port" },
-    { "id": "fetch:platform-internal", "phase": "worker", "category": "fleet-ports", "must": "fail", "desc": "Worker cannot fetch outer's loopback / celld internal ports" },
+    { "id": "fetch:platform-internal", "phase": "worker", "category": "fleet-ports", "must": "fail", "desc": "Worker cannot fetch outer's loopback / cello internal ports" },
     { "id": "fetch:metadata", "phase": "worker", "category": "blocked-egress", "must": "fail", "desc": "Worker cannot reach the cloud metadata IP" },
     { "id": "fetch:smtp-worker", "phase": "worker", "category": "blocked-egress", "must": "fail", "desc": "Worker cannot open SMTP ports" },
     { "id": "env:worker-secrets", "phase": "worker", "category": "host-secrets", "must": "fail", "desc": "No platform secret names in the worker env" },

@@ -50,7 +50,7 @@
 #     HOSTILE_S3_DEPLOY_KEY HOSTILE_S3_DEPLOY_SECRET
 #     HOSTILE_S3_DEPLOY_TOKEN HOSTILE_S3_DEPLOY_PREFIX (=<prefix>deploy/)
 #     HOSTILE_S3_DEPLOY_OBJECT (default <prefix>deploy/hostile-probe.json)
-# - Worker layer (manual, needs celld + a bucket): deploy the fixture as
+# - Worker layer (manual, needs cello + a bucket): deploy the fixture as
 #   two apps (`hostile`, `hostile-neighbour`), then
 #     curl 'https://hostile.<apps-domain>/probes?neighbour=<port>&platform=<port>'
 #   and confirm every worker probe is contained except `fetch:internet`.

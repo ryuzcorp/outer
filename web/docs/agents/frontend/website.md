@@ -42,7 +42,7 @@ export const POST: APIRoute = async () => {
 4. Declare new bindings on `Cloudflare.Env` in `src/env.d.ts`.
 5. Keep server routes few and small: at most one or two against D1.
 
-## Ship config and schema the celld way
+## Ship config and schema the Cello way
 
 1. Edit `astro.config.mjs` (`celld-config` integration), never hand-write `dist/wrangler.json`.
 2. Read derived keys from `dist/wrangler.json` after `bun run build`.

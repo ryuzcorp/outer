@@ -1,6 +1,6 @@
 // R2 browser actions: one registered entry per query/mutation the R2 panel
 // performs. Reads are S3 under `fleets/{slug}/r2/<bucket>/` with scoped
-// creds; writes and deletes go through `celld r2 put` / `celld r2 delete`
+// creds; writes and deletes go through `cello r2 put` / `cello r2 delete`
 // and are audited (client "Console").
 
 import { request } from "./http.ts";

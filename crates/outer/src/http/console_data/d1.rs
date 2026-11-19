@@ -2,7 +2,7 @@
 //
 // What changed for Outer: no collaborator roles (owner-only in v1, so no
 // `redacted`/`locked`/`caps`/`rowAction` plumbing); the database is addressed
-// by its declared `binding` and resolved server-side to the celld identity;
+//! by its declared `binding` and resolved server-side to the cello identity;
 // credentials come from `store::credentials` scoped to `fleets/{slug}/`
 // exactly like `deploy::migrate`; the fleet wakes through the fleet manager;
 // every write lands in `agent_action` with client "Console".
@@ -39,7 +39,7 @@ pub const DEFAULT_PAGE_SIZE: i64 = 25;
 /// The server clamps every page size into this range.
 pub const MIN_PAGE_SIZE: i64 = 1;
 pub const MAX_PAGE_SIZE: i64 = 100;
-/// `celld d1 execute` budget, matching Noite's 30 s.
+/// `cello d1 execute` budget, matching Noite's 30 s.
 pub const D1_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
@@ -480,7 +480,7 @@ pub fn build_delete(
 }
 
 /// One atomic batch of DELETEs, each followed by `changes()` so the caller can
-/// total the rows actually removed. `celld d1 execute` brackets several
+/// total the rows actually removed. `cello d1 execute` brackets several
 /// statements in one transaction, so a failure rolls the whole batch back.
 pub fn build_delete_keys(
     schema: &TableSchema,
@@ -505,7 +505,7 @@ pub fn build_delete_keys(
         .to_string())
 }
 
-/// Most `UNION ALL` terms one `celld d1 execute` takes. Prod celld 0.6.2
+/// Most `UNION ALL` terms one `cello d1 execute` takes. Prod celld 0.6.2
 /// refuses 6+ terms (`D1_EXEC_ERROR: too many terms in compound SELECT`;
 /// without a trailing semicolon it misleadingly says "incomplete
 /// statement"), so counts for more tables run as several execs. Found live:
@@ -541,7 +541,7 @@ pub fn table_count_queries(tables: &[String]) -> Vec<String> {
 }
 
 /// Tag column stamping every row of a batched exec so `split_batched` can
-/// route the concatenated result sets back apart. `celld d1 execute` runs
+/// route the concatenated result sets back apart. `cello d1 execute` runs
 /// several `;`-separated statements in one call and prints one JSON object
 /// per row, so without a tag the sets would be indistinguishable.
 pub const BATCH_TAG: &str = "_q";
@@ -601,29 +601,29 @@ pub fn batch_tag_collides(schema: &TableSchema) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// celld plumbing
+// cello plumbing
 // ---------------------------------------------------------------------------
 
 /// What a D1 operation needs beyond the request. Built from `AppState` in the
-/// handlers; built by hand in tests with a fake `celld`.
+/// handlers; built by hand in tests with a fake `cello`.
 #[derive(Clone)]
 pub struct D1Ctx {
-    pub celld_bin: String,
+    pub cello_bin: String,
     pub storage: FleetStorage,
     pub pool: SqlitePool,
     pub store: Store,
-    /// Derives the fleet's `CELLD_OPERATOR_TOKEN` for every `celld d1`
+    /// Derives the fleet's `CELLO_OPERATOR_TOKEN` for every `cello d1`
     /// invocation (the internal listener requires it once fleets set it).
     pub secrets_key: crate::secrets::SecretsKey,
     /// Wakes the fleet before `d1 execute` (D1 goes through a running node).
-    /// `None` in tests with a fake `celld`, where no fleet can be woken.
+    /// `None` in tests with a fake `cello`, where no fleet can be woken.
     pub wake: Option<FleetManager>,
 }
 
 impl D1Ctx {
     pub fn from_state(state: &crate::http::AppState) -> Self {
         Self {
-            celld_bin: state.mcp.fleets.celld_bin(),
+            cello_bin: state.mcp.fleets.cello_bin(),
             storage: state.mcp.fleets.storage().clone(),
             pool: state.mcp.pool.clone(),
             store: state.mcp.store.clone(),
@@ -649,9 +649,9 @@ pub enum D1Error {
     BadQuery(String),
     #[error("the app is still starting")]
     AppStarting,
-    #[error("celld d1 failed: {0}")]
-    Celld(String),
-    #[error("celld d1 timed out")]
+    #[error("cello d1 failed: {0}")]
+    Cello(String),
+    #[error("cello d1 timed out")]
     Timeout,
     #[error("database is unavailable right now")]
     Unavailable(#[source] anyhow::Error),
@@ -669,9 +669,9 @@ fn bad_err(err: anyhow::Error) -> D1Error {
     D1Error::BadQuery(format!("{err:#}"))
 }
 
-/// The minimal wrangler.json synthesized for the `celld d1 execute` cwd: only
+/// The minimal wrangler.json synthesized for the `cello d1 execute` cwd: only
 /// name (script_name), main, compatibility_date/flags, and `d1_databases`
-/// [{binding, database_name, database_id?}]. No vars, nothing else — celld
+/// [{binding, database_name, database_id?}]. No vars, nothing else — cello
 /// resolves the database identity from the cwd config, so it needs the
 /// declarations but must never see secret values.
 fn synthesize_config(manifest: &serde_json::Value, dbs: &[D1Database]) -> anyhow::Result<Vec<u8>> {
@@ -767,8 +767,8 @@ async fn deployed_state(ctx: &D1Ctx, slug: &str) -> Result<DeployedState, D1Erro
     Ok(DeployedState { dbs, config })
 }
 
-/// The argv name celld gets for `binding`: always the `database_name`, exactly
-/// as `deploy::migrate` passes it. celld resolves the real identity
+/// The argv name cello gets for `binding`: always the `database_name`, exactly
+/// as `deploy::migrate` passes it. cello resolves the real identity
 /// (`database_id` when declared) from the synthesized cwd config. Only the
 /// name reaches argv because only the name is validated against option
 /// injection (`migrate::validate_database_name` refuses a leading `-`); a
@@ -781,7 +781,7 @@ fn identity_for(dbs: &[D1Database], binding: &str) -> Result<String, D1Error> {
         .ok_or_else(|| D1Error::UnknownDatabase(binding.to_string()))
 }
 
-/// Materialize the synthesized wrangler config into a temp project dir: celld
+/// Materialize the synthesized wrangler config into a temp project dir: cello
 /// resolves the database identity from the cwd config. The dir holds only
 /// the config — no app code — and is removed with the `TempDir` guard.
 async fn materialize_project(config: &[u8]) -> anyhow::Result<tempfile::TempDir> {
@@ -790,7 +790,7 @@ async fn materialize_project(config: &[u8]) -> anyhow::Result<tempfile::TempDir>
     Ok(dir)
 }
 
-/// One `celld d1 execute` against the app's fleet. Callers pass validated
+/// One `cello d1 execute` against the app's fleet. Callers pass validated
 /// SQL only — never raw browser input. The env carries the scoped grant
 /// alone (`env_clear` + minimal PATH, so no parent-process AWS keys leak),
 /// and the timeout kills the child on expiry.
@@ -810,7 +810,7 @@ pub(crate) async fn d1_exec(
         .await
         .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("minting scoped credentials: {e:#}")))?;
     let bucket = ctx.storage.bucket_url(slug);
-    let mut cmd = tokio::process::Command::new(&ctx.celld_bin);
+    let mut cmd = tokio::process::Command::new(&ctx.cello_bin);
     cmd.arg("d1")
         .arg("execute")
         .arg(identity)
@@ -849,24 +849,24 @@ pub(crate) async fn d1_exec(
     cmd.env(token_key, token_val);
     let child = cmd
         .spawn()
-        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("spawning celld: {e:#}")))?;
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("spawning cello: {e:#}")))?;
     let out = tokio::time::timeout(D1_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| D1Error::Timeout)?
-        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("waiting for celld: {e:#}")))?;
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("waiting for cello: {e:#}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(D1Error::Celld(first_lines(&stderr, 5)));
+        return Err(D1Error::Cello(first_lines(&stderr, 5)));
     }
     String::from_utf8(out.stdout)
-        .map_err(|e| D1Error::Celld(format!("celld printed non-UTF-8 output: {e}")))
+        .map_err(|e| D1Error::Cello(format!("cello printed non-UTF-8 output: {e}")))
 }
 
 /// A dump is not a diagnostic ping: the export streams up to its 32 MiB
 /// cap through the fleet, so it gets the migration-sized deadline.
 pub const D1_EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One `celld d1 export` against the app's fleet: a consistent SQL dump of
+/// One `cello d1 export` against the app's fleet: a consistent SQL dump of
 /// exactly `tables` on stdout as text (no `--json`), read under one
 /// transaction on the owning node — a single snapshot even while the
 /// database takes writes. Their indexes and triggers follow each table
@@ -891,7 +891,7 @@ pub(crate) async fn d1_export(
         .await
         .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("minting scoped credentials: {e:#}")))?;
     let bucket = ctx.storage.bucket_url(slug);
-    let mut cmd = tokio::process::Command::new(&ctx.celld_bin);
+    let mut cmd = tokio::process::Command::new(&ctx.cello_bin);
     cmd.arg("d1").arg("export").arg(identity);
     for table in tables {
         cmd.arg("--table").arg(table);
@@ -927,20 +927,20 @@ pub(crate) async fn d1_export(
     cmd.env(token_key, token_val);
     let child = cmd
         .spawn()
-        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("spawning celld: {e:#}")))?;
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("spawning cello: {e:#}")))?;
     let out = tokio::time::timeout(D1_EXPORT_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| D1Error::Timeout)?
-        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("waiting for celld: {e:#}")))?;
+        .map_err(|e| D1Error::Unavailable(anyhow::anyhow!("waiting for cello: {e:#}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(D1Error::Celld(first_lines(&stderr, 5)));
+        return Err(D1Error::Cello(first_lines(&stderr, 5)));
     }
     String::from_utf8(out.stdout)
-        .map_err(|e| D1Error::Celld(format!("celld printed non-UTF-8 output: {e}")))
+        .map_err(|e| D1Error::Cello(format!("cello printed non-UTF-8 output: {e}")))
 }
 
-/// Last `n` non-empty lines of celld stderr, bounded for the log line.
+/// Last `n` non-empty lines of cello stderr, bounded for the log line.
 fn first_lines(stderr: &str, n: usize) -> String {
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = &lines[lines.len().saturating_sub(n)..];
@@ -955,7 +955,7 @@ fn first_lines(stderr: &str, n: usize) -> String {
         }
         format!("{}…", &joined[..end])
     } else if joined.is_empty() {
-        "celld exited non-zero with no output".to_string()
+        "cello exited non-zero with no output".to_string()
     } else {
         joined
     }
@@ -977,7 +977,7 @@ pub(crate) fn parse_json_rows(out: &str) -> Vec<serde_json::Map<String, serde_js
 
 /// Split one batched exec's concatenated rows back into per-statement sets,
 /// keyed by the `BATCH_TAG` stamp each statement puts on its rows (the tag
-/// itself is stripped). Rows without a tag — e.g. a future celld summary
+/// itself is stripped). Rows without a tag — e.g. a future cello summary
 /// object — land under the empty key instead of being silently dropped.
 pub fn split_batched(
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
@@ -1045,7 +1045,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Operations (shared by the handlers and, in tests, the fake celld)
+// Operations (shared by the handlers and, in tests, the fake cello)
 // ---------------------------------------------------------------------------
 
 /// Wake the fleet when the server runs one (D1 goes through a live node),
@@ -1060,8 +1060,8 @@ async fn ready_config(ctx: &D1Ctx, app: &crate::apps::App) -> Result<DeployedSta
 }
 
 /// The backup engine's entry point ([`crate::d1_backup`]): wake the fleet,
-/// resolve `binding` to its celld identity, and materialize the synthesized
-/// config dir celld resolves that identity from. The caller runs its own
+/// resolve `binding` to its cello identity, and materialize the synthesized
+/// config dir cello resolves that identity from. The caller runs its own
 /// validated SQL through [`d1_exec`] against the returned dir.
 pub(crate) async fn ready_backup(
     ctx: &D1Ctx,
@@ -1199,7 +1199,7 @@ async fn load_table(
 }
 
 /// Full schema for the Definition view: columns, foreign keys, indexes, DDL.
-/// Two `celld d1 execute` calls at most: one for table_info +
+/// Two `cello d1 execute` calls at most: one for table_info +
 /// foreign_key_list + index_list + the sqlite_master DDL, and — only when
 /// the table has indexes — one for every index's columns.
 pub async fn table_schema(
@@ -1315,7 +1315,7 @@ pub async fn table_schema(
 }
 
 /// One server-side page of rows plus the total under the same filters/search.
-/// Two `celld d1 execute` calls: columns first (validation needs them), then
+/// Two `cello d1 execute` calls: columns first (validation needs them), then
 /// the page and the total in one batched exec.
 pub async fn table_rows(
     ctx: &D1Ctx,
@@ -1525,16 +1525,16 @@ pub(crate) fn d1_response(result: Result<serde_json::Value, D1Error>) -> Respons
             "the app is still starting",
             Some("Starting the app — retry in a few seconds.".to_string()),
         ),
-        Err(D1Error::Celld(detail)) => data_error(
+        Err(D1Error::Cello(detail)) => data_error(
             StatusCode::BAD_GATEWAY,
             "d1_unavailable",
-            format!("celld d1 failed: {detail}"),
+            format!("cello d1 failed: {detail}"),
             Some("Couldn't reach the app's database — the app may still be starting. Retry in a few seconds.".to_string()),
         ),
         Err(D1Error::Timeout) => data_error(
             StatusCode::GATEWAY_TIMEOUT,
             "d1_timeout",
-            "celld d1 timed out",
+            "cello d1 timed out",
             Some("The database query took too long. Narrow the filters and retry.".to_string()),
         ),
         Err(D1Error::Unavailable(source)) => data_error(
@@ -1788,7 +1788,7 @@ async fn api_write(
         ),
         Err(err) => (
             format!("failed d1 {op} on {table}"),
-            Err(D1Error::Celld(format!("{err:#}"))),
+            Err(D1Error::Cello(format!("{err:#}"))),
         ),
     };
     // The audit row never carries values: only the op and the table.
@@ -1858,7 +1858,7 @@ async fn api_delete_rows(
         ),
         Err(err) => (
             format!("failed d1 bulk delete on {table}"),
-            Err(D1Error::Celld(format!("{err:#}"))),
+            Err(D1Error::Cello(format!("{err:#}"))),
         ),
     };
     let (o, code) = match &outcome {
@@ -2198,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn table_counts_chunk_at_the_celld_union_limit() {
+    fn table_counts_chunk_at_the_cello_union_limit() {
         let tables = |n: usize| (0..n).map(|i| format!("t{i:02}")).collect::<Vec<_>>();
         // At the boundary: one exec.
         assert_eq!(table_count_queries(&tables(0)).len(), 0);
@@ -2428,13 +2428,13 @@ mod tests {
         assert!(!bytes.windows(18).any(|w| w == b"super-secret-value"));
     }
 
-    // --- fake celld --------------------------------------------------------
+    // --- fake cello --------------------------------------------------------
 
-    /// A fake `celld` for D1 tests: answers `d1 execute` with canned JSON
+    /// A fake `cello` for D1 tests: answers `d1 execute` with canned JSON
     /// per `--command`, recording argv, env and cwd under the state dir it
     /// reads back out of `--bucket s3://<dir>/fleets/<slug>`.
-    fn install_fake_celld(state: &std::path::Path) -> PathBuf {
-        let script = state.join("fake-celld");
+    fn install_fake_cello(state: &std::path::Path) -> PathBuf {
+        let script = state.join("fake-cello");
         // Atomic install (write tmp, chmod, rename): an exec racing a direct
         // write fails ETXTBSY under the parallel suite.
         let tmp = script.with_extension("tmp");
@@ -2540,7 +2540,7 @@ exit 0
         let mut storage = test_storage();
         storage.bucket = state.path().to_string_lossy().into_owned();
         D1Ctx {
-            celld_bin: script.to_string_lossy().into_owned(),
+            cello_bin: script.to_string_lossy().into_owned(),
             storage,
             pool: pool.clone(),
             store,
@@ -2551,7 +2551,7 @@ exit 0
 
     const DEPLOY_PREFIX: &str = "deploy/outer-app/fd031dff832ad90a";
 
-    /// The live manifest celld published for this app: two D1 bindings (one
+    /// The live manifest cello published for this app: two D1 bindings (one
     /// with an id, one plain), plus non-D1 binding types and a top-level
     /// `vars` map carrying a would-be secret — all of which the panel must
     /// ignore, never echoing the secret anywhere.
@@ -2590,7 +2590,7 @@ exit 0
         })
     }
 
-    /// Pointer plus manifest, as `celld deploy` leaves them in the bucket.
+    /// Pointer plus manifest, as `cello deploy` leaves them in the bucket.
     async fn seed_deployed(store: &Store) {
         store
             .put(
@@ -2646,7 +2646,7 @@ exit 0
 
     /// A stub fleet health gate: answers 200 on every connection so
     /// `ensure_awake`'s pre-spawn probe counts the fleet awake and no
-    /// `celld` spawn ever runs. Loopback-only; the task dies with the test.
+    /// `cello` spawn ever runs. Loopback-only; the task dies with the test.
     /// Returns the bound port (each router test takes its own).
     async fn stub_health() -> (u16, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2687,7 +2687,7 @@ exit 0
     async fn tables_filter_hidden_and_pin_argv() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
@@ -2721,7 +2721,7 @@ exit 0
         // would 401 every D1 call against a token-protected fleet): it must
         // be the slug-derived value, never user input.
         let want = format!(
-            "CELLD_OPERATOR_TOKEN={}",
+            "CELLO_OPERATOR_TOKEN={}",
             crate::secrets::operator_token(&crate::secrets::SecretsKey::test_key(), &app.slug)
         );
         assert!(env.contains(&want), "{env}");
@@ -2738,24 +2738,24 @@ exit 0
     }
 
     #[tokio::test]
-    async fn unknown_binding_never_reaches_celld() {
+    async fn unknown_binding_never_reaches_cello() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
         let app = test_app(&pool).await;
         let err = list_tables(&ctx, &app, "OTHER").await.unwrap_err();
         assert!(matches!(err, D1Error::UnknownDatabase(_)));
-        assert!(calls(&state).is_empty(), "no celld call on bad binding");
+        assert!(calls(&state).is_empty(), "no cello call on bad binding");
     }
 
     #[tokio::test]
     async fn missing_config_is_no_config() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let ctx = op_ctx(&pool, &state, &script, Store::memory());
         let app = test_app(&pool).await;
         let err = list_tables(&ctx, &app, "DB").await.unwrap_err();
@@ -2766,7 +2766,7 @@ exit 0
     async fn pointer_without_manifest_is_no_config() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         store
             .put(
@@ -2780,14 +2780,14 @@ exit 0
         let app = test_app(&pool).await;
         let err = list_tables(&ctx, &app, "DB").await.unwrap_err();
         assert!(matches!(err, D1Error::NoConfig));
-        assert!(calls(&state).is_empty(), "no celld call without a manifest");
+        assert!(calls(&state).is_empty(), "no cello call without a manifest");
     }
 
     #[tokio::test]
     async fn schema_loads_fk_indexes_ddl() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
@@ -2812,7 +2812,7 @@ exit 0
         assert_eq!(log.len(), 2, "{log:?}");
         assert!(log[0].contains("SELECT 'ti' AS"), "{log:?}");
         assert!(log[1].contains("SELECT 'ii' AS"), "{log:?}");
-        // Hidden tables never reach celld through this path either.
+        // Hidden tables never reach cello through this path either.
         assert!(matches!(
             table_schema(&ctx, &app, "DB", "d1_migrations")
                 .await
@@ -2831,7 +2831,7 @@ exit 0
     async fn rows_clamp_page_and_size() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
@@ -2865,7 +2865,7 @@ exit 0
         let log: Vec<String> = calls(&state).lines().map(str::to_string).collect();
         assert_eq!(log.len(), 2, "{log:?}");
         assert!(log[1].contains("SELECT 'rows' AS"), "{log:?}");
-        // Unknown columns and absurd input never reach celld.
+        // Unknown columns and absurd input never reach cello.
         let bad = RowsBody {
             page: 0,
             page_size: 25,
@@ -2885,7 +2885,7 @@ exit 0
     async fn write_builds_curated_statements() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
@@ -2964,7 +2964,7 @@ exit 0
     async fn bulk_delete_sums_changes_and_caps_keys() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
@@ -3001,10 +3001,10 @@ exit 0
     }
 
     #[tokio::test]
-    async fn celld_failure_surfaces() {
+    async fn cello_failure_surfaces() {
         let pool = test_pool().await;
         let state = tempfile::tempdir().unwrap();
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         let ctx = op_ctx(&pool, &state, &script, store);
@@ -3022,7 +3022,7 @@ exit 0
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, D1Error::Celld(_)), "{err:?}");
+        assert!(matches!(err, D1Error::Cello(_)), "{err:?}");
     }
 
     // --- HTTP guard + audit tests ------------------------------------------
@@ -3079,18 +3079,18 @@ exit 0
             pool: pool.clone(),
             config,
         };
-        let script = install_fake_celld(state.path());
+        let script = install_fake_cello(state.path());
         let store = Store::memory();
         seed_deployed(&store).await;
         // The wake probe hits this stub and counts the fleet awake, so no
-        // celld spawn ever runs in router tests.
+        // cello spawn ever runs in router tests.
         let (port, health) = stub_health().await;
         seed_app(pool, port as i64).await;
         let mut storage = test_storage();
         storage.bucket = state.path().to_string_lossy().into_owned();
         let fleets = FleetManager::new(crate::fleet::manager::ManagerSettings {
             data_dir: state.path().join("fleets"),
-            celld_bin: script.to_string_lossy().into_owned(),
+            cello_bin: script.to_string_lossy().into_owned(),
             storage,
             cgroups: None,
             memory_max_bytes: 0,

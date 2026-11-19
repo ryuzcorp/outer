@@ -12,7 +12,7 @@ use anyhow::Context;
 const CONTROLLERS: &str = "+memory +pids +cpu";
 
 /// Cap on a fleet's tasks (processes and threads — the pids controller counts
-/// both). Generous on purpose: celld runs isolates in-process and a busy node
+/// both). Generous on purpose: cello runs isolates in-process and a busy node
 /// holds hundreds of threads; the binding constraint is memory.
 pub const FLEET_PIDS_MAX: u64 = 4096;
 

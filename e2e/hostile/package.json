@@ -2,7 +2,7 @@
   "name": "outer-hostile-fixture",
   "private": true,
   "version": "1.0.0",
-  "description": "Hostile tenant fixture for the §12.7 hostile suite: a celld worker plus build/release probes that try to escape. See manifest.json and scripts/hostile-suite.sh.",
+  "description": "Hostile tenant fixture for the §12.7 hostile suite: a cello worker plus build/release probes that try to escape. See manifest.json and scripts/hostile-suite.sh.",
   "scripts": {
     "build": "node ./build-probe.mjs",
     "release": "node ./r2-probe.mjs"

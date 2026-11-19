@@ -17,7 +17,7 @@ Trial a change before it goes live: commit with `preview: true` to deploy the sa
 ## Run the preview loop
 
 1. Commit with `preview: true` to refresh the app's one preview.
-2. Expect the same pipeline as live: install, build, moderation gate, migrations from scratch, then celld deploy.
+2. Expect the same pipeline as live: install, build, moderation gate, migrations from scratch, then Cello deploy.
 3. Expect an empty namespace: the preview fleet starts with fresh D1/KV/R2 state and never touches live data.
 4. Share the preview URL for click-through; unlisted previews answer `noindex` like live.
 5. Promote with `promote_preview` to fast-forward main and deploy normally.

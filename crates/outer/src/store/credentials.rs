@@ -1,4 +1,4 @@
-//! Scoped bucket credentials for fleets and `celld deploy` (spec §12.6).
+//! Scoped bucket credentials for fleets and `cello deploy` (spec §12.6).
 //!
 //! Fleets and deploy steps never hold the root bucket keys. With
 //! `OUTER_STORE=r2` and the Cloudflare pair set, outer mints Cloudflare R2
@@ -6,7 +6,7 @@
 //! dev the parent keys are used directly (`CredentialSource::Static`).
 //!
 //! A grant is a [`Permission`] over a prefix list. A fleet receives two:
-//! read-write over the celld state namespaces, and read-only over the
+//! read-write over the cello state namespaces, and read-only over the
 //! deployment artifacts (`deploy/`, `deploy-blobs/`). An app's build runs as
 //! the same uid as its fleet and can read that fleet's environment, so a
 //! credential found there must not be able to publish a deployment; see
@@ -205,7 +205,7 @@ impl CredentialSource {
     }
 }
 
-/// `fleets/{slug}/` plus, for one celld legacy contract, `fleets/{slug}/wake-`:
+/// `fleets/{slug}/` plus, for one cello legacy contract, `fleets/{slug}/wake-`:
 /// the only prefix shapes outer ever mints for. Must be non-empty, relative,
 /// and free of `..`; otherwise slash-terminated, except that one
 /// non-terminated shape under an app's fleet root.
@@ -222,7 +222,7 @@ pub fn validate_prefix(prefix: &str) -> anyhow::Result<()> {
     if prefix.ends_with('/') {
         return Ok(());
     }
-    // The celld wake-legacy keys are siblings, not children, of one name:
+    // The cello wake-legacy keys are siblings, not children, of one name:
     // `wake-format.json`, `wake-v2/` and `wake-retired-v2/`. A `wake-`
     // prefix covers exactly them (and not `wake/`), but this shape is only
     // legal directly under the app's `fleets/{slug}/` root, never at the
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn prefix_validation_rejects_shapes_outside_fleets() {
         assert!(validate_prefix("fleets/grocery/").is_ok());
-        // The celld wake-legacy group (`wake-format.json`, `wake-v2/`,
+        // The cello wake-legacy group (`wake-format.json`, `wake-v2/`,
         // `wake-retired-v2/`) is one non-slash-terminated prefix, legal only
         // directly under an app's fleet root.
         assert!(validate_prefix("fleets/grocery/wake-").is_ok());

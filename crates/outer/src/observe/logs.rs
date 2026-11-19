@@ -1,9 +1,9 @@
 //! Fleet log persistence and error grouping (spec §13).
 //!
-//! celld prints Worker `console.*` output and uncaught exceptions on its
+//! cello prints Worker `console.*` output and uncaught exceptions on its
 //! stdout/stderr (Outer sets `RUST_LOG=warn,cell_console=info` and pipes
 //! both into the per-fleet [`LogRing`](crate::fleet::supervisor::LogRing)),
-//! and celld's telemetry table confirms `console.error` carries ERROR
+//! and cello's telemetry table confirms `console.error` carries ERROR
 //! severity. The ring alone does not survive sleep or restart, so the sleep
 //! sweep flushes every tracked fleet's new lines into `app_log` (batched,
 //! once a minute) and prunes to the last 2,000 lines per app.
@@ -80,7 +80,7 @@ pub struct Issue {
 }
 
 /// Split a leading `2026-10-24T09:41:44.123Z`-style timestamp plus the
-/// tracing level/target prefix (`ERROR celld::console: `) off `line`.
+/// tracing level/target prefix (`ERROR cello::console: `) off `line`.
 /// Returns the tracing level (`TRACE`..`ERROR`) when one is present, plus
 /// the rest of the line. The rest is unchanged when no such prefix exists.
 fn split_log_prefix(line: &str) -> (Option<&'static str>, &str) {
@@ -99,18 +99,18 @@ fn split_log_prefix(line: &str) -> (Option<&'static str>, &str) {
             rest = rest[end..].trim_start();
         }
     }
-    // Level plus optional target: `ERROR `, `INFO celld::x: `.
+    // Level plus optional target: `ERROR `, `INFO cello::x: `.
     for level in ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] {
         if let Some(after) = rest.strip_prefix(level) {
             if after.starts_with(char::is_whitespace) {
                 rest = after.trim_start();
-                // The target ends at the first `: ` (`celld::console: ...`,
+                // The target ends at the first `: ` (`cello::console: ...`,
                 // not the first `:`): a target never holds whitespace.
                 if let Some(idx) = rest.find(": ") {
                     let (target, msg) = rest.split_at(idx);
                     if !target.contains(char::is_whitespace) {
                         rest = msg[2..].trim_start();
-                        // celld logs a Worker's `console.*` at tracing INFO
+                        // cello logs a Worker's `console.*` at tracing INFO
                         // under `cell_console`, with the console method's
                         // level as the message's first word:
                         // `INFO cell_console: ERROR SyntaxError: ...`. That
@@ -134,7 +134,7 @@ fn split_log_prefix(line: &str) -> (Option<&'static str>, &str) {
 }
 
 /// Strip a leading `2026-10-24T09:41:44.123Z`-style timestamp plus the
-/// tracing level/target prefix (`ERROR celld::console: `), so fingerprints
+/// tracing level/target prefix (`ERROR cello::console: `), so fingerprints
 /// don't move with the clock. Returns the rest of the line unchanged when
 /// no such prefix is present.
 fn strip_log_prefix(line: &str) -> &str {
@@ -1240,13 +1240,13 @@ mod tests {
         assert_eq!(seen, ring, "no line falls behind the cursor");
     }
 
-    /// Captured from a real fleet on the VPS (celld 0.6.2): a Worker's
+    /// (captured from a real fleet on the VPS under celld 0.6.2; the prefix shape is unchanged in Cello 0.1.0): a Worker's
     /// uncaught `JSON.parse` failure arrives as tracing INFO under
     /// `cell_console`, the console level as the first word, then V8 frames.
     #[test]
-    fn real_celld_console_error_groups_into_one_event() {
+    fn real_cello_console_error_groups_into_one_event() {
         let lines = [
-            "2026-10-24T11:01:41.495156Z  WARN celld: HTTP connections failed event=\"http_connection_failures\" total=1",
+            "2026-10-24T11:01:41.495156Z  WARN cello: HTTP connections failed event=\"http_connection_failures\" total=1",
             "2026-10-24T11:01:42.855685Z  INFO cell_console: ERROR SyntaxError: Unexpected token 'o', \"not json {\" is not valid JSON",
             "    at JSON.parse (<anonymous>)",
             "    at worker.js:11034:57",
@@ -1292,7 +1292,7 @@ mod tests {
             "2026-10-24T09:41:44.123Z  ERROR cell_console: console.error nope"
         ));
         assert!(is_error_start(
-            "2026-10-24T09:41:44.123Z  ERROR celld::console: boom"
+            "2026-10-24T09:41:44.123Z  ERROR cello::console: boom"
         ));
         assert!(is_error_start("error: script error"));
         assert!(is_error_start("Traceback (most recent call last):"));
@@ -1305,16 +1305,16 @@ mod tests {
         // An ERROR token in the message body is not error-ness: only the
         // tracing level field (or an explicit marker) decides.
         assert!(!is_error_start(
-            "2026-10-24T09:41:44.123Z  INFO celld::console: my ERROR handling broke nothing"
+            "2026-10-24T09:41:44.123Z  INFO cello::console: my ERROR handling broke nothing"
         ));
         assert!(!is_error_start(
-            "INFO celld::console: visitor said ERROR loudly"
+            "INFO cello::console: visitor said ERROR loudly"
         ));
-        assert!(!is_error_start("WARN celld::console: error counts are up"));
+        assert!(!is_error_start("WARN cello::console: error counts are up"));
         // Explicit markers still fire under a non-error level.
-        assert!(is_error_start("INFO celld::console: console.error boom"));
+        assert!(is_error_start("INFO cello::console: console.error boom"));
         assert!(is_error_start(
-            "2026-10-24T09:41:44.123Z  INFO celld::console: TypeError: bad shape"
+            "2026-10-24T09:41:44.123Z  INFO cello::console: TypeError: bad shape"
         ));
     }
 
@@ -1389,7 +1389,7 @@ mod tests {
     fn log_prefix_does_not_move_the_fingerprint() {
         let a = fingerprint("Error: boom", None);
         let b = fingerprint(
-            "2026-10-24T09:41:44.123Z  ERROR celld::console: Error: boom",
+            "2026-10-24T09:41:44.123Z  ERROR cello::console: Error: boom",
             None,
         );
         assert_eq!(a, b);
@@ -1576,7 +1576,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let fleets = FleetManager::new(crate::fleet::manager::ManagerSettings {
             data_dir: dir2.path().to_path_buf(),
-            celld_bin: "celld".to_string(),
+            cello_bin: "cello".to_string(),
             storage: crate::fleet::manager::FleetStorage {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 region: "us-east-1".to_string(),
@@ -1781,7 +1781,7 @@ mod tests {
         std::mem::forget(dir);
         crate::fleet::manager::FleetManager::new(crate::fleet::manager::ManagerSettings {
             data_dir: std::path::PathBuf::from("/nonexistent-test-dir"),
-            celld_bin: "celld".to_string(),
+            cello_bin: "cello".to_string(),
             storage: crate::fleet::manager::FleetStorage {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 region: "us-east-1".to_string(),
