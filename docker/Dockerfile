@@ -12,8 +12,8 @@
 # semver with SLSA provenance attestations. The two ARG lines below are the
 # single source of the pin: a bump changes these values (the tag, then the
 # digest from the release's publish summary).
-ARG CELLO_VERSION=0.2.6
-ARG CELLO_DIGEST=sha256:cbe5c6a9fb41712d901e82dd3b70cc736a04d2346567e4db9ac2d12a969f4f10
+ARG CELLO_VERSION=0.2.7
+ARG CELLO_DIGEST=sha256:b3748f2644138b16e12ce8e8a831207a58ea76b4691a75973f4906fe71ea7bab
 ARG CELLO_IMAGE=ghcr.io/ryuzcorp/cello:${CELLO_VERSION}@${CELLO_DIGEST}
 ARG ESBUILD_VERSION=0.28.2
 # Pinned formatter for agent commits. Keep in step with the template's
