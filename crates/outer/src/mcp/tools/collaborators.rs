@@ -15,8 +15,8 @@ use crate::mcp::error::ToolError;
 pub struct AddCollaboratorInput {
     /// The app slug.
     pub app: String,
-    /// The collaborator's email: allowlisted for the closed beta and
-    /// emailed the invite.
+    /// The collaborator's email: they get an invite email and sign
+    /// straight in; the app shows in their list_apps right after.
     pub email: String,
 }
 

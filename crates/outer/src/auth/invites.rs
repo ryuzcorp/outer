@@ -189,24 +189,6 @@ pub struct InviteRow {
     pub redeemed_by_email: Option<String>,
 }
 
-/// The caller's own codes, newest first.
-pub async fn list_for_user(pool: &SqlitePool, user_id: &str) -> anyhow::Result<Vec<InviteRow>> {
-    sqlx::query_as(
-        "SELECT i.code, i.kind, i.note, i.createdAt AS created_at, \
-                i.redeemedAt AS redeemed_at, i.revokedAt AS revoked_at, \
-                u.email AS created_by_email, r.email AS redeemed_by_email \
-         FROM invite_code i \
-         LEFT JOIN user u ON u.id = i.createdBy \
-         LEFT JOIN user r ON r.id = i.redeemedBy \
-         WHERE i.createdBy = ? \
-         ORDER BY i.createdAt DESC, i.code DESC",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(Into::into)
-}
-
 /// Every code, newest first, paged by the opaque `<createdAt>:<code>` cursor.
 pub async fn list_all(
     pool: &SqlitePool,

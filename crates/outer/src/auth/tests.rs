@@ -278,6 +278,12 @@ async fn sign_in(
     let (status, _, body) = send(&flow.app, get(&authorize_url(client_id, redirect_uri))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Send code"));
+    assert!(
+        !body.to_lowercase().contains("invite")
+            && !body.contains("waitlist")
+            && !body.contains("closed beta"),
+        "open signup shows no gate copy on the OAuth page"
+    );
     let request_id = hidden(&body, "request_id");
     let csrf = hidden(&body, "csrf");
 
@@ -2332,6 +2338,69 @@ async fn closed_beta_waitlists_by_default() {
     auth::send_code(&pool, &state.config, "owner@example.com", None, None)
         .await
         .unwrap();
+}
+
+/// Open signup admits anyone: a brand-new email and an email already on the
+/// waitlist both sign straight in, and an offered invite code is ignored
+/// (never consumed, no grants minted).
+#[tokio::test]
+async fn open_signup_admits_waitlisted_email_without_code() {
+    let pool = test_pool().await;
+    let (config, codes) = test_config();
+    assert!(config.signup_open, "the default test config runs open");
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('a1', 'a@example.com', 0, 0, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let made = auth::invites::mint_admin(&pool, "a1", 1, None, 0)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO waitlist (email, first_seen, attempts) VALUES ('waiter@example.com', 0, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // A new email registers with no code; a waitlisted one is admitted on
+    // its next sign-in; an offered code is ignored, not consumed.
+    auth::send_code(&pool, &config, "new@example.com", None, None)
+        .await
+        .unwrap();
+    auth::send_code(&pool, &config, "waiter@example.com", None, None)
+        .await
+        .unwrap();
+    auth::send_code(
+        &pool,
+        &config,
+        "codeholder@example.com",
+        Some(&made[0]),
+        None,
+    )
+    .await
+    .unwrap();
+    for email in [
+        "new@example.com",
+        "waiter@example.com",
+        "codeholder@example.com",
+    ] {
+        let otp = captured(&codes, email);
+        verify_and_accept_terms(&pool, &config, email, &otp)
+            .await
+            .unwrap();
+    }
+    let (redeemed_by,): (Option<String>,) =
+        sqlx::query_as("SELECT redeemedBy FROM invite_code WHERE code = ?")
+            .bind(&made[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(redeemed_by, None, "open signup burns no code");
+    let (grants,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM invite_code WHERE kind = 'grant'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(grants, 0, "open signup mints no grants");
 }
 
 /// Codes go only to people who joined with an invite: an account admitted

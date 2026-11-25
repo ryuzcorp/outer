@@ -37,7 +37,7 @@ One term per concept. Left column wins everywhere.
 | hold, suspend | ban, takedown | Review states an admin sets. `suspend` stops the fleet. Never promise a hold page or error code. |
 | block (deploy) | reject, fail (for the gate) | A blocked deploy keeps the old version serving. A failed deploy is a build or system error. |
 | rollback | revert, undo (as noun) | The `rollback` tool or the Console button. Never counts as a code change. |
-| invite code | referral code, coupon | `OUTER-XXXX-XXXX`, closed beta only. |
+| invite code | referral code, coupon | `OUTER-XXXX-XXXX`, only while sign-up is closed. Sign-up is open, so never promise one. |
 | plan (Free / Pro) | tier, subscription (as plan name) | Capitalized plan names. |
 | quota | limit (for counted resources) | Code changes, apps, collaborators. `limits` only for the Deploy page title and hard technical caps. |
 | preview deploy | staging, branch deploy | One per app, Pro, at `<slug>--preview.outer.now`. |

@@ -461,7 +461,16 @@ async fn authorize_get(
     }
     html(
         StatusCode::OK,
-        pages::email_page(&client, &id, &csrf, None, false, "", None),
+        pages::email_page(
+            &client,
+            &id,
+            &csrf,
+            None,
+            false,
+            "",
+            None,
+            state.config.signup_open,
+        ),
         None,
     )
 }
@@ -568,6 +577,7 @@ async fn authorize_post(
                             invite_open,
                             &invite_value,
                             None,
+                            state.config.signup_open,
                         ),
                         None,
                     )
@@ -682,6 +692,7 @@ async fn authorize_post(
                             false,
                             "",
                             Some(pages::friendly_error(err.code)),
+                            state.config.signup_open,
                         ),
                         None,
                     )
