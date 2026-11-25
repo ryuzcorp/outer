@@ -89,7 +89,7 @@ server holds the database — the stop below is what releases it:
 
 ```bash
 ssh <ssh-target> 'docker compose --env-file /srv/outer/release.env -f /srv/outer/compose.yaml stop -t 60 outer'
-ssh <ssh-target> 'docker run --rm --pull=never --env-file /srv/outer/outer.env \
+ssh <ssh-target> 'docker run --rm --pull=never --log-opt max-size=50m --log-opt max-file=5 --env-file /srv/outer/outer.env \
   -v /srv/outer/tls:/tls:ro -v /srv/outer/legal:/legal:ro \
   -v /srv/outer/data:/data "outer:<SHA>" state restore --force'
 ```
@@ -139,11 +139,11 @@ scratch dir). Run it while prod serves — no stop, no maintenance:
 
 ```bash
 SHA="$(ssh <ssh-target> 'grep OUTER_IMAGE /srv/outer/release.env | cut -d= -f2')"
-ssh <ssh-target> "mkdir -p /srv/outer/drill && docker run --rm --pull=never \
+ssh <ssh-target> "mkdir -p /srv/outer/drill && docker run --rm --pull=never --log-opt max-size=50m --log-opt max-file=5 \
   --env-file /srv/outer/outer.env -e OUTER_DATA=/scratch \
   -v /srv/outer/tls:/tls:ro -v /srv/outer/legal:/legal:ro \
   -v /srv/outer/drill:/scratch \"outer:$SHA\" state list"
-ssh <ssh-target> "docker run --rm --pull=never \
+ssh <ssh-target> "docker run --rm --pull=never --log-opt max-size=50m --log-opt max-file=5 \
   --env-file /srv/outer/outer.env -e OUTER_DATA=/scratch \
   -v /srv/outer/tls:/tls:ro -v /srv/outer/legal:/legal:ro \
   -v /srv/outer/drill:/scratch \"outer:$SHA\" state restore --force"
