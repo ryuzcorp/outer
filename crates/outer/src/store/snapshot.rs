@@ -133,9 +133,10 @@ impl DbLock {
             }
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 // Brief grace for a lock being released concurrently (a
-                // just-stopped server, a racy test): a real holder keeps it
-                // for its whole lifetime, so refusal semantics don't change —
-                // a running server still refuses, just 100 ms later.
+                // just-stopped server, a racy test — fork() duplicates fds, so
+                // a child forked mid-hold keeps the flock until exec closes it):
+                // a real holder keeps it for its whole lifetime, so refusal
+                // semantics don't change — a running server still refuses, just 100 ms later.
                 for _ in 0..5 {
                     std::thread::sleep(Duration::from_millis(20));
                     if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
