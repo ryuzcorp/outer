@@ -132,6 +132,20 @@ impl DbLock {
                 continue;
             }
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                // Brief grace for a lock being released concurrently (a
+                // just-stopped server, a racy test): a real holder keeps it
+                // for its whole lifetime, so refusal semantics don't change —
+                // a running server still refuses, just 100 ms later.
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+                        return Ok(Self { _file: file });
+                    }
+                    let retry_err = std::io::Error::last_os_error();
+                    if retry_err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                        return Err(retry_err.into());
+                    }
+                }
                 anyhow::bail!(
                     "{} {}; stop it first, then re-run",
                     busy_msg,
@@ -930,32 +944,47 @@ pub async fn restore_if_missing(store: &Store, cfg: &SnapshotConfig) -> anyhow::
 
 async fn download_snapshot(store: &Store, cfg: &SnapshotConfig) -> anyhow::Result<bool> {
     let partial = cfg.db_path.with_extension("sqlite.restoring");
-    let mut last_err = None;
-    for attempt in 1..=5u64 {
-        match try_restore_once(store, cfg, &partial).await {
-            Ok(restored) => {
-                let _ = tokio::fs::remove_file(&partial).await;
-                return Ok(restored);
-            }
-            Err(e) if is_not_found(&e) => {
-                tracing::info!("no outer state snapshot in the bucket; starting fresh");
-                return Ok(false);
-            }
-            Err(e) => {
-                tracing::warn!(attempt, error = %e, "outer state restore failed; retrying");
-                last_err = Some(e);
-                tokio::time::sleep(Duration::from_secs(attempt * 3)).await;
-            }
+    match download_with_retry(store, &cfg.state_key(), &partial).await {
+        Err(e) if is_not_found(&e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            tracing::info!("no outer state snapshot in the bucket; starting fresh");
+            return Ok(false);
         }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(e);
+        }
+        Ok(()) => {}
     }
+    // The download landed exactly once: verify it once. A checksum mismatch
+    // (or undecodable bytes) is deterministic — retrying would just sleep
+    // 45 s before refusing the boot on bytes that will never verify.
+    let placed = verify_and_place(store, cfg, &partial).await;
     let _ = tokio::fs::remove_file(&partial).await;
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("restore failed")))
+    placed
+}
+
+/// Verify downloaded bytes once against the snapshot checksum and place
+/// them: the shared tail of the boot restore (after its retried download)
+/// and of [`try_restore_once`].
+async fn verify_and_place(
+    store: &Store,
+    cfg: &SnapshotConfig,
+    partial: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let expected = snapshot_checksum(store, cfg, &cfg.state_key()).await?;
+    let (_, raw) = read_and_verify(partial, &cfg.state_key(), expected.as_deref(), true).await?;
+    place_restored_db(cfg, &raw).await?;
+    Ok(true)
 }
 
 /// One restore attempt. Only a missing key counts as no-snapshot — a
 /// transport error must never read as "start fresh". A restored database
 /// records the sidecar, so it is provably the bucket's database when the
 /// first upload's lineage gate runs.
+/// Test-only single attempt (fault injection needs exactly one try, not the
+/// boot path's retried download).
+#[cfg(test)]
 async fn try_restore_once(
     store: &Store,
     cfg: &SnapshotConfig,
@@ -964,10 +993,7 @@ async fn try_restore_once(
     if !store.get_to_file(&cfg.state_key(), partial).await? {
         return Err(not_found(&cfg.state_key()));
     }
-    let expected = snapshot_checksum(store, cfg, &cfg.state_key()).await?;
-    let (_, raw) = read_and_verify(partial, &cfg.state_key(), expected.as_deref(), true).await?;
-    place_restored_db(cfg, &raw).await?;
-    Ok(true)
+    verify_and_place(store, cfg, partial).await
 }
 
 /// Download `key` to `partial`, retrying transport errors. Only a missing
