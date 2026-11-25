@@ -1063,6 +1063,7 @@ mod tests {
             access_mode: crate::access::AccessMode::Open,
             access_hash: None,
             access_version: 0,
+            adults_only: false,
             created_at: 0,
             always_on: false,
             preview_sha: None,

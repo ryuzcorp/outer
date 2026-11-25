@@ -239,6 +239,9 @@ pub struct App {
     pub access_hash: Option<String>,
     /// Bumps on every gate change, so a new secret signs old cookies out.
     pub access_version: i64,
+    /// Adults-only flag (18+): the proxy serves the age interstitial until
+    /// the visitor confirms, after the access gate. Stored for every plan.
+    pub adults_only: bool,
     /// The active preview deploy (Pro feature #7), if any: the commit on
     /// the `preview` git ref, served at `<slug>--preview.<apps_domain>`
     /// from a fresh data namespace. All four are set or cleared together.
@@ -301,7 +304,7 @@ const APP_COLS: &str = "id, slug, owner_id, name, uid, port, internal_port, visi
     moderation_state, desired_state, paused_reason, \
     asleep_since, last_request_at, last_deploy_sha, last_activity_at, expired_at, \
     downgraded_stopped_at, created_at, always_on, access_mode, access_hash, access_version, \
-    preview_sha, preview_updated_at, \
+    adults_only, preview_sha, preview_updated_at, \
     preview_port, preview_internal_port";
 
 #[derive(Debug, sqlx::FromRow)]
@@ -328,6 +331,7 @@ struct AppRow {
     access_mode: String,
     access_hash: Option<String>,
     access_version: i64,
+    adults_only: i64,
     preview_sha: Option<String>,
     preview_updated_at: Option<i64>,
     preview_port: Option<i64>,
@@ -362,6 +366,7 @@ impl AppRow {
             access_mode: crate::access::AccessMode::parse(&self.access_mode)?,
             access_hash: self.access_hash,
             access_version: self.access_version,
+            adults_only: self.adults_only != 0,
             created_at: self.created_at,
             always_on: self.always_on != 0,
             preview_sha: self.preview_sha,
@@ -593,6 +598,7 @@ async fn create_inner(
         access_mode: crate::access::AccessMode::Open,
         access_hash: None,
         access_version: 0,
+        adults_only: false,
         // New rows start cold; the MCP `create_app` path flips Pro apps
         // on right after (the plan lives with the caller, not here).
         always_on: false,

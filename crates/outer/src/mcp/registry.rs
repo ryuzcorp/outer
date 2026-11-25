@@ -5,12 +5,12 @@
 use serde_json::Value;
 
 use crate::mcp::tools::{
-    access as access_inputs, account, add_example as add_example_inputs, apps as app_inputs,
-    backups as backup_inputs, code as code_inputs, collaborators as collab_inputs,
-    data as data_inputs, domains as domain_inputs, drafts as draft_inputs,
-    examples as examples_inputs, export as export_inputs, look as look_inputs,
-    open_app as open_app_inputs, preview as preview_inputs, runtime as runtime_inputs,
-    secrets as secrets_inputs, NoArgs,
+    access as access_inputs, account, add_example as add_example_inputs, age as age_inputs,
+    apps as app_inputs, backups as backup_inputs, code as code_inputs,
+    collaborators as collab_inputs, data as data_inputs, domains as domain_inputs,
+    drafts as draft_inputs, examples as examples_inputs, export as export_inputs,
+    look as look_inputs, open_app as open_app_inputs, preview as preview_inputs,
+    runtime as runtime_inputs, secrets as secrets_inputs, NoArgs,
 };
 
 /// Who may call the tool. `Public` tools run without a token; anything else
@@ -169,8 +169,8 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         "export_code" | "stage" | "check" | "backup_database" | "request_review"
         | "resolve_error" | "ignore_error" | "reopen_error" => Hints::ADDITIVE,
         // One reversible flag; the same call leaves the same state.
-        "set_always_on" => Hints::SETTING,
-        // Overwrites a value or replaces who can reach the app: the old
+        "set_always_on" | "set_adults_only" => Hints::SETTING,
+        // Overwrites a value or replaces who can reach the app (a
         // secret, PIN or tables are gone, and a retry can't restore them.
         // `set_secret` is the audit's example: non-destructive would let
         // injected text swap a Stripe key without a confirmation.
@@ -308,6 +308,11 @@ pub fn registry() -> Vec<ToolDef> {
         tool::<access_inputs::SetAccessInput>(
             "set_access",
             "Put a visitor gate on your app {app, mode, secret?}: open (default, everyone walks in), pin (4-8 digits) or password (8-128 chars). PIN and password are a Pro feature; opening is always allowed. The gate locks every host and path until the visitor unlocks; changing the secret signs everyone out. Never returns the secret. Owner only.",
+            Account, false,
+        ),
+        tool::<age_inputs::SetAdultsOnlyInput>(
+            "set_adults_only",
+            "Mark an app adults-only (18+) {app, adults_only}: visitors confirm they are an adult before the app serves them, after the visitor gate when one is set. The confirmation cookie lasts 30 days per host. Owner only.",
             Account, false,
         ),
         tool::<app_inputs::ShareAppInput>(
@@ -535,7 +540,7 @@ mod tests {
     #[test]
     fn registry_shapes() {
         let tools = registry();
-        assert_eq!(tools.len(), 58);
+        assert_eq!(tools.len(), 59);
     }
 
     /// Commerce guidelines (owner decision D2): no tool description

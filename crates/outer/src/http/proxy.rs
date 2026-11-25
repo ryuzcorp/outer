@@ -62,6 +62,11 @@ pub struct ProxyState {
     /// wired by the integration owner). `None` in tests that never lock an
     /// app: a gated app fails closed without it.
     pub access_key: Option<crate::access::AccessKey>,
+    /// Age-confirmation cookie HMAC key (derived from `OUTER_SECRET`, wired
+    /// by the integration owner). `None` in tests that never flag an app
+    /// adults-only: such an app fails closed at confirm time, like the
+    /// access gate without its key.
+    pub age_key: Option<crate::age::AgeKey>,
     /// Process-wide Argon2 verify budget (8 permits): `unlock_submit` takes
     /// one before hashing and fails fast with 429 when none is free, so a
     /// burst of unlocks never stacks blocking-pool threads. From state, never
@@ -94,6 +99,7 @@ impl ProxyState {
             look_tokens: LookTokens::new(),
             crawl_hooks: None,
             access_key: None,
+            age_key: None,
             verify_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
@@ -103,6 +109,14 @@ impl ProxyState {
     /// [`crate::access::AccessKey::test_key`]).
     pub fn with_access_key(mut self, key: crate::access::AccessKey) -> Self {
         self.access_key = Some(key);
+        self
+    }
+
+    /// Wire the age-gate cookie key (the integration owner derives it from
+    /// `OUTER_SECRET` once; tests for the age gate pass
+    /// [`crate::age::AgeKey::test_key`]).
+    pub fn with_age_key(mut self, key: crate::age::AgeKey) -> Self {
+        self.age_key = Some(key);
         self
     }
 
@@ -838,6 +852,9 @@ async fn outer_page(state: &ProxyState, app: &apps::App, suffix: &str, req: Requ
         // The access gate's own unlock form: reachable on a locked app, so
         // it answers here with the other proxy-owned pages, before the gate.
         ("POST", "unlock") => unlock_submit(state, app, req).await,
+        // The age gate's own confirm form: reachable on an adults-only app
+        // even while the gates block it, like the unlock form above.
+        ("POST", "age") => age_confirm_submit(state, app, req).await,
         ("GET", "held") => held_page(),
         ("GET", "suspended") => suspended_page(),
         ("GET", "paused") => paused_page(app.paused_reason.as_deref()),
@@ -1218,6 +1235,153 @@ fn redirect_next(next: &str) -> Response {
         .unwrap()
 }
 
+/// The age gate's plain answer for non-navigation requests on an
+/// adults-only app (assets, API calls, anything without a navigation
+/// signal): 403 JSON, `no-store` so nothing caches the refusal, `noindex`
+/// so it never gets indexed.
+fn age_plain() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("cache-control", "no-store")
+        .header("x-robots-tag", "noindex, nofollow")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            "{\"error\":\"adults_only\",\"message\":\"This app is for adults (18+).\"}",
+        ))
+        .unwrap()
+}
+
+/// The age gate's HTML answer for navigations (status 200, so the address
+/// bar keeps the app's URL): the Outer-served interstitial — the app's
+/// name, "This app is for adults (18+)", one confirm button and Leave.
+/// Same-origin, no external assets, strict CSP (the page carries no styles
+/// or scripts).
+fn age_page(app: &apps::App, next: &str) -> Response {
+    let page = crate::age::render_age_page(app.name.as_deref().unwrap_or(&app.slug), next);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("cache-control", "no-store")
+        .header("x-robots-tag", "noindex, nofollow")
+        .header(
+            "content-security-policy",
+            "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        )
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(page))
+        .unwrap()
+}
+
+/// Whether `req` is an age-gate navigation: a `Sec-Fetch-Mode: navigate`
+/// request (top-level document loads carry it; nested frame loads do too,
+/// and both render a document), or — when the browser omits the Fetch
+/// Metadata headers — a GET/HEAD asking for HTML. Anything else is an
+/// asset, API or prefetch call and gets the plain 403.
+fn wants_age_page(req: &Request) -> bool {
+    if let Some(mode) = req
+        .headers()
+        .get("sec-fetch-mode")
+        .and_then(|value| value.to_str().ok())
+    {
+        return mode.eq_ignore_ascii_case("navigate");
+    }
+    matches!(req.method().as_str(), "GET" | "HEAD")
+        && crate::http::badge::accepts_html(req.headers())
+}
+
+/// The request's age cookie, if it holds a live confirmation for this app
+/// on this host: the right app, the request's host, unexpired, valid MAC.
+/// Anything else — missing, moved from another app or host, expired,
+/// forged — is unconfirmed. Recognition shares [`crate::age::is_age_pair`]
+/// with the forward strip, so every spelling the gate accepts is stripped
+/// before the app sees it.
+fn has_age_cookie(state: &ProxyState, headers: &HeaderMap, app: &apps::App, host: &str) -> bool {
+    let Some(key) = state.age_key.as_ref() else {
+        // Fail closed: an adults-only app without a wired key never confirms.
+        return false;
+    };
+    let now = apps::now_ms();
+    crate::age::age_cookie_values(headers)
+        .any(|value| crate::age::verify_cookie(key, value, &app.id, now, host))
+}
+
+/// `POST /.outer/age` (form-encoded): check the same-origin proof, mint
+/// the confirmation cookie for this app on this host and 303 back to `next`
+/// (a validated same-host relative path, never an open redirect). There is
+/// no secret to guess, so no failure budgets: a cross-site POST is refused
+/// before it mints, like the unlock form.
+async fn age_confirm_submit(state: &ProxyState, app: &apps::App, req: Request) -> Response {
+    // Same-origin proof: `Sec-Fetch-Site: same-origin`, or — when the
+    // browser omits it — an `Origin` equal to the request's own scheme and
+    // host. Browsers always send `Origin` on form POSTs, so a missing or
+    // foreign value is a cross-site auto-POST driving the victim's browser:
+    // refuse before minting a cookie. Curl (no headers at all) is refused
+    // too: the interstitial form the page serves always posts same-origin.
+    let fetch_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok());
+    let raw_host = request_host(&req).unwrap_or_default();
+    let scheme = if state.behind_tunnel { "https" } else { "http" };
+    let origin_ok = req
+        .headers()
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| {
+            origin
+                .trim()
+                .eq_ignore_ascii_case(&format!("{scheme}://{raw_host}"))
+        });
+    if fetch_site != Some("same-origin") && !origin_ok {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("cache-control", "no-store")
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from("same-origin requests only"))
+            .unwrap();
+    }
+    let Some(key) = state.age_key.clone() else {
+        return text(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+    };
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("cache-control", "no-store")
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(Body::from("confirm too large"))
+                .unwrap();
+        }
+    };
+    let fields = crawl::parse_form(&bytes);
+    let next = fields
+        .get("next")
+        .map(|raw| crate::access::sanitize_next(raw))
+        .unwrap_or("/");
+    // The confirmation binds the request host (port already stripped), so
+    // the live, preview and custom-domain scopes stay separate.
+    let host = strip_port(&raw_host);
+    let now = apps::now_ms();
+    let value = crate::age::mint_cookie(&key, &app.id, now, host);
+    let location = axum::http::HeaderValue::from_str(next)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("/"));
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header("location", location)
+        .header(
+            "set-cookie",
+            format!(
+                "{}={value}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+                crate::age::COOKIE_NAME,
+                crate::age::COOKIE_TTL_MS / 1000,
+            ),
+        )
+        .header("cache-control", "no-store")
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// The held interstitial (spec §15.2): 503 while the app is being reviewed.
 fn held_page() -> Response {
     outer_html(
@@ -1423,7 +1587,11 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     let is_unlisted = app.visibility == apps::Visibility::Unlisted;
     // A gated app answers the disallowing robots.txt whatever its
     // visibility, and crawlers carry no cookie: serve it before the gate.
-    let gated = app.access_mode != crate::access::AccessMode::Open;
+    let access_gated = app.access_mode != crate::access::AccessMode::Open;
+    // Cookie-gated is access-locked or adults-only: both vary the response
+    // by cookie, so the robots disallow, the noindex and the no-store
+    // treatment below cover both.
+    let gated = access_gated || app.adults_only;
     if req.method() == axum::http::Method::GET
         && req.uri().path() == "/robots.txt"
         && (is_unlisted || gated)
@@ -1464,7 +1632,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // render, and the robots answer above. Locked requests never wake the
     // fleet: the gate answers before `ensure_awake`. The cookie binds the
     // request host, so live, preview and custom-domain scopes stay separate.
-    if gated && !look_armed && !has_access_cookie(&state, req.headers(), &app, bare) {
+    if access_gated && !look_armed && !has_access_cookie(&state, req.headers(), &app, bare) {
         if wants_lock_page(&req) {
             let raw = req
                 .uri()
@@ -1475,6 +1643,25 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             return locked_page(&app, next, None);
         }
         return locked_plain();
+    }
+    // Adults-only gate: after the access gate (a private app still unlocks
+    // first), on every host that serves the app, with no bypass for preview
+    // hosts, owner/collaborator views or console captures — one predictable
+    // rule. Unconfirmed navigations get the interstitial (status 200, so
+    // the address bar keeps the app's URL); anything else gets the plain
+    // 403. Confirmed requests never wake the fleet here either: the gate
+    // answers before `ensure_awake`.
+    if app.adults_only && !has_age_cookie(&state, req.headers(), &app, bare) {
+        if wants_age_page(&req) {
+            let raw = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
+            let next = crate::access::sanitize_next(raw);
+            return age_page(&app, next);
+        }
+        return age_plain();
     }
     // A gated response is never indexed either, whatever the visibility.
     let noindex = is_unlisted || gated;
@@ -1534,7 +1721,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     } else {
         None
     };
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let path = parts
         .uri
         .path_and_query()
@@ -1573,10 +1760,12 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // asks for an identity body so the recorder can be injected below. The
     // header never reaches upstream either way (skipped in the loop).
     let badge_identity = badge.is_some() && badge::accepts_html(&parts.headers);
-    // The gate cookie is Outer's, never the app's: drop that pair and keep
-    // every other cookie. The shared [`crate::access::forwarded_cookie`]
-    // recognizes exactly the spellings the gate accepts, so a cookie that
-    // unlocks is always stripped before the app sees it.
+    // The gate cookies are Outer's, never the app's: drop those pairs and
+    // keep every other cookie. The shared [`crate::access::forwarded_cookie`]
+    // plus the age strip below recognize exactly the spellings the gates
+    // accept, so a cookie that unlocks or confirms is always stripped before
+    // the app sees it.
+    crate::age::strip_age_cookie(&mut parts.headers);
     let fwd_cookie: Option<String> = crate::access::forwarded_cookie(&parts.headers);
     for (name, value) in parts.headers.iter() {
         if *name == axum::http::header::HOST {
@@ -2314,6 +2503,7 @@ mod tests {
             MetricsAgg::new(),
         )
         .with_access_key(crate::access::AccessKey::test_key())
+        .with_age_key(crate::age::AgeKey::test_key())
     }
 
     /// Lock `id` behind `mode` with `secret`.
@@ -2328,6 +2518,43 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// Flag `id` adults-only (18+).
+    async fn flag_adults_only(pool: &sqlx::SqlitePool, id: &str) {
+        sqlx::query("UPDATE app SET adults_only = 1 WHERE id = ?1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn age_nav(host: &str, path: &str, cookie: Option<&str>) -> Request {
+        // A top-level document navigation: browsers attach
+        // `Sec-Fetch-Mode: navigate`, which the age gate reads first.
+        let mut req = Request::builder()
+            .uri(path)
+            .header("host", host)
+            .header("sec-fetch-mode", "navigate")
+            .header("accept", "text/html,application/xhtml+xml");
+        if let Some(cookie) = cookie {
+            req = req.header("cookie", cookie);
+        }
+        visitor(req.body(Body::empty()).unwrap())
+    }
+
+    fn age_post(host: &str, body: &str) -> Request {
+        // The interstitial form posts same-origin: browsers attach `Origin`,
+        // which the handler requires when `Sec-Fetch-Site` is absent.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/.outer/age")
+            .header("host", host)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", format!("http://{host}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        visitor(req)
     }
 
     /// A visitor request from one fixed client IP (so the per-IP failure
@@ -2550,6 +2777,194 @@ mod tests {
             rows, 10,
             "five failures on two budgets, nothing recorded past the limit"
         );
+    }
+
+    /// An adults-only navigation without the cookie gets the Outer-served
+    /// interstitial (200, "This app is for adults (18+)"), `no-store`,
+    /// `noindex` and a strict CSP — via `Sec-Fetch-Mode: navigate` and via
+    /// the `Accept` fallback — before any wake or forward.
+    #[tokio::test]
+    async fn adults_only_nav_without_cookie_serves_interstitial() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        flag_adults_only(&fix.pool, "app-shop").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let before = fleet.hits.load(Ordering::SeqCst);
+        let (status, headers, body) = body_text(
+            router(state.clone())
+                .oneshot(age_nav("shop.outer.test", "/items?page=2", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("This app is for adults (18+)"), "{body}");
+        assert!(body.contains("I am 18 or older"), "{body}");
+        assert!(body.contains("action=\"/.outer/age\""), "{body}");
+        assert!(body.contains("value=\"/items?page=2\""), "{body}");
+        assert!(body.contains("Leave"), "{body}");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+        assert!(
+            headers
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|csp| csp.contains("default-src 'none'")),
+            "strict CSP: {headers:?}"
+        );
+        // No Fetch Metadata headers (old browser, curl with Accept): the
+        // `Accept` fallback still serves the interstitial.
+        let (status, _, fallback) = body_text(
+            router(state.clone())
+                .oneshot(html_nav("shop.outer.test", "/", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(fallback.contains("action=\"/.outer/age\""), "{fallback}");
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            before,
+            "unconfirmed requests never wake or forward"
+        );
+    }
+
+    /// Confirming sets the host-only age cookie and 303s back to `next`.
+    #[tokio::test]
+    async fn age_confirm_sets_cookie_and_redirects() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        flag_adults_only(&fix.pool, "app-shop").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let req = age_post("shop.outer.test", "next=/items?page=2");
+        let (status, headers, _) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers.get("location").unwrap(), "/items?page=2");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        let set_cookie = headers
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .expect("confirm sets the cookie")
+            .to_string();
+        assert!(set_cookie.starts_with("__Host-outer-age="), "{set_cookie}");
+        assert!(set_cookie.contains("; Secure"), "{set_cookie}");
+        assert!(set_cookie.contains("; HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("; SameSite=Lax"), "{set_cookie}");
+        assert!(set_cookie.contains("; Path=/"), "{set_cookie}");
+        assert!(set_cookie.contains("; Max-Age=2592000"), "{set_cookie}");
+        // A cross-site POST mints nothing.
+        let foreign = visitor(
+            Request::builder()
+                .method("POST")
+                .uri("/.outer/age")
+                .header("host", "shop.outer.test")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "https://evil.example")
+                .body(Body::from("next=/"))
+                .unwrap(),
+        );
+        let (status, _, _) = body_text(router(state).oneshot(foreign).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A confirmed navigation proxies with the age cookie stripped (other
+    /// cookies ride along) and the response carries the no-store treatment.
+    #[tokio::test]
+    async fn confirmed_request_proxies_and_strips_age_cookie() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        flag_adults_only(&fix.pool, "app-shop").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let before = fleet.hits.load(Ordering::SeqCst);
+        let key = crate::age::AgeKey::test_key();
+        let value =
+            crate::age::mint_cookie(&key, "app-shop", crate::apps::now_ms(), "shop.outer.test");
+        let req = age_nav(
+            "shop.outer.test",
+            "/echo",
+            Some(&format!(
+                "session=abc; __Host-outer-age={value}; theme=dark"
+            )),
+        );
+        let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got = echo(&body);
+        assert_eq!(got["headers"]["cookie"], "session=abc; theme=dark");
+        assert_eq!(headers.get("cache-control").unwrap(), "private, no-store");
+        assert_eq!(headers.get("vary").unwrap(), "Cookie");
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+        assert_eq!(fleet.hits.load(Ordering::SeqCst), before + 1);
+    }
+
+    /// Non-navigation requests on an adults-only app without the cookie
+    /// (assets, API calls) get the plain 403 JSON, never the app.
+    #[tokio::test]
+    async fn age_non_navigation_without_cookie_is_403() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        flag_adults_only(&fix.pool, "app-shop").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let before = fleet.hits.load(Ordering::SeqCst);
+        // An asset fetch: `Sec-Fetch-Mode: no-cors`, no navigation Accept.
+        let asset = visitor(
+            Request::builder()
+                .uri("/asset.css")
+                .header("host", "shop.outer.test")
+                .header("sec-fetch-mode", "no-cors")
+                .header("accept", "text/css,*/*;q=0.1")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (status, headers, body) =
+            body_text(router(state.clone()).oneshot(asset).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert_eq!(headers.get("x-robots-tag").unwrap(), "noindex, nofollow");
+        let got: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(got["error"], "adults_only");
+        // No headers at all (curl default): still the 403, never proxied.
+        let bare = visitor(
+            Request::builder()
+                .uri("/asset.css")
+                .header("host", "shop.outer.test")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (status, _, _) = body_text(router(state).oneshot(bare).await.unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            fleet.hits.load(Ordering::SeqCst),
+            before,
+            "unconfirmed assets never wake or forward"
+        );
+    }
+
+    /// Access ordering: a private adults-only app asks for the unlock first
+    /// (401), and only then for the age confirmation.
+    #[tokio::test]
+    async fn private_app_unlocks_before_age_gate() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        lock_app(&fix.pool, "app-shop", "pin", "1234").await;
+        flag_adults_only(&fix.pool, "app-shop").await;
+        let state = gate_state(fix.pool.clone(), fix._dir.path());
+        let (status, _, body) = body_text(
+            router(state)
+                .oneshot(age_nav("shop.outer.test", "/items", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("This app is private"), "{body}");
+        assert!(!body.contains("adults (18+)"), "{body}");
     }
 
     /// A secret change (bumped version) signs old cookies out, a cookie

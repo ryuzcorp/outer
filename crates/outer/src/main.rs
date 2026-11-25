@@ -1114,7 +1114,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .with_look_tokens(look_tokens)
         .with_crawl_hooks(crawl_hooks)
-        .with_access_key(outer::access::AccessKey::derive(&config.outer_secret)),
+        .with_access_key(outer::access::AccessKey::derive(&config.outer_secret))
+        .with_age_key(outer::age::AgeKey::derive(&config.outer_secret)),
         config.domain.clone(),
     );
     tracing::info!(

@@ -30,6 +30,8 @@
 //!   path (Pro keep-warm), including the shared Pro gate.
 //! - `POST /api/console/apps/:slug/access {mode, secret?}`: the MCP
 //!   `set_access` path (Pro visitor gate), including the shared Pro gate.
+//! - `POST /api/console/apps/:slug/adults-only {adults_only}`: the MCP
+//!   `set_adults_only` path (adults-only 18+ flag, every plan).
 //! - `POST /api/console/apps/:slug/delete {confirm}`: the MCP `delete_app`
 //!   path; `confirm` must equal the slug.
 //! - `PUT /api/console/apps/:slug/secrets/:name {value}` and
@@ -779,7 +781,7 @@ async fn api_apps(State(state): State<super::AppState>, headers: HeaderMap) -> R
             },
             "visibility": app.visibility.as_str(),
             "access": app.access_mode.as_str(),
-            "always_on": app.always_on,
+            "adults_only": app.adults_only,
             "status": status,
             "last_request_at": app.last_request_at,
         });
@@ -925,7 +927,7 @@ async fn api_app(
         },
         "visibility": app.visibility.as_str(),
         "access": app.access_mode.as_str(),
-        "always_on": app.always_on,
+        "adults_only": app.adults_only,
         "status": status,
         "last_request_at": app.last_request_at,
         "deploys": deploys,
@@ -3772,6 +3774,62 @@ mod tests {
             summaries.iter().all(|s| !s.contains("1234")),
             "audit never holds the secret: {summaries:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn console_adults_only_flips_the_flag() {
+        let (app, pool, _, _) = test_app().await;
+        let now = crate::auth::now_ms();
+        seed_app(&pool, "ana@example.com", "groceries", now).await;
+        seed_app(&pool, "bob@example.com", "bobshop", now).await;
+        let ana = login(&pool, "ana@example.com").await;
+        let bob = login(&pool, "bob@example.com").await;
+        let path = "/api/console/apps/groceries/adults-only";
+
+        // Owner flips the flag on, on any plan.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &ana, serde_json::json!({"adults_only": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["adults_only"],
+            true
+        );
+        let flag: i64 = sqlx::query_scalar("SELECT adults_only FROM app WHERE slug = 'groceries'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(flag, 1);
+
+        // And back off.
+        let (status, _, body) = send(
+            &app,
+            post_json(path, &ana, serde_json::json!({"adults_only": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.parse::<serde_json::Value>().unwrap()["adults_only"],
+            false
+        );
+
+        // Another owner's slug answers 404, exactly like a missing one.
+        let (status, _, _) = send(
+            &app,
+            post_json(path, &bob, serde_json::json!({"adults_only": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Every attempt audited under the MCP tool name.
+        let rows = action_rows(&pool).await;
+        assert!(
+            rows.iter().all(|(tool, _, _)| tool == "set_adults_only"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|(_, outcome, _)| outcome == "ok"));
     }
 
     #[tokio::test]

@@ -373,7 +373,7 @@ async fn tools_list_is_identical_per_caller() {
     )
     .await;
     let anon = list(&anon);
-    assert_eq!(anon.len(), 58);
+    assert_eq!(anon.len(), 59);
     assert!(anon.contains(&"create_app".to_string()));
     assert!(anon.contains(&"add_example".to_string()));
     // Sign-in and key minting moved to the web (`/keys`), never MCP tools.
@@ -3699,6 +3699,65 @@ async fn downgrade_keeps_the_gate_enforced() {
     )
     .await;
     assert_eq!(result(&open)["structuredContent"]["mode"], "open");
+}
+
+/// `set_adults_only` flips the flag on every plan (no Pro gate): `get_app`
+/// shows it, and a stranger's slug answers `not_found`.
+#[tokio::test]
+async fn set_adults_only_flips_the_flag_on_every_plan() {
+    let (state, _) = setup().await;
+    let ana = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &ana, "groceries").await;
+
+    // Free owner: marking 18+ works (no Pro gate on this flag).
+    let (_, on) = call(
+        &state,
+        Some(&ana),
+        "set_adults_only",
+        json!({"app": "groceries", "adults_only": true}),
+    )
+    .await;
+    assert_eq!(result(&on)["structuredContent"]["adults_only"], true);
+    let flag: i64 = sqlx::query_scalar("SELECT adults_only FROM app WHERE slug = 'groceries'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(flag, 1);
+
+    // A no-op repeat still answers the flag.
+    let (_, again) = call(
+        &state,
+        Some(&ana),
+        "set_adults_only",
+        json!({"app": "groceries", "adults_only": true}),
+    )
+    .await;
+    assert_eq!(result(&again)["structuredContent"]["adults_only"], true);
+
+    // `get_app` shows the flag.
+    let (_, got) = call(&state, Some(&ana), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(result(&got)["structuredContent"]["adults_only"], true);
+
+    // Clearing works too.
+    let (_, off) = call(
+        &state,
+        Some(&ana),
+        "set_adults_only",
+        json!({"app": "groceries", "adults_only": false}),
+    )
+    .await;
+    assert_eq!(result(&off)["structuredContent"]["adults_only"], false);
+
+    // A stranger's slug answers `not_found`, like every other app tool.
+    let bob = api_key_for(&state, "bob@example.com").await;
+    let (_, missing) = call(
+        &state,
+        Some(&bob),
+        "set_adults_only",
+        json!({"app": "groceries", "adults_only": true}),
+    )
+    .await;
+    assert_eq!(is_error(&missing)["error"], "not_found");
 }
 
 /// New Pro apps default to keep-warm; Free apps start cold.

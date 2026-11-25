@@ -30,6 +30,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/console/apps/{slug}/visibility", post(api_visibility))
         .route("/api/console/apps/{slug}/access", post(api_access))
+        .route(
+            "/api/console/apps/{slug}/adults-only",
+            post(api_adults_only),
+        )
         .route("/api/console/apps/{slug}/always-on", post(api_always_on))
         .route("/api/console/apps/{slug}/rename", post(api_rename))
         .route("/api/console/apps/{slug}/delete", post(api_delete))
@@ -302,6 +306,64 @@ async fn set_app_access(
         );
     }
     Ok(json!({"access": mode.as_str()}))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdultsOnlyBody {
+    adults_only: bool,
+}
+
+/// `POST /api/console/apps/:slug/adults-only {adults_only}`: the MCP
+/// `set_adults_only` path — mark the app 18+ (or clear it). Available on
+/// every plan; owner only. The audit summary names the flag, never a
+/// secret (there is none: visitors just confirm their age).
+async fn api_adults_only(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Json(body): Json<AdultsOnlyBody>,
+) -> Response {
+    let mcp = &state.mcp;
+    let (account, app, admin) = match owner_mutation_app(mcp, &headers, &slug).await {
+        Ok(pair) => pair,
+        Err(res) => return *res,
+    };
+    let summary = format!("set_adults_only {}", body.adults_only);
+    let result = set_app_adults_only(mcp, &app, body.adults_only).await;
+    audited(
+        mcp,
+        &account,
+        &app,
+        admin,
+        "set_adults_only",
+        &summary,
+        result,
+    )
+    .await
+}
+
+/// The domain call, shared by the adults-only endpoint's two values.
+async fn set_app_adults_only(
+    mcp: &McpState,
+    app: &crate::apps::App,
+    adults_only: bool,
+) -> Result<serde_json::Value, ToolError> {
+    let changed = crate::age::set_adults_only(&mcp.pool, &app.id, adults_only)
+        .await
+        .map_err(crate::mcp::tools::internal)?;
+    // Same purge as the MCP tool: a real change evicts anything cached
+    // before the flag flipped on every host serving the app.
+    if changed {
+        crate::access::spawn_gate_purge(
+            &mcp.purges,
+            mcp.delete_cfg.cache_purge.clone(),
+            mcp.pool.clone(),
+            mcp.delete_cfg.apps_domain.clone(),
+            app.id.clone(),
+            app.slug.clone(),
+        );
+    }
+    Ok(json!({"adults_only": adults_only}))
 }
 
 #[derive(Debug, Deserialize)]

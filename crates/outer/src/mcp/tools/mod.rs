@@ -8,6 +8,7 @@
 pub(crate) mod access;
 pub(crate) mod account;
 pub(crate) mod add_example;
+pub(crate) mod age;
 pub(crate) mod apps;
 pub(crate) mod backups;
 pub(crate) mod code;
@@ -1172,6 +1173,9 @@ pub async fn dispatch(tool: &str, args: Option<Value>, ctx: &Ctx<'_>) -> Result<
             .await
             .map_err(CallError::from),
         "set_access" => access::set_access(parse_args(args)?, ctx)
+            .await
+            .map_err(CallError::from),
+        "set_adults_only" => age::set_adults_only(parse_args(args)?, ctx)
             .await
             .map_err(CallError::from),
         "share_app" => apps::share_app(parse_args(args)?, ctx)

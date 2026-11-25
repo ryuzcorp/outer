@@ -63,6 +63,15 @@ export interface SetAccessOutput {
   access: string;
 }
 
+export interface SetAdultsOnlyInput {
+  slug: string;
+  adults_only: boolean;
+}
+
+export interface SetAdultsOnlyOutput {
+  adults_only: boolean;
+}
+
 export interface RenameAppInput {
   slug: string;
   newSlug: string;
@@ -162,6 +171,32 @@ const setAccess: ConsoleAction<SetAccessInput, SetAccessOutput> = {
   },
 };
 
+const setAdultsOnly: ConsoleAction<SetAdultsOnlyInput, SetAdultsOnlyOutput> = {
+  name: "set_adults_only",
+  title: "Mark app adults-only",
+  description:
+    "Mark an app adults-only (18+) or clear it: visitors confirm they are an adult before the app serves them, after the visitor gate when one is set. Available on every plan. Returns {adults_only}.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      slug: { type: "string" },
+      adults_only: { type: "boolean" },
+    },
+    required: ["slug", "adults_only"],
+  },
+  readOnly: false,
+  consequential: false,
+  untrusted: false,
+  run(input, _ctx, signal) {
+    return request<SetAdultsOnlyOutput>(
+      "POST",
+      `/api/console/apps/${encodeURIComponent(input.slug)}/adults-only`,
+      { adults_only: input.adults_only },
+      signal,
+    );
+  },
+};
+
 const renameApp: ConsoleAction<RenameAppInput, RenameAppOutput> = {
   name: "rename_app",
   title: "Rename app",
@@ -229,8 +264,9 @@ export const actions: ConsoleAction<unknown, unknown>[] = [
   setVisibility as ConsoleAction<unknown, unknown>,
   setAlwaysOn as ConsoleAction<unknown, unknown>,
   setAccess as ConsoleAction<unknown, unknown>,
+  setAdultsOnly as ConsoleAction<unknown, unknown>,
   renameApp as ConsoleAction<unknown, unknown>,
   deleteApp as ConsoleAction<unknown, unknown>,
 ];
 
-export const settingsActions = { setVisibility, setAlwaysOn, setAccess, renameApp, deleteApp };
+export const settingsActions = { setVisibility, setAlwaysOn, setAccess, setAdultsOnly, renameApp, deleteApp };
