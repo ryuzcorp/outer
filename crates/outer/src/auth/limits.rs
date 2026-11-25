@@ -1,6 +1,7 @@
 //! Abuse limits on the `rate_limit_events` ledger: OTP sends (5/h per
-//! email, 20/h per IP), DCR registrations (20/h per IP), account creation
-//! (3/day per IP). Rows older than the window stay until the daily prune.
+//! email, 20/h per IP), DCR registrations (120/h per IP plus 300/h global),
+//! account creation (3/day per IP). Rows older than the window stay until
+//! the daily prune.
 
 use sqlx::SqlitePool;
 
