@@ -15,6 +15,7 @@ pub mod browser;
 pub mod cloudflare;
 pub mod collaborators;
 pub mod config;
+pub mod cookies;
 pub mod cron;
 pub mod d1_backup;
 pub mod db;

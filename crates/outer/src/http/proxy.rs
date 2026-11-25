@@ -340,13 +340,21 @@ fn response_bytes(res: &hyper::Response<hyper::body::Incoming>) -> u64 {
 /// upstream `Vary` the app sent. `ETag`/`Last-Modified` stay: validators are
 /// harmless once nothing stores the response. An open app keeps every
 /// upstream header untouched.
+///
+/// On a shared-domain host (`isolate`) every `Set-Cookie` is rewritten into
+/// its host-locked form first (see [`crate::cookies`]); custom-domain hosts
+/// pass the upstream headers through byte-identical.
 fn from_upstream(
     res: hyper::Response<hyper::body::Incoming>,
     is_unlisted: bool,
     gated: bool,
+    isolate: bool,
 ) -> Response {
     let keep_upgrade = res.status() == StatusCode::SWITCHING_PROTOCOLS;
     let (mut parts, body) = res.into_parts();
+    if isolate {
+        crate::cookies::rewrite_set_cookie_headers(&mut parts.headers);
+    }
     // Collected before the drain: every name this response's `Connection`
     // nominates goes with the fixed hop-by-hop list.
     let nominated = connection_tokens(&parts.headers);
@@ -624,7 +632,12 @@ async fn badge_response(
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED | StatusCode::PARTIAL_CONTENT
         );
     if !is_html || encoded || bodyless {
-        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted, gated);
+        return from_upstream(
+            hyper::Response::from_parts(parts, body),
+            is_unlisted,
+            gated,
+            false,
+        );
     }
     // A declared length grows by exactly the badge: the framing stays exact
     // and keep-alive survives. Undeclared lengths chunk, as before.
@@ -660,6 +673,220 @@ async fn badge_response(
     }
     out.body(chain_suffix(Body::new(body), badge.to_vec()))
         .unwrap()
+}
+
+/// How far into a streaming HTML body the cookie shim looks for the head
+/// element: a normal page carries `<head>` in its first bytes, so injection
+/// rarely waits on the network, and a huge headless page never buffers
+/// fully just to place the shim.
+const COOKIE_SHIM_SCAN_CAP: usize = 16 * 1024;
+
+/// Buffer an HTML body up to one byte past [`COOKIE_SHIM_SCAN_CAP`]: the
+/// bytes plus `None` fit (inject into the whole page), the bytes plus `Some`
+/// overflowed (inject into the prefix when it already holds the head
+/// element, else skip the shim and stream the bytes through untouched).
+/// Returns `Err` when the upstream breaks mid-body. Stops reading as soon
+/// as the buffered prefix holds the head close, so a slow upstream never
+/// waits on the cap.
+async fn read_shim_prefix(
+    body: hyper::body::Incoming,
+) -> Result<
+    (
+        Vec<u8>,
+        Option<http_body_util::combinators::BoxBody<bytes::Bytes, hyper::Error>>,
+    ),
+    hyper::Error,
+> {
+    use http_body::Body as _;
+    use http_body_util::BodyExt as _;
+    let mut body = body.boxed();
+    let mut buf = Vec::new();
+    loop {
+        // A complete small page (the common case: hyper already counted it
+        // ended) injects into the whole body with an exact length below;
+        // a still-open body injects into the prefix and streams the rest,
+        // so a slow upstream never waits on the cap.
+        if buf.len() > COOKIE_SHIM_SCAN_CAP {
+            return Ok((buf, Some(body)));
+        }
+        if crate::cookies::find_head_insert(&buf).is_some() {
+            if body.is_end_stream() {
+                return Ok((buf, None));
+            }
+            return Ok((buf, Some(body)));
+        }
+        match body.frame().await {
+            None => return Ok((buf, None)),
+            Some(Err(err)) => return Err(err),
+            Some(Ok(frame)) => match frame.into_data() {
+                // Trailers carry no document bytes; the loop ends next.
+                Err(_) => {}
+                Ok(data) => {
+                    buf.extend_from_slice(&data);
+                }
+            },
+        }
+    }
+}
+
+/// Whether `headers` claims an HTML document: the only content type the
+/// cookie shim ever edits.
+fn is_html_body(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/html"))
+        })
+}
+
+/// Whether `headers` claims a content encoding: encoded bytes must never be
+/// edited, so an encoded response skips the shim (the proxy never forces
+/// identity encoding upstream — compression keeps working, and an encoded
+/// HTML page simply keeps server-side isolation only).
+fn is_encoded_body(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|encoding| {
+            !encoding.is_empty() && !encoding.trim().eq_ignore_ascii_case("identity")
+        })
+}
+
+/// The shared-domain response path (cookie isolation): `Set-Cookie`
+/// rewriting always applies, and plain-HTML identity bodies additionally
+/// gain the client shim (with its CSP hash). The shim injects into a
+/// bounded head prefix so large pages keep streaming: when the prefix
+/// already holds the head element the shim lands there and the rest
+/// streams; when a streamed page carries no head element in its first
+/// [`COOKIE_SHIM_SCAN_CAP`] bytes the shim is skipped (logged at debug)
+/// and the bytes pass through untouched. Non-HTML, encoded and bodyless
+/// responses keep the [`from_upstream`] framing exactly.
+///
+/// `badge` is the Free badge (plan-dependent, so validators are stripped
+/// and the cache treatment matches [`badge_response`]); without one the
+/// upstream cache headers survive and only the stale validators go (the
+/// body changed under them).
+async fn isolated_response(
+    upstream: hyper::Response<hyper::body::Incoming>,
+    is_unlisted: bool,
+    gated: bool,
+    badge: Option<&[u8]>,
+    head: bool,
+) -> Response {
+    let (mut parts, body) = upstream.into_parts();
+    crate::cookies::rewrite_set_cookie_headers(&mut parts.headers);
+    let bodyless = head
+        || parts.status.is_informational()
+        || matches!(
+            parts.status,
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED | StatusCode::PARTIAL_CONTENT
+        );
+    if !is_html_body(&parts.headers) || is_encoded_body(&parts.headers) || bodyless {
+        return from_upstream(
+            hyper::Response::from_parts(parts, body),
+            is_unlisted,
+            gated,
+            true,
+        );
+    }
+    if badge.is_some() {
+        // Plan-dependent body: no validators, and every reuse revalidates,
+        // so an upgrade never keeps showing a cached badged page.
+        parts.headers.remove(axum::http::header::ETAG);
+        parts.headers.remove(axum::http::header::LAST_MODIFIED);
+        parts.headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static(if gated {
+                "private, no-store"
+            } else {
+                "private, no-cache"
+            }),
+        );
+    }
+    match read_shim_prefix(body).await {
+        Err(_) => text(StatusCode::BAD_GATEWAY, "app unavailable"),
+        Ok((buf, None)) => {
+            // The whole page fit: inject after `<head>` (or prepend when
+            // headless) and fix the length. The body changed under any
+            // upstream validators, so they go.
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.remove(axum::http::header::ETAG);
+            parts.headers.remove(axum::http::header::LAST_MODIFIED);
+            let mut page = crate::cookies::inject_cookie_shim(&buf);
+            crate::cookies::append_shim_csp_hash(&mut parts.headers);
+            if let Some(suffix) = badge {
+                page.extend_from_slice(suffix);
+            }
+            let out = copy_response_headers(
+                Response::builder().status(parts.status),
+                &mut parts.headers,
+                is_unlisted,
+                gated,
+            );
+            out.header("content-length", page.len())
+                .body(Body::from(page))
+                .unwrap()
+        }
+        Ok((buf, Some(rest))) => {
+            match crate::cookies::find_head_insert(&buf) {
+                Some(pos) => {
+                    // Head element in the prefix: inject there, stream the
+                    // rest. The length is unknowable up front, so framing
+                    // chunks and validators go.
+                    let mut prefix =
+                        Vec::with_capacity(buf.len() + crate::cookies::cookie_shim_snippet().len());
+                    prefix.extend_from_slice(&buf[..pos]);
+                    prefix.extend_from_slice(&crate::cookies::cookie_shim_snippet());
+                    prefix.extend_from_slice(&buf[pos..]);
+                    crate::cookies::append_shim_csp_hash(&mut parts.headers);
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    parts.headers.remove(axum::http::header::ETAG);
+                    parts.headers.remove(axum::http::header::LAST_MODIFIED);
+                    let out = copy_response_headers(
+                        Response::builder().status(parts.status),
+                        &mut parts.headers,
+                        is_unlisted,
+                        gated,
+                    );
+                    let mut streamed = prepend_look_stream(prefix, rest);
+                    if let Some(suffix) = badge {
+                        streamed = chain_suffix(streamed, suffix.to_vec());
+                    }
+                    out.body(streamed).unwrap()
+                }
+                None => {
+                    // No head element in the first bytes of a streamed page:
+                    // placing the shim would need the whole body, so skip it
+                    // (server-side isolation still holds) and pass the bytes
+                    // through. A badged skip keeps the badge contract (no
+                    // validators, plan-dependent cache treatment) but drops
+                    // the declared length — the badge changed the tail.
+                    tracing::debug!(
+                        "cookie shim skipped: no head element in the first {} bytes",
+                        COOKIE_SHIM_SCAN_CAP,
+                    );
+                    if badge.is_some() {
+                        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    }
+                    let out = copy_response_headers(
+                        Response::builder().status(parts.status),
+                        &mut parts.headers,
+                        is_unlisted,
+                        gated,
+                    );
+                    let mut streamed = prepend_look_stream(buf, rest);
+                    if let Some(suffix) = badge {
+                        streamed = chain_suffix(streamed, suffix.to_vec());
+                    }
+                    out.body(streamed).unwrap()
+                }
+            }
+        }
+    }
 }
 
 /// Buffer the upstream body up to one byte past [`MAX_LOOK_HTML_BYTES`]:
@@ -707,8 +934,12 @@ async fn look_response(
     is_unlisted: bool,
     gated: bool,
     badge: Option<&[u8]>,
+    isolate: bool,
 ) -> Response {
     let (mut parts, body) = upstream.into_parts();
+    if isolate {
+        crate::cookies::rewrite_set_cookie_headers(&mut parts.headers);
+    }
     let is_html = parts
         .headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -729,7 +960,12 @@ async fn look_response(
             !encoding.is_empty() && !encoding.trim().eq_ignore_ascii_case("identity")
         });
     if !is_html || encoded {
-        return from_upstream(hyper::Response::from_parts(parts, body), is_unlisted, gated);
+        return from_upstream(
+            hyper::Response::from_parts(parts, body),
+            is_unlisted,
+            gated,
+            isolate,
+        );
     }
     // Everything below rewrites the page for one browser render. The edge
     // must never store it: Cloudflare's cache key ignores the look header,
@@ -747,7 +983,18 @@ async fn look_response(
         // Oversize on paper: never buffer, stream the body with the marker
         // in front and a corrected length.
         use http_body_util::BodyExt as _;
-        let total = declared.unwrap_or(0) + LOOK_SKIP_OVERSIZE.len() + badge.map_or(0, <[u8]>::len);
+        let shim: Vec<u8> = if isolate {
+            crate::cookies::cookie_shim_snippet()
+        } else {
+            Vec::new()
+        };
+        if isolate {
+            crate::cookies::append_shim_csp_hash(&mut parts.headers);
+        }
+        let total = declared.unwrap_or(0)
+            + LOOK_SKIP_OVERSIZE.len()
+            + shim.len()
+            + badge.map_or(0, <[u8]>::len);
         parts.headers.remove(axum::http::header::CONTENT_LENGTH);
         let out = copy_response_headers(
             Response::builder().status(parts.status),
@@ -755,7 +1002,9 @@ async fn look_response(
             is_unlisted,
             gated,
         );
-        let streamed = prepend_look_stream(LOOK_SKIP_OVERSIZE.to_vec(), body.boxed());
+        let mut marker = LOOK_SKIP_OVERSIZE.to_vec();
+        marker.extend_from_slice(&shim);
+        let streamed = prepend_look_stream(marker, body.boxed());
         let streamed = match badge {
             Some(suffix) => chain_suffix(streamed, suffix.to_vec()),
             None => streamed,
@@ -768,12 +1017,20 @@ async fn look_response(
             if csp_blocks_inline(&parts.headers) {
                 let mut marked = LOOK_SKIP_CSP.to_vec();
                 marked.extend_from_slice(&buf);
+                if isolate {
+                    marked = crate::cookies::inject_cookie_shim(&marked);
+                    crate::cookies::append_shim_csp_hash(&mut parts.headers);
+                }
                 if let Some(suffix) = badge {
                     marked.extend_from_slice(suffix);
                 }
                 rebuild_look_body(parts, is_unlisted, gated, &marked)
             } else {
                 let mut page = inject_look_snippet(&buf);
+                if isolate {
+                    page = crate::cookies::inject_cookie_shim(&page);
+                    crate::cookies::append_shim_csp_hash(&mut parts.headers);
+                }
                 if let Some(suffix) = badge {
                     page.extend_from_slice(suffix);
                 }
@@ -783,6 +1040,9 @@ async fn look_response(
         Ok((buf, Some(rest))) => {
             // Overflow discovered mid-read: marker, what was read, the rest.
             parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            if isolate {
+                crate::cookies::append_shim_csp_hash(&mut parts.headers);
+            }
             let out = copy_response_headers(
                 Response::builder().status(parts.status),
                 &mut parts.headers,
@@ -790,6 +1050,9 @@ async fn look_response(
                 gated,
             );
             let mut prefix = LOOK_SKIP_OVERSIZE.to_vec();
+            if isolate {
+                prefix.extend_from_slice(&crate::cookies::cookie_shim_snippet());
+            }
             prefix.extend_from_slice(&buf);
             let streamed = prepend_look_stream(prefix, rest);
             let streamed = match badge {
@@ -1509,6 +1772,11 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
             }
         },
     };
+    // Cookie isolation applies on shared-domain hosts only (`<slug>` labels
+    // under the apps domain, previews included): one registrable domain
+    // means one app's `Domain` cookie would otherwise reach every other
+    // app. Custom domains are their own sites and stay untouched.
+    let shared = slug_for(bare, &state.apps_domain).is_some();
     // The one serving rule (`apps::serving`): expired beats suspended beats
     // held beats stopped beats paused. Read once here so the operator pages
     // and the liveness gates below answer from the same verdict.
@@ -1760,13 +2028,23 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     // asks for an identity body so the recorder can be injected below. The
     // header never reaches upstream either way (skipped in the loop).
     let badge_identity = badge.is_some() && badge::accepts_html(&parts.headers);
-    // The gate cookies are Outer's, never the app's: drop those pairs and
-    // keep every other cookie. The shared [`crate::access::forwarded_cookie`]
-    // plus the age strip below recognize exactly the spellings the gates
-    // accept, so a cookie that unlocks or confirms is always stripped before
-    // the app sees it.
+    // The gate cookies are Outer's, never the app's: drop those pairs. The
+    // shared [`crate::access::forwarded_cookie`] plus the age strip below
+    // recognize exactly the spellings the gates accept, so a cookie that
+    // unlocks or confirms is always stripped before the app sees it.
     crate::age::strip_age_cookie(&mut parts.headers);
     let fwd_cookie: Option<String> = crate::access::forwarded_cookie(&parts.headers);
+    // On a shared-domain host only `__Host-` cookies travel on: `__Host-o`
+    // pairs map back to the names the app set, platform cookies stay
+    // stripped, and everything else — including any `Domain` cookie another
+    // app tossed, which can never carry a `__Host-` name — is dropped before
+    // the app sees it. Custom-domain hosts forward the gate-stripped value
+    // untouched.
+    let fwd_cookie = if shared {
+        fwd_cookie.and_then(|merged| crate::cookies::isolate_request_cookies(&merged))
+    } else {
+        fwd_cookie
+    };
     for (name, value) in parts.headers.iter() {
         if *name == axum::http::header::HOST {
             continue;
@@ -1870,7 +2148,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
                 upstream_start.elapsed().as_millis() as u64,
                 0,
             );
-            return from_upstream(upstream, noindex, gated);
+            return from_upstream(upstream, noindex, gated, shared);
         }
     }
     if look_armed {
@@ -1880,7 +2158,18 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         let status = upstream.status();
         let bytes_out = response_bytes(&upstream);
         let latency_ms = upstream_start.elapsed().as_millis() as u64;
-        let response = look_response(upstream, noindex, gated, badge.as_deref()).await;
+        let response = look_response(upstream, noindex, gated, badge.as_deref(), shared).await;
+        meter(status.as_u16(), latency_ms, bytes_out);
+        return response;
+    }
+    if shared {
+        // Cookie isolation: host-locked `Set-Cookie` rewriting always, plus
+        // the client shim on plain-HTML identity bodies. Custom-domain hosts
+        // keep the badge path below byte-identical.
+        let status = upstream.status();
+        let bytes_out = response_bytes(&upstream);
+        let latency_ms = upstream_start.elapsed().as_millis() as u64;
+        let response = isolated_response(upstream, noindex, gated, badge.as_deref(), is_head).await;
         meter(status.as_u16(), latency_ms, bytes_out);
         return response;
     }
@@ -1897,7 +2186,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     let status = upstream.status();
     let bytes_out = response_bytes(&upstream);
     let latency_ms = upstream_start.elapsed().as_millis() as u64;
-    let response = from_upstream(upstream, noindex, gated);
+    let response = from_upstream(upstream, noindex, gated, false);
     meter(status.as_u16(), latency_ms, bytes_out);
     response
 }
@@ -2017,6 +2306,23 @@ mod tests {
                 }),
             )
             .route(
+                "/cookie-set",
+                axum::routing::get(|| async {
+                    // An app setting a cross-host cookie the old way: the
+                    // proxy must host-lock it before it reaches the browser.
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header(
+                            "set-cookie",
+                            "sid=abc; Domain=outer.test; Path=/app; HttpOnly; SameSite=Lax",
+                        )
+                        .header("set-cookie", "__Host-x=1; Path=/; Secure")
+                        .body(Body::from("<html><head><title>C</title></head><body>cook</body></html>"))
+                        .unwrap()
+                }),
+            )
+            .route(
                 "/asset.css",
                 axum::routing::get(|| async {
                     Response::builder()
@@ -2068,11 +2374,14 @@ mod tests {
                 "/slow-html",
                 axum::routing::get(|| async {
                     // First chunk now, the rest after a beat: proves the
-                    // badge path streams instead of buffering the page.
+                    // response path streams instead of buffering the page.
+                    // The head element lands in the first chunk, so the
+                    // cookie shim injects into the prefix while the tail is
+                    // still upstream.
                     use futures::stream::StreamExt as _;
                     let first = futures::stream::once(async {
                         Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                            b"<html><body>slow-",
+                            b"<html><head></head><body>slow-",
                         ))
                     });
                     let rest = futures::stream::once(async {
@@ -2689,8 +2998,8 @@ mod tests {
     }
 
     /// The unlock round trip: a correct PIN sets the cookie and 303s to
-    /// `next`; the next request forwards WITHOUT the gate cookie and with
-    /// every other cookie intact.
+    /// `next`; the next request forwards WITHOUT the gate cookie, mapping
+    /// the visitor's `__Host-o` cookies back and dropping tossed ones.
     #[tokio::test]
     async fn unlock_sets_cookie_and_forwards_without_it() {
         let fix = fixture().await;
@@ -2722,19 +3031,24 @@ mod tests {
             .unwrap()
             .strip_prefix("__Host-outer-access=")
             .unwrap();
-        // The visitor's other cookies ride along; the gate pair must not
-        // reach the app.
+        // The visitor's host-locked cookies map back to the names the app
+        // set; the gate pair, the platform session, and any tossed cookie
+        // never reach the app.
         let req = html_nav(
             "shop.outer.test",
             "/echo",
             Some(&format!(
-                "session=abc; __Host-outer-access={value}; theme=dark"
+                "__Host-o.session=abc; __Host-outer-access={value}; tossed=evil; \
+                 __Host-x=1; __Host-outer_sid=s; __Host-o.theme=dark"
             )),
         );
         let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         let got = echo(&body);
-        assert_eq!(got["headers"]["cookie"], "session=abc; theme=dark");
+        assert_eq!(
+            got["headers"]["cookie"],
+            "session=abc; __Host-x=1; theme=dark"
+        );
     }
 
     /// A wrong PIN re-renders with 401 ("Wrong PIN") and records the
@@ -2871,8 +3185,9 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
-    /// A confirmed navigation proxies with the age cookie stripped (other
-    /// cookies ride along) and the response carries the no-store treatment.
+    /// A confirmed navigation proxies with the age cookie stripped (host-locked
+    /// cookies map back, tossed ones drop) and the response carries the
+    /// no-store treatment.
     #[tokio::test]
     async fn confirmed_request_proxies_and_strips_age_cookie() {
         let fix = fixture().await;
@@ -2888,7 +3203,7 @@ mod tests {
             "shop.outer.test",
             "/echo",
             Some(&format!(
-                "session=abc; __Host-outer-age={value}; theme=dark"
+                "__Host-o.session=abc; __Host-outer-age={value}; tossed=evil; __Host-o.theme=dark"
             )),
         );
         let (status, headers, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
@@ -3437,7 +3752,7 @@ mod tests {
             "shop.outer.test",
             "/echo",
             Some(&format!(
-                "session=abc; __Host-outer-access ={cookie}; theme=dark"
+                "__Host-o.session=abc; __Host-outer-access ={cookie}; tossed=1; __Host-o.theme=dark"
             )),
         );
         let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
@@ -4255,6 +4570,11 @@ mod tests {
         req.body(Body::empty()).unwrap()
     }
 
+    /// The isolation shim as text, for expected-body assembly.
+    fn cookie_shim() -> String {
+        String::from_utf8(crate::cookies::cookie_shim_snippet()).unwrap()
+    }
+
     /// A live token injects the recorder right after `<head>`, asks
     /// upstream for identity, and never leaks the token upstream.
     #[tokio::test]
@@ -4274,16 +4594,18 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        // The shim lands right after `<head>`, ahead of the recorder and
+        // every app script; the badge still closes the page on Free.
         let mut expected = String::from("<html><head>");
+        expected.push_str(&cookie_shim());
         expected.push_str(&String::from_utf8(look_snippet()).unwrap());
         expected.push_str(
             "<title>T</title></head><body>hi<!--ae:identity leaked:false--></body></html>",
         );
-        // The fixture owner is Free: the badge rides after the recorder page.
         expected.push_str(&String::from_utf8(badge::badge_snippet("shop")).unwrap());
         assert_eq!(
             body, expected,
-            "recorder injected, token stripped, identity asked"
+            "shim, then recorder injected; token stripped, identity asked"
         );
         assert_eq!(
             headers.get("content-type").and_then(|v| v.to_str().ok()),
@@ -4354,10 +4676,10 @@ mod tests {
         assert_eq!(capture.console[0].message, "boom </script> bam");
     }
 
-    /// Without any token the proxy path is byte-for-byte what upstream
-    /// sent: the recorder never runs for real visitors.
+    /// Without any token the recorder never runs for real visitors — but the
+    /// isolation shim still does: every shared-domain HTML page carries it.
     #[tokio::test]
-    async fn look_without_token_leaves_bytes_untouched() {
+    async fn look_without_token_skips_recorder_but_adds_cookie_shim() {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
@@ -4377,17 +4699,12 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            "<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>"
-        );
-        assert_eq!(
-            headers
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|text| text.parse::<usize>().ok()),
-            Some(body.len())
-        );
+        let expected = String::from_utf8(crate::cookies::inject_cookie_shim(
+            b"<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>",
+        ))
+        .unwrap();
+        assert_eq!(body, expected);
+        assert_eq!(content_len(&headers), Some(body.len()));
     }
 
     /// Tokens are single-use and host-bound: a replay or a token minted for
@@ -4429,10 +4746,10 @@ mod tests {
         }
     }
 
-    /// An expired token is exactly like no token: the response is the
-    /// upstream page untouched.
+    /// An expired token is exactly like no token: the recorder never runs —
+    /// but the isolation shim still does.
     #[tokio::test]
-    async fn look_expired_token_leaves_bytes_untouched() {
+    async fn look_expired_token_skips_recorder_but_adds_cookie_shim() {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
@@ -4450,14 +4767,16 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            "<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>"
-        );
+        let expected = String::from_utf8(crate::cookies::inject_cookie_shim(
+            b"<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>",
+        ))
+        .unwrap();
+        assert_eq!(body, expected);
     }
 
     /// A CSP blocking inline scripts skips the recorder but leaves a marker
-    /// the tool reports; `'unsafe-inline'` allows the injection.
+    /// the tool reports; `'unsafe-inline'` allows the injection. Either way
+    /// the isolation shim is injected with its hash allowlisted.
     #[tokio::test]
     async fn look_csp_block_skips_with_marker_and_allowance_injects() {
         let fix = fixture().await;
@@ -4481,6 +4800,20 @@ mod tests {
             body.starts_with("<!--__outer_look:csp-->"),
             "skip marker first: {body}"
         );
+        assert!(
+            body.matches("<script>").count() == 1,
+            "exactly the shim script: {body}"
+        );
+        assert!(body.contains("__Host-o."), "shim injected: {body}");
+        let hash = crate::cookies::shim_csp_hash();
+        assert!(
+            headers
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|policy| policy.contains(&hash)),
+            "shim hash allowlisted: {:?}",
+            headers.get("content-security-policy")
+        );
         assert_eq!(
             headers
                 .get("content-length")
@@ -4499,6 +4832,10 @@ mod tests {
         let (_, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
         assert!(body.contains("id=\"__outer_look\""), "injected: {body}");
         assert!(!body.contains("__outer_look:csp"), "{body}");
+        assert!(
+            body.contains("__Host-o."),
+            "shim alongside recorder: {body}"
+        );
     }
 
     /// An oversize page streams with the marker prepended instead of
@@ -4527,9 +4864,12 @@ mod tests {
         let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(status, StatusCode::OK);
+        // The shim rides right behind the marker, ahead of the page: the
+        // oversize path never buffers, so it cannot thread the head.
+        let shim = cookie_shim();
         assert!(
-            body.starts_with("<!--__outer_look:oversize-->"),
-            "marker first"
+            body.starts_with(&format!("<!--__outer_look:oversize-->{shim}")),
+            "marker, then shim"
         );
         // The fixture owner is Free: the streamed tail ends with the badge.
         assert!(body.contains("</body></html>"), "page whole");
@@ -4705,10 +5045,10 @@ mod tests {
         assert_eq!(content_len(&headers), Some(body.len()));
     }
 
-    /// A Pro owner's page is byte-for-byte what upstream sent: no badge,
-    /// and no identity override on the encoding.
+    /// A Pro owner's page carries no badge and keeps its own encoding — but
+    /// the isolation shim still injects exactly once, with a fixed length.
     #[tokio::test]
-    async fn badge_pro_owner_page_untouched() {
+    async fn pro_owner_page_gets_shim_but_no_badge() {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
@@ -4723,10 +5063,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            "<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>"
-        );
+        let expected = String::from_utf8(crate::cookies::inject_cookie_shim(
+            b"<html><head><title>T</title></head><body>hi<!--ae: leaked:false--></body></html>",
+        ))
+        .unwrap();
+        assert_eq!(body, expected);
         assert!(!body.contains("outer-badge"), "{body}");
         assert_eq!(content_len(&headers), Some(body.len()));
     }
@@ -4839,8 +5180,8 @@ mod tests {
         );
     }
 
-    /// HEAD answers carry no badge (and skip the plan lookup, so the client's
-    /// encoding goes upstream as-is); a 304 stays an empty 304.
+    /// HEAD answers carry no badge and no shim (and skip the plan lookup, so
+    /// the client's encoding goes upstream as-is); a 304 stays an empty 304.
     #[tokio::test]
     async fn badge_head_and_304_untouched() {
         let fix = fixture().await;
@@ -4868,9 +5209,10 @@ mod tests {
         assert!(head_body.is_empty());
         // The fake page echoes the encoding asked for: GET was forced to
         // `identity`, HEAD forwards none, so its own length is 8 bytes less.
+        // Neither HEAD nor the 304 carries the badge or the shim.
         assert_eq!(
             content_len(&headers),
-            Some(get_body.len() - shop_badge().len() - "identity".len()),
+            Some(get_body.len() - shop_badge().len() - cookie_shim().len() - "identity".len()),
             "the page's own length, not the badged one"
         );
 
@@ -4885,8 +5227,9 @@ mod tests {
         assert!(body.is_empty());
     }
 
-    /// The first chunk leaves before upstream finishes: the badge is
-    /// chained onto the open stream, never buffered.
+    /// The first chunk leaves before upstream finishes: the cookie shim
+    /// injects into the head prefix and the badge chains onto the open
+    /// stream, never buffered.
     #[tokio::test]
     async fn badge_first_chunk_streams_before_upstream_finishes() {
         use http_body_util::BodyExt as _;
@@ -4915,10 +5258,11 @@ mod tests {
             .into_data()
             .expect("data, not trailers");
         let first_elapsed = started.elapsed();
-        // The socket may split upstream's first item; any non-empty prefix
-        // of it arriving now proves the stream wasn't held back.
+        // The socket may split the injected prefix; any non-empty prefix of
+        // it arriving now proves the stream wasn't held back.
+        let prefix = format!("<html><head>{}</head><body>slow-", cookie_shim());
         assert!(
-            !first.is_empty() && b"<html><body>slow-".starts_with(&first),
+            !first.is_empty() && prefix.as_bytes().starts_with(&first),
             "{first:?}"
         );
         let mut tail = Vec::new();
@@ -4932,7 +5276,7 @@ mod tests {
         page.extend_from_slice(&tail);
         assert_eq!(
             String::from_utf8(page).unwrap(),
-            format!("<html><body>slow--tail</body></html>{}", shop_badge())
+            format!("{prefix}-tail</body></html>{}", shop_badge())
         );
         assert!(
             gap >= Duration::from_millis(300),
@@ -4940,8 +5284,8 @@ mod tests {
         );
     }
 
-    /// With a live look token on a Free app, the recorder and the badge
-    /// coexist: the badge closes the page.
+    /// With a live look token on a Free app, the shim, the recorder and the
+    /// badge coexist: the shim runs first, the badge closes the page.
     #[tokio::test]
     async fn badge_coexists_with_look_recorder() {
         let fix = fixture().await;
@@ -4960,8 +5304,182 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("id=\"__outer_look\""), "{body}");
+        assert!(body.contains("__Host-o."), "shim first: {body}");
         assert!(body.ends_with(&shop_badge()), "badge closes the page");
         assert_eq!(content_len(&headers), Some(body.len()));
+    }
+
+    /// Shared-domain HTML carries exactly one shim; assets and API JSON
+    /// carry none.
+    #[tokio::test]
+    async fn shim_injects_once_into_html_only() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        set_plan(&fix.pool, "pro").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+
+        let (_, _, html) = outer_get(&state, "shop.outer.test", "/look-html").await;
+        assert_eq!(html.matches("<script>").count(), 1, "{html}");
+        assert!(html.contains("__Host-o."), "{html}");
+        assert!(html.starts_with("<html><head><script>"), "{html}");
+
+        let (status, _, png) = outer_get(&state, "shop.outer.test", "/pixel.png").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(png, "PNG-DATA");
+
+        let (status, _, json) = outer_get(&state, "shop.outer.test", "/echo").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!json.contains("<script>"), "{json}");
+    }
+
+    /// A shared-domain CSP gains exactly the shim's hash on its effective
+    /// script directive and nothing else changes.
+    #[tokio::test]
+    async fn shared_csp_gains_the_shim_hash() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        set_plan(&fix.pool, "pro").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+
+        let (status, headers, body) = outer_get(&state, "shop.outer.test", "/look-csp").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.matches("<script>").count(), 1, "{body}");
+        let hash = crate::cookies::shim_csp_hash();
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("script-src 'self' '{hash}'").as_str()),
+        );
+    }
+
+    /// Custom domains are their own sites: no shim, no `Set-Cookie` rewrite,
+    /// tossed cookies forwarded as-is — while the sibling shared-domain host
+    /// isolates the same upstream bytes.
+    #[tokio::test]
+    async fn custom_domains_skip_cookie_isolation() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        set_plan(&fix.pool, "pro").await;
+        sqlx::query(
+            "INSERT INTO app_domain (hostname, app_id, cf_custom_hostname_id, status, created_at) \
+             VALUES ('shop.example.com', 'app-shop', 'cf-1', 'active', 0)",
+        )
+        .execute(&fix.pool)
+        .await
+        .unwrap();
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+
+        // The custom host: everything upstream sent arrives byte-identical.
+        let req = Request::builder()
+            .uri("/cookie-set")
+            .header("host", "shop.example.com")
+            .header("cookie", "tossed=1; sid=abc; __Host-outer_sid=s")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) =
+            body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("<script>"),
+            "no shim on custom hosts: {body}"
+        );
+        let set_cookies: Vec<_> = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            set_cookies,
+            [
+                "sid=abc; Domain=outer.test; Path=/app; HttpOnly; SameSite=Lax",
+                "__Host-x=1; Path=/; Secure",
+            ],
+        );
+        // And the app's request view on the custom host: every pair
+        // forwards, tossed or platform-named, exactly as sent.
+        let req = Request::builder()
+            .uri("/echo")
+            .header("host", "shop.example.com")
+            .header("cookie", "tossed=1; sid=abc; __Host-outer_sid=s")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state.clone()).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            echo(&body)["headers"]["cookie"],
+            "tossed=1; sid=abc; __Host-outer_sid=s"
+        );
+
+        // The same upstream bytes on the shared-domain host: host-locked,
+        // shimmed, and tossed cookies mapped away.
+        let (status, headers, body) = outer_get(&state, "shop.outer.test", "/cookie-set").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.matches("<script>").count(), 1, "{body}");
+        let set_cookies: Vec<_> = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            set_cookies,
+            [
+                "__Host-o.sid=abc; Path=/; Secure; HttpOnly; SameSite=Lax",
+                "__Host-x=1; Path=/; Secure",
+            ],
+        );
+    }
+
+    /// The round trip: the app sets `sid`, the browser stores it host-locked,
+    /// and the next request delivers `sid` back to the app — while a tossed
+    /// `Domain` cookie from a sibling app never arrives.
+    #[tokio::test]
+    async fn shared_cookie_round_trip_survives_prefixing() {
+        let fix = fixture().await;
+        let fleet = start_fake_fleet().await;
+        insert_app(&fix.pool, "app-shop", "shop", fleet.addr.port(), "public").await;
+        set_plan(&fix.pool, "pro").await;
+        let state = ProxyState::new(
+            fix.pool.clone(),
+            manager(fix._dir.path()),
+            "outer.test".to_string(),
+            false,
+            MetricsAgg::new(),
+        );
+
+        // App B's server view of a request carrying its own host-locked
+        // cookie plus a cookie tossed by sibling app A: only its own maps
+        // back, exactly under the name it set.
+        let req = Request::builder()
+            .uri("/echo")
+            .header("host", "shop.outer.test")
+            .header("cookie", "__Host-o.sid=abc; sid=tossed-by-a")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = body_text(router(state).oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(echo(&body)["headers"]["cookie"], "sid=abc");
     }
 
     async fn outer_get(

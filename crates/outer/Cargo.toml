@@ -23,6 +23,7 @@ hex = "0.4"
 hkdf = "0.13"
 hmac = "0.13"
 http = "1"
+http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
