@@ -37,6 +37,8 @@ const USAGE: &str = "usage:
   outer seed demo --owner EMAIL [--url URL]
   outer state adopt-lineage --expect-instance ID
   outer state release-backup --sha SHA
+  outer state list
+  outer state restore --force [--key KEY] [--no-verify]
   outer hash-password
   outer docs tools
   outer version";
@@ -73,6 +75,11 @@ async fn main() -> ExitCode {
         ["state", "release-backup", rest @ ..] => {
             let rest = rest.to_vec();
             run(move |config| state_release_backup(config, rest)).await
+        }
+        ["state", "list"] => run(state_list).await,
+        ["state", "restore", rest @ ..] => {
+            let rest = rest.to_vec();
+            run(move |config| state_restore(config, rest)).await
         }
         ["app", "create", slug, rest @ ..] => {
             let (slug, rest) = (slug.to_string(), rest.to_vec());
@@ -447,6 +454,82 @@ async fn state_adopt_lineage(config: Config, rest: Vec<&str>) -> anyhow::Result<
     Ok(())
 }
 
+/// List every restorable snapshot key with its timestamp: the live snapshot
+/// plus the `history/` copies. Read-only against the bucket (one line per
+/// key, like `app list`).
+async fn state_list(config: Config) -> anyhow::Result<()> {
+    let store = build_store(&config)?;
+    let snapshot_cfg = store::snapshot::SnapshotConfig {
+        db_path: config.db_path(),
+        key_prefix: "outer/state".to_string(),
+        host_id: config.host_id.clone(),
+    };
+    for entry in store::snapshot::list_snapshots(&store, &snapshot_cfg).await? {
+        println!(
+            "{}\t{}",
+            entry.key,
+            entry.written_at.as_deref().unwrap_or("unknown")
+        );
+    }
+    Ok(())
+}
+
+/// Restore the platform SQLite from the bucket snapshot even when a local
+/// database exists. `--force` is required (without it the command only
+/// explains); `--key` picks a history copy from `outer state list`
+/// (default: the live snapshot); `--no-verify` blesses a snapshot whose
+/// metadata records no checksum — a recorded checksum that mismatches
+/// always refuses. The existing database moves aside to
+/// `outer.sqlite.pre-restore-<UTC timestamp>-<pid>`, and the command refuses
+/// while a server runs against the same data dir (stop it first).
+async fn state_restore(config: Config, rest: Vec<&str>) -> anyhow::Result<()> {
+    let mut force = false;
+    let mut no_verify = false;
+    let mut key: Option<String> = None;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        match *word {
+            "--force" => force = true,
+            "--no-verify" => no_verify = true,
+            "--key" => {
+                let Some(value) = words.next() else {
+                    anyhow::bail!("--key needs a value");
+                };
+                key = Some(value.to_string());
+            }
+            other => anyhow::bail!("unknown option {other:?}\n{USAGE}"),
+        }
+    }
+    if !force {
+        anyhow::bail!(
+            "refusing to overwrite the local database without --force (the current file moves aside, nothing is deleted)"
+        );
+    }
+    let store = build_store(&config)?;
+    let snapshot_cfg = store::snapshot::SnapshotConfig {
+        db_path: config.db_path(),
+        key_prefix: "outer/state".to_string(),
+        host_id: config.host_id.clone(),
+    };
+    let report = store::snapshot::force_restore(
+        &store,
+        &snapshot_cfg,
+        &store::snapshot::RestoreOpts { key, no_verify },
+    )
+    .await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "restored": report.key,
+            "backup": report.backup.as_ref().map(|p| p.display().to_string()),
+            "bytes": report.bytes,
+            "raw_bytes": report.raw_bytes,
+            "sha256": report.sha256,
+        })
+    );
+    Ok(())
+}
+
 async fn app_create(config: Config, slug: String, rest: Vec<&str>) -> anyhow::Result<()> {
     let flags = flags(&rest, &["--owner", "--name", "--description", "--template"])?;
     let Some(owner) = flag(&flags, "--owner") else {
@@ -733,6 +816,17 @@ async fn app_list(config: Config) -> anyhow::Result<()> {
 
 async fn serve(config: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
+    let snapshot_cfg = store::snapshot::SnapshotConfig {
+        db_path: config.db_path(),
+        key_prefix: "outer/state".to_string(),
+        host_id: config.host_id.clone(),
+    };
+    // The database lock, shared: held for the life of the process, so
+    // `state restore --force` refuses while any server runs against this
+    // data dir. Shared holders coexist, so the release handoff (two
+    // processes on one SQLite file) boots fine; a second server outside a
+    // handoff refuses here instead of splitting the bucket lineage.
+    let _db_lock = store::snapshot::DbLock::shared(&snapshot_cfg)?;
     if !config.oxfmt_available() {
         // An explicitly configured binary that isn't executable is a prod
         // misconfiguration; the default path missing is the localhost case.
@@ -750,11 +844,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     let store = build_store(&config)?;
 
-    let snapshot_cfg = store::snapshot::SnapshotConfig {
-        db_path: config.db_path(),
-        key_prefix: "outer/state".to_string(),
-        host_id: config.host_id.clone(),
-    };
     if store::snapshot::restore_if_missing(&store, &snapshot_cfg).await? {
         tracing::info!("restored platform state from the bucket snapshot");
     }
