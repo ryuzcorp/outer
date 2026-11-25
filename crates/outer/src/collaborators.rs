@@ -66,6 +66,14 @@ pub async fn role(
     if owner_id == account_id {
         return Ok(Some(Role::Owner));
     }
+    // L-42: a banned owner's collaborators lose tool access: the owner's
+    // apps are parked as stopped, and the slug must read as missing for
+    // everyone but the owner from here on (every MCP tool, the console and
+    // the activity log gate through this one function, so nothing downstream
+    // can wake the fleet for them either).
+    if owner_banned(pool, owner_id).await? {
+        return Ok(None);
+    }
     let email = normalize_email(account_email);
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT userId FROM app_collaborator WHERE app_id = ?1 AND (userId = ?2 OR email = ?3)",
@@ -303,6 +311,21 @@ async fn owner_plan(pool: &sqlx::SqlitePool, owner_id: &str) -> anyhow::Result<S
         .await?;
     Ok(plan.unwrap_or_else(|| "free".to_string()))
 }
+/// Whether `owner_id` is currently banned (L-42): `banned` set and the ban
+/// not yet expired. A NULL `banExpires` never expires (the operator ban in
+/// `moderation::admin` writes NULL), mirroring the OAuth session check, so
+/// every caller agrees on who counts as banned.
+async fn owner_banned(pool: &sqlx::SqlitePool, owner_id: &str) -> anyhow::Result<bool> {
+    let row: Option<(i64, Option<i64>)> =
+        sqlx::query_as("SELECT banned, banExpires FROM user WHERE id = ?1")
+            .bind(owner_id)
+            .fetch_optional(pool)
+            .await?;
+    let now = chrono::Utc::now().timestamp();
+    Ok(
+        matches!(row, Some((banned, expires)) if banned != 0 && expires.is_none_or(|until| now < until)),
+    )
+}
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -423,5 +446,78 @@ mod tests {
         let listed = list(&pool, &app.id).await.unwrap();
         let order: Vec<&str> = listed.iter().map(|c| c.email.as_str()).collect();
         assert_eq!(order, ["first@example.com", "second@example.com"]);
+    }
+
+    /// L-42: a banned owner's collaborators lose tool access — the slug
+    /// reads as missing for everyone but the owner. An expired ban
+    /// restores access.
+    #[tokio::test]
+    async fn banned_owner_cuts_off_collaborators() {
+        let (_dir, pool, app, _) = setup().await;
+        sqlx::query(
+            "INSERT INTO app_collaborator (app_id, email, userId, added_at) \
+             VALUES ('app1', 'friend@example.com', NULL, 1_700_000_000_000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Free owner, oldest invite: access before the ban.
+        assert_eq!(
+            role(
+                &pool,
+                &app.id,
+                &app.owner_id,
+                "nobody",
+                "friend@example.com"
+            )
+            .await
+            .unwrap(),
+            Some(Role::Collaborator),
+            "the collaborator has access before the ban"
+        );
+        // The operator ban parks the account (NULL expiry = permanent).
+        sqlx::query("UPDATE user SET banned = 1, banExpires = NULL WHERE id = 'owner'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            role(
+                &pool,
+                &app.id,
+                &app.owner_id,
+                "nobody",
+                "friend@example.com"
+            )
+            .await
+            .unwrap(),
+            None,
+            "a banned owner's collaborator loses access"
+        );
+        assert_eq!(
+            role(&pool, &app.id, &app.owner_id, "owner", "owner@example.com")
+                .await
+                .unwrap(),
+            Some(Role::Owner),
+            "the owner row itself is untouched by the cutoff"
+        );
+        // An expired ban restores access: the cutoff follows the same clock
+        // as the OAuth session check.
+        sqlx::query("UPDATE user SET banExpires = 1 WHERE id = 'owner'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            role(
+                &pool,
+                &app.id,
+                &app.owner_id,
+                "nobody",
+                "friend@example.com"
+            )
+            .await
+            .unwrap(),
+            Some(Role::Collaborator),
+            "an expired ban restores access"
+        );
     }
 }

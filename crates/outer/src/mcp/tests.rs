@@ -71,12 +71,25 @@ async fn post(
     token: Option<&str>,
     body: Value,
 ) -> (StatusCode, HeaderMap, Value) {
+    post_headers(state, token, body, &[]).await
+}
+
+/// Like [`post`], with extra request headers (Origin, protocol version).
+async fn post_headers(
+    state: &McpState,
+    token: Option<&str>,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Value) {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/mcp")
         .header("content-type", "application/json");
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
     }
     let req = builder
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -87,7 +100,7 @@ async fn post(
     let parsed = if bytes.is_empty() {
         Value::Null
     } else {
-        // Handler-level failures (401) carry a plain-text body, not JSON.
+        // Handler-level failures (401, 403) carry a plain-text body, not JSON.
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     (parts.status, parts.headers, parsed)
@@ -353,6 +366,160 @@ async fn initialize_negotiates_and_pins_instructions() {
         .unwrap()
         .iter()
         .any(|k| k["client"] == "claude-code/1.2.3"));
+}
+
+#[tokio::test]
+async fn origin_gate_refuses_only_foreign_pages() {
+    let (state, _) = setup().await;
+    let ping = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+    // Missing Origin is fine: non-browser MCP clients do not send one.
+    let (status, _, body) = post(&state, None, ping.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(result(&body).is_object());
+
+    // Our own site and the directory clients' web origins pass.
+    for origin in [
+        "https://outer.now",
+        "https://app.outer.now",
+        "https://claude.ai",
+        "https://x.chatgpt.com",
+        "https://chat.openai.com",
+        "http://localhost:8080",
+    ] {
+        let (status, _, _) = post_headers(&state, None, ping.clone(), &[("origin", origin)]).await;
+        assert_eq!(status, StatusCode::OK, "origin {origin}");
+    }
+
+    // A present but foreign Origin is refused with 403 before any body.
+    for origin in [
+        "https://evil.example",
+        "https://outer.now.evil.example",
+        "null",
+        "not-a-url",
+        "ftp://outer.now",
+    ] {
+        let (status, _, body) =
+            post_headers(&state, None, ping.clone(), &[("origin", origin)]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "origin {origin}");
+        assert_eq!(body, Value::Null, "origin {origin}");
+    }
+}
+
+#[tokio::test]
+async fn protocol_version_mismatch_is_400_off_initialize() {
+    let (state, _) = setup().await;
+    // `initialize` itself negotiates, so even a bad header still answers.
+    let (status, _, body) = post_headers(
+        &state,
+        None,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-11-25"}}),
+        &[("mcp-protocol-version", "1999-01-01")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result(&body)["protocolVersion"], "2025-11-25");
+
+    // Any other method with an unsupported version: 400, JSON-RPC error.
+    for method in ["ping", "tools/list", "tools/call"] {
+        let (status, _, body) = post_headers(
+            &state,
+            None,
+            json!({"jsonrpc": "2.0", "id": 2, "method": method, "params": {}}),
+            &[("mcp-protocol-version", "1999-01-01")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}");
+        assert_eq!(body["error"]["code"], -32600, "{method}");
+        assert_eq!(body["id"], 2, "{method}");
+    }
+
+    // A supported version passes through.
+    let (status, _, body) = post_headers(
+        &state,
+        None,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+        &[("mcp-protocol-version", "2025-06-18")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(result(&body).is_object());
+}
+
+#[tokio::test]
+async fn notification_with_id_is_a_request_error() {
+    let (state, _) = setup().await;
+    let (status, _, body) = post(
+        &state,
+        None,
+        json!({"jsonrpc": "2.0", "id": 7, "method": "notifications/initialized"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["id"], 7);
+}
+
+#[tokio::test]
+async fn initialize_advertises_server_metadata() {
+    let (state, _) = setup().await;
+    let (_, _, body) = post(
+        &state,
+        None,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-11-25"}}),
+    )
+    .await;
+    let info = &result(&body)["serverInfo"];
+    assert_eq!(info["name"], "outer");
+    assert_eq!(info["title"], "Outer");
+    assert!(info["description"].as_str().unwrap().contains("outer.now"));
+    assert_eq!(info["websiteUrl"], "https://outer.now/");
+    let icons = info["icons"].as_array().unwrap();
+    assert_eq!(icons.len(), 1);
+    assert_eq!(icons[0]["src"], "https://outer.now/logo.svg");
+}
+
+#[tokio::test]
+async fn tools_list_carries_output_schemas_for_read_only_tools() {
+    let (state, _) = setup().await;
+    let (_, _, body) = post(
+        &state,
+        None,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    for tool in result(&body)["tools"].as_array().unwrap() {
+        let schema = tool.get("outputSchema");
+        if tool["annotations"]["readOnlyHint"] == true {
+            let schema = schema.unwrap_or_else(|| panic!("{} lacks outputSchema", tool["name"]));
+            assert_eq!(schema["type"], "object");
+        } else {
+            assert!(schema.is_none(), "{} carries outputSchema", tool["name"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn untrusted_structured_content_carries_the_notice() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    create_app(&state, &token, "groceries").await;
+    let (_, read) = call(
+        &state,
+        Some(&token),
+        "read_files",
+        json!({"app": "groceries", "files": [{"path": "pages/index.tsx"}]}),
+    )
+    .await;
+    let structured = &result(&read)["structuredContent"];
+    assert!(structured["untrusted_notice"]
+        .as_str()
+        .unwrap()
+        .starts_with("The following was produced by your app and its visitors."));
+    // The mirror keys are untouched by the framing.
+    assert!(structured.get("files").is_some());
+    assert!(structured.get("truncated").is_some());
 }
 
 #[tokio::test]
@@ -3454,6 +3621,41 @@ async fn collaborator_access_follows_the_owner_plan() {
     let (_, back) = call(&state, Some(&cara), "get_app", json!({"app": "groceries"})).await;
     assert!(result(&back).get("isError").is_none());
 }
+
+/// L-42: a banned owner's collaborators lose tool access — every app of
+/// that owner reads as missing (the same `not_found` a stranger gets),
+/// so no tool downstream can wake the fleet for them either.
+#[tokio::test]
+async fn banned_owner_cuts_off_collaborators_over_mcp() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let (_, seen) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert!(result(&seen).get("isError").is_none(), "{seen}");
+    // The operator bans the owner and the app parks as stopped (what
+    // `ban_account` writes): the collaborator reads the slug as missing
+    // from here on.
+    sqlx::query("UPDATE user SET banned = 1 WHERE email = 'ana@example.com'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app SET desired_state = 'stopped' WHERE slug = 'groceries'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, hidden) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(is_error(&hidden)["error"], "not_found");
+    let (_, apps) = call(&state, Some(&bruno), "list_apps", json!({})).await;
+    assert_eq!(
+        result(&apps)["structuredContent"]["apps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
 /// `public` is a Pro feature, gated in the shared domain function: a Free
 /// owner is refused with `payment_required` (and a user message pointing to
 /// Pro), `unlisted` is always allowed, and Pro flips the row.

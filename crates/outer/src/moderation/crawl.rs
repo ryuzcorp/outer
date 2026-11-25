@@ -735,6 +735,8 @@ pub async fn crawl_app<F: PageFetch>(
             let texts: Vec<String> = indexed.iter().map(|(_, t)| t.clone()).collect();
             match client.classify(&texts).await {
                 Ok(chunk_scores) => {
+                    crate::ops_alerts::record_heartbeat_ok(pool, crate::ops_alerts::KIND_JEV, now)
+                        .await;
                     let mut full = vec![ChunkScores::default(); reports.len()];
                     for ((i, _), score) in indexed.iter().zip(chunk_scores.iter()) {
                         full[*i] = *score;
@@ -742,6 +744,13 @@ pub async fn crawl_app<F: PageFetch>(
                     Some(full)
                 }
                 Err(err) => {
+                    crate::ops_alerts::record_heartbeat_err(
+                        pool,
+                        crate::ops_alerts::KIND_JEV,
+                        now,
+                        &err.to_string(),
+                    )
+                    .await;
                     tracing::warn!(slug = %app.slug, error = %err, "after-live crawl: Jev unavailable, failing open");
                     None
                 }

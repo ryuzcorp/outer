@@ -1,0 +1,45 @@
+# External uptime check (L-24): no new account anywhere. GitHub runs this
+# on a schedule and emails the repo owner when a scheduled run fails, so a
+# failing probe pages without a monitor subscription.
+#
+# Probes: /health (liveness), /ready (db + snapshot lineage) and one MCP
+# `initialize` POST (the directory clients' first call). Each probe retries
+# three times; any hard failure fails the job.
+
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe outer.now
+        run: |
+          set -euo pipefail
+          base="https://outer.now"
+          attempt() {
+            local tries=0
+            while [ "$tries" -lt 3 ]; do
+              tries=$((tries + 1))
+              if "$@"; then
+                return 0
+              fi
+              echo "attempt $tries failed: $*" >&2
+              sleep 20
+            done
+            echo "FAILED after 3 attempts: $*" >&2
+            return 1
+          }
+          attempt sh -c 'curl -sS --fail --max-time 20 "$0/health" | grep -q "^ok$"' "$base"
+          echo "health ok"
+          attempt sh -c 'curl -sS --fail --max-time 20 "$0/ready" | grep -q "\"ok\": *true"' "$base"
+          echo "ready ok"
+          body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"outer-uptime","version":"1"}}}'
+          attempt sh -c 'curl -sS --fail --max-time 20 -X POST "$0/mcp" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "$1" | grep -q "\"protocolVersion\""' "$base" "$body"
+          echo "mcp initialize ok"

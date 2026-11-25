@@ -42,9 +42,22 @@ use crate::store::Store;
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
 pub const LATEST_PROTOCOL: &str = "2025-11-25";
 
-/// Exactly the §8.1 text (Codex reads only this much). The length test pins
-/// it at or under 512 chars.
-pub const INSTRUCTIONS: &str = "Start with `create_app {examples}` or `add_example`, then customise with `commit`. New apps are empty shells until you build. Begin `open_app`, read (`read_files` batches, `search_code`), iterate `stage`→`check`→`ship`. Relay `user_message` verbatim. Guides: `docs {topic}`, /llms.txt.";
+/// What Outer is, in domain terms (Codex reads only this much). The length
+/// test pins it at or under 512 chars. It states facts about the domain —
+/// never workflow orders, and never how the model should behave.
+pub const INSTRUCTIONS: &str = "Outer is an app cloud for AI agents: each app is an Ilha + Void site at https://<slug>.outer.now, with code, a D1 database, files, secrets and scheduled jobs. Drafts stage edits, deploys build and publish, previews trial changes before going live. The docs tool lists the agent guides; /llms.txt is the full reference.";
+
+/// The stable public asset the `initialize` icons point at (Blume inlines
+/// `web/public/logo.svg` and serves it at `/logo.svg`; the owner is making
+/// a square one later, so this stays one constant).
+pub const SERVER_ICON_SRC: &str = "https://outer.now/logo.svg";
+/// The service homepage, served as `websiteUrl` in `initialize`.
+pub const SERVER_WEBSITE_URL: &str = "https://outer.now/";
+/// The annotation title for the server itself.
+pub const SERVER_TITLE: &str = "Outer";
+/// One sentence on what the server is, served as `description`.
+pub const SERVER_DESCRIPTION: &str =
+    "Outer is an agent's app cloud: it builds Ilha + Void web apps and serves them at https://<slug>.outer.now.";
 
 /// Largest `POST /mcp` body: one `commit` at the caps fits (spec §8.1).
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -629,9 +642,20 @@ async fn resolve_caller(state: &McpState, headers: &HeaderMap) -> Option<Princip
 }
 
 fn rpc_error(id: Option<Value>, code: i64, message: impl Into<String>) -> Response {
+    rpc_error_with_status(id, code, message, StatusCode::OK)
+}
+
+/// A JSON-RPC error with a non-200 transport status (the 400 the spec
+/// demands for an unsupported `MCP-Protocol-Version`).
+fn rpc_error_with_status(
+    id: Option<Value>,
+    code: i64,
+    message: impl Into<String>,
+    status: StatusCode,
+) -> Response {
     let id = id.unwrap_or(Value::Null);
     (
-        StatusCode::OK,
+        status,
         axum::Json(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -735,6 +759,16 @@ pub async fn mcp_handler(
 ) -> Response {
     let state = &app.mcp;
     let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+    // DNS-rebinding guard (2025-11-25 transport): a present `Origin` that is
+    // not an allowed page is refused with 403 before the body even loads. A
+    // missing `Origin` is fine — non-browser MCP clients do not send one.
+    if let Some(origin) = headers.get("origin") {
+        let origin = origin.to_str().unwrap_or("");
+        if !origin_allowed(origin) {
+            return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+        }
+    }
     let peer = parts
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
@@ -749,7 +783,6 @@ pub async fn mcp_handler(
                 .into_response();
         }
     };
-    let headers = parts.headers;
     let message: Value = match serde_json::from_slice(&body) {
         Ok(message) => message,
         Err(_) => return rpc_error(extract_id(&body), -32700, "Parse error"),
@@ -773,6 +806,24 @@ pub async fn mcp_handler(
         return rpc_error(id, -32600, "Invalid Request: missing method");
     };
     let params = message.get("params").cloned().unwrap_or(Value::Null);
+    // The 2025-06-18/2025-11-25 transport: after `initialize` negotiates the
+    // revision, the client repeats it on every request. An unsupported
+    // revision is the client's bug: 400 with a JSON-RPC error. `initialize`
+    // itself negotiates (unknown falls back to the newest), so only the
+    // other methods are checked.
+    if method != "initialize" {
+        if let Some(version) = headers.get("mcp-protocol-version") {
+            let version = version.to_str().unwrap_or("").trim();
+            if !PROTOCOL_VERSIONS.contains(&version) {
+                return rpc_error_with_status(
+                    id.clone(),
+                    -32600,
+                    format!("Invalid Request: unsupported MCP-Protocol-Version {version:?}"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        }
+    }
 
     match method {
         "initialize" => {
@@ -797,13 +848,17 @@ pub async fn mcp_handler(
             let tools: Vec<Value> = registry::registry()
                 .iter()
                 .map(|t| {
-                    json!({
+                    let mut entry = json!({
                         "name": t.name,
                         "title": registry::title_of(t.name),
                         "description": t.description,
                         "inputSchema": t.input_schema,
                         "annotations": t.hints.to_json(&registry::title_of(t.name)),
-                    })
+                    });
+                    if let Some(schema) = &t.output_schema {
+                        entry["outputSchema"] = schema.clone();
+                    }
+                    entry
                 })
                 .collect();
             rpc_result(id, json!({"tools": tools}))
@@ -815,7 +870,19 @@ pub async fn mcp_handler(
             };
             handle_call(state, &headers, peer, id, &params).await
         }
-        _ if method.starts_with("notifications/") => StatusCode::ACCEPTED.into_response(),
+        _ if method.starts_with("notifications/") => {
+            match id {
+                // A notification carries no `id` by definition; one that
+                // does is a malformed request, answered with a JSON-RPC
+                // error instead of the bare 202.
+                Some(id) => rpc_error(
+                    Some(id),
+                    -32600,
+                    "Invalid Request: notifications must not include an id",
+                ),
+                None => StatusCode::ACCEPTED.into_response(),
+            }
+        }
         _ => {
             if notification {
                 return StatusCode::ACCEPTED.into_response();
@@ -882,10 +949,64 @@ async fn handle_initialize(
         json!({
             "protocolVersion": negotiated,
             "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "outer", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {
+                "name": "outer",
+                "title": SERVER_TITLE,
+                "version": env!("CARGO_PKG_VERSION"),
+                "description": SERVER_DESCRIPTION,
+                "websiteUrl": SERVER_WEBSITE_URL,
+                "icons": [{"src": SERVER_ICON_SRC, "mimeType": "image/svg+xml", "sizes": ["any"]}],
+            },
             "instructions": INSTRUCTIONS,
         }),
     )
+}
+
+/// Whether a present `Origin` header comes from a page the MCP endpoint
+/// serves. Browsers send `Origin` on cross-site POSTs; non-browser MCP
+/// clients (CLIs, IDE agents, directory backends) send none, and a missing
+/// header is therefore allowed. Anything else — including `"null"` — is
+/// refused: only our own site and the directory clients' web origins may
+/// drive the endpoint from a browser.
+fn origin_allowed(origin: &str) -> bool {
+    let Some(host) = origin_host(origin) else {
+        return false;
+    };
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return true;
+    }
+    // Our own site, plus the web origins the directory clients connect
+    // from (custom connectors and MCP apps run in their pages).
+    const SUFFIXES: &[&str] = &["outer.now", "claude.ai", "chatgpt.com", "openai.com"];
+    SUFFIXES
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
+/// The lowercase host of an `Origin` header value, or `None` when it is not
+/// an `http(s)` origin at all.
+fn origin_host(origin: &str) -> Option<String> {
+    let (scheme, rest) = origin.trim().split_once("://")?;
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next()?
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            host
+        } else {
+            authority
+        }
+    } else {
+        authority
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
 }
 
 async fn handle_call(

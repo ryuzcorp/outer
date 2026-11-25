@@ -172,7 +172,7 @@ handoff_to() {
     docker rm -f outer-next >/dev/null 2>&1 || true
     # Same volumes, env, caps and host network as the compose service
     # (deploy/compose.yaml): the newcomer is the service, started by hand.
-    docker run -d --pull=never --name outer-next --network host \
+    docker run -d --pull=never --name outer-next --network host --log-opt max-size=50m --log-opt max-file=5 \
         --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add SYS_ADMIN \
         --security-opt apparmor:unconfined \
         --env-file /srv/outer/outer.env \
