@@ -39,21 +39,20 @@ pub struct DeleteAccountInput {
 pub async fn about(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let keys_url = format!("{}/keys", ctx.state.platform_url());
     let structured = json!({
-        "what": "Outer is your agent's own app cloud, built on Ilha. Your agent talks to Outer, Outer builds the app and serves it at https://<slug>.outer.now.",
+        "what": "Outer is an agent's app cloud, built on Ilha. An agent talks to Outer, Outer builds the app and serves it at https://<slug>.outer.now.",
         "connect": format!(
             "Claude, Codex and ChatGPT sign in through OAuth automatically. Clients without OAuth: sign in at {keys_url} and send `Authorization: Bearer <key>`."
         ),
         "rules": [
-            "Call docs {topic: \"ilha\"} before writing code.",
-            "create_app {examples}, then add_example, then commit (prefer edits). Every code tool waits for the deploy.",
-            "New apps are empty shells until you build: start from create_app {examples} or add_example, then customise.",
-            "Relay user_message to your human verbatim.",
+            "The ilha guide covers writing code for these apps.",
+            "create_app seeds an app and deploys it; add_example adds a ready feature; commit changes files and deploys.",
+            "New apps are empty shells until built.",
         ],
         "plans": "Free: 2 apps, 40 code changes and 30 build minutes/day. Pro: 20 apps, 1,000 changes and 300 build minutes/day. See docs {topic: \"limits\"}.",
     });
     Ok(ok(
         format!(
-            "Outer hosts Ilha apps at https://<slug>.outer.now. Sign in with OAuth (or get a key at {keys_url}), create_app, then commit. Relay any user_message verbatim."
+            "Outer hosts Ilha apps at https://<slug>.outer.now. OAuth sign-in is automatic (or get a key at {keys_url}); create_app seeds an app, commit changes it."
         ),
         structured,
     ))

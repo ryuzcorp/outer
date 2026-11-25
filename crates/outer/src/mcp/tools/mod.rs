@@ -102,6 +102,8 @@ pub fn ok(summary: impl Into<String>, structured: Value) -> Value {
 }
 
 /// Like [`ok`], but `data` follows the §8.4 notice as its own text block.
+/// The same notice is embedded in `structuredContent` (`untrusted_notice`),
+/// so untrusted data stays framed for clients that read past `content`.
 pub fn ok_untrusted(
     summary: impl Into<String>,
     data: impl Into<String>,
@@ -109,8 +111,25 @@ pub fn ok_untrusted(
 ) -> Value {
     json!({
         "content": [text_block(summary.into()), text_block(format!("{UNTRUSTED_NOTICE}\n\n{}", data.into()))],
-        "structuredContent": structured,
+        "structuredContent": frame_untrusted(structured),
     })
+}
+
+/// Embed the §8.4 notice in a `structuredContent` value carrying untrusted
+/// data: objects gain the `untrusted_notice` key (every other key is
+/// untouched, so advertised `outputSchema` shapes stay accurate); anything
+/// else rides under `data` next to the notice.
+pub fn frame_untrusted(structured: Value) -> Value {
+    match structured {
+        Value::Object(mut map) => {
+            map.insert(
+                "untrusted_notice".to_string(),
+                Value::String(UNTRUSTED_NOTICE.to_string()),
+            );
+            Value::Object(map)
+        }
+        data => json!({"untrusted_notice": UNTRUSTED_NOTICE, "data": data}),
+    }
 }
 
 /// Parse `args` (which must be an object, or missing) into the tool's input.
