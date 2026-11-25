@@ -178,15 +178,17 @@ fn hostile_fleet_limits_bound_memory_cpu_and_pids() {
     }
 }
 
-/// Fleet AND build leaves carry cpu.max (spec §12.7 gate): both quotas
-/// parse as cgroup v2 `"quota period"`, and the leaves the constructors
-/// write carry the configured value — so the spinner fixture runs under a
-/// real quota whichever phase (fleet or build) it escapes into.
+/// Fleet AND build leaves carry cpu.max (spec §12.7 gate): all three quotas
+/// parse as cgroup v2 `"quota period"`, the fleet leaf carries the fleet
+/// quota and the build leaf its own, looser one — so a hostile build that
+/// busy-loops is capped without stalling install/bundling under the
+/// half-core fleet quota.
 #[test]
 fn hostile_cgroup_config_sets_cpu_max_for_fleets_and_builds() {
     for cpu in [
         outer::fleet::cgroups::FLEET_CPU_MAX_FREE,
         outer::fleet::cgroups::FLEET_CPU_MAX_PRO,
+        outer::fleet::cgroups::BUILD_CPU_MAX,
     ] {
         let (quota, period) = cpu.split_once(' ').expect("cpu.max is quota and period");
         assert!(
@@ -198,6 +200,23 @@ fn hostile_cgroup_config_sets_cpu_max_for_fleets_and_builds() {
             "cpu period is positive: {cpu:?}"
         );
     }
+    // The build quota is looser than the fleet's: installs must not stall.
+    let build_quota: u64 = outer::fleet::cgroups::BUILD_CPU_MAX
+        .split_once(' ')
+        .expect("quota period")
+        .0
+        .parse()
+        .expect("quota");
+    let fleet_quota: u64 = outer::fleet::cgroups::FLEET_CPU_MAX_FREE
+        .split_once(' ')
+        .expect("quota period")
+        .0
+        .parse()
+        .expect("quota");
+    assert!(
+        build_quota > fleet_quota,
+        "build quota {build_quota} must exceed the fleet quota {fleet_quota}"
+    );
     let dir = tempfile::tempdir().expect("tempdir");
     let fleet = outer::fleet::cgroups::ensure_fleet_leaf(
         dir.path(),
@@ -218,14 +237,14 @@ fn hostile_cgroup_config_sets_cpu_max_for_fleets_and_builds() {
         dir.path(),
         "build-1",
         2 * 1024 * 1024 * 1024,
-        outer::fleet::cgroups::FLEET_CPU_MAX_FREE,
+        outer::fleet::cgroups::BUILD_CPU_MAX,
     )
     .expect("build leaf");
     assert_eq!(
         std::fs::read_to_string(build.join("cpu.max"))
             .expect("build cpu.max")
             .trim(),
-        outer::fleet::cgroups::FLEET_CPU_MAX_FREE
+        outer::fleet::cgroups::BUILD_CPU_MAX
     );
 }
 
@@ -557,7 +576,7 @@ async fn hostile_export_carries_no_secret_values() {
             },
             step_timeout: std::time::Duration::from_secs(120),
             cgroups: None,
-            cpu_max: "50000 100000".to_string(),
+            build_cpu_max: "200000 100000".to_string(),
             apps_domain: "example.com".to_string(),
             cache_purge: None,
             jev: None,
@@ -964,11 +983,14 @@ fn chown(path: &Path, uid: u32, gid: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
 }
 
-/// The fleet/build cpu.max quota under test (`OUTER_FLEET_CPU_MAX`, default
-/// the `serve` default): the privileged leaves mirror what production
-/// writes, so the spinner probes the real quota.
+/// The cpu.max quotas under test (`OUTER_FLEET_CPU_MAX` / `OUTER_BUILD_CPU_MAX`,
+/// defaults the `serve` defaults): the privileged leaves mirror what
+/// production writes, so the probes run under the real quotas.
 fn fleet_cpu_max() -> String {
     std::env::var("OUTER_FLEET_CPU_MAX").unwrap_or_else(|_| "50000 100000".to_string())
+}
+fn build_cpu_max() -> String {
+    std::env::var("OUTER_BUILD_CPU_MAX").unwrap_or_else(|_| "200000 100000".to_string())
 }
 
 /// The real build path: `build-probe.mjs` through `run_sandboxed` as an app
@@ -1073,7 +1095,7 @@ async fn hostile_build_probes_are_contained() {
 
     let anchor = PathBuf::from("/sys/fs/cgroup");
     let leaf_name = format!("hostile-{}", std::process::id());
-    let Some(leaf) = make_leaf(&anchor, &leaf_name, "536870912", "512", &fleet_cpu_max()) else {
+    let Some(leaf) = make_leaf(&anchor, &leaf_name, "536870912", "512", &build_cpu_max()) else {
         return;
     };
     let own = format!("0::/{}", leaf_name);
@@ -1169,10 +1191,10 @@ async fn hostile_build_probes_are_contained() {
 }
 
 /// CPU quota and neighbour latency (spec §12.7 M3 gate): a spinner
-/// busy-looping on up to 8 cores in a leaf capped at the fleet cpu.max quota
+/// busy-looping on up to 8 cores in a leaf capped at the build cpu.max quota
 /// must burn no more than the quota allows (measured from the leaf's
 /// cpu.stat), while a well-behaved neighbour serving /health in its own
-/// capped leaf keeps its loopback p95 within the probe's bound. Needs root,
+/// fleet-capped leaf keeps its loopback p95 within the probe's bound. Needs root,
 /// a writable cgroupfs with delegation and a JS runtime. Run with
 /// `cargo test --locked -- --ignored hostile`.
 #[tokio::test]
@@ -1196,17 +1218,17 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
     }
     // 2 GiB spinner leaf (the build-leaf size): the per-CPU runtimes are
     // small but 8 of them must never OOM, or a memory kill pollutes a CPU
-    // experiment. Memory size is irrelevant to the assertions; the quota
-    // under test is cpu.max. The neighbour leaf is the fleet size.
+    // experiment. Memory size is irrelevant to the assertions. The spinner
+    // mirrors a build (build quota) and the neighbour a fleet (fleet quota),
+    // exactly the leaves production writes.
     let anchor = PathBuf::from("/sys/fs/cgroup");
     let tag = std::process::id();
-    let quota = fleet_cpu_max();
     let Some(spin_leaf) = make_leaf(
         &anchor,
         &format!("hostile-spin-{tag}"),
         "2147483648",
         "512",
-        &quota,
+        &build_cpu_max(),
     ) else {
         return;
     };
@@ -1215,7 +1237,7 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
         &format!("hostile-neigh-{tag}"),
         "536870912",
         "512",
-        &quota,
+        &fleet_cpu_max(),
     ) else {
         kill_leaf(&spin_leaf);
         return;

@@ -208,13 +208,15 @@ log "loopback target serves at $TARGET"
 # delegation) skips instead of running uncapped.
 LEAF="$ANCHOR/hostile-$(date +%s)-$$"
 mkdir "$LEAF" || skip "cannot create cgroup leaf under $ANCHOR"
-for spec in "memory.max 536870912" "pids.max 512" "cpu.max ${OUTER_FLEET_CPU_MAX:-50000 100000}"; do
+for spec in "memory.max 536870912" "pids.max 512" "cpu.max ${OUTER_BUILD_CPU_MAX:-200000 100000}"; do
     # shellcheck disable=SC2086
     set -- $spec
-    echo "$2" > "$LEAF/$1" 2>/dev/null || skip "cannot write $LEAF/$1 (no delegation?)"
-    [ "$(cat "$LEAF/$1")" = "$2" ] || skip "$1 did not apply (wrote $2, have $(cat "$LEAF/$1"))"
+    # A bare quota would keep the kernel's default period; write the full
+    # value so the leaf carries exactly the configured quota and period.
+    echo "$2${3:+ $3}" > "$LEAF/$1" 2>/dev/null || skip "cannot write $LEAF/$1 (no delegation?)"
+    [ "$(cat "$LEAF/$1")" = "$2${3:+ $3}" ] || skip "$1 did not apply (wrote $2, have $(cat "$LEAF/$1"))"
 done
-log "leaf $LEAF carries memory.max=536870912 pids.max=512 cpu.max=${OUTER_FLEET_CPU_MAX:-50000 100000}"
+log "leaf $LEAF carries memory.max=536870912 pids.max=512 cpu.max=${OUTER_BUILD_CPU_MAX:-200000 100000}"
 
 # The child's explicit env, mirroring sandbox.rs: base vars plus the HOSTILE_*
 # fixture pointers. Reserved platform names an app must never set are
@@ -327,32 +329,36 @@ log "done: every must-fail build probe stayed contained"
 
 # --- CPU-spin and neighbour-p95 layer (spec §12.7 M3 gate) ---
 #
-# A hostile busy-loop in a leaf capped at the fleet cpu.max quota must burn
-# no more than the quota allows (the fixture measures its own cpu.stat),
-# while a well-behaved neighbour serving /health in its own capped leaf
-# keeps its loopback p95 within the probe's bound (at most twice the idle
-# baseline, or the baseline plus 50 ms of shared-vCore scheduling slack).
+# A hostile build busy-looping in a leaf capped at the build cpu.max quota
+# (`OUTER_BUILD_CPU_MAX`, default two CPUs) must burn no more than the quota
+# allows (the fixture measures its own cpu.stat), while a well-behaved
+# neighbour serving /health in its own fleet-capped leaf
+# (`OUTER_FLEET_CPU_MAX`) keeps its loopback p95 within the probe's bound
+# (at most twice the idle baseline, or the baseline plus 50 ms of
+# shared-vCore scheduling slack). The spinner mirrors a build, the neighbour
+# a fleet — exactly the leaves production writes.
 # Bounded: each probe runs under `timeout 90` but the layer settles in
 # ~25 s; the EXIT trap above kills both runners and removes both leaves.
 # Read-only toward prod data: only the nft table is listed (above), the
 # fixture dirs below are fresh temp dirs, and the uids need no cleanup.
-CPU_QUOTA="${OUTER_FLEET_CPU_MAX:-50000 100000}"
+BUILD_QUOTA="${OUTER_BUILD_CPU_MAX:-200000 100000}"
+FLEET_QUOTA="${OUTER_FLEET_CPU_MAX:-50000 100000}"
 SPIN_LEAF="$ANCHOR/hostile-spin-$(date +%s)-$$"
 NEIGH_LEAF="$ANCHOR/hostile-neigh-$(date +%s)-$$"
 mkleaf() {
-    _leaf="$1"; _mem="$2"
-    for spec in "memory.max $_mem" "pids.max 512" "cpu.max $CPU_QUOTA"; do
+    _leaf="$1"; _mem="$2"; _cpu="$3"
+    for spec in "memory.max $_mem" "pids.max 512" "cpu.max $_cpu"; do
         # shellcheck disable=SC2086
         set -- $spec
-        echo "$2" > "$_leaf/$1" 2>/dev/null || skip "cannot write $_leaf/$1 (no delegation?)"
-        [ "$(cat "$_leaf/$1")" = "$2" ] || skip "$1 did not apply (wrote $2, have $(cat "$_leaf/$1"))"
+        echo "$2${3:+ $3}" > "$_leaf/$1" 2>/dev/null || skip "cannot write $_leaf/$1 (no delegation?)"
+        [ "$(cat "$_leaf/$1")" = "$2${3:+ $3}" ] || skip "$1 did not apply (wrote $2, have $(cat "$_leaf/$1"))"
     done
 }
 mkdir "$SPIN_LEAF" || skip "cannot create cgroup leaf under $ANCHOR"
 mkdir "$NEIGH_LEAF" || skip "cannot create cgroup leaf under $ANCHOR"
-mkleaf "$SPIN_LEAF" 2147483648
-mkleaf "$NEIGH_LEAF" 536870912
-log "cpu leaves carry cpu.max=$CPU_QUOTA"
+mkleaf "$SPIN_LEAF" 2147483648 "$BUILD_QUOTA"
+mkleaf "$NEIGH_LEAF" 536870912 "$FLEET_QUOTA"
+log "spin leaf carries cpu.max=$BUILD_QUOTA, neighbour leaf cpu.max=$FLEET_QUOTA"
 SPIN_WORK="$BASE/work/spin"
 NEIGH_WORK="$BASE/work/neigh"
 mkdir -p "$SPIN_WORK" "$NEIGH_WORK" "$BASE/home-spin" "$BASE/tmp-spin" "$BASE/home-neigh" "$BASE/tmp-neigh"

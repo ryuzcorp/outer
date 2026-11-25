@@ -333,7 +333,7 @@ async fn platform(config: &Config) -> anyhow::Result<Platform> {
             storage,
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
-            cpu_max: rt.fleet_cpu_max.clone(),
+            build_cpu_max: rt.build_cpu_max.clone(),
             apps_domain: rt.apps_domain.clone(),
             cache_purge: cache_purge(config),
             jev,
@@ -957,7 +957,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             step_timeout: Duration::from_secs(120),
             cgroups: cgroups(),
             apps_domain: rt.apps_domain.clone(),
-            cpu_max: rt.fleet_cpu_max.clone(),
+            build_cpu_max: rt.build_cpu_max.clone(),
             cache_purge: cache_purge(&config),
             jev: jev.clone(),
             // The migrate step wakes a sleeping fleet before applying D1

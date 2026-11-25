@@ -20,6 +20,10 @@ pub const FLEET_PIDS_MAX: u64 = 4096;
 /// (bytes for memory.max, `"MAX PERIOD"` for cpu.max) is what matters here.
 pub const FLEET_CPU_MAX_FREE: &str = "50000 100000";
 pub const FLEET_CPU_MAX_PRO: &str = "100000 100000";
+/// Build leaves get their own, looser quota (`OUTER_BUILD_CPU_MAX`): bun
+/// install and bundling stall under the half-core fleet quota, but a hostile
+/// build still busy-loops under this cap instead of starving neighbours.
+pub const BUILD_CPU_MAX: &str = "200000 100000";
 
 /// Everything `setup` needs to find and lay out, so tests can point `root`
 /// at a temp dir faking cgroupfs files.
@@ -786,7 +790,7 @@ mod tests {
             "10"
         );
         let leaf =
-            ensure_build_leaf(&parent, "build-1", 1024 * 1024 * 1024, FLEET_CPU_MAX_FREE).unwrap();
+            ensure_build_leaf(&parent, "build-1", 1024 * 1024 * 1024, BUILD_CPU_MAX).unwrap();
         assert_eq!(
             std::fs::read_to_string(leaf.join("memory.max"))
                 .unwrap()
@@ -801,12 +805,13 @@ mod tests {
                 .trim(),
             BUILD_PIDS_MAX.to_string()
         );
-        // A hostile build busy-loops under the same quota as a fleet.
+        // A hostile build busy-loops under the build quota, looser than the
+        // fleet's so install/bundling are not stalled.
         assert_eq!(
             std::fs::read_to_string(leaf.join("cpu.max"))
                 .unwrap()
                 .trim(),
-            FLEET_CPU_MAX_FREE
+            BUILD_CPU_MAX
         );
     }
 

@@ -1,9 +1,10 @@
 // CPU-spin probe: a hostile tenant busy-looping on every core. The harness
 // (`hostile_cpu_spin_is_capped_and_neighbour_keeps_p95`) or
 // `scripts/hostile-probe-vps.sh` runs this inside a cgroup leaf whose
-// cpu.max is the fleet quota (`OUTER_FLEET_CPU_MAX`, default
-// `"50000 100000"`). The probe spawns one busy child per CPU, then measures
-// its own usage from the leaf's `cpu.stat` against the quota.
+// cpu.max is the build quota (`OUTER_BUILD_CPU_MAX`, default `"200000
+// 100000"`): the spinner mirrors a hostile build. The probe spawns one busy
+// child per CPU, then measures its own usage from the leaf's `cpu.stat`
+// against the quota.
 //
 // Verdict follows the fail-closed convention for must-fail probes:
 // contained (usage within quota plus tolerance) reports `ok: false`; a leak
@@ -14,9 +15,10 @@
 // enforces cpu.max per period (100 ms), so over a ~15 s window (150+
 // periods) boundary effects are under 2%; spawn/stop skew and cpu.stat
 // sampling add a few percent more. 20% headroom absorbs all of that without
-// masking a missing cap: uncapped, N busy children burn N CPUs, i.e.
-// N/quota-share times the allowance (16x on the 8-core VPS at the default
-// half-CPU quota, 4x even on 2 cores).
+// masking a missing cap: uncapped, N busy children burn N CPUs — 4x the
+// default two-CPU build quota with 8 children on the 8-core VPS the suite
+// runs on. (On a 2-core box an uncapped 2-thread spin would exactly match
+// the quota, so the gate is VPS-only by design.)
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { cpus } from "node:os";
@@ -76,9 +78,9 @@ const period = Number(cpuMax[1]);
 // `max <period>` means uncapped: any usage fits, which the harness treats as
 // a setup failure (the leaf must carry the quota), not a pass.
 try {
-  // At most 8 busy children: enough to saturate the quota on any host the
-  // suite runs on (uncapped, 8 threads still burn 16x the default half-CPU
-  // allowance), while bounding runtime footprint so the leaf's memory.max —
+  // At most 8 busy children: enough to saturate the quota on the 8-core VPS
+  // the suite runs on (uncapped, 8 threads burn 4x the default two-CPU build
+  // quota), while bounding runtime footprint so the leaf's memory.max —
   // sized for the experiment, not the assertion — never OOM-kills a spinner
   // and turns a CPU test into a memory one.
   const ncpus = Math.min(cpus().length, 8);
