@@ -17,7 +17,8 @@ User=cloudflared
 Group=cloudflared
 StateDirectory=cloudflared
 Environment=HOME=/var/lib/cloudflared
-ExecStart=/usr/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run --no-autoupdate
+# --no-autoupdate is a `tunnel` flag: after `run` it is an unknown flag.
+ExecStart=/usr/bin/cloudflared tunnel --config /etc/cloudflared/config.yml --no-autoupdate run
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

@@ -154,7 +154,9 @@ if [[ ! -f /etc/apt/sources.list.d/cloudflared.list ]]; then
     curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
         -o /etc/apt/keyrings/cloudflare-main.gpg
     chmod a+r /etc/apt/keyrings/cloudflare-main.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared ${CODENAME} main" \
+    # `any`, not the release codename: Cloudflare publishes one suite for
+    # every Debian/Ubuntu release (there is no resolute/26.04 suite).
+    echo "deb [signed-by=/etc/apt/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
         >/etc/apt/sources.list.d/cloudflared.list
 fi
 apt-get update -qq
