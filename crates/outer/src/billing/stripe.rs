@@ -44,9 +44,12 @@ pub fn form_encode(raw: &str) -> String {
 
 /// The `POST /v1/checkout/sessions` body (spec §14.2): subscription mode,
 /// the Pro price, the account as client reference and metadata, the payer's
-/// email, Stripe Tax on, billing address required, and the launch coupon
-/// when one is passed (only while the promo runs in Stripe). Pure so tests
-/// pin the exact params against a fake Stripe instead of the network.
+/// email, Stripe Tax on, billing address required, the launch coupon when
+/// one is passed (only while the promo runs in Stripe), and the seller
+/// identity as `custom_text[submit][message]` when one is passed (read from
+/// the host legal dir per checkout; `None` on localhost dev without the
+/// dir sends no custom text). Pure so tests pin the exact params against a
+/// fake Stripe instead of the network.
 ///
 /// A stored `customer` reuses that Stripe customer so a second checkout can
 /// never open a second customer record; Stripe rejects `customer` and
@@ -60,6 +63,7 @@ pub fn checkout_form(
     customer: Option<&str>,
     success_url: &str,
     coupon: Option<&str>,
+    notice: Option<&str>,
 ) -> String {
     let mut pairs = vec![
         ("mode", "subscription".to_string()),
@@ -78,6 +82,9 @@ pub fn checkout_form(
     pairs.push(("billing_address_collection", "required".to_string()));
     if let Some(coupon) = coupon {
         pairs.push(("discounts[0][coupon]", coupon.to_string()));
+    }
+    if let Some(notice) = notice {
+        pairs.push(("custom_text[submit][message]", notice.to_string()));
     }
     pairs
         .iter()
@@ -323,13 +330,17 @@ impl StripeClient {
     /// Stripe customer (Stripe rejects `customer` with `customer_email`,
     /// so the email is only sent when there is no customer yet). The launch
     /// coupon rides along only while [`Self::launch_discount_active`] says
-    /// the promo runs.
+    /// the promo runs. `notice` is the host's `checkout-notice.txt` (or
+    /// `None` on localhost dev without the legal dir): the seller identity
+    /// the law requires before a paid contract, shown as
+    /// `custom_text[submit][message]`.
     pub async fn create_checkout_session(
         &self,
         account_id: &str,
         email: &str,
         customer: Option<&str>,
         success_url: &str,
+        notice: Option<&str>,
     ) -> anyhow::Result<CheckoutSession> {
         let coupon = if self.launch_discount_active().await {
             self.launch_coupon.as_deref()
@@ -343,6 +354,7 @@ impl StripeClient {
             customer,
             success_url,
             coupon,
+            notice,
         );
         session_url(&self.post("/v1/checkout/sessions", &form).await?)
     }
@@ -450,6 +462,7 @@ mod tests {
             None,
             "https://outer.now/billing/done",
             Some("launch50"),
+            Some("Seller: Example Sp. z o.o."),
         );
         for param in [
             "mode=subscription",
@@ -462,9 +475,30 @@ mod tests {
             "automatic_tax%5Benabled%5D=true",
             "billing_address_collection=required",
             "discounts%5B0%5D%5Bcoupon%5D=launch50",
+            // The seller identity rides verbatim as custom_text[submit][message].
+            "custom_text%5Bsubmit%5D%5Bmessage%5D=Seller%3A+Example+Sp.+z+o.o.",
         ] {
             assert!(form.contains(param), "missing {param} in {form}");
         }
+    }
+
+    /// No legal dir on localhost dev: no notice, so the form carries no
+    /// `custom_text` at all.
+    #[test]
+    fn checkout_form_omits_custom_text_without_a_notice() {
+        let form = checkout_form(
+            "price_pro",
+            "acct-1",
+            "me@example.com",
+            None,
+            "https://outer.now/billing/done",
+            None,
+            None,
+        );
+        assert!(
+            !form.contains("custom_text"),
+            "unexpected custom_text in {form}"
+        );
     }
 
     #[test]
@@ -475,6 +509,7 @@ mod tests {
             "me@example.com",
             None,
             "https://outer.now/billing/done",
+            None,
             None,
         );
         assert!(!form.contains("coupon"), "unexpected coupon in {form}");
@@ -491,6 +526,7 @@ mod tests {
             "me@example.com",
             Some("cus_1"),
             "https://outer.now/billing/done",
+            None,
             None,
         );
         assert!(form.contains("customer=cus_1"), "{form}");
@@ -767,6 +803,7 @@ mod tests {
                 "me@example.com",
                 None,
                 "https://outer.now/billing/done",
+                Some("Seller: Example Sp. z o.o."),
             )
             .await
             .unwrap();
@@ -790,6 +827,7 @@ mod tests {
             "client_reference_id=acct-1",
             "metadata%5Baccount_id%5D=acct-1",
             "customer_email=me%40example.com",
+            "custom_text%5Bsubmit%5D%5Bmessage%5D=Seller%3A+Example+Sp.+z+o.o.",
         ] {
             assert!(
                 call.body.contains(param),
@@ -809,6 +847,7 @@ mod tests {
                 "me@example.com",
                 None,
                 "https://outer.now/billing/done",
+                None,
             )
             .await
             .unwrap();
@@ -838,6 +877,7 @@ mod tests {
                 "me@example.com",
                 None,
                 "https://outer.now/billing/done",
+                None,
             )
             .await
             .unwrap();
@@ -872,6 +912,7 @@ mod tests {
                 "me@example.com",
                 None,
                 "https://outer.now/billing/done",
+                None,
             )
             .await
             .unwrap();
@@ -901,6 +942,7 @@ mod tests {
                 "me@example.com",
                 None,
                 "https://outer.now/billing/done",
+                None,
             )
             .await
             .unwrap();
@@ -925,6 +967,7 @@ mod tests {
                 "me@example.com",
                 None,
                 "https://outer.now/billing/done",
+                None,
             )
             .await
             .unwrap();
@@ -950,6 +993,7 @@ mod tests {
                     "me@example.com",
                     None,
                     "https://outer.now/billing/done",
+                    None,
                 )
                 .await
                 .unwrap();
