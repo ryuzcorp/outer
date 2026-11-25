@@ -268,9 +268,6 @@ impl std::fmt::Debug for Config {
             .field("data_dir", &self.data_dir)
             .field("site_dir", &self.site_dir)
             .field("listen", &self.listen)
-            .field("tls_cert", &self.tls_cert)
-            .field("tls_key", &self.tls_key)
-            .field("origin_pull_ca", &self.origin_pull_ca)
             .field("host_id", &self.host_id)
             .field("store", &self.store)
             .field("cloudflare", &self.cloudflare)
@@ -296,14 +293,10 @@ pub struct Config {
     pub site_dir: PathBuf,
     /// SQLite, git mirrors, worktrees and caches (`OUTER_DATA`).
     pub data_dir: PathBuf,
-    /// Listener (`OUTER_LISTEN`); TLS when the TLS triple below is set.
+    /// Listener (`OUTER_LISTEN`): loopback-only off localhost (production
+    /// ingress is the cloudflared tunnel on the host), anything on localhost
+    /// dev.
     pub listen: SocketAddr,
-    /// Origin-cert PEM chain (`OUTER_TLS_CERT`); all three TLS paths set or none.
-    pub tls_cert: Option<PathBuf>,
-    /// Origin-cert private key PEM (`OUTER_TLS_KEY`).
-    pub tls_key: Option<PathBuf>,
-    /// Origin-pull client-CA PEM (`OUTER_ORIGIN_PULL_CA`).
-    pub origin_pull_ca: Option<PathBuf>,
     /// This host's identity for the snapshot owner fence (`OUTER_HOST_ID`).
     pub host_id: String,
     /// `OUTER_STORE=r2|memory` plus the R2 variables.
@@ -452,10 +445,16 @@ impl Config {
                     .expect("default listen address parses")
             }
         };
-        let opt_path = |name: &str| get(name).map(PathBuf::from);
-        let tls_cert = opt_path("OUTER_TLS_CERT");
-        let tls_key = opt_path("OUTER_TLS_KEY");
-        let origin_pull_ca = opt_path("OUTER_ORIGIN_PULL_CA");
+        // Removed in the tunnel cutover: TLS now terminates at Cloudflare and
+        // the origin is reached through cloudflared, so a stale outer.env
+        // carrying the old triple must fail loud here, never boot half-migrated.
+        for name in ["OUTER_TLS_CERT", "OUTER_TLS_KEY", "OUTER_ORIGIN_PULL_CA"] {
+            if get(name).is_some() {
+                problems.push(format!(
+                    "{name} was removed: the origin is now the Cloudflare Tunnel (cloudflared on the host forwards to the loopback listener); delete {name} from outer.env"
+                ));
+            }
+        }
         let host_id = get("OUTER_HOST_ID")
             .map(str::to_string)
             .or_else(|| {
@@ -732,9 +731,6 @@ impl Config {
             data_dir,
             site_dir,
             listen,
-            tls_cert,
-            tls_key,
-            origin_pull_ca,
             host_id,
             store,
             cloudflare,
@@ -774,27 +770,10 @@ impl Config {
         if !is_hostname(&self.domain) {
             problems.push(format!("OUTER_DOMAIN={:?} is not a hostname", self.domain));
         }
-        let tls = [
-            ("OUTER_TLS_CERT", &self.tls_cert),
-            ("OUTER_TLS_KEY", &self.tls_key),
-            ("OUTER_ORIGIN_PULL_CA", &self.origin_pull_ca),
-        ];
-        let tls_set = tls.iter().filter(|(_, p)| p.is_some()).count();
-        if tls_set > 0 && tls_set < 3 {
-            let missing = tls
-                .iter()
-                .filter(|(_, p)| p.is_none())
-                .map(|(name, _)| *name)
-                .collect::<Vec<_>>()
-                .join(", ");
+        if !self.is_local() && !self.listen.ip().is_loopback() {
             problems.push(format!(
-                "partial TLS config: OUTER_TLS_CERT, OUTER_TLS_KEY and OUTER_ORIGIN_PULL_CA must all be set or all be empty (missing {missing})"
-            ));
-        }
-        if !self.is_local() && tls_set < 3 {
-            problems.push(format!(
-                "OUTER_TLS_CERT, OUTER_TLS_KEY and OUTER_ORIGIN_PULL_CA are required when OUTER_DOMAIN={} is not a localhost dev domain",
-                self.domain
+                "OUTER_LISTEN={} must be a loopback address (127.0.0.0/8 or ::1) when OUTER_DOMAIN={} is not a localhost dev domain: production ingress is the cloudflared tunnel on the host, which forwards to 127.0.0.1:8443",
+                self.listen, self.domain
             ));
         }
         if self.store == StoreKind::Memory && !self.is_local() {
@@ -951,33 +930,6 @@ impl Config {
     /// The `localhost` family: dev-only settings are allowed here and nowhere else.
     pub fn is_local(&self) -> bool {
         is_local_domain(&self.domain)
-    }
-
-    /// TLS terminates locally with an origin-pull client-CA: the full triple is set.
-    pub fn tls_enabled(&self) -> bool {
-        self.tls_cert.is_some() && self.tls_key.is_some() && self.origin_pull_ca.is_some()
-    }
-
-    /// Boot-time file checks shared by `serve` and `check-config`: every file
-    /// the config points at that `serve` must read to listen (the TLS triple)
-    /// is read and parsed here first. Pure reads — no DB, no network, no
-    /// sockets — and every failure names the variable, never its value.
-    /// `validate` (above) already covers presence and consistency plus the
-    /// `OUTER_REVIEW_LOGINS_FILE` read; this covers readability, which used
-    /// to fail only at boot, after the old container was already stopping.
-    pub fn boot_file_problems(&self) -> Vec<String> {
-        let mut problems = Vec::new();
-        if self.tls_enabled() {
-            let files = crate::http::tls::TlsFiles {
-                cert: self.tls_cert.clone().expect("tls triple is set"),
-                key: self.tls_key.clone().expect("tls triple is set"),
-                ca: self.origin_pull_ca.clone().expect("tls triple is set"),
-            };
-            if let Err(err) = crate::http::tls::load_server_config(&files) {
-                problems.push(format!("{err:#}"));
-            }
-        }
-        problems
     }
 
     /// True when the platform oxfmt binary exists and is executable.
@@ -1204,7 +1156,6 @@ mod tests {
         assert_eq!(cfg.domain, "outer.localhost");
         assert_eq!(cfg.store, StoreKind::Memory);
         assert_eq!(cfg.listen, "127.0.0.1:8080".parse().unwrap());
-        assert!(!cfg.tls_enabled());
         assert_eq!(
             cfg.db_path(),
             std::env::current_dir().unwrap().join("data/outer.sqlite")
@@ -1215,9 +1166,6 @@ mod tests {
         let err = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
             ("OUTER_STORE", "memory"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
         ]))
         .unwrap_err();
         assert!(
@@ -1228,13 +1176,7 @@ mod tests {
 
     #[test]
     fn r2_reports_every_missing_variable_at_once() {
-        let err = Config::from_vars(&vars(&[
-            ("OUTER_DOMAIN", "outer.now"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
-        ]))
-        .unwrap_err();
+        let err = Config::from_vars(&vars(&[("OUTER_DOMAIN", "outer.now")])).unwrap_err();
         for name in [
             "OUTER_R2_ENDPOINT",
             "OUTER_R2_BUCKET",
@@ -1263,9 +1205,6 @@ mod tests {
             ("R2_SECRET_ACCESS_KEY", "s3cret"),
             ("CLOUDFLARE_ACCOUNT_ID", "acct"),
             ("CLOUDFLARE_API_TOKEN", "cf-token"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
             ("OUTER_TERMS_VERSION", "2026-10-23"),
             ("OUTER_ADMIN_EMAILS", " Owner@Example.com ,"),
             ("OUTER_SIGNUP", "closed"),
@@ -1309,9 +1248,6 @@ mod tests {
         let err = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
             ("OUTER_STORE", "memory"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
             ("OUTER_SIGNUP", "sometimes"),
             ("OUTER_OAUTH_ACCESS_TTL_S", "0"),
             ("OUTER_OAUTH_REFRESH_TTL_D", "0"),
@@ -1333,9 +1269,6 @@ mod tests {
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
             ("OUTER_STORE", "memory"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
             ("OUTER_TERMS_VERSION", "2026-10-23"),
             ("OUTER_SIGNUP", "open"),
             ("OUTER_OAUTH_ACCESS_TTL_S", "600"),
@@ -1375,9 +1308,6 @@ mod tests {
             ("OUTER_R2_BUCKET", "outer"),
             ("R2_ACCESS_KEY_ID", "key"),
             ("R2_SECRET_ACCESS_KEY", "secret"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
         ]))
         .unwrap_err();
         for name in ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"] {
@@ -1574,9 +1504,6 @@ mod tests {
             ("R2_SECRET_ACCESS_KEY", "s3cret"),
             ("CLOUDFLARE_ACCOUNT_ID", "acct"),
             ("CLOUDFLARE_API_TOKEN", "cf-token"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
             ("OUTER_TERMS_VERSION", "2026-10-23"),
             ("OUTER_SECRET", "test-outer-secret"),
             ("STRIPE_SECRET_KEY", "sk_test_1"),
@@ -1657,61 +1584,44 @@ mod tests {
     }
 
     #[test]
-    fn partial_tls_triple_is_rejected() {
-        for missing in ["OUTER_TLS_CERT", "OUTER_TLS_KEY", "OUTER_ORIGIN_PULL_CA"] {
-            let mut pairs = vec![
+    fn non_localhost_domain_requires_a_loopback_listen() {
+        for listen in ["[::]:443", "0.0.0.0:8443", "203.0.113.7:8443"] {
+            let err = Config::from_vars(&vars(&[
+                ("OUTER_DOMAIN", "outer.now"),
                 ("OUTER_STORE", "memory"),
-                ("OUTER_TLS_CERT", "/tls/cert.pem"),
-                ("OUTER_TLS_KEY", "/tls/key.pem"),
-                ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
-            ];
-            pairs.retain(|(name, _)| *name != missing);
-            let err = Config::from_vars(&vars(&pairs)).unwrap_err();
+                ("OUTER_LISTEN", listen),
+            ]))
+            .unwrap_err();
             assert!(
-                err.iter().any(|p| p.contains("partial TLS config")),
-                "missing partial-triple problem without {missing}: {err:?}"
-            );
-            assert!(
-                err.iter().any(|p| p.contains(missing)),
-                "missing variable name {missing} in {err:?}"
+                err.iter()
+                    .any(|p| p.contains("OUTER_LISTEN") && p.contains("loopback")),
+                "public listener {listen} must be refused: {err:?}"
             );
         }
-    }
-
-    #[test]
-    fn non_localhost_domain_requires_tls() {
+        // A loopback listener adds no problem of its own (the memory store
+        // still refuses off localhost for its own reason).
         let err = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
             ("OUTER_STORE", "memory"),
-            ("OUTER_TLS_CERT", "/tls/cert.pem"),
-            ("OUTER_TLS_KEY", "/tls/key.pem"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
+            ("OUTER_LISTEN", "127.0.0.1:8443"),
         ]))
         .unwrap_err();
         assert!(
-            !err.iter().any(|p| p.contains("OUTER_TLS_CERT")),
-            "full triple on a non-localhost domain must not raise TLS problems: {err:?}"
-        );
-        let err = Config::from_vars(&vars(&[
-            ("OUTER_DOMAIN", "outer.now"),
-            ("OUTER_STORE", "memory"),
-        ]))
-        .unwrap_err();
-        assert!(
-            err.iter()
-                .any(|p| p.contains("OUTER_TLS_CERT") && p.contains("outer.now")),
-            "non-localhost domain without TLS must be refused: {err:?}"
+            !err.iter().any(|p| p.contains("OUTER_LISTEN")),
+            "loopback listener must not raise listen problems: {err:?}"
         );
     }
 
     #[test]
-    fn localhost_without_tls_stays_valid() {
-        let cfg = Config::from_vars(&vars(&[
-            ("OUTER_DOMAIN", "apps.localhost"),
-            ("OUTER_STORE", "memory"),
-        ]))
-        .unwrap();
-        assert!(!cfg.tls_enabled());
+    fn localhost_listen_stays_unrestricted() {
+        for listen in ["127.0.0.1:8080", "[::]:8080", "0.0.0.0:8080"] {
+            let cfg = Config::from_vars(&vars(&[
+                ("OUTER_STORE", "memory"),
+                ("OUTER_LISTEN", listen),
+            ]))
+            .unwrap();
+            assert_eq!(cfg.listen.to_string(), listen);
+        }
     }
 
     #[test]
@@ -1924,6 +1834,7 @@ mod tests {
             ("STRIPE_WEBHOOK_SECRET", "whsec-NEVER-LEAK-5"),
             ("STRIPE_PRICE_PRO", "price-NEVER-LEAK-6"),
             ("OUTER_TERMS_VERSION", "2026-11-14"),
+            ("OUTER_LISTEN", "127.0.0.1:8443"),
             ("OUTER_SECRET", "outer-secret-NEVER-LEAK-7"),
         ];
         base.extend_from_slice(extra);
@@ -1940,81 +1851,27 @@ mod tests {
     }
 
     #[test]
-    fn boot_files_accept_localhost_without_tls() {
-        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
-        assert!(cfg.boot_file_problems().is_empty());
-    }
-
-    #[test]
-    fn boot_files_refuse_missing_tls_files_without_echoing_values() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
-        let cfg = Config::from_vars(&prod_vars(&[
-            ("OUTER_TLS_CERT", missing("origin.pem").as_str()),
-            ("OUTER_TLS_KEY", missing("origin.key").as_str()),
-            (
-                "OUTER_ORIGIN_PULL_CA",
-                missing("origin-pull-ca.pem").as_str(),
-            ),
-        ]))
-        .unwrap();
-        let problems = cfg.boot_file_problems();
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("OUTER_TLS_CERT"), "{problems:?}");
-        assert_no_secrets(&problems);
-    }
-
-    #[test]
-    fn boot_files_refuse_garbage_tls_pem_without_echoing_values() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["origin.pem", "origin.key", "origin-pull-ca.pem"] {
-            std::fs::write(dir.path().join(name), "not pem at all\n").unwrap();
+    fn removed_tls_vars_are_refused_without_echoing_values() {
+        for name in ["OUTER_TLS_CERT", "OUTER_TLS_KEY", "OUTER_ORIGIN_PULL_CA"] {
+            let err = Config::from_vars(&prod_vars(&[(name, "/tls/stale.pem")])).unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains(name) && p.contains("was removed")),
+                "{name} must be refused as removed: {err:?}"
+            );
+            assert_no_secrets(&err);
         }
-        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
-        let cfg = Config::from_vars(&prod_vars(&[
-            ("OUTER_TLS_CERT", path("origin.pem").as_str()),
-            ("OUTER_TLS_KEY", path("origin.key").as_str()),
-            ("OUTER_ORIGIN_PULL_CA", path("origin-pull-ca.pem").as_str()),
+        let err = Config::from_vars(&prod_vars(&[
+            ("OUTER_TLS_CERT", "/tls/origin.pem"),
+            ("OUTER_TLS_KEY", "/tls/origin.key"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
         ]))
-        .unwrap();
-        let problems = cfg.boot_file_problems();
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("OUTER_TLS_CERT"), "{problems:?}");
-        assert_no_secrets(&problems);
-    }
-
-    #[test]
-    fn boot_files_accept_a_valid_tls_triple() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ca_params = rcgen::CertificateParams::new(vec!["test CA".to_string()]).unwrap();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-        let issuer = rcgen::Issuer::new(ca_params, ca_key);
-        let params = rcgen::CertificateParams::new(vec!["outer.test".to_string()]).unwrap();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, &issuer).unwrap();
-        let blobs = [
-            ("OUTER_TLS_CERT", "origin.pem", cert.pem().into_bytes()),
-            (
-                "OUTER_TLS_KEY",
-                "origin.key",
-                key.serialize_pem().into_bytes(),
-            ),
-            (
-                "OUTER_ORIGIN_PULL_CA",
-                "origin-pull-ca.pem",
-                ca_cert.pem().into_bytes(),
-            ),
-        ];
-        let mut map = prod_vars(&[]);
-        for (var, name, bytes) in &blobs {
-            let file = dir.path().join(name);
-            std::fs::write(&file, bytes).unwrap();
-            map.insert(var.to_string(), file.to_string_lossy().into_owned());
-        }
-        let cfg = Config::from_vars(&map).unwrap();
-        assert!(cfg.boot_file_problems().is_empty(), "{cfg:?}");
+        .unwrap_err();
+        assert_eq!(
+            err.iter().filter(|p| p.contains("was removed")).count(),
+            3,
+            "each removed var gets its own problem: {err:?}"
+        );
     }
 
     #[test]
@@ -2024,15 +1881,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let logins = dir.path().join("review-logins");
         std::fs::write(&logins, "review@example.com:not-a-phc-NEVER-LEAK-8\n").unwrap();
-        let mut map = prod_vars(&[
-            ("OUTER_TLS_CERT", "/tls/origin.pem"),
-            ("OUTER_TLS_KEY", "/tls/origin.key"),
-            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
-            (
-                "OUTER_REVIEW_LOGINS_FILE",
-                logins.to_string_lossy().as_ref(),
-            ),
-        ]);
+        let mut map = prod_vars(&[(
+            "OUTER_REVIEW_LOGINS_FILE",
+            logins.to_string_lossy().as_ref(),
+        )]);
         map.remove("STRIPE_SECRET_KEY");
         let err = Config::from_vars(&map).unwrap_err();
         assert!(

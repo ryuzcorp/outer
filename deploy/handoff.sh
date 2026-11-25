@@ -4,12 +4,13 @@
 # deploy/release.sh and deploy/rollback.sh inside their remote heredocs —
 # every function runs on the VPS, where /srv/outer is the state dir.
 #
-# How a handoff works: the newcomer container binds 443 with SO_REUSEPORT
-# while the old one is still serving (the kernel splits new connections),
-# the old container drains on SIGTERM (refuses new deploys, exits once
-# in-flight ones finish), and the compose service is recreated last onto the
-# same image, overlapping the newcomer the same way. At no point is 443
-# without a listener, and no in-flight deploy dies with its process.
+# How a handoff works: the newcomer container binds the loopback origin port
+# (127.0.0.1:8443) with SO_REUSEPORT while the old one is still serving (the
+# kernel splits new connections), and the old container drains on SIGTERM
+# (refuses new deploys, exits once in-flight ones finish), and the compose
+# service is recreated last onto the same image, overlapping the newcomer
+# the same way. At no point is the origin without a listener, and no
+# in-flight deploy dies with its process.
 #
 # Coordination is the handoff flag file (/srv/outer/data/handoff): the
 # release script writes the heartbeat epoch into it every minute while the
@@ -63,8 +64,8 @@ handoff_clear() {
 
 # Abort a failed handoff: clear the flag, and remove outer-next only while
 # a compose-managed outer still serves. Past the old container's removal
-# outer-next may be the only listener on 443, so it stays up and the
-# operator recovers with a fresh release.
+# outer-next may be the only listener on the origin port, so it stays up
+# and the operator recovers with a fresh release.
 handoff_abort() {
     handoff_clear
     local old want
@@ -73,9 +74,9 @@ handoff_abort() {
     # Healthy = the compose outer is running on the image this release line
     # recorded — not a log line: log rotation eats "listening on" on a
     # long-lived container, and a rotated log must not read as "no healthy
-    # outer" (which would leave outer-next running next to the old one on
-    # 443). Read OUTER_IMAGE without sourcing the whole file. The log line
-    # stays the signal for freshly started containers (wait_for_listening).
+    # outer" (which would leave outer-next running next to the old one).
+    # Read OUTER_IMAGE without sourcing the whole file. The log line stays
+    # the signal for freshly started containers (wait_for_listening).
     want="$(grep -E '^OUTER_IMAGE=' /srv/outer/release.env 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
     if [[ -n "$old" && -n "$want" ]] \
         && [[ "$(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$old")" == "true $want" ]]; then
@@ -86,9 +87,10 @@ handoff_abort() {
 }
 
 # wait_for_listening <container> <image>: the container is running on
-# <image> and outer logged its "listening on" line. mTLS admits no
-# unauthenticated HTTP probe, so the log line is the signal (same as the
-# old stop-start rollout). 60 s deadline, then failure.
+# <image> and outer logged its "listening on" line. The origin is plain HTTP
+# on loopback behind the tunnel, but the log line stays the signal (same as
+# the old stop-start rollout): it also covers boot failures a probe cannot
+# distinguish. 60 s deadline, then failure.
 wait_for_listening() {
     local name="$1" image="$2"
     local cid deadline
@@ -157,7 +159,7 @@ record_image() {
     rm -f "$tmp"
 }
 
-# handoff_to <image>: roll <image> out with no 443 blackout.
+# handoff_to <image>: roll <image> out with no origin blackout.
 handoff_to() {
     local image="$1"
     local old

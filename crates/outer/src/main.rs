@@ -50,12 +50,6 @@ async fn main() -> ExitCode {
             let Some(config) = load_config() else {
                 return ExitCode::from(2);
             };
-            // The same file validation `check-config` runs, before
-            // `prepare_host` creates dirs and chmods: refuse an unreadable
-            // TLS triple before touching the host.
-            if !report_boot_files(&config) {
-                return ExitCode::from(2);
-            }
             init_tracing(&config.log_filter);
             if let Err(err) = prepare_host(&config) {
                 return report(Err(err));
@@ -63,13 +57,9 @@ async fn main() -> ExitCode {
             report(serve(config).await)
         }
         ["check-config"] => match load_config() {
-            Some(config) => {
-                if report_boot_files(&config) {
-                    println!("configuration ok");
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::from(2)
-                }
+            Some(_) => {
+                println!("configuration ok");
+                ExitCode::SUCCESS
             }
             None => ExitCode::from(2),
         },
@@ -181,21 +171,6 @@ fn load_config() -> Option<Config> {
             None
         }
     }
-}
-
-/// The one shared boot file check: print `Config::boot_file_problems` and
-/// report whether the config is bootable. `serve` runs this before
-/// `prepare_host` touches the host; `check-config` is this and nothing else.
-fn report_boot_files(config: &Config) -> bool {
-    let problems = config.boot_file_problems();
-    if problems.is_empty() {
-        return true;
-    }
-    eprintln!("outer: invalid configuration:");
-    for problem in problems {
-        eprintln!("  - {problem}");
-    }
-    false
 }
 
 fn build_store(config: &Config) -> anyhow::Result<Store> {
@@ -557,7 +532,7 @@ fn app_url(config: &Config, slug: &str) -> String {
         scheme(config),
         slug,
         config.runtime.apps_domain,
-        port_suffix(config.listen, config.tls_enabled())
+        port_suffix(config)
     )
 }
 
@@ -673,36 +648,43 @@ fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> anyhow::Result<outer:
             email,
             is_local: config.is_local(),
             allow_loopback_fetch: false,
-            origin_locked: config.tls_enabled(),
+            behind_tunnel: !config.is_local(),
         },
     })
 }
 
-/// The platform origin (`{scheme}://{domain}{port}`): the auth issuer, the
-/// MCP endpoint clients see, and the seed command's default URL.
+/// The platform origin: `https://{domain}` in production (served through
+/// the Cloudflare Tunnel), `http://{domain}{port}` on localhost dev. The
+/// auth issuer, the MCP endpoint clients see, and the seed command's
+/// default URL.
 fn platform_url(config: &Config) -> String {
     format!(
         "{}://{}{}",
         scheme(config),
         config.domain,
-        port_suffix(config.listen, config.tls_enabled())
+        port_suffix(config)
     )
 }
 
-/// `:8080` unless the listener is on the scheme's default port.
-fn port_suffix(listen: SocketAddr, tls: bool) -> String {
-    match (listen.port(), tls) {
-        (80, false) | (443, true) => String::new(),
-        (port, _) => format!(":{port}"),
+/// `:port` on localhost dev (`:8080` by default); empty in production, where
+/// the public URL is always the default HTTPS port via Cloudflare.
+fn port_suffix(config: &Config) -> String {
+    if !config.is_local() {
+        return String::new();
+    }
+    match config.listen.port() {
+        80 => String::new(),
+        port => format!(":{port}"),
     }
 }
 
-/// `https` when TLS terminates locally, else `http`.
+/// `https` off localhost (Cloudflare terminates TLS in front of the tunnel),
+/// else `http`.
 fn scheme(config: &Config) -> &'static str {
-    if config.tls_enabled() {
-        "https"
-    } else {
+    if config.is_local() {
         "http"
+    } else {
+        "https"
     }
 }
 
@@ -808,25 +790,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     // Bind before claiming the bucket: a second instance that can't listen
     // must not take ownership away from the one that's serving. The bind is
-    // SO_REUSEPORT, so during a release handoff the newcomer shares 443 with
-    // the old container and the kernel splits new connections; the claim
+    // SO_REUSEPORT, so during a release handoff the newcomer shares the
+    // loopback port with the old container and the kernel splits new
+    // connections; the claim
     // below then moves the snapshot-owner fence to the newcomer, and the old
     // process stands down on its next tick.
     let listener = outer::handoff::bind_reuseport(config.listen)?;
-    // Read the TLS triple right after binding (still before the bucket
-    // claim): an unreadable cert must fail the boot, never the claim.
-    let tls_files = match (&config.tls_cert, &config.tls_key, &config.origin_pull_ca) {
-        (Some(cert), Some(key), Some(ca)) => Some(http::tls::TlsFiles {
-            cert: cert.clone(),
-            key: key.clone(),
-            ca: ca.clone(),
-        }),
-        _ => None,
-    };
-    let rustls_config = tls_files
-        .as_ref()
-        .map(http::tls::load_server_config)
-        .transpose()?;
     let sync = store::snapshot::StateSync::new(config.host_id.clone());
     sync.claim(&store, &snapshot_cfg).await?;
     store::snapshot::spawn_sync_task(
@@ -928,7 +897,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         domain: config.domain.clone(),
         apps_domain: rt.apps_domain.clone(),
         app_scheme: scheme(&config).to_string(),
-        app_port_suffix: port_suffix(config.listen, config.tls_enabled()),
+        app_port_suffix: port_suffix(&config),
         tool_wait: config.tool_wait,
         inactivity: outer::inactivity::Windows::new(rt.inactive_days, rt.inactive_grace_days),
         jev,
@@ -949,14 +918,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         billing: outer::billing::BillingState::from_config(
             &config.stripe,
             // The platform base URL the checkout-starter links and
-            // webhook mails point at: scheme + platform host (+ port
-            // off the default, localhost dev only).
-            format!(
-                "{}://{}{}",
-                scheme(&config),
-                config.domain,
-                port_suffix(config.listen, config.tls_enabled())
-            ),
+            // webhook mails point at: the public platform origin.
+            platform_url(&config),
             config.outer_secret.as_bytes().to_vec(),
         )?,
     };
@@ -1145,7 +1108,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             pool.clone(),
             fleets.clone(),
             rt.apps_domain.clone(),
-            config.tls_enabled(),
+            !config.is_local(),
             metrics.clone(),
         )
         .with_look_tokens(look_tokens)
@@ -1154,42 +1117,21 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         config.domain.clone(),
     );
     tracing::info!(
-        "outer {} listening on {}://{} (platform {}, apps *.{})",
+        "outer {} listening on {} (platform {}, apps *.{})",
         env!("CARGO_PKG_VERSION"),
-        scheme(&config),
         config.listen,
         config.domain,
         rt.apps_domain
     );
-    if let Some(rustls_config) = rustls_config {
-        // Origin pull (mTLS): axum-server owns the accept loop, so a failed
-        // handshake drops just that connection and never stops serving.
-        let rustls_config =
-            axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(rustls_config));
-        let std_listener = listener;
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        let shutdown_pool = pool.clone();
-        let shutdown_drain = drain.clone();
-        tokio::spawn(async move {
-            drain_and_wait(shutdown_pool, shutdown_drain).await;
-            // Bounded HTTP drain: stop_all and the final snapshot run after
-            // serve returns, all inside compose's 15 min stop_grace_period.
-            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
-        });
-        axum_server::tls_rustls::from_tcp_rustls(std_listener, rustls_config)?
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await?;
-    } else {
-        let shutdown_pool = pool.clone();
-        axum::serve(
-            tokio::net::TcpListener::from_std(listener)?,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(drain_and_wait(shutdown_pool, drain))
-        .await?;
-    }
+    // Plain HTTP on the loopback listener: TLS terminates at Cloudflare and
+    // cloudflared on the host forwards to us.
+    let shutdown_pool = pool.clone();
+    axum::serve(
+        tokio::net::TcpListener::from_std(listener)?,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(drain_and_wait(shutdown_pool, drain))
+    .await?;
 
     tracing::info!("shutting down: stopping fleets, then writing the final state snapshot");
     // The sweep may be mid-flush; aborting it is safe (its transaction
@@ -1253,28 +1195,19 @@ mod tests {
     }
 
     #[test]
-    fn boot_gate_passes_localhost_and_refuses_garbage_tls() {
-        // The gate both `serve` (before `prepare_host`) and `check-config`
-        // share: localhost without TLS passes, an unreadable triple fails.
-        // Presence alone is not enough — `validate` accepts a set triple
-        // and only this gate reads it.
+    fn config_gate_passes_localhost_and_refuses_stale_tls_vars() {
+        // `load_config` (shared by `serve` and `check-config`) passes on
+        // localhost defaults and fails loud on the removed TLS triple, so a
+        // stale outer.env never boots.
         let ok = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
-        assert!(report_boot_files(&ok));
-        let dir = tempfile::tempdir().unwrap();
-        let cert = dir.path().join("origin.pem");
-        std::fs::write(&cert, "not pem at all\n").unwrap();
-        let missing = dir
-            .path()
-            .join("missing.pem")
-            .to_string_lossy()
-            .into_owned();
-        let bad = Config::from_vars(&vars(&[
+        assert!(ok.is_local());
+        let err = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
-            ("OUTER_TLS_CERT", cert.to_string_lossy().as_ref()),
-            ("OUTER_TLS_KEY", missing.as_str()),
-            ("OUTER_ORIGIN_PULL_CA", missing.as_str()),
+            ("OUTER_TLS_CERT", "/tls/origin.pem"),
+            ("OUTER_TLS_KEY", "/tls/origin.key"),
+            ("OUTER_ORIGIN_PULL_CA", "/tls/origin-pull-ca.pem"),
         ]))
-        .unwrap();
-        assert!(!report_boot_files(&bad));
+        .unwrap_err();
+        assert!(err.iter().any(|p| p.contains("OUTER_TLS_CERT")), "{err:?}");
     }
 }

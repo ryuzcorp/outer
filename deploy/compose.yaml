@@ -5,13 +5,12 @@
 # (see outer.env.example); release.env carries only OUTER_IMAGE (plus
 # OUTER_PREVIOUS_IMAGE for rollback).
 #
-# Networking: `network_mode: host` on purpose. Published ports traverse
-# Docker's iptables chains, which bypass a plain INPUT filter, so a
-# `443:443` publish would need extra DOCKER-USER rules to actually restrict
-# 443 to Cloudflare. On the host network the container binds 0.0.0.0:443
-# directly and the host nftables INPUT policy (deploy/firewall.sh: 443 only
-# from Cloudflare's ranges) applies with no exception. The fleet loopback
-# ports (OUTER_FLEET_PORTS) stay on host loopback either way.
+# Networking: `network_mode: host` on purpose. The host nftables INPUT
+# policy (deploy/firewall.sh) drops every inbound connection, so nothing
+# reaches the origin from outside; cloudflared (a host process) proxies the
+# tunnel to 127.0.0.1:8443 on loopback, and the OUTPUT hook admits only uid
+# 0 and cloudflared there. The fleet loopback ports (OUTER_FLEET_PORTS)
+# stay on host loopback either way.
 name: outer
 
 services:
@@ -47,12 +46,9 @@ services:
       # SQLite, git mirrors, worktrees, caches: the bucket can rebuild all of
       # it via the snapshot restore, but the live DB lives here.
       - /srv/outer/data:/data
-      # Cloudflare Origin CA certificate + key and the Authenticated Origin
-      # Pulls CA (OUTER_TLS_CERT/KEY, OUTER_ORIGIN_PULL_CA). Read-only: the
-      # container never writes key material.
+      # Review-logins file (OUTER_REVIEW_LOGINS_FILE). Read-only: the
+      # container never writes secrets.
       - /srv/outer/tls:/tls:ro
-    # No HTTP healthcheck on purpose: outer serves TLS with required client
-    # certificates (mTLS), so no unauthenticated probe can pass the
-    # handshake — not even from inside the container, which holds no client
-    # key. deploy/release.sh verifies the rollout instead (container running
-    # + outer's "listening on" log line).
+    # No HTTP healthcheck on purpose: the rollout verifies instead (the
+    # container running on the new image + outer's "listening on" log line,
+    # see deploy/release.sh).

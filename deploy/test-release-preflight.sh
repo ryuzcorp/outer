@@ -228,4 +228,17 @@ grep -q "usage:" "$LOG/err.log" || fail "unknown flag prints no usage"
 [[ ! -f "$LOG/ssh.log" ]] || fail "ssh ran after an unknown flag"
 echo "case 11 ok: unknown second arg refuses before any ssh (exit $code)"
 
+# --- case 12: tunnel-only rollout (no 443/TLS/origin-pull, no refresh) -----
+# The rollout heredoc must not gate on the Origin CA files, must not mention
+# the deleted refresh units, and the scp upload must carry firewall.nft.
+reset_case "docker,podman"
+code="$(run_release)"
+[[ "$code" == 0 ]] || fail "tunnel pass-through exited $code"
+rollout12="$(grep -l "FRESH_INSTALL" "$LOG"/stdin-*.bin 2>/dev/null || true)"
+[[ -n "$rollout12" ]] || fail "rollout heredoc missing on tunnel case"
+if grep -E -q "origin\.pem|origin-pull|firewall-refresh|:443|mTLS" "$rollout12"; then fail "rollout still references direct ingress"; fi
+grep -q "firewall.nft" "$LOG/scp.log" || fail "scp upload lacks firewall.nft"
+if grep -q "firewall-refresh" "$LOG/scp.log"; then fail "scp upload still carries firewall-refresh units"; fi
+echo "case 12 ok: rollout is tunnel-only (exit 0)"
+
 echo "test-release-preflight: all cases passed"

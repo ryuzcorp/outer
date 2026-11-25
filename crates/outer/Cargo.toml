@@ -13,14 +13,13 @@ argon2 = { version = "0.5", features = ["std", "password-hash"] }
 aes-gcm = "0.10"
 anyhow = "1"
 axum = "0.8"
-axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 constant_time_eq = "0.6"
 croner = "4.0.2"
 futures = "0.3"
- hex = "0.4"
+hex = "0.4"
 hkdf = "0.13"
 hmac = "0.13"
 http = "1"
@@ -41,11 +40,6 @@ reqwest = { version = "0.13", default-features = false, features = [
   "json",
   "rustls",
   "stream",
-] }
-rustls = { version = "0.23", default-features = false, features = [
-  "std",
-  "tls12",
-  "aws_lc_rs",
 ] }
 rusty-s3 = "0.10.2"
 qrcode = "0.14"
@@ -76,4 +70,3 @@ zstd = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-rcgen = "0.14"

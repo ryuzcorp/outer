@@ -1,0 +1,38 @@
+# Outer host firewall: static tunnel-only ruleset (open beta).
+#
+# Applied atomically by deploy/firewall.sh (`add table; delete table;
+# table ...` is one nft transaction, valid whether or not the table
+# exists, so there is never a window with no table or a stale one), and at
+# boot by firewall.service before network-pre/docker.
+#
+# Inbound policy is drop, with no exceptions for ports: no inbound port is
+# open at all — not SSH (it rides the Cloudflare Tunnel behind Access), and
+# nothing listens on any external interface anymore. The old Cloudflare
+# IP-range fetch and the weekly refresh timer are gone with direct ingress.
+#
+# Outbound policy stays accept, with one exception (defense in depth on top
+# of the per-app `inet outer` egress table): the platform origin listens on
+# loopback only (OUTER_LISTEN=127.0.0.1:8443, plain HTTP behind
+# cloudflared), and only uid 0 (outer itself, operator checks) and the
+# cloudflared service user may open connections to it. Anything else local
+# — a compromised app uid first of all — gets a reject, never a hang.
+# nft resolves the username at load; the user must exist (provision.sh
+# creates it) or this file fails closed at `nft --check`.
+add table inet outer_fw
+delete table inet outer_fw
+table inet outer_fw {
+	chain input {
+		type filter hook input priority 0; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
+		icmpv6 type { echo-request, echo-reply, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
+		udp sport 67 udp dport 68 accept
+		udp sport 547 udp dport 546 accept
+	}
+	chain output {
+		type filter hook output priority 0; policy accept;
+		tcp dport 8443 ip daddr 127.0.0.1 meta skuid != { 0, "cloudflared" } reject
+		tcp dport 8443 ip6 daddr ::1 meta skuid != { 0, "cloudflared" } reject
+	}
+}

@@ -1595,10 +1595,10 @@ fn redirect(to: &str, cookie: Option<String>) -> Response {
 
 fn request_ip(
     headers: &HeaderMap,
-    origin_locked: bool,
+    behind_tunnel: bool,
     peer: Option<SocketAddr>,
 ) -> Option<String> {
-    client_ip(headers, origin_locked, peer)
+    client_ip(headers, behind_tunnel, peer)
 }
 
 /// `GET /console/sign-in`: a signed-in session with current terms skips
@@ -1658,7 +1658,7 @@ async fn sign_in_post(
         );
     }
     let mcp = &state.mcp;
-    let ip = request_ip(&headers, mcp.auth.config.origin_locked, Some(peer));
+    let ip = request_ip(&headers, mcp.auth.config.behind_tunnel, Some(peer));
     let target = safe_next(form.get("next").map(String::as_str));
     match form.get("step").map(String::as_str) {
         Some("email") => {

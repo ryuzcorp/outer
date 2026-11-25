@@ -1,7 +1,7 @@
 [Unit]
-Description=Apply the outer nftables firewall from the saved ruleset
-# Before any interface comes up: no boot window with 443 open. The saved
-# ruleset needs only the kernel, not the network.
+Description=Apply the outer nftables firewall from the static ruleset
+# Before any interface comes up: no boot window with an open port. The
+# static ruleset needs only the kernel, not the network.
 DefaultDependencies=no
 Before=network-pre.target docker.service
 Wants=network-pre.target
@@ -9,7 +9,7 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/srv/outer/firewall.sh --apply-saved
+ExecStart=/srv/outer/firewall.sh
 
 [Install]
 WantedBy=multi-user.target

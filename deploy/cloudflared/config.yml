@@ -1,0 +1,20 @@
+# cloudflared tunnel config for outer (locally-managed tunnel).
+#
+# Installed at /etc/cloudflared/config.yml by deploy/provision.sh, which
+# replaces the TUNNEL_ID placeholders below with the real tunnel id (taken
+# from the one /etc/cloudflared/<tunnel-id>.json the integrator copies in;
+# provision refuses to enable cloudflared until that file exists).
+#
+# Ingress: SSH to the host sshd on loopback (gated by a Cloudflare Access
+# self-hosted app, configured in the dashboard, not here), and a catch-all
+# to the platform origin on loopback. The catch-all MUST stay a catch-all:
+# custom hostnames (customers.outer.now) arrive with arbitrary Host headers.
+tunnel: TUNNEL_ID
+credentials-file: /etc/cloudflared/TUNNEL_ID.json
+metrics: 127.0.0.1:9101
+no-autoupdate: true
+
+ingress:
+  - hostname: ssh.outer.now
+    service: ssh://127.0.0.1:22
+  - service: http://127.0.0.1:8443

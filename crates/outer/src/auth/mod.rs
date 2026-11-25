@@ -74,9 +74,9 @@ pub struct AuthConfig {
     pub is_local: bool,
     /// CIMD fetches allow loopback/client images (tests only, never prod).
     pub allow_loopback_fetch: bool,
-    /// Behind Cloudflare origin pull: rate limits key on `CF-Connecting-IP`,
+    /// Behind the Cloudflare Tunnel: rate limits key on `CF-Connecting-IP`,
     /// else on the TCP peer.
-    pub origin_locked: bool,
+    pub behind_tunnel: bool,
 }
 
 /// Axum state for [`router`].
@@ -1243,7 +1243,7 @@ pub mod test_support {
             },
             is_local: true,
             allow_loopback_fetch: true,
-            origin_locked: false,
+            behind_tunnel: false,
         };
         (config, codes)
     }

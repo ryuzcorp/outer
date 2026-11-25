@@ -26,17 +26,16 @@
 #   changes prod. A non-zero exit aborts the release here with prod untouched:
 #   no uploads, no backup, no handoff. Only then uploads compose.yaml + the
 #   firewall files + handoff.sh to /srv/outer, then hands the new image out:
-#   the newcomer shares 443 via SO_REUSEPORT while the old container drains
-#   (refuses new deploys, exits once in-flight ones finish), and the compose
-#   service is recreated last onto the same image. At no point is 443 without
-#   a listener, and no in-flight deploy dies with its process.
+#   the newcomer shares the loopback origin port via SO_REUSEPORT while the
+#   old container drains (refuses new deploys, exits once in-flight ones
+#   finish), and the compose service is recreated last onto the same image.
+#   At no point is the origin without a listener, and no in-flight deploy
+#   dies with its process.
 #
-# Health check from the box: outer serves TLS with required client
-# certificates (mTLS), so no unauthenticated probe can pass the handshake —
-# not even `curl --resolve ... https://outer.now/health` from here. The check
-# is therefore: the container is running on the new image and outer logged
-# its "listening on" line. Rollback: deploy/rollback.sh <ssh-target> (same
-# handoff, previous image).
+# Health check from the box: outer serves plain HTTP on loopback behind the
+# tunnel, so no edge probe applies — the check is: the container is running
+# on the new image and outer logged its "listening on" line. Rollback:
+# deploy/rollback.sh <ssh-target> (same handoff, previous image).
 #
 # Migrations are append-only within a release line: the newcomer runs them
 # at boot while the old container is still serving, so a release's
@@ -154,9 +153,9 @@ fi
 # and mounts the compose `outer` service gets: --env-file carries
 # /srv/outer/outer.env (including OUTER_HOST_ID when the operator set it;
 # otherwise outer defaults to the container hostname on both paths), and
-# every compose volume read-only: /tls (OUTER_REVIEW_LOGINS_FILE and the TLS
-# triple resolve under it) and /data (the live DB dir; check-config never
-# opens it, and read-only keeps even a buggy validation from touching prod).
+# every compose volume read-only: /tls (OUTER_REVIEW_LOGINS_FILE lives under
+# it) and /data (the live DB dir; check-config never opens it, and read-only
+# keeps even a buggy validation from touching prod).
 # check-config has no side effects (no DB, no network, no sockets) and names
 # variables, never values. --pull=never: a missing local image must fail
 # here, never pull a same-named registry image and run it with the
@@ -171,9 +170,8 @@ if ! ssh "$TARGET" docker run --rm --pull=never --env-file /srv/outer/outer.env 
 fi
 
 ssh "$TARGET" mkdir -p /srv/outer
-scp deploy/compose.yaml deploy/handoff.sh deploy/firewall.sh deploy/firewall.service \
-    deploy/firewall-refresh.service deploy/firewall-refresh.timer \
-    "$TARGET:/srv/outer/"
+scp deploy/compose.yaml deploy/handoff.sh deploy/firewall.sh deploy/firewall.nft \
+    deploy/firewall.service "$TARGET:/srv/outer/"
 
 # Remote rollout. SHA is hex (validated above), so interpolating it into the
 # remote script is safe; the heredoc is otherwise quoted. FRESH_INSTALL is
@@ -188,21 +186,14 @@ cd /srv/outer
     echo "remote: /srv/outer/outer.env missing (copy deploy/outer.env.example and fill it)" >&2
     exit 1
 }
-# Default TLS paths from outer.env.example; a custom layout needs this
-# check updated, outer itself still validates at boot.
-for f in /srv/outer/tls/origin.pem /srv/outer/tls/origin.key /srv/outer/tls/origin-pull-ca.pem; do
-    [[ -f "$f" ]] || {
-        echo "remote: $f missing" >&2
-        exit 1
-    }
-done
 
-# outer runs on the host network: the ingress filter must be in place before
-# it starts (a first install may predate it). firewall.sh exits nonzero on
-# failure, which stops the rollout here.
-if ! nft list table inet outer_fw >/dev/null 2>&1; then
-    /srv/outer/firewall.sh
-fi
+# Outer runs on the host network behind the tunnel: the closed ingress filter
+# must be in place before it starts. The unit file is reinstalled in case it
+# changed, then firewall.sh applies the static ruleset atomically (--check
+# fails closed first); either failure stops the rollout here.
+install -m 0644 /srv/outer/firewall.service /etc/systemd/system/firewall.service
+systemctl daemon-reload
+/srv/outer/firewall.sh
 
 source /srv/outer/handoff.sh
 # Lineage across the handoff needs no release-time step: the upload gate

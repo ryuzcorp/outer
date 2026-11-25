@@ -6,8 +6,8 @@
 #   ├── cello × N       one fleet per awake app, each as the app's own uid
 #   └── bun / sh        builds, as the app's uid
 #
-# outer terminates TLS itself (rustls) on OUTER_LISTEN: the Cloudflare
-# Origin CA certificate plus Authenticated Origin Pulls (mTLS).
+# outer serves plain HTTP on OUTER_LISTEN: the only ingress is the
+# Cloudflare Tunnel (cloudflared on the host proxies to loopback).
 # cello (ryuzcorp/cello): the runtime each app fleet runs, published as
 # semver with SLSA provenance attestations. The two ARG lines below are the
 # single source of the pin: a bump changes these values (the tag, then the
@@ -109,11 +109,11 @@ RUN printf '#!/bin/sh\nexec /usr/local/bin/bun /opt/oxfmt/node_modules/oxfmt/dis
 COPY LICENSE NOTICE /licenses/
 WORKDIR /data
 ENV OUTER_DATA=/data \
-    OUTER_LISTEN=[::]:443 \
+    OUTER_LISTEN=127.0.0.1:8443 \
     OUTER_SITE_DIR=/usr/share/outer/site \
     CELLO_ESBUILD=/usr/local/bin/esbuild \
     CELLO_VERSION="${CELLO_VERSION}"
 VOLUME /data
-EXPOSE 443
+EXPOSE 8443
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/outer"]
 CMD ["serve"]

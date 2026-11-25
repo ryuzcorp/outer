@@ -941,7 +941,7 @@ async fn handle_call(
             .into_response();
     }
     let client_ip =
-        crate::http::client_ip::client_ip(headers, state.auth.config.origin_locked, peer);
+        crate::http::client_ip::client_ip(headers, state.auth.config.behind_tunnel, peer);
     let ctx = tools::Ctx {
         state,
         principal: caller,
