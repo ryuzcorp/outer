@@ -4,6 +4,8 @@
 // Noite's Config coupling, metrics, readiness plumbing and anything about an
 // attached metrics.sqlite — Outer has one DB.
 
+use anyhow::Context as _;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,6 +65,96 @@ impl SnapshotConfig {
         let mut path = self.db_path.as_os_str().to_owned();
         path.push(".snapshot-sha");
         PathBuf::from(path)
+    }
+
+    /// The database lock file: next to the database, never renamed by a
+    /// restore (the database itself moves aside, the lock stays put).
+    fn lock_path(&self) -> PathBuf {
+        let mut path = self.db_path.as_os_str().to_owned();
+        path.push(".lock");
+        PathBuf::from(path)
+    }
+}
+
+/// Guard for the platform database file. `serve` holds it shared from boot
+/// to shutdown — shared holders coexist, so the release handoff (two
+/// processes on one SQLite file) boots fine — and `outer state restore
+/// --force` takes it exclusive before touching the database, so a restore
+/// refuses while any server runs against the same data dir, and a server
+/// refuses to boot mid-restore. The kernel releases the lock on crash, so
+/// there is no stale lock to clear. The bucket owner fence cannot do this
+/// job: the claim persists after a stop and can't tell a running server
+/// from a stopped one with the same host id.
+pub struct DbLock {
+    _file: std::fs::File,
+}
+
+impl DbLock {
+    /// Hold the lock shared: what `serve` takes at boot and keeps for the
+    /// life of the process.
+    pub fn shared(cfg: &SnapshotConfig) -> anyhow::Result<Self> {
+        Self::take(
+            cfg,
+            libc::LOCK_SH,
+            "another outer server holds the database lock for",
+        )
+    }
+
+    /// Hold the lock exclusive, failing at once when a server holds it:
+    /// what `state restore --force` takes before touching the database.
+    pub fn exclusive(cfg: &SnapshotConfig) -> anyhow::Result<Self> {
+        Self::take(
+            cfg,
+            libc::LOCK_EX,
+            "outer is running against this data dir (it holds the database lock for",
+        )
+    }
+
+    fn take(cfg: &SnapshotConfig, op: libc::c_int, busy_msg: &str) -> anyhow::Result<Self> {
+        if let Some(parent) = cfg.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let path = cfg.lock_path();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        loop {
+            // SAFETY: flock on an owned fd; retries on EINTR, non-blocking.
+            let held = unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0;
+            if held {
+                return Ok(Self { _file: file });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                // Brief grace for a lock being released concurrently (a
+                // just-stopped server, a racy test — fork() duplicates fds, so
+                // a child forked mid-hold keeps the flock until exec closes it):
+                // a real holder keeps it for its whole lifetime, so refusal
+                // semantics don't change — a running server still refuses, just 100 ms later.
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+                        return Ok(Self { _file: file });
+                    }
+                    let retry_err = std::io::Error::last_os_error();
+                    if retry_err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                        return Err(retry_err.into());
+                    }
+                }
+                anyhow::bail!(
+                    "{} {}; stop it first, then re-run",
+                    busy_msg,
+                    path.display()
+                );
+            }
+            return Err(err.into());
+        }
     }
 }
 
@@ -590,14 +682,14 @@ impl StateSync {
         // `last_hash`: a crash here retries the upload (the gate allows it)
         // instead of skipping as "identical" with a stale sidecar.
         write_sidecar(&cfg.sidecar_path(), &hash).await?;
-        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
+        *self.last_hash.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash.clone());
         tracing::info!(
             bytes = packed_len,
             raw_bytes = raw.len(),
             generation,
             "outer state snapshot uploaded"
         );
-        file_hourly_copy(store, cfg, &packed).await;
+        file_hourly_copy(store, cfg, &packed, &hash, raw.len()).await;
         prune_history(store, cfg).await;
         Ok(packed_len)
     }
@@ -669,9 +761,47 @@ async fn fsync_parent(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Checksum companion for a history copy (`<data key>.meta.json`): the
+/// sha256 of the raw database the packed bytes decode to, so `state
+/// restore --key` verifies before replacing anything. Best-effort like the
+/// copies themselves: a failure warns, and the copy restores only with
+/// `--no-verify`.
+async fn file_history_meta(
+    store: &Store,
+    key: &str,
+    raw_hash: &str,
+    packed_len: usize,
+    raw_len: usize,
+    source: &str,
+) {
+    let meta = serde_json::json!({
+        "sha256": raw_hash,
+        "bytes": packed_len,
+        "raw_bytes": raw_len,
+        "written_at": chrono::Utc::now().to_rfc3339(),
+        "source": source,
+    });
+    let meta_key = format!("{key}.meta.json");
+    if let Err(e) = store
+        .put(&meta_key, serde_json::to_vec(&meta).unwrap_or_default())
+        .await
+    {
+        tracing::warn!(meta_key, error = %e, "state history checksum filing failed");
+    }
+}
+
 /// Hourly copy, first per UTC hour wins. Best-effort (the live snapshot
-/// already landed); a failure warns and the next upload retries.
-async fn file_hourly_copy(store: &Store, cfg: &SnapshotConfig, packed: &[u8]) {
+/// already landed); a failure warns and the next upload retries. A new copy
+/// files its checksum companion alongside; an hour another upload already
+/// filed stays exactly as it is, companion or not — a copy without one
+/// restores only with `--no-verify`.
+async fn file_hourly_copy(
+    store: &Store,
+    cfg: &SnapshotConfig,
+    packed: &[u8],
+    raw_hash: &str,
+    raw_len: usize,
+) {
     let hour = chrono::Utc::now().format("%Y-%m-%dT%H");
     let key = format!("{}{hour}.sqlite.zst", cfg.history_prefix());
     match store.get(&key).await {
@@ -679,6 +809,8 @@ async fn file_hourly_copy(store: &Store, cfg: &SnapshotConfig, packed: &[u8]) {
         Ok(None) => {
             if let Err(e) = store.put(&key, packed.to_vec()).await {
                 tracing::warn!(key, error = %e, "state history copy failed; next upload retries");
+            } else {
+                file_history_meta(store, &key, raw_hash, packed.len(), raw_len, "hourly").await;
             }
         }
         Err(e) => {
@@ -701,6 +833,12 @@ async fn prune_history(store: &Store, cfg: &SnapshotConfig) {
     for key in select_history_prune(&keys, &prefix, chrono::Utc::now()) {
         if let Err(e) = store.delete(&key).await {
             tracing::warn!(key, error = %e, "state history prune delete failed");
+        }
+        // The checksum companion goes with its copy; a missing one is fine
+        // (copies filed before companions existed have none).
+        let meta_key = format!("{key}.meta.json");
+        if let Err(e) = store.delete(&meta_key).await {
+            tracing::warn!(meta_key, error = %e, "state history prune delete failed");
         }
     }
 }
@@ -728,7 +866,27 @@ pub async fn release_copy(
         cfg.history_prefix(),
         now.format("%Y-%m-%dT%H-%M-%SZ"),
     );
-    store.put(&key, bytes).await?;
+    store.put(&key, bytes.clone()).await?;
+    // The companion records the sha256 of the raw database the copy decodes
+    // to, so `state restore --key` verifies before replacing anything. A
+    // copy whose bytes don't decode stays filed but unrestorable without
+    // `--no-verify` (the release must not fail on a companion).
+    match zstd::decode_all(&bytes[..]) {
+        Ok(raw) => {
+            file_history_meta(
+                store,
+                &key,
+                &sha256_hex(&raw),
+                bytes.len(),
+                raw.len(),
+                "release",
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(key, error = %e, "state pre-release copy does not decode; no checksum filed");
+        }
+    }
     tracing::info!(key, "state pre-release copy filed");
     Ok(Some(key))
 }
@@ -767,7 +925,9 @@ fn not_found(key: &str) -> anyhow::Error {
 /// Ok(false) only when the bucket has no snapshot; any other failure is an
 /// error the caller must not start past, because starting with an empty
 /// database would upload it over the good snapshot on the next write. If
-/// the local file exists, keep it.
+/// the local file exists, keep it. The download verifies against the
+/// snapshot checksum when the metadata records one; a pre-checksum snapshot
+/// lands with a warning, so an ancient snapshot never bricks a boot.
 pub async fn restore_if_missing(store: &Store, cfg: &SnapshotConfig) -> anyhow::Result<bool> {
     if cfg.db_path.exists() {
         return Ok(false);
@@ -785,32 +945,47 @@ pub async fn restore_if_missing(store: &Store, cfg: &SnapshotConfig) -> anyhow::
 
 async fn download_snapshot(store: &Store, cfg: &SnapshotConfig) -> anyhow::Result<bool> {
     let partial = cfg.db_path.with_extension("sqlite.restoring");
-    let mut last_err = None;
-    for attempt in 1..=5u64 {
-        match try_restore_once(store, cfg, &partial).await {
-            Ok(restored) => {
-                let _ = tokio::fs::remove_file(&partial).await;
-                return Ok(restored);
-            }
-            Err(e) if is_not_found(&e) => {
-                tracing::info!("no outer state snapshot in the bucket; starting fresh");
-                return Ok(false);
-            }
-            Err(e) => {
-                tracing::warn!(attempt, error = %e, "outer state restore failed; retrying");
-                last_err = Some(e);
-                tokio::time::sleep(Duration::from_secs(attempt * 3)).await;
-            }
+    match download_with_retry(store, &cfg.state_key(), &partial).await {
+        Err(e) if is_not_found(&e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            tracing::info!("no outer state snapshot in the bucket; starting fresh");
+            return Ok(false);
         }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(e);
+        }
+        Ok(()) => {}
     }
+    // The download landed exactly once: verify it once. A checksum mismatch
+    // (or undecodable bytes) is deterministic — retrying would just sleep
+    // 45 s before refusing the boot on bytes that will never verify.
+    let placed = verify_and_place(store, cfg, &partial).await;
     let _ = tokio::fs::remove_file(&partial).await;
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("restore failed")))
+    placed
+}
+
+/// Verify downloaded bytes once against the snapshot checksum and place
+/// them: the shared tail of the boot restore (after its retried download)
+/// and of [`try_restore_once`].
+async fn verify_and_place(
+    store: &Store,
+    cfg: &SnapshotConfig,
+    partial: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let expected = snapshot_checksum(store, cfg, &cfg.state_key()).await?;
+    let (_, raw) = read_and_verify(partial, &cfg.state_key(), expected.as_deref(), true).await?;
+    place_restored_db(cfg, &raw).await?;
+    Ok(true)
 }
 
 /// One restore attempt. Only a missing key counts as no-snapshot — a
 /// transport error must never read as "start fresh". A restored database
 /// records the sidecar, so it is provably the bucket's database when the
 /// first upload's lineage gate runs.
+/// Test-only single attempt (fault injection needs exactly one try, not the
+/// boot path's retried download).
+#[cfg(test)]
 async fn try_restore_once(
     store: &Store,
     cfg: &SnapshotConfig,
@@ -819,18 +994,77 @@ async fn try_restore_once(
     if !store.get_to_file(&cfg.state_key(), partial).await? {
         return Err(not_found(&cfg.state_key()));
     }
+    verify_and_place(store, cfg, partial).await
+}
+
+/// Download `key` to `partial`, retrying transport errors. Only a missing
+/// key counts as absent — a transport error must never read as "no snapshot".
+async fn download_with_retry(store: &Store, key: &str, partial: &Path) -> anyhow::Result<()> {
+    let mut last_err = None;
+    for attempt in 1..=5u64 {
+        match store.get_to_file(key, partial).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => return Err(not_found(key)),
+            Err(e) => {
+                tracing::warn!(attempt, error = %e, "snapshot download failed; retrying");
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(attempt * 3)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("snapshot download failed")))
+}
+
+/// Read back a downloaded snapshot, decode it, and check the decoded bytes
+/// against the checksum the snapshot's metadata recorded — before anything
+/// is replaced. A recorded checksum that mismatches always refuses (swapped
+/// or corrupt bytes must never land, `--no-verify` or not). A snapshot with
+/// no recorded checksum restores only when `bless_missing` is set: the boot
+/// path for pre-checksum snapshots, or `state restore --no-verify`.
+async fn read_and_verify(
+    partial: &Path,
+    key: &str,
+    expected_sha: Option<&str>,
+    bless_missing: bool,
+) -> anyhow::Result<(u64, Vec<u8>)> {
     let packed = tokio::fs::read(partial).await?;
-    let raw = zstd::decode_all(&packed[..])?;
+    let bytes = packed.len() as u64;
+    let raw = zstd::decode_all(&packed[..])
+        .with_context(|| format!("snapshot {key} is not valid zstd"))?;
+    match expected_sha {
+        Some(sha) => {
+            let actual = sha256_hex(&raw);
+            if actual != sha {
+                anyhow::bail!("checksum mismatch for snapshot {key}: metadata says {sha}, downloaded bytes hash to {actual}; refusing");
+            }
+        }
+        None if bless_missing => {
+            tracing::warn!(
+                key,
+                "snapshot records no checksum; restoring unverified (old snapshot)"
+            );
+        }
+        None => {
+            anyhow::bail!("no checksum recorded for snapshot {key}; refusing (old snapshot — re-run with --no-verify to bless it)");
+        }
+    }
+    Ok((bytes, raw))
+}
+
+/// Write a verified snapshot into place: the data reaches the disk before
+/// the rename (without the fsync a power loss right after the rename can
+/// leave a zero-length file, which reads as a valid empty SQLite database
+/// and would then be uploaded over the good snapshot), the directory entry
+/// is fsynced so the rename survives a power loss, and the sidecar records
+/// the restored sha so the lineage gate adopts this database.
+async fn place_restored_db(cfg: &SnapshotConfig, raw: &[u8]) -> anyhow::Result<()> {
     // Rename into place only once complete: a crash mid-write must not leave
-    // a truncated database that "exists". The data must reach the disk
-    // before the rename — without the fsync a power loss right after the
-    // rename can leave a zero-length file, which reads as a valid empty
-    // SQLite database and would then be uploaded over the good snapshot.
+    // a truncated database that "exists".
     let decoded = cfg.db_path.with_extension("sqlite.decoded");
     {
         use tokio::io::AsyncWriteExt;
         let mut f = tokio::fs::File::create(&decoded).await?;
-        f.write_all(&raw).await?;
+        f.write_all(raw).await?;
         f.sync_all().await?;
     }
     tokio::fs::rename(&decoded, &cfg.db_path).await?;
@@ -842,9 +1076,218 @@ async fn try_restore_once(
     // adopts this database. Before the rename it would name bytes that may
     // never land; after, a crash leaves at worst a stale sidecar, which the
     // crash-window rule repairs.
-    write_sidecar(&cfg.sidecar_path(), &sha256_hex(&raw)).await?;
+    write_sidecar(&cfg.sidecar_path(), &sha256_hex(raw)).await?;
     tracing::info!(path = %cfg.db_path.display(), "outer state restored from bucket");
-    Ok(true)
+    Ok(())
+}
+
+/// The checksum a snapshot's metadata records for the raw database its
+/// packed bytes decode to: the live key's meta, or a history copy's
+/// `<key>.meta.json` companion. `None` means the snapshot predates
+/// checksums (or its companion never landed).
+async fn snapshot_checksum(
+    store: &Store,
+    cfg: &SnapshotConfig,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    let meta_key = if key == cfg.state_key() {
+        cfg.meta_key()
+    } else {
+        format!("{key}.meta.json")
+    };
+    match store.get(&meta_key).await? {
+        None => Ok(None),
+        Some(bytes) => Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_default()
+            .get("sha256")
+            .and_then(|s| s.as_str())
+            .map(str::to_owned)),
+    }
+}
+
+/// Options for `outer state restore --force`.
+#[derive(Clone, Debug)]
+pub struct RestoreOpts {
+    /// Snapshot key to restore; the live snapshot when `None`. A custom key
+    /// must be the live key or a `history/` copy, so a typo can't land an
+    /// unrelated bucket object as the database.
+    pub key: Option<String>,
+    /// Bless a snapshot whose metadata records no checksum. A recorded
+    /// checksum that mismatches always refuses.
+    pub no_verify: bool,
+}
+
+/// What a force restore did, for the CLI to print.
+#[derive(Clone, Debug)]
+pub struct RestoreReport {
+    /// The snapshot key restored.
+    pub key: String,
+    /// Where the previous database moved, if one existed.
+    pub backup: Option<PathBuf>,
+    /// Packed bytes downloaded.
+    pub bytes: u64,
+    /// Raw database bytes restored.
+    pub raw_bytes: usize,
+    /// sha256 of the restored database.
+    pub sha256: String,
+}
+
+/// Restore the platform SQLite from the bucket snapshot even when a local
+/// database exists: the default key is the live snapshot, `--key` picks a
+/// history copy (see `outer state list`). Verifies the checksum before
+/// replacing anything; moves the existing database aside to
+/// `outer.sqlite.pre-restore-<UTC timestamp>-<pid>` instead of deleting it;
+/// and refuses while a server holds the database (the exclusive [`DbLock`]
+/// fails), so a restore never races a running outer.
+pub async fn force_restore(
+    store: &Store,
+    cfg: &SnapshotConfig,
+    opts: &RestoreOpts,
+) -> anyhow::Result<RestoreReport> {
+    let _exclusive = DbLock::exclusive(cfg)?;
+    let key = match opts.key.as_deref() {
+        None => cfg.state_key(),
+        Some(key) if key == cfg.state_key() => key.to_string(),
+        Some(key) if key.starts_with(&cfg.history_prefix()) && key.ends_with(".sqlite.zst") => {
+            key.to_string()
+        }
+        Some(key) => {
+            anyhow::bail!("refusing to restore {key:?}: not a snapshot key (pick one from `outer state list`)")
+        }
+    };
+    let expected = snapshot_checksum(store, cfg, &key).await?;
+    let partial = cfg.db_path.with_extension("sqlite.restoring");
+    let download = async {
+        download_with_retry(store, &key, &partial).await?;
+        read_and_verify(&partial, &key, expected.as_deref(), opts.no_verify).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&partial).await;
+    let (bytes, raw) = download.map_err(|e| {
+        if is_not_found(&e) {
+            anyhow::anyhow!("no snapshot at {key} (see `outer state list`)")
+        } else {
+            e
+        }
+    })?;
+    let backup = if cfg.db_path.exists() {
+        Some(move_aside_db(cfg).await?)
+    } else {
+        None
+    };
+    if let Err(e) = place_restored_db(cfg, &raw).await {
+        if let Some(backup) = backup.as_ref() {
+            return Err(e.context(format!(
+                "download verified but replacing the database failed; the previous database is intact at {}",
+                backup.display()
+            )));
+        }
+        return Err(e);
+    }
+    let sha256 = sha256_hex(&raw);
+    Ok(RestoreReport {
+        key,
+        backup,
+        bytes,
+        raw_bytes: raw.len(),
+        sha256,
+    })
+}
+
+/// Move the live database (plus any WAL sidecars) aside to
+/// `outer.sqlite.pre-restore-<UTC timestamp>-<pid>`, so a restore never
+/// deletes local state. The pid keeps two restores in one second apart.
+async fn move_aside_db(cfg: &SnapshotConfig) -> anyhow::Result<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
+    let target = PathBuf::from(format!(
+        "{}.pre-restore-{stamp}-{}",
+        cfg.db_path.display(),
+        std::process::id()
+    ));
+    tokio::fs::rename(&cfg.db_path, &target).await?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", cfg.db_path.display()));
+        if sidecar.exists() {
+            let dest = PathBuf::from(format!("{}{suffix}", target.display()));
+            tokio::fs::rename(&sidecar, &dest).await?;
+        }
+    }
+    fsync_parent(&target).await?;
+    tracing::info!(from = %cfg.db_path.display(), to = %target.display(), "moved existing database aside for restore");
+    Ok(target)
+}
+
+/// One restorable snapshot for `outer state list`.
+#[derive(Clone, Debug)]
+pub struct SnapshotEntry {
+    /// The full bucket key: the live snapshot or a `history/` copy.
+    pub key: String,
+    /// When the snapshot was filed: the metadata timestamp, else the
+    /// timestamp baked into a history key name, else `None` (unknown).
+    pub written_at: Option<String>,
+}
+
+/// Every restorable snapshot key with its timestamp: the live snapshot plus
+/// the `history/` copies. Companions (`*.meta.json`) and the owner claim are
+/// not snapshots and never listed.
+pub async fn list_snapshots(
+    store: &Store,
+    cfg: &SnapshotConfig,
+) -> anyhow::Result<Vec<SnapshotEntry>> {
+    let mut out = Vec::new();
+    for key in store.list(&format!("{}/", cfg.key_prefix)).await? {
+        let live = key == cfg.state_key();
+        let history = key.starts_with(&cfg.history_prefix()) && key.ends_with(".sqlite.zst");
+        if !live && !history {
+            continue;
+        }
+        out.push(SnapshotEntry {
+            written_at: snapshot_written_at(store, cfg, &key).await?,
+            key,
+        });
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(out)
+}
+
+async fn snapshot_written_at(
+    store: &Store,
+    cfg: &SnapshotConfig,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    let meta_key = if key == cfg.state_key() {
+        cfg.meta_key()
+    } else {
+        format!("{key}.meta.json")
+    };
+    if let Some(bytes) = store.get(&meta_key).await? {
+        let ts = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_default()
+            .get("written_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if ts.is_some() {
+            return Ok(ts);
+        }
+    }
+    Ok(name_timestamp(key, &cfg.history_prefix()))
+}
+
+/// Timestamps baked into history key names: hourly
+/// `<prefix><UTC yyyy-mm-ddTHH>.sqlite.zst` and release
+/// `<prefix>release-<UTC ts>-<sha>.sqlite.zst`. Pure for testing.
+fn name_timestamp(key: &str, history_prefix: &str) -> Option<String> {
+    let rest = key.strip_prefix(history_prefix)?;
+    let stem = rest.strip_suffix(".sqlite.zst")?;
+    if parse_hour_stamp(stem).is_some() {
+        return Some(stem.to_string());
+    }
+    let dated = stem.strip_prefix("release-")?;
+    let (ts, _sha) = dated.rsplit_once('-')?;
+    if chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H-%M-%SZ").is_ok() {
+        return Some(ts.to_string());
+    }
+    None
 }
 
 /// Background sync: poll `data_version` on a dedicated connection, then
@@ -1384,7 +1827,10 @@ mod tests {
         let hourly: Vec<&String> = keys
             .iter()
             .filter(|k| {
-                !k.contains("release-") && !k.ends_with("junk.sqlite.zst") && !seeds.contains(k)
+                !k.contains("release-")
+                    && !k.ends_with("junk.sqlite.zst")
+                    && !k.ends_with(".meta.json")
+                    && !seeds.contains(k)
             })
             .collect();
         let mut saw_first = false;
@@ -1821,6 +2267,444 @@ mod tests {
         );
         assert_eq!(meta_generation(&store, &fresh_cfg).await, first_gen + 1);
         pool.close().await;
+    }
+
+    /// Force restore replaces the live database and keeps the old file: the
+    /// sentinel local database moves aside, the restored row is back, and
+    /// the sidecar names the bucket sha so uploads resume.
+    #[tokio::test]
+    async fn force_restore_replaces_and_keeps_old_file() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        let sentinel = b"local file stays unless forced".to_vec();
+        tokio::fs::write(&cfg.db_path, &sentinel)
+            .await
+            .expect("sentinel");
+        let report = super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: None,
+                no_verify: false,
+            },
+        )
+        .await
+        .expect("force restore");
+        assert_eq!(report.key, format!("{}/outer.sqlite.zst", cfg.key_prefix));
+        let backup = report.backup.expect("old file moves aside");
+        assert_eq!(
+            tokio::fs::read(&backup).await.expect("read backup"),
+            sentinel
+        );
+        assert!(backup
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .starts_with("outer.sqlite.pre-restore-"));
+        let pool = test_pool(&cfg.db_path).await;
+        let v: String = sqlx::query_scalar("SELECT v FROM kv WHERE k = 'a'")
+            .fetch_one(&pool)
+            .await
+            .expect("row restored");
+        assert_eq!(v, "1");
+        pool.close().await;
+        assert_sidecar_matches_meta(&store, &cfg).await;
+    }
+
+    /// A recorded checksum that mismatches refuses, `--no-verify` or not:
+    /// swapped or corrupt bytes must never land, and the local file is
+    /// untouched.
+    #[tokio::test]
+    async fn force_restore_checksum_mismatch_refuses() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        let live_key = format!("{}/outer.sqlite.zst", cfg.key_prefix);
+        // Valid zstd of *other* bytes: decodes fine, hashes differently, so
+        // the restore reaches the checksum comparison and refuses there.
+        let other = zstd::encode_all(b"other database".as_slice(), 3).expect("encode");
+        store
+            .put(&live_key, other)
+            .await
+            .expect("tamper live bytes");
+        for no_verify in [false, true] {
+            let err = super::force_restore(
+                &store,
+                &cfg,
+                &super::RestoreOpts {
+                    key: None,
+                    no_verify,
+                },
+            )
+            .await
+            .expect_err("mismatch must refuse");
+            assert!(
+                format!("{err:#}").contains("checksum mismatch"),
+                "unexpected: {err:#}"
+            );
+        }
+        // The local database is untouched: the seeded row is still there.
+        let pool = test_pool(&cfg.db_path).await;
+        let v: String = sqlx::query_scalar("SELECT v FROM kv WHERE k = 'a'")
+            .fetch_one(&pool)
+            .await
+            .expect("local row survives");
+        assert_eq!(v, "1");
+        pool.close().await;
+    }
+
+    /// Boot verifies too: a tampered live snapshot refuses the boot restore
+    /// instead of landing corrupt bytes.
+    #[tokio::test]
+    async fn boot_restore_verifies_live_checksum() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        tokio::fs::remove_file(&cfg.db_path)
+            .await
+            .expect("drop local db");
+        let live_key = format!("{}/outer.sqlite.zst", cfg.key_prefix);
+        let other = zstd::encode_all(b"other database".as_slice(), 3).expect("encode");
+        store
+            .put(&live_key, other)
+            .await
+            .expect("tamper live bytes");
+        let err = super::restore_if_missing(&store, &cfg)
+            .await
+            .expect_err("tampered snapshot must refuse boot");
+        assert!(
+            format!("{err:#}").contains("checksum mismatch"),
+            "unexpected: {err:#}"
+        );
+        assert!(!cfg.db_path.exists());
+    }
+
+    /// A held database lock refuses the force restore: the "server" is the
+    /// shared holder, and releasing it lets the restore through.
+    #[tokio::test]
+    async fn force_restore_running_server_lock_refuses() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        let server = super::DbLock::shared(&cfg).expect("server holds the lock");
+        let err = super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: None,
+                no_verify: false,
+            },
+        )
+        .await
+        .expect_err("running server must refuse");
+        assert!(
+            format!("{err:#}").contains("running"),
+            "unexpected: {err:#}"
+        );
+        assert!(!cfg.db_path.with_extension("sqlite.restoring").exists());
+        drop(server);
+        super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: None,
+                no_verify: false,
+            },
+        )
+        .await
+        .expect("restore proceeds once the server is gone");
+    }
+
+    /// Lock discipline: shared holders coexist (the release handoff runs two
+    /// servers on one database), an exclusive fails while any shared lives,
+    /// and a shared fails while an exclusive lives.
+    #[test]
+    fn db_lock_shared_coexists_exclusive_refuses() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = test_cfg(dir.path(), "host-1");
+        let first = super::DbLock::shared(&cfg).expect("first shared");
+        let _second = super::DbLock::shared(&cfg).expect("second shared coexists");
+        assert!(super::DbLock::exclusive(&cfg).is_err());
+        drop(first);
+        assert!(super::DbLock::exclusive(&cfg).is_err());
+        drop(_second);
+        let exclusive = super::DbLock::exclusive(&cfg).expect("exclusive once free");
+        assert!(super::DbLock::shared(&cfg).is_err());
+        drop(exclusive);
+        let _free = super::DbLock::shared(&cfg).expect("shared once free");
+    }
+
+    /// `--key` restores a history copy: diverge the live database, restore
+    /// the hour's first copy, the old row is back and the diverged database
+    /// moves aside.
+    #[tokio::test]
+    async fn force_restore_history_key_rolls_back() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        // The seed upload filed the hour's first copy (one row); diverge and
+        // upload again so the live snapshot carries two.
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('b', '2')")
+            .execute(&pool)
+            .await
+            .expect("diverge");
+        let sync = super::StateSync::new("host-1");
+        sync.claim(&store, &cfg).await.expect("claim");
+        sync.snapshot_now(&pool, &store, &cfg)
+            .await
+            .expect("second upload");
+        pool.close().await;
+        let history_key = super::list_snapshots(&store, &cfg)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|e| e.key)
+            .find(|k| k.contains("/history/"))
+            .expect("hourly copy listed");
+        let report = super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: Some(history_key.clone()),
+                no_verify: false,
+            },
+        )
+        .await
+        .expect("history restore");
+        assert_eq!(report.key, history_key);
+        let pool = test_pool(&cfg.db_path).await;
+        let rows: Vec<String> = sqlx::query_scalar("SELECT k FROM kv ORDER BY k")
+            .fetch_all(&pool)
+            .await
+            .expect("rows restored");
+        assert_eq!(rows, vec!["a".to_string()]);
+        pool.close().await;
+        // The diverged database moved aside with both rows.
+        let backup = report.backup.expect("diverged file moves aside");
+        let pool = test_pool(&backup).await;
+        let rows: Vec<String> = sqlx::query_scalar("SELECT k FROM kv ORDER BY k")
+            .fetch_all(&pool)
+            .await
+            .expect("backup rows");
+        assert_eq!(rows, vec!["a".to_string(), "b".to_string()]);
+        pool.close().await;
+    }
+
+    /// A history copy filed before companions existed restores only with
+    /// `--no-verify`; a non-snapshot key always refuses.
+    #[tokio::test]
+    async fn force_restore_history_without_checksum_needs_no_verify() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        let legacy_key = format!("{}/history/legacy.sqlite.zst", cfg.key_prefix);
+        store
+            .put(&legacy_key, live_bytes(&store, &cfg).await)
+            .await
+            .expect("legacy copy without companion");
+        let err = super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: Some(legacy_key.clone()),
+                no_verify: false,
+            },
+        )
+        .await
+        .expect_err("checksum-less copy must refuse");
+        assert!(
+            format!("{err:#}").contains("no checksum"),
+            "unexpected: {err:#}"
+        );
+        super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: Some(legacy_key),
+                no_verify: true,
+            },
+        )
+        .await
+        .expect("--no-verify blesses a checksum-less copy");
+        let err = super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: Some("outer/state/owner.json".to_string()),
+                no_verify: true,
+            },
+        )
+        .await
+        .expect_err("non-snapshot key must refuse");
+        assert!(
+            format!("{err:#}").contains("not a snapshot key"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    /// A live snapshot whose metadata records no checksum restores only with
+    /// `--no-verify` (and the boot path still blesses it with a warning).
+    #[tokio::test]
+    async fn force_restore_live_without_checksum_needs_no_verify() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        let meta_key = format!("{}/outer.sqlite.meta.json", cfg.key_prefix);
+        store
+            .put(&meta_key, b"{}".to_vec())
+            .await
+            .expect("strip live checksum");
+        let err = super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: None,
+                no_verify: false,
+            },
+        )
+        .await
+        .expect_err("checksum-less live snapshot must refuse");
+        assert!(
+            format!("{err:#}").contains("no checksum"),
+            "unexpected: {err:#}"
+        );
+        super::force_restore(
+            &store,
+            &cfg,
+            &super::RestoreOpts {
+                key: None,
+                no_verify: true,
+            },
+        )
+        .await
+        .expect("--no-verify blesses a checksum-less live snapshot");
+    }
+
+    /// `state list` shows the live snapshot and the history copies with
+    /// timestamps, and never the companions or the owner claim.
+    #[tokio::test]
+    async fn state_list_shows_keys_with_timestamps() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        let sync = super::StateSync::new("host-1");
+        sync.claim(&store, &cfg).await.expect("claim");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-14T15:04:22Z")
+            .expect("fixed now")
+            .to_utc();
+        let release = super::release_copy(&store, &cfg, "abc123", now)
+            .await
+            .expect("release copy")
+            .expect("key");
+        pool.close().await;
+        store
+            .put("outer/state/history/junk.sqlite.zst", b"junk".to_vec())
+            .await
+            .expect("seed unknown key");
+        let mut entries = super::list_snapshots(&store, &cfg).await.expect("list");
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        let live = format!("{}/outer.sqlite.zst", cfg.key_prefix);
+        assert!(keys.contains(&live.as_str()), "live listed; have {keys:?}");
+        assert!(
+            keys.contains(&release.as_str()),
+            "release listed; have {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| k.contains("/history/") && k.ends_with(".sqlite.zst")),
+            "hourly listed; have {keys:?}"
+        );
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.ends_with(".meta.json") || k.ends_with("owner.json")),
+            "no companions or claims; have {keys:?}"
+        );
+        for entry in &entries {
+            if entry.key.ends_with("junk.sqlite.zst") {
+                assert_eq!(entry.written_at, None);
+            } else {
+                assert!(entry.written_at.is_some(), "timestamp for {}", entry.key);
+            }
+        }
+    }
+
+    /// The pre-release copy files its checksum companion alongside, so a
+    /// `--key` restore of it verifies.
+    #[tokio::test]
+    async fn release_copy_files_checksum_companion() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        pool.close().await;
+        let now = chrono::Utc::now();
+        let key = super::release_copy(&store, &cfg, "abc123", now)
+            .await
+            .expect("copy")
+            .expect("key");
+        let meta: serde_json::Value = serde_json::from_slice(
+            &store
+                .get(&format!("{key}.meta.json"))
+                .await
+                .expect("read companion")
+                .expect("companion filed"),
+        )
+        .expect("companion json");
+        let packed = live_bytes(&store, &cfg).await;
+        let raw = zstd::decode_all(&packed[..]).expect("decode live");
+        assert_eq!(
+            meta.get("sha256").and_then(|v| v.as_str()),
+            Some(super::sha256_hex(&raw).as_str())
+        );
+        assert!(meta.get("written_at").and_then(|v| v.as_str()).is_some());
+    }
+
+    /// Prune takes a copy's checksum companion with it.
+    #[tokio::test]
+    async fn prune_removes_checksum_companions() {
+        let (_dir, store, cfg, pool) = seed_store().await;
+        let old = history_key_at(40, 6);
+        let companion = format!("{old}.meta.json");
+        for key in [&old, &companion] {
+            store
+                .put(key, b"old".to_vec())
+                .await
+                .expect("seed old copy");
+        }
+        sqlx::query("INSERT INTO kv (k, v) VALUES ('b', '2')")
+            .execute(&pool)
+            .await
+            .expect("new row");
+        let sync = super::StateSync::new("host-1");
+        sync.claim(&store, &cfg).await.expect("claim");
+        sync.snapshot_now(&pool, &store, &cfg)
+            .await
+            .expect("upload prunes");
+        pool.close().await;
+        let keys = store
+            .list("outer/state/history/")
+            .await
+            .expect("list history");
+        assert!(!keys.contains(&old), "copy pruned; have {keys:?}");
+        assert!(
+            !keys.contains(&companion),
+            "companion pruned; have {keys:?}"
+        );
+    }
+
+    /// History key names carry their timestamps; anything else is unknown.
+    #[test]
+    fn history_name_timestamps_parse() {
+        let prefix = "outer/state/history/";
+        assert_eq!(
+            super::name_timestamp("outer/state/history/2026-11-25T03.sqlite.zst", prefix),
+            Some("2026-11-25T03".to_string())
+        );
+        assert_eq!(
+            super::name_timestamp(
+                "outer/state/history/release-2026-01-01T00-00-00Z-abc123.sqlite.zst",
+                prefix
+            ),
+            Some("2026-01-01T00-00-00Z".to_string())
+        );
+        assert_eq!(
+            super::name_timestamp("outer/state/history/junk.sqlite.zst", prefix),
+            None
+        );
+        assert_eq!(
+            super::name_timestamp("outer/state/outer.sqlite.zst", prefix),
+            None
+        );
     }
 
     async fn meta_generation(store: &super::Store, cfg: &super::SnapshotConfig) -> u64 {
