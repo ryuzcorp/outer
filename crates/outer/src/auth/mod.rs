@@ -166,10 +166,19 @@ pub struct ConnectionInfo {
     pub created_at: i64,
     pub last_used_at: Option<i64>,
 }
-/// Lowercase and trim. Emails compare normalized everywhere: allowlist,
-/// waitlist, codes and accounts.
+/// Lowercase and trim. A single trailing dot on the domain is the FQDN
+/// root, not a different domain, so it is stripped: `u@x.com.` normalizes
+/// to `u@x.com`, and `valid_email`, the disposable check,
+/// `canonical_email_for_limits` and the stored identity all see the
+/// stripped form (every caller normalizes first).
 pub fn normalize_email(email: &str) -> String {
-    email.trim().to_ascii_lowercase()
+    let email = email.trim().to_ascii_lowercase();
+    match email.rsplit_once('@') {
+        Some((local, domain)) => {
+            format!("{local}@{}", domain.strip_suffix('.').unwrap_or(domain))
+        }
+        None => email,
+    }
 }
 
 pub(crate) fn valid_email(email: &str) -> bool {

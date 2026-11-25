@@ -473,6 +473,64 @@ async fn hostile_export_carries_no_secret_values() {
     )
     .await
     .unwrap();
+    // The risky ordering: inject the live secret into a scratch worktree
+    // config (the file now holds plaintext), THEN export. The export
+    // reads pre-injection commit blobs, so it must stay clean even with
+    // the value on disk. The guard restores the worktree on drop.
+    let work = dir.path().join("work").join("grocery");
+    std::fs::create_dir_all(&work).expect("work");
+    let config = work.join("wrangler.json");
+    std::fs::write(
+        &config,
+        r#"{"name": "grocery", "main": "index.js", "vars": {}}"#,
+    )
+    .expect("config");
+    let app = outer::apps::get_by_id(&pool, "app1")
+        .await
+        .expect("get")
+        .expect("app");
+    let deployer = outer::deploy::Deployer::new(
+        outer::deploy::DeploySettings {
+            data_dir: dir.path().join("data"),
+            cello_bin: "cello".to_string(),
+            esbuild_bin: None,
+            bun_bin: "bun".to_string(),
+            storage: outer::fleet::manager::FleetStorage {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "hostile".to_string(),
+                credentials: outer::store::credentials::CredentialSource::Static {
+                    access_key_id: "test".to_string(),
+                    secret_access_key: "test".to_string(),
+                },
+            },
+            step_timeout: std::time::Duration::from_secs(120),
+            cgroups: None,
+            apps_domain: "example.com".to_string(),
+            cache_purge: None,
+            jev: None,
+            wake: None,
+            secrets_key: key,
+        },
+        1,
+    );
+    let _guard = deployer
+        .inject_secrets(
+            &pool,
+            &app,
+            &outer::deploy::DeployRoot {
+                root: work.clone(),
+                config: config.clone(),
+            },
+        )
+        .await
+        .expect("inject")
+        .expect("secrets injected");
+    let injected = std::fs::read_to_string(&config).expect("read");
+    assert!(
+        injected.contains(CANARY),
+        "the worktree really holds plaintext now"
+    );
     let outcome = outer::git::export::export_app(
         &ExportDeps {
             pool: &pool,
@@ -498,7 +556,7 @@ async fn hostile_export_carries_no_secret_values() {
         .expect("zip bytes");
     // Decompressed: the raw zip bytes would hide the value under deflate.
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip parses");
-    assert!(zip.len() > 0, "the zip holds the committed tree");
+    assert!(!zip.is_empty(), "the zip holds the committed tree");
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).expect("entry");
         let name = entry
@@ -519,8 +577,8 @@ async fn hostile_export_carries_no_secret_values() {
 /// every shape refusal, fed a canary, must describe the fix without echoing
 /// it. (The deploy outcome's blocked message is pinned the same way by the
 /// pipeline's own `hostile_assets_*` tests.)
-#[test]
-fn hostile_error_bodies_never_echo_secrets() {
+#[tokio::test]
+async fn hostile_error_bodies_never_echo_secrets() {
     const CANARY: &str = "hostile-shape-canary-51bd";
     for mode in [
         outer::access::AccessMode::Open,
@@ -537,17 +595,21 @@ fn hostile_error_bodies_never_echo_secrets() {
             }
         }
     }
-    // Name rules, not values: reserved and malformed names are refused by
-    // rule text, and the set_secret size refusal carries byte counts only.
-    for refused in [
-        outer::secrets::check_name("has space"),
-        outer::secrets::check_reserved("STRIPE_SECRET_KEY"),
+    // Names travel by design (`list_secrets` returns them); values never
+    // do. Feed canary-derived names so the `{name:?}` interpolation has
+    // something to echo, then prove the refusal carries the name and the
+    // rule — the lowercase canary fails the shape rule, the
+    // reserved-prefixed one fails the platform rule.
+    for (name, rule) in [
+        ("hostile-shape-name-51bd", "must match"),
+        ("OUTER_HOSTILE_SHAPE_CANARY", "reserved"),
     ] {
-        let err = refused.expect_err("the name is refused");
-        assert!(
-            !err.contains(CANARY),
-            "name refusal echoes the secret: {err}"
-        );
+        let err = outer::secrets::check_name(name)
+            .err()
+            .or_else(|| outer::secrets::check_reserved(name).err())
+            .unwrap_or_else(|| panic!("{name} is refused"));
+        assert!(err.contains(name), "the refusal names its input: {err}");
+        assert!(err.contains(rule), "the refusal states the rule: {err}");
     }
     let err = outer::mcp::error::ToolError::invalid_argument(format!(
         "value is {} bytes; at most {} bytes",
@@ -559,6 +621,40 @@ fn hostile_error_bodies_never_echo_secrets() {
         "size refusal echoes the secret: {}",
         err.message
     );
+    // A corrupt row fails closed naming the row, never the plaintext: set
+    // a live canary value, tamper the blob, and prove the error keeps the
+    // name but drops the value.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = outer::db::open(&dir.path().join("outer.sqlite"))
+        .await
+        .expect("db");
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('owner1', 'o@example.com', 0, 0, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) \
+         VALUES ('app1', 'grocery', 'owner1', 424202, 42413, 42414, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let key = outer::secrets::SecretsKey::derive("outer-hostile-test (never production)");
+    let blob = outer::secrets::encrypt(&key, "app1", "API_KEY", CANARY.as_bytes());
+    outer::secrets::set(&pool, "app1", "API_KEY", &blob, 1)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_secret SET value_enc = ?1 WHERE app_id = 'app1'")
+        .bind(vec![0u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = outer::secrets::decrypt_all(&pool, "app1", &key)
+        .await
+        .unwrap_err();
+    let shown = format!("{err:#}");
+    assert!(shown.contains("API_KEY"), "names the row: {shown}");
+    assert!(!shown.contains(CANARY), "never echoes plaintext: {shown}");
 }
 
 /// Worker source maps live outside the deploy root and never enter the

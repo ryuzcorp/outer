@@ -44,6 +44,7 @@ struct BillingAccount {
     customer: Option<String>,
     subscription: Option<String>,
     banned: bool,
+    ban_expires: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -55,11 +56,22 @@ struct BillingAccountRow {
     #[sqlx(rename = "stripeSubscriptionId")]
     subscription: Option<String>,
     banned: i64,
+    #[sqlx(rename = "banExpires")]
+    ban_expires: Option<i64>,
+}
+
+impl BillingAccount {
+    /// Whether the account is currently banned (L-42): same expiry-aware
+    /// rule as the webhook path (`UserBilling::banned_now`) and the OAuth
+    /// session check, so an expired ban stops blocking checkout and portal.
+    fn banned_now(&self, now_secs: i64) -> bool {
+        self.banned && self.ban_expires.is_none_or(|until| now_secs < until)
+    }
 }
 
 async fn billing_account(pool: &sqlx::SqlitePool, account_id: &str) -> Option<BillingAccount> {
     let row: Option<BillingAccountRow> = sqlx::query_as(
-        "SELECT email, plan, stripeCustomerId, stripeSubscriptionId, banned FROM user WHERE id = ?1",
+        "SELECT email, plan, stripeCustomerId, stripeSubscriptionId, banned, banExpires FROM user WHERE id = ?1",
     )
     .bind(account_id)
     .fetch_optional(pool)
@@ -71,6 +83,7 @@ async fn billing_account(pool: &sqlx::SqlitePool, account_id: &str) -> Option<Bi
         customer: row.customer,
         subscription: row.subscription,
         banned: row.banned != 0,
+        ban_expires: row.ban_expires,
     })
 }
 
@@ -256,8 +269,9 @@ async fn billing_checkout(
         );
     };
     // L-42: a banned account can never pay its way back — the link refuses
-    // before Stripe is involved, so no Checkout Session is ever minted.
-    if account.banned {
+    // before Stripe is involved, so no Checkout Session is ever minted. An
+    // expired ban no longer blocks: same expiry-aware rule as the webhook.
+    if account.banned_now(now_ms() / 1000) {
         return text(
             StatusCode::FORBIDDEN,
             "This account is banned and cannot upgrade. Contact support if this is a mistake.",
@@ -330,22 +344,23 @@ async fn billing_portal(
     };
     // Decode the nullable column as `Option`: sqlx reads a NULL into a bare
     // `String` as "", which would mint a portal session for no customer.
-    let row: Option<(Option<String>, i64)> =
-        sqlx::query_as("SELECT stripeCustomerId, banned FROM user WHERE id = ?1")
+    let row: Option<(Option<String>, i64, Option<i64>)> =
+        sqlx::query_as("SELECT stripeCustomerId, banned, banExpires FROM user WHERE id = ?1")
             .bind(&account_id)
             .fetch_optional(&state.mcp.pool)
             .await
             .ok()
             .flatten();
-    let Some((customer, banned)) = row else {
+    let Some((customer, banned, ban_expires)) = row else {
         return text(
             StatusCode::NOT_FOUND,
             "This account has no billing history yet. Ask your agent for a fresh upgrade link.",
         );
     };
     // L-42: a banned account gets no portal session either — same as the
-    // checkout starter, the link refuses before Stripe is involved.
-    if banned != 0 {
+    // checkout starter, the link refuses before Stripe is involved. An
+    // expired ban no longer blocks.
+    if banned != 0 && ban_expires.is_none_or(|until| now_ms() / 1000 < until) {
         return text(
             StatusCode::FORBIDDEN,
             "This account is banned and cannot manage billing. Contact support if this is a mistake.",

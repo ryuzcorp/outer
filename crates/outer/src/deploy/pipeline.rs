@@ -139,7 +139,10 @@ pub struct DeployRoot {
 /// an early return in the upload window still scrubs the worktree. A
 /// crash between processes is covered by [`scrub_interrupted_injections`],
 /// which replays the sidecar stashed before the inject.
-struct InjectedSecrets {
+///
+/// Public for the hostile suite: the export test injects into a scratch
+/// worktree, then proves the export still carries no secret value.
+pub struct InjectedSecrets {
     path: PathBuf,
     original: Vec<u8>,
     mode: u32,
@@ -1798,7 +1801,10 @@ impl Deployer {
     /// DB-written rows predate the tool-time checks, and must never override
     /// platform vars. The config symlink checks run again here (discovery
     /// ran before the build): a planted link fails the deploy closed.
-    async fn inject_secrets(
+    /// Public for the hostile suite (see `InjectedSecrets`): the export
+    /// test injects into a scratch worktree, then proves the export
+    /// still carries no secret value.
+    pub async fn inject_secrets(
         &self,
         pool: &SqlitePool,
         app: &App,
