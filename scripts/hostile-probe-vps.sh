@@ -121,13 +121,15 @@ BASE="$(mktemp -d /tmp/hostile-XXXXXX)"
 LEAF=""
 LISTENER_PID=""
 SPIN_PID=""
-NEIGH_PID=""
+SERVER_PID=""
+CLIENT_PID=""
 SPIN_LEAF=""
 NEIGH_LEAF=""
 cleanup() {
     if [ -n "$LISTENER_PID" ]; then kill "$LISTENER_PID" 2>/dev/null || true; fi
     if [ -n "$SPIN_PID" ]; then kill "$SPIN_PID" 2>/dev/null || true; fi
-    if [ -n "$NEIGH_PID" ]; then kill "$NEIGH_PID" 2>/dev/null || true; fi
+    if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi
+    if [ -n "$CLIENT_PID" ]; then kill "$CLIENT_PID" 2>/dev/null || true; fi
     for dead in "$LEAF" "$SPIN_LEAF" "$NEIGH_LEAF"; do
         if [ -n "$dead" ]; then
             echo 1 > "$dead/cgroup.kill" 2>/dev/null || true
@@ -331,16 +333,23 @@ log "done: every must-fail build probe stayed contained"
 #
 # A hostile build busy-looping in a leaf capped at the build cpu.max quota
 # (`OUTER_BUILD_CPU_MAX`, default two CPUs) must burn no more than the quota
-# allows (the fixture measures its own cpu.stat), while a well-behaved
-# neighbour serving /health in its own fleet-capped leaf
-# (`OUTER_FLEET_CPU_MAX`) keeps its loopback p95 within the probe's bound
-# (at most twice the idle baseline, or the baseline plus 50 ms of
-# shared-vCore scheduling slack). The spinner mirrors a build, the neighbour
-# a fleet — exactly the leaves production writes.
-# Bounded: each probe runs under `timeout 90` but the layer settles in
-# ~25 s; the EXIT trap above kills both runners and removes both leaves.
-# Read-only toward prod data: only the nft table is listed (above), the
-# fixture dirs below are fresh temp dirs, and the uids need no cleanup.
+# allows (the spinner fixture measures its own cpu.stat), while the neighbour
+# server in its own fleet-capped leaf (`OUTER_FLEET_CPU_MAX`) keeps serving
+# /health with a p95 within the probe's bound (at most twice the idle
+# baseline, or the baseline plus 50 ms of shared-vCore scheduling slack).
+# The spinner mirrors a build, the server a fleet — exactly the leaves
+# production writes. The measuring client runs UNCONFINED as root, like real
+# external traffic: the nft `inet outer` table lets an app uid reach loopback
+# only on its own registered fleet ports and rejects everything else, so a
+# client running as an app uid cannot fetch even its own listener (the first
+# prod run failed exactly there: the baseline never completed).
+# Bounded: each process runs under `timeout 90` but the layer settles in
+# ~25 s; the EXIT trap above kills all three runners and removes both
+# leaves. Read-only toward prod data: only the nft table is listed (above),
+# the fixture dirs below are fresh temp dirs, and the uids need no cleanup.
+# Handoff files live in the tenant-owned workdirs, never in $BASE (0711
+# root-owned, which the sandbox uids cannot write): GO in the spinner's dir,
+# the rest in the neighbour's.
 BUILD_QUOTA="${OUTER_BUILD_CPU_MAX:-200000 100000}"
 FLEET_QUOTA="${OUTER_FLEET_CPU_MAX:-50000 100000}"
 SPIN_LEAF="$ANCHOR/hostile-spin-$(date +%s)-$$"
@@ -361,19 +370,24 @@ mkleaf "$NEIGH_LEAF" 536870912 "$FLEET_QUOTA"
 log "spin leaf carries cpu.max=$BUILD_QUOTA, neighbour leaf cpu.max=$FLEET_QUOTA"
 SPIN_WORK="$BASE/work/spin"
 NEIGH_WORK="$BASE/work/neigh"
-mkdir -p "$SPIN_WORK" "$NEIGH_WORK" "$BASE/home-spin" "$BASE/tmp-spin" "$BASE/home-neigh" "$BASE/tmp-neigh"
+CLIENT_WORK="$BASE/work/client"
+mkdir -p "$SPIN_WORK" "$NEIGH_WORK" "$CLIENT_WORK" "$BASE/home-spin" "$BASE/tmp-spin" "$BASE/home-neigh" "$BASE/tmp-neigh" "$BASE/home-client" "$BASE/tmp-client"
 cp "$FIXTURES/cpu-spin.mjs" "$SPIN_WORK/cpu-spin.mjs"
-cp "$FIXTURES/neighbour-probe.mjs" "$NEIGH_WORK/neighbour-probe.mjs"
+cp "$FIXTURES/neighbour-server.mjs" "$NEIGH_WORK/neighbour-server.mjs"
+cp "$FIXTURES/neighbour-probe.mjs" "$CLIENT_WORK/neighbour-probe.mjs"
 chown "$PROBE_UID:$PROBE_UID" "$SPIN_WORK" "$SPIN_WORK/cpu-spin.mjs" "$BASE/home-spin" "$BASE/tmp-spin"
-chown "$SIBLING_UID:$SIBLING_UID" "$NEIGH_WORK" "$NEIGH_WORK/neighbour-probe.mjs" "$BASE/home-neigh" "$BASE/tmp-neigh"
+chown "$SIBLING_UID:$SIBLING_UID" "$NEIGH_WORK" "$NEIGH_WORK/neighbour-server.mjs" "$BASE/home-neigh" "$BASE/tmp-neigh"
 chmod 0700 "$SPIN_WORK" "$NEIGH_WORK"
-GO="$BASE/spin.go"
-READY="$BASE/spin.ready"
-DONE="$BASE/baseline.done"
-rm -f "$GO" "$READY" "$DONE"
-# One runner per tenant, same shape as the build runner above: move into
-# the leaf while still root, then drop to the tenant uid with an explicit
-# env. The CPU probes need no egress, so the env stays small.
+GO="$SPIN_WORK/spin.go"
+PORT="$NEIGH_WORK/port"
+READY="$NEIGH_WORK/spin.ready"
+DONE="$NEIGH_WORK/baseline.done"
+STOP="$NEIGH_WORK/stop"
+rm -f "$GO" "$PORT" "$READY" "$DONE" "$STOP"
+# One runner per sandboxed tenant, same shape as the build runner above: move
+# into the leaf while still root, then drop to the tenant uid with an explicit
+# env. The CPU fixtures need no egress, so the env stays small. The client
+# runs as root with its own minimal env — no runner, no leaf.
 ASSIGN=""
 putenv PATH "/usr/local/bin:/usr/bin:/bin"
 putenv HOME "$BASE/home-spin"
@@ -394,27 +408,33 @@ ASSIGN=""
 putenv PATH "/usr/local/bin:/usr/bin:/bin"
 putenv HOME "$BASE/home-neigh"
 putenv TMPDIR "$BASE/tmp-neigh"
-putenv HOSTILE_SPIN_READY "$READY"
-putenv HOSTILE_BASELINE_DONE "$DONE"
-putenv HOSTILE_NEIGHBOUR_COUNT "200"
-NEIGH_ASSIGN="$ASSIGN"
+putenv HOSTILE_PORT_FILE "$PORT"
+putenv HOSTILE_STOP_FILE "$STOP"
+SERVER_ASSIGN="$ASSIGN"
 {
     printf '#!/bin/sh\nset -eu\n'
     printf 'echo $$ > %s\n' "$(sq "$NEIGH_LEAF/cgroup.procs")"
     printf 'cd %s\n' "$(sq "$NEIGH_WORK")"
     # shellcheck disable=SC2086
     printf 'exec setpriv --reuid %s --regid %s --clear-groups env -i %s %s %s\n' \
-        "$SIBLING_UID" "$SIBLING_UID" "$NEIGH_ASSIGN" "$(sq "$RUNTIME")" "$(sq "$NEIGH_WORK/neighbour-probe.mjs")"
-} > "$BASE/neigh-runner.sh"
-chmod 0755 "$BASE/spin-runner.sh" "$BASE/neigh-runner.sh"
-log "running cpu-spin.mjs as uid $PROBE_UID in $SPIN_LEAF and neighbour-probe.mjs as uid $SIBLING_UID in $NEIGH_LEAF"
-timeout 90 sh "$BASE/neigh-runner.sh" > "$BASE/neigh-stdout.log" 2> "$BASE/neigh-stderr.log" &
-NEIGH_PID="$!"
+        "$SIBLING_UID" "$SIBLING_UID" "$SERVER_ASSIGN" "$(sq "$RUNTIME")" "$(sq "$NEIGH_WORK/neighbour-server.mjs")"
+} > "$BASE/server-runner.sh"
+chmod 0755 "$BASE/spin-runner.sh" "$BASE/server-runner.sh"
+log "running cpu-spin.mjs as uid $PROBE_UID in $SPIN_LEAF, neighbour-server.mjs as uid $SIBLING_UID in $NEIGH_LEAF, neighbour-probe.mjs unconfined"
+timeout 90 sh "$BASE/server-runner.sh" > "$BASE/server-stdout.log" 2> "$BASE/server-stderr.log" &
+SERVER_PID="$!"
 timeout 90 sh "$BASE/spin-runner.sh" > "$BASE/spin-stdout.log" 2> "$BASE/spin-stderr.log" &
 SPIN_PID="$!"
-# Driver: the neighbour takes its unloaded baseline first, then the spin
-# starts; release the loaded loop once the workers ramped up.
+timeout 90 env -i PATH="/usr/local/bin:/usr/bin:/bin" HOME="$BASE/home-client" TMPDIR="$BASE/tmp-client" HOSTILE_PORT_FILE="$PORT" HOSTILE_SPIN_READY="$READY" HOSTILE_BASELINE_DONE="$DONE" HOSTILE_NEIGHBOUR_COUNT="200" "$RUNTIME" "$CLIENT_WORK/neighbour-probe.mjs" > "$BASE/client-stdout.log" 2> "$BASE/client-stderr.log" &
+CLIENT_PID="$!"
+# Driver: the server publishes its port, the client takes its unloaded
+# baseline, then the spin starts; release the loaded loop once the workers
+# ramped up, then stop the server once the client reported.
 deadline=$(( $(date +%s) + 60 ))
+while [ ! -f "$PORT" ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || die "neighbour server never published its port"
+    sleep 0.2
+done
 while [ ! -f "$DONE" ]; do
     [ "$(date +%s)" -lt "$deadline" ] || die "neighbour probe never finished its baseline"
     sleep 0.2
@@ -424,10 +444,14 @@ sleep 2
 : > "$READY"
 status=0; wait "$SPIN_PID" || status="$?"
 [ "$status" = 0 ] || { tail -30 "$BASE/spin-stderr.log" >&2; die "spinner run failed (exit $status)"; }
-status=0; wait "$NEIGH_PID" || status="$?"
-[ "$status" = 0 ] || { tail -30 "$BASE/neigh-stderr.log" >&2; die "neighbour run failed (exit $status)"; }
 SPIN_PID=""
-NEIGH_PID=""
+status=0; wait "$CLIENT_PID" || status="$?"
+[ "$status" = 0 ] || { tail -30 "$BASE/client-stderr.log" >&2; die "neighbour client run failed (exit $status)"; }
+CLIENT_PID=""
+: > "$STOP"
+status=0; wait "$SERVER_PID" || status="$?"
+[ "$status" = 0 ] || { tail -30 "$BASE/server-stderr.log" >&2; die "neighbour server run failed (exit $status)"; }
+SERVER_PID=""
 # Fail closed on the cpu fixture contract, like assert_contained: the
 # must-fail spin probe contained (ok:false), the must-succeed neighbour
 # control green. Two reports merge into one verdict.
@@ -470,11 +494,11 @@ if (leaked.length > 0) {
 console.log(`all ${wanted.length} cpu probes held`);
 EOF
 SPIN_REPORT="$SPIN_WORK/dist/cpu-spin.json"
-NEIGH_REPORT="$NEIGH_WORK/dist/neighbour.json"
+NEIGH_REPORT="$CLIENT_WORK/dist/neighbour.json"
 [ -f "$SPIN_REPORT" ] || { LINE="$(grep '"phase"' "$BASE/spin-stdout.log" | tail -1)"; [ -n "$LINE" ] && { printf '%s\n' "$LINE" > "$BASE/cpu-spin.json"; SPIN_REPORT="$BASE/cpu-spin.json"; }; }
-[ -f "$NEIGH_REPORT" ] || { LINE="$(grep '"phase"' "$BASE/neigh-stdout.log" | tail -1)"; [ -n "$LINE" ] && { printf '%s\n' "$LINE" > "$BASE/neighbour.json"; NEIGH_REPORT="$BASE/neighbour.json"; }; }
+[ -f "$NEIGH_REPORT" ] || { LINE="$(grep '"phase"' "$BASE/client-stdout.log" | tail -1)"; [ -n "$LINE" ] && { printf '%s\n' "$LINE" > "$BASE/neighbour.json"; NEIGH_REPORT="$BASE/neighbour.json"; }; }
 [ -f "$SPIN_REPORT" ] || { cat "$BASE/spin-stdout.log" >&2; die "the spinner printed no JSON report"; }
-[ -f "$NEIGH_REPORT" ] || { cat "$BASE/neigh-stdout.log" >&2; die "the neighbour printed no JSON report"; }
+[ -f "$NEIGH_REPORT" ] || { cat "$BASE/client-stdout.log" >&2; die "the neighbour client printed no JSON report"; }
 log "cpu probe reports:"
 cat "$SPIN_REPORT" "$NEIGH_REPORT"
 "$RUNTIME" "$BASE/eval-cpu.mjs" "$FIXTURES/manifest.json" "$SPIN_REPORT" "$NEIGH_REPORT" || die "a cpu probe leaked (see LEAK lines above)"

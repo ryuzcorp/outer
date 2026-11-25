@@ -1194,8 +1194,11 @@ async fn hostile_build_probes_are_contained() {
 /// busy-looping on up to 8 cores in a leaf capped at the build cpu.max quota
 /// must burn no more than the quota allows (measured from the leaf's
 /// cpu.stat), while a well-behaved neighbour serving /health in its own
-/// fleet-capped leaf keeps its loopback p95 within the probe's bound. Needs root,
-/// a writable cgroupfs with delegation and a JS runtime. Run with
+/// fleet-capped leaf keeps its loopback p95 within the probe's bound. The
+/// measuring client runs unconfined (like real external traffic: the nft
+/// table refuses an app uid's fetch of even its own loopback listener), so
+/// the nft table is not a prerequisite here. Needs root, a writable
+/// cgroupfs with delegation and a JS runtime. Run with
 /// `cargo test --locked -- --ignored hostile`.
 #[tokio::test]
 #[ignore = "needs root, a writable cgroupfs with delegation and bun/node"]
@@ -1242,14 +1245,28 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
         kill_leaf(&spin_leaf);
         return;
     };
-    // One work/cache pair per tenant, staged with its fixture and owned by
-    // its uid — the same layout `run_sandboxed` expects from the pipeline.
+    // One work/cache pair per sandboxed tenant, staged with its fixture and
+    // owned by its uid — the same layout `run_sandboxed` expects from the
+    // pipeline. The measuring client runs unconfined (like real external
+    // traffic: the nft table would refuse an app uid's own loopback fetch),
+    // so its dirs stay harness-owned. All handoff files live in the
+    // tenant-owned workdirs, never in the harness temp root the sandbox uids
+    // cannot write: GO in the spinner's dir, the rest in the neighbour's.
     let dir = tempfile::tempdir().expect("tempdir");
     let spin_work = dir.path().join("spin");
     let neigh_work = dir.path().join("neigh");
+    let client_work = dir.path().join("client");
     let spin_cache = dir.path().join("cache-spin");
     let neigh_cache = dir.path().join("cache-neigh");
-    for work in [&spin_work, &neigh_work, &spin_cache, &neigh_cache] {
+    let client_cache = dir.path().join("cache-client");
+    for work in [
+        &spin_work,
+        &neigh_work,
+        &client_work,
+        &spin_cache,
+        &neigh_cache,
+        &client_cache,
+    ] {
         std::fs::create_dir_all(work).expect("tenant dir");
     }
     std::fs::copy(
@@ -1258,20 +1275,29 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
     )
     .expect("stage spinner");
     std::fs::copy(
-        fixture_dir().join("neighbour-probe.mjs"),
-        neigh_work.join("neighbour-probe.mjs"),
+        fixture_dir().join("neighbour-server.mjs"),
+        neigh_work.join("neighbour-server.mjs"),
     )
-    .expect("stage neighbour");
+    .expect("stage server");
+    std::fs::copy(
+        fixture_dir().join("neighbour-probe.mjs"),
+        client_work.join("neighbour-probe.mjs"),
+    )
+    .expect("stage client");
     chown(&spin_work, probe_uid, probe_uid);
     chown(&spin_cache, probe_uid, probe_uid);
     chown(&neigh_work, sibling_uid, sibling_uid);
     chown(&neigh_cache, sibling_uid, sibling_uid);
-    // Handoff files: the neighbour takes its unloaded baseline first, then
-    // the harness starts the spin (GO), waits for the workers to ramp, and
-    // releases the loaded loop (READY).
-    let go = dir.path().join("spin.go");
-    let ready = dir.path().join("spin.ready");
-    let baseline_done = dir.path().join("baseline.done");
+    // Handoff files: the server publishes its port, the client takes its
+    // unloaded baseline, then the harness starts the spin (GO), waits for
+    // the workers to ramp, releases the loaded loop (READY), and stops the
+    // server once the client reported (STOP).
+    let go = spin_work.join("spin.go");
+    let port_file = neigh_work.join("port");
+    let ready = neigh_work.join("spin.ready");
+    let baseline_done = neigh_work.join("baseline.done");
+    let stop = neigh_work.join("stop");
+    let client_report = client_work.join("dist").join("neighbour.json");
     let empty: Vec<(String, String)> = Vec::new();
     let spin_env = vec![
         (
@@ -1284,7 +1310,21 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
             go.to_string_lossy().into_owned(),
         ),
     ];
-    let neigh_env = vec![
+    let server_env = vec![
+        (
+            "HOSTILE_PORT_FILE".to_string(),
+            port_file.to_string_lossy().into_owned(),
+        ),
+        (
+            "HOSTILE_STOP_FILE".to_string(),
+            stop.to_string_lossy().into_owned(),
+        ),
+    ];
+    let client_env = vec![
+        (
+            "HOSTILE_PORT_FILE".to_string(),
+            port_file.to_string_lossy().into_owned(),
+        ),
         (
             "HOSTILE_SPIN_READY".to_string(),
             ready.to_string_lossy().into_owned(),
@@ -1303,15 +1343,25 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
         cache_root: &spin_cache,
         cgroup_leaf: Some(&spin_leaf),
     };
-    let neigh_sb = outer::fleet::sandbox::Sandbox {
+    let server_sb = outer::fleet::sandbox::Sandbox {
         uid: Some(sibling_uid),
         gid: Some(sibling_uid),
         platform_env: &empty,
-        env: neigh_env.as_slice(),
+        env: server_env.as_slice(),
         cache_root: &neigh_cache,
         cgroup_leaf: Some(&neigh_leaf),
     };
-    // Both fixtures start at once; the driver sequences them through the
+    // The client is external traffic: no uid drop, no leaf. (The nft table
+    // would refuse an app uid's fetch of even its own loopback listener.)
+    let client_sb = outer::fleet::sandbox::Sandbox {
+        uid: None,
+        gid: None,
+        platform_env: &empty,
+        env: client_env.as_slice(),
+        cache_root: &client_cache,
+        cgroup_leaf: None,
+    };
+    // All fixtures start at once; the driver sequences them through the
     // handoff files. `join!` (not spawned tasks) keeps the borrows local.
     let spinner = outer::fleet::sandbox::run_sandboxed(
         &runtime,
@@ -1320,32 +1370,52 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
         &spin_sb,
         std::time::Duration::from_secs(90),
     );
-    let neighbour = outer::fleet::sandbox::run_sandboxed(
+    let server = outer::fleet::sandbox::run_sandboxed(
+        &runtime,
+        &["neighbour-server.mjs"],
+        &neigh_work,
+        &server_sb,
+        std::time::Duration::from_secs(90),
+    );
+    let client = outer::fleet::sandbox::run_sandboxed(
         &runtime,
         &["neighbour-probe.mjs"],
-        &neigh_work,
-        &neigh_sb,
+        &client_work,
+        &client_sb,
         std::time::Duration::from_secs(90),
     );
     let driver = async {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            if baseline_done.exists() {
-                std::fs::write(&go, "go\n").expect("go file");
-                // Let the workers ramp up before the loaded loop starts.
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                std::fs::write(&ready, "ready\n").expect("ready file");
+        let wait_for = async |file: &PathBuf, what: &str| loop {
+            if file.exists() {
                 return;
             }
             if std::time::Instant::now() > deadline {
-                panic!("neighbour probe never finished its baseline; cannot start the spinner");
+                panic!("{what}");
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        };
+        wait_for(&port_file, "neighbour server never published its port").await;
+        wait_for(
+            &baseline_done,
+            "neighbour probe never finished its baseline; cannot start the spinner",
+        )
+        .await;
+        std::fs::write(&go, "go\n").expect("go file");
+        // Let the workers ramp up before the loaded loop starts.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        std::fs::write(&ready, "ready\n").expect("ready file");
+        wait_for(
+            &client_report,
+            "neighbour probe never reported; cannot stop the server",
+        )
+        .await;
+        std::fs::write(&stop, "stop\n").expect("stop file");
     };
-    let (spin_out, neigh_out, ()) = tokio::join!(spinner, neighbour, driver);
+    let (spin_out, server_out, client_out, ()) = tokio::join!(spinner, server, client, driver);
     let spin_out = spin_out.expect("the spinner runs");
-    let neigh_out = neigh_out.expect("the neighbour runs");
+    let client_out = client_out.expect("the client runs");
+    server_out.expect("the server runs");
     kill_leaf(&spin_leaf);
     kill_leaf(&neigh_leaf);
     let spin_line = spin_out
@@ -1357,19 +1427,19 @@ async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
                 spin_out.chars().take(500).collect::<String>()
             )
         });
-    let neigh_line = neigh_out
+    let client_line = client_out
         .lines()
         .rfind(|line| line.contains("\"phase\""))
         .unwrap_or_else(|| {
             panic!(
-                "the neighbour prints a JSON report, got: {}",
-                neigh_out.chars().take(500).collect::<String>()
+                "the client prints a JSON report, got: {}",
+                client_out.chars().take(500).collect::<String>()
             )
         });
     let mut report: ProbeReport = serde_json::from_str(spin_line).expect("spinner report parses");
-    let neigh_report: ProbeReport =
-        serde_json::from_str(neigh_line).expect("neighbour report parses");
-    for (id, probe) in neigh_report.probes {
+    let client_report: ProbeReport =
+        serde_json::from_str(client_line).expect("client report parses");
+    for (id, probe) in client_report.probes {
         if report.probes.insert(id.clone(), probe).is_some() {
             panic!("duplicate probe id {id}");
         }

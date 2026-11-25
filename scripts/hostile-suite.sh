@@ -22,8 +22,10 @@
 #   `run_sandboxed` as a scratch app uid in a 512 MiB / 512-pid leaf —
 #   the same function `deploy::pipeline` runs install/build through — and
 #   the suite fails unless every must-fail probe stayed contained. The cpu
-#   layer (`cpu-spin.mjs` + `neighbour-probe.mjs` in quota-capped leaves)
-#   proves the cpu.max quota holds and the neighbour keeps its p95. Probes
+#   layer (spinner in the build-quota leaf, `neighbour-server.mjs` in a
+#   fleet-quota leaf, the `neighbour-probe.mjs` client unconfined like real
+#   external traffic) proves the cpu.max quotas hold and the neighbour keeps
+#   its p95. Probes
 #   that cannot prove containment skip loudly instead of passing.
 # - VPS container path (no cargo on the box): `scripts/hostile-probe-vps.sh`
 #   runs the build-probe and cpu layers as root inside `outer-outer-1` with
