@@ -61,7 +61,8 @@ case "$SIBLING_UID" in ''|*[!0-9]*) die "SIBLING_UID must be a non-negative inte
 # below), so the probe proves it cannot see either name. Never reuse a real
 # platform secret here (OUTER_SECRET, STRIPE_SECRET_KEY, …): a harness leak
 # would then cost money.
-export HOSTILE_PLATFORM_CANARY_VALUE="hostile-canary-$(date +%s)-$$-${RANDOM:-0}"
+HOSTILE_PLATFORM_CANARY_VALUE="hostile-canary-$(date +%s)-$$-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+export HOSTILE_PLATFORM_CANARY_VALUE
 export HOSTILE_HARNESS_PID="$$"
 export OUTER_HOSTILE_PROBE_CANARY="$HOSTILE_PLATFORM_CANARY_VALUE"
 
