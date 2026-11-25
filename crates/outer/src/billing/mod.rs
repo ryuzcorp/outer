@@ -153,13 +153,16 @@ impl BillingState {
     /// Mint a live Checkout Session URL for the human to open (the MCP
     /// `upgrade` tool and the console Plan card). A stored `customer`
     /// reuses that Stripe customer so the session cannot open a second
-    /// customer record; without one the `email` starts it. `None` when
-    /// disabled.
+    /// customer record; without one the `email` starts it. `notice` is the
+    /// host's `checkout-notice.txt` (or `None` without the legal dir): the
+    /// seller identity shown on the Stripe page as
+    /// `custom_text[submit][message]`. `None` when disabled.
     pub async fn checkout_url(
         &self,
         account_id: &str,
         email: &str,
         customer: Option<&str>,
+        notice: Option<&str>,
     ) -> Option<anyhow::Result<stripe::CheckoutSession>> {
         match self {
             Self::Disabled { .. } => None,
@@ -167,7 +170,7 @@ impl BillingState {
                 let success_url = format!("{}/billing/done", self.platform_base());
                 Some(
                     client
-                        .create_checkout_session(account_id, email, customer, &success_url)
+                        .create_checkout_session(account_id, email, customer, &success_url, notice)
                         .await,
                 )
             }
