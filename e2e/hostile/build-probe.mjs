@@ -67,6 +67,49 @@ deny("env:host-environ", () => {
   if (hit.length > 0) return `leaked ${hit.join(",")}`;
   throw new Error("no platform secrets in environ");
 });
+// Platform canary: the harness keeps HOSTILE_PLATFORM_CANARY_VALUE and
+// HOSTILE_HARNESS_PID in its own environ and never passes them to the
+// sandbox (env -i end to end). Either name showing up here is a leak.
+deny("secret:build-platform-env", () => {
+  const own = readFileSync("/proc/self/environ", "utf-8");
+  const hits = [];
+  if (own.includes("HOSTILE_PLATFORM_CANARY_VALUE=")) hits.push("pointer");
+  if (own.includes("OUTER_HOSTILE_PROBE_CANARY=")) hits.push("value-name");
+  if (own.includes("HOSTILE_HARNESS_PID=")) hits.push("harness-pid");
+  if (hits.length > 0) return `harness-only var in build env: ${hits.join(",")}`;
+  throw new Error("build env carries no harness-only vars");
+});
+
+// Another uid's environ must stay unreadable, and even when readable it
+// must never carry the harness pointer: the probe walks its parents up to
+// pid 1 (the harness is an ancestor) and fails on the pointer's name, so
+// no secret value ever enters this report.
+deny("secret:proc-environ", () => {
+  const pids = new Set([1]);
+  let ppid = process.ppid;
+  for (let i = 0; i < 4 && ppid > 1; i++) {
+    pids.add(ppid);
+    try {
+      const status = readFileSync(`/proc/${ppid}/status`, "utf-8");
+      const found = status.match(/^PPid:\s+(\d+)/m);
+      ppid = found ? Number(found[1]) : 1;
+    } catch {
+      break;
+    }
+  }
+  for (const pid of pids) {
+    let raw = "";
+    try {
+      raw = readFileSync(`/proc/${pid}/environ`, "utf-8");
+    } catch {
+      continue;
+    }
+    if (raw.includes("HOSTILE_PLATFORM_CANARY_VALUE=")) {
+      return `harness environ readable via /proc/${pid}/environ`;
+    }
+  }
+  throw new Error("other uids' environs unreadable or pointer-free");
+});
 
 // Cross-app reads: the harness points these at real sibling dirs (0700,
 // owned by another uid) so a failure proves isolation, not absence.

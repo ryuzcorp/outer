@@ -332,11 +332,9 @@ async fn run_git_sidecar(
     timeout: Duration,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("GIT_INDEX_FILE", index)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    cmd.args(args).current_dir(cwd);
+    crate::git::manifest::lock_tokio_git_env(&mut cmd);
+    cmd.env("GIT_INDEX_FILE", index)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .stdout(std::process::Stdio::piped())

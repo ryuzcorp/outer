@@ -126,10 +126,9 @@ pub(crate) async fn run_git(
     env: &[(&str, &str)],
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
+    cmd.args(args);
+    crate::git::manifest::lock_tokio_git_env(&mut cmd);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

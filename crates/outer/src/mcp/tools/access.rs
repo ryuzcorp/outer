@@ -9,7 +9,7 @@ use super::{internal, ok, owner_app, with_plans, Ctx};
 use crate::access::AccessMode;
 use crate::mcp::error::ToolError;
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct SetAccessInput {
     /// The app slug.
     pub app: String,
@@ -18,6 +18,17 @@ pub struct SetAccessInput {
     pub mode: String,
     /// Required for pin/password, refused for open. Never echoed back.
     pub secret: Option<String>,
+}
+
+/// Never formats the gate secret: tool inputs can land in logs and reports.
+impl std::fmt::Debug for SetAccessInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetAccessInput")
+            .field("app", &self.app)
+            .field("mode", &self.mode)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Set the app's visitor gate (owner only). `pin`/`password` need Pro;
@@ -99,5 +110,47 @@ pub fn access_tool_error(
         ),
         crate::access::AccessError::BadSecret(message) => ToolError::invalid_argument(message),
         crate::access::AccessError::Internal(err) => internal(err),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::SetAccessInput;
+
+    #[test]
+    fn hostile_access_input_debug_redacts_the_secret() {
+        let input = SetAccessInput {
+            app: "grocery".to_string(),
+            mode: "password".to_string(),
+            secret: Some("correct-horse-9".to_string()),
+        };
+        let shown = format!("{input:?}");
+        assert!(shown.contains("grocery"), "keeps context: {shown}");
+        assert!(shown.contains("password"), "keeps the mode: {shown}");
+        assert!(!shown.contains("correct-horse-9"), "redacts: {shown}");
+    }
+
+    #[test]
+    fn hostile_access_errors_name_the_rule_never_the_secret() {
+        // Every shape refusal the gate can return, fed a canary secret:
+        // the message must describe the rule, not echo the value.
+        for (mode, secret) in [
+            ("open", Some("correct-horse-9")),
+            ("pin", Some("correct-horse-9")),
+            ("pin", None),
+            ("password", Some("short")),
+            ("password", None),
+        ] {
+            let mode = match mode {
+                "open" => crate::access::AccessMode::Open,
+                "pin" => crate::access::AccessMode::Pin,
+                _ => crate::access::AccessMode::Password,
+            };
+            let err = crate::access::check_secret(mode, secret).unwrap_err();
+            let shown = format!("{err}");
+            assert!(
+                !shown.contains("correct-horse-9") && !shown.contains("short"),
+                "mode {mode:?} echoes the secret: {shown}"
+            );
+        }
     }
 }

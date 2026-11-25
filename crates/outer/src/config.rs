@@ -1554,6 +1554,7 @@ mod tests {
         assert!(!shown.contains("cf-token"), "{shown}");
         assert!(!shown.contains("sk_test_1"), "{shown}");
         assert!(!shown.contains("whsec_test"), "{shown}");
+        assert!(!shown.contains("coupon_test"), "{shown}");
         assert!(!shown.contains("test-outer-secret"), "{shown}");
     }
 

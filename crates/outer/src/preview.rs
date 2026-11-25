@@ -4,10 +4,12 @@
 //! fleet served at `<slug>--preview.<apps_domain>`. The `--preview` suffix
 //! is a single DNS label, so the existing wildcard cert covers it; a
 //! sub-label (`preview.<slug>...`) would need a second cert level and is
-//! refused by design. Previews share no production data: the preview fleet's
-//! bucket prefix (`fleets/{slug}--preview/`) is fresh and empty, D1
-//! migrations run into it from scratch, and the same pre-live moderation
-//! gate that guards main deploys guards preview deploys.
+//! refused by design. Previews get the live secrets: the preview deploy
+//! injects the app's secrets as env vars exactly like a live deploy, so
+//! preview code can read every secret. What stays separate is the data: the
+//! preview fleet's bucket prefix (`fleets/{slug}--preview/`) is fresh and
+//! empty, D1 migrations run into it from scratch, and the same pre-live
+//! moderation gate that guards main deploys guards preview deploys.
 //!
 //! State is four columns on the app row (set or cleared together): the
 //! preview commit, when it was last touched, and the preview fleet's two

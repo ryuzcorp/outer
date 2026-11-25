@@ -273,7 +273,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `add_collaborator`
 
 - **Access:** signed in
-- **Description:** Invite a collaborator to your app by email: {app, email}. The address gets an invite email and sees the app once they sign in. Owner only; Free 1 collaborator per app, Pro 10.
+- **Description:** Invite a collaborator to your app by email: {app, email}. The address gets an invite email and sees the app once they sign in. Owner only; Free 1 collaborator per app, Pro 10. Collaborators can change and deploy the code, and every deploy makes the app's secrets available to that code as env vars.
 
 **Input:**
 

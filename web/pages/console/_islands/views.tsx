@@ -2066,6 +2066,12 @@ export function CollaboratorsCard({
             </button>
           </div>
         )}
+        {isOwner && (
+          <p class="m-0 min-w-0 text-sm opacity-60">
+            Collaborators can change and deploy the code, and every deploy makes the app's
+            secrets available to that code as env vars — so they can read every secret.
+          </p>
+        )}
         {error() && (
           <p class="m-0 min-w-0 break-words text-sm text-error" role="alert">
             {error()}

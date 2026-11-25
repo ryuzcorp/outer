@@ -13,6 +13,7 @@ A preview deploy trials a change at a temporary URL before it goes live. Your li
 
 - The preview runs the same pipeline as a live deploy, including the moderation gate.
 - It starts with empty data: anything the preview writes never touches live data, and shipping it ships code only.
+- It gets your live secrets: the preview deploy injects the same env vars as a live deploy, so preview code can read every secret.
 - An unlisted app's preview stays unlisted too.
 - One preview exists per app at a time. A new preview refreshes it.
 - A preview with no visits for 24 hours is discarded on its own.

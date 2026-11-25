@@ -241,10 +241,21 @@ async fn set_app_visibility(
     Ok(json!({"visibility": visibility.as_str()}))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
+/// The gate secret must never reach a log line: `Debug` redacts it, like
+/// the MCP `SetAccessInput`.
 struct AccessBody {
     mode: String,
     secret: Option<String>,
+}
+
+impl std::fmt::Debug for AccessBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessBody")
+            .field("mode", &self.mode)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// `POST /api/console/apps/:slug/access {mode, secret?}`: the MCP
@@ -561,9 +572,19 @@ async fn api_delete(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
+/// The secret value must never reach a log line: `Debug` redacts it, like
+/// the MCP `SetSecretInput`.
 struct SecretValueBody {
     value: String,
+}
+
+impl std::fmt::Debug for SecretValueBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretValueBody")
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 /// `PUT /api/console/apps/:slug/secrets/:name {value}`: the MCP `set_secret`
@@ -992,4 +1013,29 @@ async fn api_rename(
         return *res;
     }
     ok_json(json!({"slug": out.app.slug, "url": url}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccessBody, SecretValueBody};
+
+    #[test]
+    fn hostile_console_secret_bodies_redact_debug() {
+        let shown = format!(
+            "{:?}",
+            SecretValueBody {
+                value: "live-app-secret".to_string(),
+            }
+        );
+        assert!(!shown.contains("live-app-secret"), "redacts: {shown}");
+        let shown = format!(
+            "{:?}",
+            AccessBody {
+                mode: "password".to_string(),
+                secret: Some("visitor-gate-secret".to_string()),
+            }
+        );
+        assert!(shown.contains("password"), "keeps the mode: {shown}");
+        assert!(!shown.contains("visitor-gate-secret"), "redacts: {shown}");
+    }
 }

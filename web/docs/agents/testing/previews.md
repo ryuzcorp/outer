@@ -18,7 +18,7 @@ Trial a change before it goes live: commit with `preview: true` to deploy the sa
 
 1. Commit with `preview: true` to refresh the app's one preview.
 2. Expect the same pipeline as live: install, build, moderation gate, migrations from scratch, then Cello deploy.
-3. Expect an empty namespace: the preview fleet starts with fresh D1/KV/R2 state and never touches live data.
+3. Expect an empty namespace but live secrets: the preview fleet starts with fresh D1/KV/R2 state and never touches live data, yet the deploy injects the app's live secrets as env vars, so preview code can read every secret.
 4. Share the preview URL for click-through; unlisted previews answer `noindex` like live.
 5. Promote with `promote_preview` to fast-forward main and deploy normally.
 6. Discard with `discard_preview` to stop the fleet and remove trial state.

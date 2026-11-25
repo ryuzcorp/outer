@@ -81,8 +81,12 @@ export default {
         "OUTER_SECRET",
         "AWS_SECRET_ACCESS_KEY",
         "R2_SECRET_ACCESS_KEY",
+        "R2_ACCESS_KEY_ID",
         "CLOUDFLARE_API_TOKEN",
         "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        "RESEND_API_KEY",
+        "JEV_API_KEY",
       ]) {
         if (key === "AWS_SECRET_ACCESS_KEY") {
           // The fleet legitimately holds *scoped* bucket creds under the
@@ -95,6 +99,20 @@ export default {
           secrets[key] = env[key] ? "present" : "absent";
         }
       }
+      // Aggregate for the manifest's secret:worker-env-clean probe: clean
+      // means no platform secret name beyond the fleet's own scoped grant.
+      const leaked = Object.entries(secrets).filter(
+        ([k, v]) => k !== "env:worker-secrets" && v === "present"
+      );
+      const unscoped = secrets["env:worker-secrets"];
+      secrets["secret:worker-env-clean"] =
+        leaked.length === 0 &&
+        (unscoped === "scoped-or-absent" || unscoped === undefined)
+          ? { detail: "worker env holds no platform secret value", ok: false }
+          : {
+              detail: `platform secret in worker env: ${leaked.map(([k]) => k).join(",") || unscoped}`.slice(0, 200),
+              ok: true,
+            };
 
       return Response.json({
         build: buildProbes,
