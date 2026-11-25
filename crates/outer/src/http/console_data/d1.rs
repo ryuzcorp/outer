@@ -3115,6 +3115,7 @@ exit 0
             auth,
             mcp,
             site: crate::http::site::SiteDir::new(std::path::Path::new("/nonexistent-site")),
+            legal: crate::http::legal::LegalDir::missing(),
         });
         (router, health)
     }

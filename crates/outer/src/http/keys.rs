@@ -201,6 +201,7 @@ mod tests {
             auth,
             mcp,
             site: crate::http::site::SiteDir::new(std::path::Path::new("/nonexistent-site")),
+            legal: crate::http::legal::LegalDir::missing(),
         });
         (router, pool, config, codes)
     }

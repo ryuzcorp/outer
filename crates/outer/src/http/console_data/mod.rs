@@ -447,6 +447,7 @@ mod tests {
             auth,
             mcp,
             site: crate::http::site::SiteDir::new(missing),
+            legal: super::super::legal::LegalDir::missing(),
         });
         (app, pool, data_dir, store)
     }

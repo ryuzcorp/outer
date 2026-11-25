@@ -1103,6 +1103,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 }
                 None => http::site::SiteDir::new(&config.site_dir),
             },
+            legal: http::legal::LegalDir::new(config.legal_dir.as_deref()),
         },
         http::proxy::ProxyState::new(
             pool.clone(),

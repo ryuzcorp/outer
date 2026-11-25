@@ -709,6 +709,7 @@ mod tests {
             auth,
             mcp: mcp.clone(),
             site: crate::http::site::SiteDir::new(missing),
+            legal: crate::http::legal::LegalDir::missing(),
         });
         let (cookie, c1, c2) = seed(&pool, &mcp, &config).await;
         (app, pool, cookie, c1, c2)

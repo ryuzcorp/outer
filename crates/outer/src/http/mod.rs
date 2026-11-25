@@ -18,6 +18,7 @@ pub mod console_domains;
 pub mod console_export;
 pub mod console_observe;
 pub mod keys;
+pub mod legal;
 pub mod proxy;
 pub mod site;
 
@@ -38,6 +39,7 @@ pub struct AppState {
     pub auth: crate::auth::AuthState,
     pub mcp: crate::mcp::McpState,
     pub site: site::SiteDir,
+    pub legal: legal::LegalDir,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -59,6 +61,13 @@ pub fn router(state: AppState) -> Router {
         // never serves app hosts. GET/DELETE on /mcp answer 405 from the
         // method router; the handler refuses bodies over 32 MiB (§8.1).
         .route("/mcp", post(crate::mcp::mcp_handler))
+        // Host-served legal pages (EN + PL): explicit routes, so they win
+        // over the site fallback below (the docs build no longer emits
+        // them). `axum::routing::get` answers HEAD too.
+        .route("/terms", get(legal::serve_terms))
+        .route("/privacy", get(legal::serve_privacy))
+        .route("/pl/terms", get(legal::serve_terms_pl))
+        .route("/pl/privacy", get(legal::serve_privacy_pl))
         .merge(console)
         .merge(console_data)
         .merge(keys)
@@ -224,6 +233,7 @@ mod tests {
             auth: auth.clone(),
             mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
             site: site::SiteDir::new(site_root),
+            legal: legal::LegalDir::missing(),
         })
     }
 
@@ -240,6 +250,7 @@ mod tests {
             auth: auth.clone(),
             mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
             site: site::SiteDir::new(std::path::Path::new("/nonexistent")),
+            legal: legal::LegalDir::missing(),
         });
 
         let ok = app
@@ -308,6 +319,7 @@ mod tests {
             auth: auth.clone(),
             mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
             site: site::SiteDir::new(std::path::Path::new("/nonexistent")),
+            legal: legal::LegalDir::missing(),
         });
         let cfg = SnapshotConfig {
             db_path: dir.path().join("outer.sqlite"),
@@ -359,6 +371,7 @@ mod tests {
             auth: auth.clone(),
             mcp: crate::mcp::McpState::for_tests(pool.clone(), auth),
             site: site::SiteDir::new(site_root.path()),
+            legal: legal::LegalDir::missing(),
         });
 
         // Outer's own routes win and never reach the site.

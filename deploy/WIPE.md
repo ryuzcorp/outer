@@ -40,7 +40,9 @@ Kept untouched:
   `deploy/outer.env.example` (fill blanks, `chmod 600`). Outer no longer
   reads any `CELLD_*` or `OUTER_CELLD_BIN` key; a fresh copy keeps the
   file free of dead config.
-- `/srv/outer/release.env`, `/srv/outer/tls/` (review-logins), the firewall
+- `/srv/outer/release.env`, `/srv/outer/tls/` (review-logins),
+  `/srv/outer/legal/` (the Terms and Privacy files — host-only, never in
+  the repo; back them up, there is no other copy), the firewall
   units/table (`inet outer_fw`), and the tunnel (`/etc/cloudflared/`,
   cloudflared.service).
 

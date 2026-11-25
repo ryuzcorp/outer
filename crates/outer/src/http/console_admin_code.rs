@@ -303,6 +303,7 @@ mod tests {
             auth,
             mcp: mcp.clone(),
             site: crate::http::site::SiteDir::new(missing),
+            legal: crate::http::legal::LegalDir::missing(),
         });
         let now = crate::auth::now_ms();
         for (id, email) in [

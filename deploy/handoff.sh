@@ -178,6 +178,7 @@ handoff_to() {
         --env-file /srv/outer/outer.env \
         -v /srv/outer/data:/data \
         -v /srv/outer/tls:/tls:ro \
+        -v /srv/outer/legal:/legal:ro \
         "$image" serve >/dev/null
     old="$(docker compose --env-file /srv/outer/release.env \
         -f /srv/outer/compose.yaml ps -q outer)"
