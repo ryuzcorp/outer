@@ -128,6 +128,10 @@ chmod 700 /srv/outer/data /srv/outer/tls
 # /srv/outer/tls holds review-logins now (the Origin CA files are gone with
 # direct ingress); whatever secrets land there stay root-only.
 chmod 600 /srv/outer/tls/* 2>/dev/null || true
+# /srv/outer/legal holds the Terms and Privacy files (OUTER_LEGAL_DIR):
+# public documents, so the dir stays world-readable; the files themselves
+# are never committed to the repo.
+install -m 0755 -d /srv/outer/legal
 
 # --- 5. nftables ---------------------------------------------------------------
 apt-get install -y -qq nftables curl

@@ -1001,6 +1001,7 @@ mod tests {
             auth: state.auth.clone(),
             mcp: state.clone(),
             site: crate::http::site::SiteDir::new(std::path::Path::new("/nonexistent")),
+            legal: crate::http::legal::LegalDir::missing(),
         });
         let handle = tokio::spawn(async move {
             axum::serve(listener, app.into_make_service())

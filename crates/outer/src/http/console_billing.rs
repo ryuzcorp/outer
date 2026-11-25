@@ -565,6 +565,7 @@ mod tests {
             auth,
             mcp,
             site: crate::http::site::SiteDir::new(std::path::Path::new("/nonexistent")),
+            legal: crate::http::legal::LegalDir::missing(),
         };
         (state, pool, codes)
     }

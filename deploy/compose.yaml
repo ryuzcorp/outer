@@ -49,6 +49,9 @@ services:
       # Review-logins file (OUTER_REVIEW_LOGINS_FILE). Read-only: the
       # container never writes secrets.
       - /srv/outer/tls:/tls:ro
+      # Legal pages (OUTER_LEGAL_DIR). Host-only files, never committed:
+      # read per request, so host edits go live without a rollout.
+      - /srv/outer/legal:/legal:ro
     # No HTTP healthcheck on purpose: the rollout verifies instead (the
     # container running on the new image + outer's "listening on" log line,
     # see deploy/release.sh).

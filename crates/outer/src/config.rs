@@ -267,6 +267,7 @@ impl std::fmt::Debug for Config {
             .field("domain", &self.domain)
             .field("data_dir", &self.data_dir)
             .field("site_dir", &self.site_dir)
+            .field("legal_dir", &self.legal_dir)
             .field("listen", &self.listen)
             .field("host_id", &self.host_id)
             .field("store", &self.store)
@@ -291,6 +292,13 @@ pub struct Config {
     pub domain: String,
     /// Built web site served on the platform host (`OUTER_SITE_DIR`).
     pub site_dir: PathBuf,
+    /// Host-served legal pages (`OUTER_LEGAL_DIR`, `None` on localhost dev):
+    /// off localhost the dir must exist and hold `terms.html`,
+    /// `privacy.html`, `terms.pl.html` and `privacy.pl.html`, served at
+    /// `/terms`, `/privacy`, `/pl/terms` and `/pl/privacy`. The files live
+    /// only on the host, never in the repo, and are read per request so
+    /// edits go live without a rollout.
+    pub legal_dir: Option<PathBuf>,
     /// SQLite, git mirrors, worktrees and caches (`OUTER_DATA`).
     pub data_dir: PathBuf,
     /// Listener (`OUTER_LISTEN`): loopback-only off localhost (production
@@ -433,6 +441,7 @@ impl Config {
         // already passes an absolute dir, so this only changes localhost.
         let data_dir = absolutize(PathBuf::from(get("OUTER_DATA").unwrap_or("./data")));
         let site_dir = PathBuf::from(get("OUTER_SITE_DIR").unwrap_or("./web/dist"));
+        let legal_dir = get("OUTER_LEGAL_DIR").map(PathBuf::from);
         let listen = match get("OUTER_LISTEN").unwrap_or(DEFAULT_LISTEN).parse() {
             Ok(addr) => addr,
             Err(_) => {
@@ -730,6 +739,7 @@ impl Config {
             domain,
             data_dir,
             site_dir,
+            legal_dir,
             listen,
             host_id,
             store,
@@ -851,6 +861,38 @@ impl Config {
                 "OUTER_TERMS_VERSION is required when OUTER_DOMAIN is not a localhost dev domain (changing it re-asks every account at next sign-in)"
                     .to_string(),
             );
+        }
+        // Legal pages (spec: terms + privacy, EN + PL): off localhost the
+        // dir is required and must hold all four files; the routes read
+        // them per request, so host edits go live without a rollout.
+        // Localhost dev without the dir serves a placeholder instead.
+        if !self.is_local() && self.legal_dir.is_none() {
+            problems.push(
+                "OUTER_LEGAL_DIR is required when OUTER_DOMAIN is not a localhost dev domain (the Terms and Privacy pages are served from host files, never committed to the repo)"
+                    .to_string(),
+            );
+        }
+        if let Some(dir) = &self.legal_dir {
+            if !dir.is_dir() {
+                problems.push(format!(
+                    "OUTER_LEGAL_DIR={} is not a directory (it must hold terms.html, privacy.html, terms.pl.html and privacy.pl.html, served at /terms, /privacy, /pl/terms and /pl/privacy)",
+                    dir.display()
+                ));
+            } else {
+                for (file, route) in [
+                    ("terms.html", "/terms"),
+                    ("privacy.html", "/privacy"),
+                    ("terms.pl.html", "/pl/terms"),
+                    ("privacy.pl.html", "/pl/privacy"),
+                ] {
+                    if !dir.join(file).is_file() {
+                        problems.push(format!(
+                            "OUTER_LEGAL_DIR={} is missing {file} (served at {route})",
+                            dir.display()
+                        ));
+                    }
+                }
+            }
         }
         if !self.is_local() && self.outer_secret == "dev" {
             problems.push(
@@ -1096,6 +1138,58 @@ mod tests {
     }
 
     #[test]
+    fn legal_dir_optional_on_localhost_and_required_off_it() {
+        // Unset on localhost: dev keeps working, the routes serve a
+        // placeholder.
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert_eq!(cfg.legal_dir, None);
+        // Off localhost unset is a problem naming the variable.
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_STORE", "memory"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.starts_with("OUTER_LEGAL_DIR is required")),
+            "{err:?}"
+        );
+        // Set but missing: the dir itself is reported.
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_LEGAL_DIR", "/nonexistent-legal-dir"),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter().any(|p| p.contains("is not a directory")),
+            "{err:?}"
+        );
+        // A dir missing one file names the file and its route.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["terms.html", "privacy.html", "terms.pl.html"] {
+            std::fs::write(dir.path().join(name), "<html></html>").unwrap();
+        }
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_LEGAL_DIR", dir.path().to_str().unwrap()),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.contains("privacy.pl.html") && p.contains("/pl/privacy")),
+            "{err:?}"
+        );
+        // All four files present: no legal problems.
+        std::fs::write(dir.path().join("privacy.pl.html"), "<html></html>").unwrap();
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_LEGAL_DIR", dir.path().to_str().unwrap()),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.legal_dir, Some(dir.path().to_path_buf()));
+    }
+
+    #[test]
     fn ai_gateway_defaults_to_outer_and_overrides() {
         let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
         assert_eq!(cfg.ai_gateway, "outer");
@@ -1194,6 +1288,16 @@ mod tests {
 
     #[test]
     fn r2_config_parses_and_never_prints_the_secret() {
+        let legal = tempfile::tempdir().unwrap();
+        for name in [
+            "terms.html",
+            "privacy.html",
+            "terms.pl.html",
+            "privacy.pl.html",
+        ] {
+            std::fs::write(legal.path().join(name), "<html></html>").unwrap();
+        }
+        let legal = legal.path().to_str().unwrap().to_string();
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
             ("OUTER_LISTEN", "127.0.0.1:8443"),
@@ -1208,6 +1312,7 @@ mod tests {
             ("CLOUDFLARE_API_TOKEN", "cf-token"),
             ("OUTER_TERMS_VERSION", "2026-10-23"),
             ("OUTER_ADMIN_EMAILS", " Owner@Example.com ,"),
+            ("OUTER_LEGAL_DIR", legal.as_str()),
             ("OUTER_SIGNUP", "closed"),
             ("OUTER_SECRET", "test-outer-secret"),
             ("STRIPE_SECRET_KEY", "sk_test_1"),

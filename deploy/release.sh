@@ -154,17 +154,18 @@ fi
 # /srv/outer/outer.env (including OUTER_HOST_ID when the operator set it;
 # otherwise outer defaults to the container hostname on both paths), and
 # every compose volume read-only: /tls (OUTER_REVIEW_LOGINS_FILE lives under
-# it) and /data (the live DB dir; check-config never opens it, and read-only
+# it), /legal (the Terms and Privacy files OUTER_LEGAL_DIR points at) and
+# /data (the live DB dir; check-config never opens it, and read-only
 # keeps even a buggy validation from touching prod).
 # check-config has no side effects (no DB, no network, no sockets) and names
 # variables, never values. --pull=never: a missing local image must fail
 # here, never pull a same-named registry image and run it with the
 # production env. A non-zero exit aborts the release here with prod
 # untouched: past aborts this must catch are a malformed OUTER_REVIEW_LOGINS
-# PHC, a review-logins path missing its /tls mount, and STRIPE_* missing off
-# localhost.
+# PHC, a review-logins path missing its /tls mount, a legal dir missing its
+# /legal mount, and STRIPE_* missing off localhost.
 if ! ssh "$TARGET" docker run --rm --pull=never --env-file /srv/outer/outer.env \
-    -v /srv/outer/tls:/tls:ro -v /srv/outer/data:/data:ro "$IMAGE" check-config; then
+    -v /srv/outer/tls:/tls:ro -v /srv/outer/legal:/legal:ro -v /srv/outer/data:/data:ro "$IMAGE" check-config; then
     echo "release.sh: preflight check-config on $IMAGE failed; release aborted, prod untouched (fix the config or the image, then release again)" >&2
     exit 1
 fi
@@ -210,9 +211,11 @@ source /srv/outer/handoff.sh
 # this step runs on both paths. SHA is hex (validated
 # above), so interpolating it into the docker args is safe. No data mount:
 # the subcommand only reads config env and the bucket, never the local DB.
-# validation reads files under /tls (e.g. OUTER_REVIEW_LOGINS_FILE).
+# validation reads files under /tls (e.g. OUTER_REVIEW_LOGINS_FILE) and
+# /legal (the Terms and Privacy files).
 # --pull=never: the image is local-only (same as the preflight above).
 docker run --rm --pull=never --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
+    -v /srv/outer/legal:/legal:ro \
     "outer:$SHA" state release-backup --sha "$SHA"
 if [[ "$FRESH_INSTALL" == 1 ]]; then
     # Fresh box: no old container to drain and no handoff heartbeat. Re-check

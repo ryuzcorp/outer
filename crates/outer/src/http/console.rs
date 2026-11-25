@@ -1893,6 +1893,7 @@ mod tests {
             auth,
             mcp,
             site: crate::http::site::SiteDir::new(missing),
+            legal: crate::http::legal::LegalDir::missing(),
         });
         (app, pool)
     }
@@ -2421,6 +2422,7 @@ mod tests {
             auth,
             mcp,
             site: crate::http::site::SiteDir::new(site_root.path()),
+            legal: crate::http::legal::LegalDir::missing(),
         });
         let (status, _, body) = send(
             &app,
