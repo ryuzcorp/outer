@@ -55,6 +55,17 @@ case "$PROBE_UID" in ''|*[!0-9]*) die "PROBE_UID must be a non-negative integer"
 case "$SIBLING_UID" in ''|*[!0-9]*) die "SIBLING_UID must be a non-negative integer" ;; esac
 [ "$PROBE_UID" != "$SIBLING_UID" ] || die "uids must be distinct"
 
+# Harness-only canary for the secret:build-platform-env and
+# secret:proc-environ probes. This stays in the HARNESS environ: the probe
+# runs under `env -i` with an explicit assignment list (see runner.sh
+# below), so the probe proves it cannot see either name. Never reuse a real
+# platform secret here (OUTER_SECRET, STRIPE_SECRET_KEY, …): a harness leak
+# would then cost money.
+HOSTILE_PLATFORM_CANARY_VALUE="hostile-canary-$(date +%s)-$$-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+export HOSTILE_PLATFORM_CANARY_VALUE
+export HOSTILE_HARNESS_PID="$$"
+export OUTER_HOSTILE_PROBE_CANARY="$HOSTILE_PLATFORM_CANARY_VALUE"
+
 
 # The app range prod polices (config.rs default when the env is absent here).
 RANGE="${OUTER_APP_UID_RANGE:-200000-201023}"

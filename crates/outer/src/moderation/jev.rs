@@ -38,13 +38,27 @@ const MAX_PARALLEL_CALLS: usize = 4;
 /// What the gate needs to reach Jev. Built once at boot from the config's
 /// Cloudflare pair plus `OUTER_AI_GATEWAY`; tests point `api_base` at a
 /// fake server on 127.0.0.1.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JevConfig {
     pub api_base: String,
     pub account_id: String,
     pub api_token: String,
     pub gateway: String,
     pub timeout: Duration,
+}
+
+/// The token is a live credential: `Debug` names it, never its value,
+/// mirroring [`JevClient`].
+impl std::fmt::Debug for JevConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JevConfig")
+            .field("api_base", &self.api_base)
+            .field("account_id", &self.account_id)
+            .field("api_token", &"<redacted>")
+            .field("gateway", &self.gateway)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl JevConfig {
@@ -645,6 +659,20 @@ mod tests {
         config.api_base = base_url.to_string();
         config.timeout = Duration::from_millis(500);
         JevClient::new(config).unwrap()
+    }
+
+    #[test]
+    fn hostile_jev_config_debug_redacts_the_token() {
+        let shown = format!(
+            "{:?}",
+            JevConfig::new(
+                "test-account".to_string(),
+                "live-jev-token".to_string(),
+                "outer".to_string(),
+            )
+        );
+        assert!(shown.contains("test-account"), "keeps context: {shown}");
+        assert!(!shown.contains("live-jev-token"), "redacts: {shown}");
     }
 
     /// A real app's seed (557 short UI strings, 2026-10-26) packed ~250

@@ -64,7 +64,8 @@ fn hostile_manifest_covers_every_required_category() {
     for probe in &manifest.probes {
         assert!(!probe.id.is_empty(), "probe ids are non-empty");
         assert!(
-            ["build", "worker", "r2"].contains(&probe.phase.as_str()),
+            ["build", "worker", "r2", "deploy", "export", "platform"]
+                .contains(&probe.phase.as_str()),
             "probe {} has a known phase",
             probe.id
         );
@@ -87,6 +88,7 @@ fn hostile_manifest_covers_every_required_category() {
         "credential-scope",
         "fleet-ports",
         "cgroup-bounds",
+        "secret-leak",
     ] {
         let probes = by_category
             .get(required)
@@ -403,6 +405,281 @@ fn hostile_data_dir_layout_isolates_apps() {
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700))
             .expect("chmod leaf");
         assert_eq!(mode(&leaf), 0o700, "app leaf is private");
+    }
+}
+
+/// An export of an app holding a live secret carries no secret value: the
+/// zip is built from pre-injection commit blobs, while `app_secret` rows
+/// stay in the database (encrypted) and never enter the bundle.
+#[tokio::test]
+async fn hostile_export_carries_no_secret_values() {
+    use outer::git::commit::commit;
+    use outer::git::export::{ExportCaps, ExportDeps, ExportParams};
+    use outer::git::{Author, CommitChanges, CommitRequest, FileWrite, WriteBody};
+    const CANARY: &str = "hostile-export-canary-9f31ac";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = outer::db::open(&dir.path().join("outer.sqlite"))
+        .await
+        .expect("db");
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('owner1', 'o@example.com', 0, 0, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) \
+         VALUES ('app1', 'grocery', 'owner1', 424201, 42411, 42412, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A live secret value in the platform's own table, like a user's paid
+    // API key. The key derivation is test-only: production derives from
+    // config, and no test ever touches the real OUTER_SECRET (cargo test
+    // threads share process env).
+    let key = outer::secrets::SecretsKey::derive("outer-hostile-test (never production)");
+    let blob = outer::secrets::encrypt(&key, "app1", "API_KEY", CANARY.as_bytes());
+    outer::secrets::set(&pool, "app1", "API_KEY", &blob, 1)
+        .await
+        .unwrap();
+    let store = outer::store::Store::memory();
+    let cfg = outer::git::GitConfig::new(dir.path().join("git"), None);
+    let sync = outer::git::GitSync::default();
+    outer::git::manifest::init_repo(&store, &cfg, &sync, "grocery")
+        .await
+        .unwrap();
+    commit(
+        &store,
+        &cfg,
+        &sync,
+        "grocery",
+        CommitRequest {
+            message: "seed".to_string(),
+            base: None,
+            changes: CommitChanges {
+                writes: vec![FileWrite {
+                    path: "index.ts".to_string(),
+                    body: WriteBody::Text(
+                        "export default { fetch: () => new Response(\"hi\") };".to_string(),
+                    ),
+                    expect_blob: None,
+                }],
+                ..Default::default()
+            },
+            author: Author {
+                name: "t".to_string(),
+                email: "t@example.com".to_string(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    // The risky ordering: inject the live secret into a scratch worktree
+    // config (the file now holds plaintext), THEN export. The export
+    // reads pre-injection commit blobs, so it must stay clean even with
+    // the value on disk. The guard restores the worktree on drop.
+    let work = dir.path().join("work").join("grocery");
+    std::fs::create_dir_all(&work).expect("work");
+    let config = work.join("wrangler.json");
+    std::fs::write(
+        &config,
+        r#"{"name": "grocery", "main": "index.js", "vars": {}}"#,
+    )
+    .expect("config");
+    let app = outer::apps::get_by_id(&pool, "app1")
+        .await
+        .expect("get")
+        .expect("app");
+    let deployer = outer::deploy::Deployer::new(
+        outer::deploy::DeploySettings {
+            data_dir: dir.path().join("data"),
+            cello_bin: "cello".to_string(),
+            esbuild_bin: None,
+            bun_bin: "bun".to_string(),
+            storage: outer::fleet::manager::FleetStorage {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "hostile".to_string(),
+                credentials: outer::store::credentials::CredentialSource::Static {
+                    access_key_id: "test".to_string(),
+                    secret_access_key: "test".to_string(),
+                },
+            },
+            step_timeout: std::time::Duration::from_secs(120),
+            cgroups: None,
+            apps_domain: "example.com".to_string(),
+            cache_purge: None,
+            jev: None,
+            wake: None,
+            secrets_key: key,
+        },
+        1,
+    );
+    let _guard = deployer
+        .inject_secrets(
+            &pool,
+            &app,
+            &outer::deploy::DeployRoot {
+                root: work.clone(),
+                config: config.clone(),
+            },
+        )
+        .await
+        .expect("inject")
+        .expect("secrets injected");
+    let injected = std::fs::read_to_string(&config).expect("read");
+    assert!(
+        injected.contains(CANARY),
+        "the worktree really holds plaintext now"
+    );
+    let outcome = outer::git::export::export_app(
+        &ExportDeps {
+            pool: &pool,
+            store: &store,
+            git: &cfg,
+            sync: &sync,
+        },
+        ExportParams {
+            slug: "grocery",
+            app_id: "app1",
+            rev: None,
+            caps: &ExportCaps::default(),
+            now: chrono::Utc::now(),
+        },
+    )
+    .await
+    .expect("export");
+    assert!(outcome.bytes > 0, "the export is not empty");
+    let bytes = store
+        .get(&outcome.key)
+        .await
+        .expect("get")
+        .expect("zip bytes");
+    // Decompressed: the raw zip bytes would hide the value under deflate.
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip parses");
+    assert!(!zip.is_empty(), "the zip holds the committed tree");
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).expect("entry");
+        let name = entry
+            .name()
+            .map(|name| name.into_owned())
+            .unwrap_or_else(|_| "<bad-name>".to_string());
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content).expect("read");
+        let text = String::from_utf8_lossy(&content);
+        assert!(
+            !text.contains(CANARY),
+            "export entry {name} carries the secret value"
+        );
+    }
+}
+
+/// Tool and deploy error bodies name rules and paths, never secret values:
+/// every shape refusal, fed a canary, must describe the fix without echoing
+/// it. (The deploy outcome's blocked message is pinned the same way by the
+/// pipeline's own `hostile_assets_*` tests.)
+#[tokio::test]
+async fn hostile_error_bodies_never_echo_secrets() {
+    const CANARY: &str = "hostile-shape-canary-51bd";
+    for mode in [
+        outer::access::AccessMode::Open,
+        outer::access::AccessMode::Pin,
+        outer::access::AccessMode::Password,
+    ] {
+        for secret in [None, Some(CANARY), Some("short"), Some("1234")] {
+            if let Err(err) = outer::access::check_secret(mode, secret) {
+                let shown = format!("{err}");
+                assert!(
+                    !shown.contains(CANARY) && !shown.contains("short"),
+                    "gate refusal echoes the secret: {shown}"
+                );
+            }
+        }
+    }
+    // Names travel by design (`list_secrets` returns them); values never
+    // do. Feed canary-derived names so the `{name:?}` interpolation has
+    // something to echo, then prove the refusal carries the name and the
+    // rule — the lowercase canary fails the shape rule, the
+    // reserved-prefixed one fails the platform rule.
+    for (name, rule) in [
+        ("hostile-shape-name-51bd", "must match"),
+        ("OUTER_HOSTILE_SHAPE_CANARY", "reserved"),
+    ] {
+        let err = outer::secrets::check_name(name)
+            .err()
+            .or_else(|| outer::secrets::check_reserved(name).err())
+            .unwrap_or_else(|| panic!("{name} is refused"));
+        assert!(err.contains(name), "the refusal names its input: {err}");
+        assert!(err.contains(rule), "the refusal states the rule: {err}");
+    }
+    let err = outer::mcp::error::ToolError::invalid_argument(format!(
+        "value is {} bytes; at most {} bytes",
+        CANARY.len(),
+        outer::secrets::MAX_VALUE_BYTES
+    ));
+    assert!(
+        !err.message.contains(CANARY),
+        "size refusal echoes the secret: {}",
+        err.message
+    );
+    // A corrupt row fails closed naming the row, never the plaintext: set
+    // a live canary value, tamper the blob, and prove the error keeps the
+    // name but drops the value.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pool = outer::db::open(&dir.path().join("outer.sqlite"))
+        .await
+        .expect("db");
+    sqlx::query("INSERT INTO user (id, email, lastActiveAt, createdAt, updatedAt) VALUES ('owner1', 'o@example.com', 0, 0, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) \
+         VALUES ('app1', 'grocery', 'owner1', 424202, 42413, 42414, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let key = outer::secrets::SecretsKey::derive("outer-hostile-test (never production)");
+    let blob = outer::secrets::encrypt(&key, "app1", "API_KEY", CANARY.as_bytes());
+    outer::secrets::set(&pool, "app1", "API_KEY", &blob, 1)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_secret SET value_enc = ?1 WHERE app_id = 'app1'")
+        .bind(vec![0u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = outer::secrets::decrypt_all(&pool, "app1", &key)
+        .await
+        .unwrap_err();
+    let shown = format!("{err:#}");
+    assert!(shown.contains("API_KEY"), "names the row: {shown}");
+    assert!(!shown.contains(CANARY), "never echoes plaintext: {shown}");
+}
+
+/// Worker source maps live outside the deploy root and never enter the
+/// bundle: maps sit under `maps/<slug>/<sha>/`, keyed by hex sha, beside
+/// fleet state — never inside a worktree or an asset root a deploy uploads.
+/// (The deploy's bundle sweep over `.sourcemap-*` temp files is pinned by
+/// the pipeline's own `deploy_stores_the_worker_map_*` test.)
+#[test]
+fn hostile_sourcemaps_stay_outside_the_deploy_root() {
+    use outer::observe::sourcemaps::{app_maps_dir, is_key_sha, MAPS_DIR, WORKER_MAP_FILE};
+    let data = std::path::PathBuf::from("/data");
+    assert_eq!(
+        app_maps_dir(&data, "grocery"),
+        data.join(MAPS_DIR).join("grocery")
+    );
+    for root in ["work/grocery", "fleets/grocery", "cache/grocery"] {
+        assert!(
+            !app_maps_dir(&data, "grocery").starts_with(data.join(root)),
+            "maps dir escapes {root}"
+        );
+    }
+    assert_eq!(WORKER_MAP_FILE, "worker.js.map");
+    assert!(is_key_sha("abc123"));
+    for bad in ["", "..", "../maps", "/abs", "ABCDEF02!?", "xyz"] {
+        assert!(!is_key_sha(bad), "{bad} must not key the maps dir");
     }
 }
 
@@ -735,6 +1012,16 @@ async fn hostile_build_probes_are_contained() {
         own.contains(&leaf_name),
         "the probe checks its own placement against the leaf"
     );
+    // Harness-only canary for the secret:build-platform-env and
+    // secret:proc-environ probes: set in THIS process env under a dedicated
+    // name and never added to the sandbox env list below, so the probe
+    // proves it cannot see the harness environ. Never the real OUTER_SECRET
+    // here: cargo test threads share process env, and a harness leak of a
+    // money-moving key would cost money.
+    let probe_canary = format!("hostile-canary-{}-{}", std::process::id(), probe_uid);
+    std::env::set_var("HOSTILE_PLATFORM_CANARY_VALUE", &probe_canary);
+    std::env::set_var("HOSTILE_HARNESS_PID", std::process::id().to_string());
+    std::env::set_var("OUTER_HOSTILE_PROBE_CANARY", &probe_canary);
 
     let sandbox = outer::fleet::sandbox::Sandbox {
         uid: Some(probe_uid),
@@ -750,7 +1037,7 @@ async fn hostile_build_probes_are_contained() {
             ),
         ],
         env: &[
-            ("OUTER_SECRET".to_string(), "planted".to_string()),
+            ("OUTER_SECRET".to_string(), probe_canary.clone()),
             ("STRIPE_SECRET_KEY".to_string(), "planted".to_string()),
             ("APP_KEY".to_string(), "allowed".to_string()),
             (

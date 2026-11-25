@@ -152,7 +152,10 @@ impl std::fmt::Debug for StripeClient {
         f.debug_struct("StripeClient")
             .field("price_pro", &self.price_pro)
             .field("secret_key", &"<redacted>")
-            .field("launch_coupon", &self.launch_coupon)
+            .field(
+                "launch_coupon",
+                &self.launch_coupon.as_ref().map(|_| "<redacted>"),
+            )
             .field("api_base", &self.api_base)
             .finish()
     }
@@ -1025,11 +1028,15 @@ mod tests {
         let client = StripeClient::new(
             "sk_live_redact_me".to_string(),
             "price_pro".to_string(),
-            None,
+            Some("launch_coupon_redact_me".to_string()),
         )
         .unwrap();
         let shown = format!("{client:?}");
         assert!(!shown.contains("sk_live_redact_me"), "{shown}");
+        assert!(
+            !shown.contains("launch_coupon_redact_me"),
+            "coupon redacted: {shown}"
+        );
         assert!(shown.contains("<redacted>"), "{shown}");
     }
 }

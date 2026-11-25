@@ -234,11 +234,11 @@ fn build_zip(job: &ZipJob, dest: &Path) -> anyhow::Result<()> {
         let name = format!("{}{}", job.prefix, entry.path);
         zip.start_file(name, options)?;
         let spec = format!("{}:{}", job.sha, entry.path);
-        let out = std::process::Command::new("git")
-            .arg(format!("--git-dir={}", job.bare.display()))
-            .args(["cat-file", "blob", &spec])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        let mut cat = std::process::Command::new("git");
+        cat.arg(format!("--git-dir={}", job.bare.display()))
+            .args(["cat-file", "blob", &spec]);
+        super::manifest::lock_std_git_env(&mut cat);
+        let out = cat
             .output()
             .map_err(|err| anyhow::anyhow!("git cat-file {}: {err:#}", entry.path))?;
         if !out.status.success() {

@@ -236,7 +236,6 @@ async fn authorization_server(State(state): State<AuthState>) -> Response {
     }))
 }
 
-#[derive(Debug)]
 struct PendingRequest {
     id: String,
     client_id: String,
@@ -245,6 +244,21 @@ struct PendingRequest {
     scope: String,
     account_id: Option<String>,
     csrf: String,
+}
+
+/// The CSRF token is a live credential: `Debug` names it, never its value.
+impl std::fmt::Debug for PendingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRequest")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("state", &self.state)
+            .field("scope", &self.scope)
+            .field("account_id", &self.account_id)
+            .field("csrf", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One pending authorization row: id, client_id, redirect_uri, state,
@@ -1878,4 +1892,27 @@ pub async fn add_operator_client(
     .execute(pool)
     .await?;
     Ok((client_id, secret))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingRequest;
+
+    #[test]
+    fn hostile_pending_request_debug_redacts_csrf() {
+        let shown = format!(
+            "{:?}",
+            PendingRequest {
+                id: "req-1".to_string(),
+                client_id: "https://client.example".to_string(),
+                redirect_uri: "https://client.example/cb".to_string(),
+                state: None,
+                scope: "apps".to_string(),
+                account_id: None,
+                csrf: "csrf-live-token".to_string(),
+            }
+        );
+        assert!(shown.contains("req-1"), "keeps context: {shown}");
+        assert!(!shown.contains("csrf-live-token"), "redacts: {shown}");
+    }
 }

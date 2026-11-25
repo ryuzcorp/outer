@@ -201,6 +201,33 @@ pub(crate) async fn run_git_stdin(
     run_git_inner(args, Some(stdin.to_vec()), env, timeout).await
 }
 
+/// Locked-down env for git children that touch app content: start from
+/// `env_clear` so platform secrets (`OUTER_*`, `AWS_*`, `STRIPE_*`, …)
+/// never reach a process an app's gitattributes filters could steer, then
+/// set only what git needs to run deterministically.
+pub(crate) fn lock_tokio_git_env(cmd: &mut tokio::process::Command) {
+    cmd.env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0");
+}
+
+/// [`lock_tokio_git_env`] for synchronous spawns (the export zip builder).
+pub(crate) fn lock_std_git_env(cmd: &mut std::process::Command) {
+    cmd.env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0");
+}
+
 async fn run_git_inner(
     args: &[&str],
     stdin: Option<Vec<u8>>,
@@ -216,23 +243,16 @@ async fn run_git_inner(
     }
 
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env("LANG", "C.UTF-8")
-        .env("HOME", "/nonexistent")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.args(args);
+    lock_tokio_git_env(&mut cmd);
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     for (k, v) in env {
         cmd.env(k, v);
     }

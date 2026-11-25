@@ -31,6 +31,9 @@ static PARSED: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// True when `domain` (case-insensitive) is listed or sits under a listed
 /// domain. Callers pass the domain part of an already-normalized email.
 pub fn is_disposable_domain(domain: &str) -> bool {
+    // A single trailing dot is the FQDN root, not a different domain:
+    // without this `u@0-mail.com.` would dodge the blocklist.
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
     let mut suffix = domain.trim().to_ascii_lowercase();
     loop {
         if PARSED.contains(suffix.as_str()) {
@@ -67,6 +70,10 @@ pub fn canonical_email_for_limits(email: &str) -> String {
     let Some((local, domain)) = email.split_once('@') else {
         return email;
     };
+    // The FQDN root dot again: `F.O.O+b@gmail.com.` must fold into the
+    // same OTP bucket as `foo@gmail.com`. `normalize_email` strips it too,
+    // so every layer agrees.
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
     let local = local.split('+').next().unwrap_or(local);
     if domain == "gmail.com" || domain == "googlemail.com" {
         let local: String = local.chars().filter(|c| *c != '.').collect();
@@ -136,5 +143,25 @@ mod tests {
         );
         // Identity keeps the full address: only limits fold.
         assert_eq!(canonical_email_for_limits("plain@x.com"), "plain@x.com");
+    }
+
+    #[test]
+    fn trailing_dot_dodges_nothing() {
+        // The stored identity sees the stripped form too.
+        assert_eq!(
+            super::super::normalize_email("U@0-Mail.COM."),
+            "u@0-mail.com"
+        );
+        assert!(is_disposable_domain("0-mail.com."));
+        assert!(is_disposable_email("u@0-mail.com."));
+        // ... nor split the Gmail OTP bucket.
+        assert_eq!(
+            canonical_email_for_limits("F.O.O+b@gmail.com."),
+            canonical_email_for_limits("foo@gmail.com")
+        );
+        assert_eq!(
+            canonical_email_for_limits("a+b@x.com."),
+            canonical_email_for_limits("a+c@x.com")
+        );
     }
 }

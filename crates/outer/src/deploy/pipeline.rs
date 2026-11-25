@@ -94,9 +94,9 @@ pub struct Step {
 
 /// The deploy result returned to the caller (and mirrored into the row).
 /// `status` is `success`, `failed` or `blocked`. A blocked deploy carries
-/// `reason` (`profanity` | `too_large_to_review`), `findings` and a
-/// `user_message` written for the human; the CLI prints the whole outcome
-/// as JSON.
+/// `reason` (`profanity` | `too_large_to_review` | `exposed_config`),
+/// `findings` and a `user_message` written for the human; the CLI prints
+/// the whole outcome as JSON.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeployOutcome {
     pub deploy_id: String,
@@ -139,7 +139,10 @@ pub struct DeployRoot {
 /// an early return in the upload window still scrubs the worktree. A
 /// crash between processes is covered by [`scrub_interrupted_injections`],
 /// which replays the sidecar stashed before the inject.
-struct InjectedSecrets {
+///
+/// Public for the hostile suite: the export test injects into a scratch
+/// worktree, then proves the export still carries no secret value.
+pub struct InjectedSecrets {
     path: PathBuf,
     original: Vec<u8>,
     mode: u32,
@@ -461,6 +464,12 @@ const BUILD_LEAF_MEMORY_MAX: u64 = 2 * 1024 * 1024 * 1024;
 /// `user_message`.
 pub(crate) const BINDING_CAP_MESSAGE: &str =
     "Outer apps can have one D1 database and one R2 bucket for now; merge the extra ones";
+
+/// Blocked-deploy reason when `assets.directory` would serve the deploy-root
+/// config itself: `GET /wrangler.json` would hand out the injected `vars`
+/// (live secrets). Kept as a const so the message stays identical between
+/// the guard, the outcome's `user_message` and the tests.
+pub(crate) const EXPOSED_CONFIG_REASON: &str = "exposed_config";
 
 /// Top-level wrangler keys cello accepts. Anything else fails `deploy-root`.
 const ACCEPTED_CONFIG_KEYS: &[&str] = &[
@@ -896,7 +905,7 @@ impl Deployer {
                     deploy_id,
                     sha: sha.to_string(),
                     status: "blocked",
-                    failed_step: Some("gate".to_string()),
+                    failed_step: Some(blocked.step.to_string()),
                     error: Some(blocked.reason.to_string()),
                     reason: Some(blocked.reason.to_string()),
                     findings: blocked.findings,
@@ -1184,6 +1193,20 @@ impl Deployer {
         let (deploy_root, crons) = match self.deploy_root(app) {
             Ok((deploy_root, crons, out)) => {
                 push_step(steps, log, "deploy-root", started, false, &out);
+                // The secret-leak guard: an assets directory containing the
+                // config would publish `wrangler.json` (with this deploy's
+                // injected `vars`) to every visitor. Block before secrets
+                // are injected, so the outcome carries no secret value.
+                if let Some(dir) = self.assets_guard(&deploy_root) {
+                    let message = exposed_config_message(&dir);
+                    push_step(steps, log, "deploy-root", started, false, &message);
+                    return Err(StepEnd::Blocked(BlockedInfo {
+                        step: "deploy-root",
+                        reason: EXPOSED_CONFIG_REASON,
+                        findings: Vec::new(),
+                        user_message: message,
+                    }));
+                }
                 (deploy_root, crons)
             }
             Err(e) => {
@@ -1640,6 +1663,16 @@ impl Deployer {
         Ok((DeployRoot { root, config }, crons, out))
     }
 
+    /// Re-read the selected config and refuse an `assets.directory` that
+    /// would serve the config file itself. Returns the offending directory
+    /// as written in the config. Reads the same file the step validated
+    /// (never re-decides), so D1 detection, the upload and this guard all
+    /// agree on which config won.
+    fn assets_guard(&self, deploy_root: &DeployRoot) -> Option<String> {
+        let parsed = read_config_file(&deploy_root.config).ok()?;
+        assets_directory_serves_config(&parsed, &deploy_root.root, &deploy_root.config)
+    }
+
     /// Whether this `cello` writes Worker maps: `deploy --sourcemap`.
     /// Best-effort `deploy --help` probe, so a runtime without the flag
     /// keeps deploying without maps instead of failing on an unknown flag.
@@ -1768,7 +1801,10 @@ impl Deployer {
     /// DB-written rows predate the tool-time checks, and must never override
     /// platform vars. The config symlink checks run again here (discovery
     /// ran before the build): a planted link fails the deploy closed.
-    async fn inject_secrets(
+    /// Public for the hostile suite (see `InjectedSecrets`): the export
+    /// test injects into a scratch worktree, then proves the export
+    /// still carries no secret value.
+    pub async fn inject_secrets(
         &self,
         pool: &SqlitePool,
         app: &App,
@@ -2318,6 +2354,7 @@ impl Deployer {
                 );
                 return Ok((
                     Some(BlockedInfo {
+                        step: "gate",
                         reason: "too_large_to_review",
                         findings,
                         user_message,
@@ -2360,6 +2397,7 @@ impl Deployer {
                 stats,
             } => Ok((
                 Some(BlockedInfo {
+                    step: "gate",
                     reason: reason.as_str(),
                     findings,
                     user_message,
@@ -2381,9 +2419,11 @@ enum StepEnd {
     Blocked(BlockedInfo),
 }
 
-/// A gate block: the deploy row's `error` column carries `reason`, and
-/// `findings` go to the row as JSON.
+/// A deploy-root or gate block: the deploy row's `error` column carries
+/// `reason`, and `findings` go to the row as JSON. `step` names the step
+/// that blocked (`gate` or `deploy-root`), so the outcome points at the fix.
 struct BlockedInfo {
+    step: &'static str,
     reason: &'static str,
     findings: Vec<crate::moderation::gate::Finding>,
     user_message: String,
@@ -2681,6 +2721,74 @@ fn validate_config_keys(value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `assets.directory` form: a bare string (`"./client"`) or the object
+/// form (`{"binding": "ASSETS", "directory": "client"}`). Anything else is
+/// not an assets dir (a binding-only object serves nothing).
+fn assets_directory_of(parsed: &serde_json::Value) -> Option<&str> {
+    let assets = parsed.get("assets")?;
+    if let Some(dir) = assets.as_str() {
+        return Some(dir);
+    }
+    assets.get("directory")?.as_str()
+}
+
+/// Lexically normalize `path` (`.`/`..` resolved, no symlink reads): the
+/// worktree belongs to the app uid, so the guard must not follow links it
+/// could have planted between the check and the upload.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `assets.directory` serving the deploy-root config: the static assets
+/// would include `wrangler.json` itself, and `GET /wrangler.json` would hand
+/// out the injected `vars` (live secrets) to any visitor. Returns the
+/// offending directory as written in the config, or `None` when the config
+/// sits outside the served tree. A directory that escapes the deploy root
+/// (`..`) or rides a symlink is refused the same way: fail closed, since
+/// either can expose files outside the intended static tree.
+pub(crate) fn assets_directory_serves_config(
+    parsed: &serde_json::Value,
+    root: &Path,
+    config: &Path,
+) -> Option<String> {
+    let dir = assets_directory_of(parsed)?;
+    if dir.trim().is_empty() {
+        return None;
+    }
+    let served = lexical_normalize(&root.join(dir));
+    let root_norm = lexical_normalize(root);
+    if served != root_norm && !served.starts_with(&root_norm) {
+        return Some(dir.to_string());
+    }
+    if refuse_symlink_components(&served).is_err() {
+        return Some(dir.to_string());
+    }
+    let config_norm = lexical_normalize(config);
+    if config_norm == served || config_norm.starts_with(&served) {
+        return Some(dir.to_string());
+    }
+    None
+}
+
+/// The agent-facing line for [`EXPOSED_CONFIG_REASON`]: names the directory
+/// and the fix, never a secret value (vars are injected after this step).
+pub(crate) fn exposed_config_message(dir: &str) -> String {
+    format!(
+        "assets.directory {dir:?} would serve wrangler.json itself, including your secrets, as a public file. \
+         Point assets at a subdirectory holding only public files (for example \"client\"), or move the config out of the served tree."
+    )
+}
+
 /// Strip `//` and `/* */` comments from `.jsonc`, leaving strings (which may
 /// contain `//` or `/* */`) byte-identical. The result parses as JSON.
 fn strip_jsonc_comments(src: &str) -> String {
@@ -2746,11 +2854,9 @@ async fn run_git(
     timeout: Duration,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("GIT_INDEX_FILE", index)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    cmd.args(args).current_dir(cwd);
+    crate::git::manifest::lock_tokio_git_env(&mut cmd);
+    cmd.env("GIT_INDEX_FILE", index)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .stdout(std::process::Stdio::piped())
@@ -7033,6 +7139,153 @@ exit 0
         assert_eq!(outcome.failed_step.as_deref(), Some("deploy-root"));
         assert_eq!(outcome.error.as_deref(), Some(BINDING_CAP_MESSAGE));
         assert_eq!(outcome.user_message.as_deref(), Some(BINDING_CAP_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn hostile_assets_directory_serving_config_blocks_the_deploy() {
+        // `assets.directory: "."` would publish wrangler.json itself — with
+        // this deploy's injected `vars` — to every visitor. The deploy
+        // blocks at deploy-root, before secrets are injected, so the
+        // outcome carries the fix, never a secret value.
+        for (name, assets) in [
+            ("dot", r#"{"directory": "."}"#),
+            ("object-dot", r#"{"binding": "ASSETS", "directory": "."}"#),
+            (
+                "escaped-root",
+                r#"{"binding": "ASSETS", "directory": "client/../../"}"#,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = GitConfig::new(dir.path().join("git"), None);
+            let store = Store::memory();
+            let sync = GitSync::default();
+            manifest::init_repo(&store, &cfg, &sync, "grocery")
+                .await
+                .unwrap();
+            let sha = commit::commit(
+                &store,
+                &cfg,
+                &sync,
+                "grocery",
+                CommitRequest {
+                    message: "seed".to_string(),
+                    base: None,
+                    changes: crate::git::commit::CommitChanges {
+                        writes: vec![
+                            write("index.ts", "v1"),
+                            write(
+                                "wrangler.json",
+                                &format!(
+                                    r#"{{"name":"grocery","main":"index.js","assets":{assets}}}"#
+                                ),
+                            ),
+                        ],
+                        edits: vec![],
+                        deletes: vec![],
+                        moves: vec![],
+                        ..Default::default()
+                    },
+                    author: author(),
+                },
+            )
+            .await
+            .unwrap();
+            let (_ddir, pool) = test_pool().await;
+            let app = test_app(10121);
+            sqlx::query(
+                "INSERT INTO app (id, slug, owner_id, uid, port, internal_port, last_activity_at, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+            )
+            .bind(&app.id)
+            .bind(&app.slug)
+            .bind(&app.owner_id)
+            .bind(app.uid as i64)
+            .bind(app.port as i64)
+            .bind(app.internal_port as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let deployer = Deployer::new(test_settings(data.path().to_path_buf()), 1);
+            let outcome = deployer
+                .deploy(&pool, &store, &cfg, &app, &sha)
+                .await
+                .unwrap();
+            assert_eq!(outcome.status, "blocked", "case {name}");
+            assert_eq!(
+                outcome.reason.as_deref(),
+                Some(EXPOSED_CONFIG_REASON),
+                "case {name}"
+            );
+            assert_eq!(
+                outcome.failed_step.as_deref(),
+                Some("deploy-root"),
+                "case {name}"
+            );
+            let user_message = outcome.user_message.as_deref().unwrap_or("");
+            assert!(
+                user_message.contains("assets.directory"),
+                "case {name}: actionable line: {user_message:?}"
+            );
+            assert!(
+                !user_message.contains("hunter2"),
+                "case {name}: the refusal names no secret value"
+            );
+            let (status,): (String,) = sqlx::query_as("SELECT status FROM deploy WHERE id = ?1")
+                .bind(&outcome.deploy_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(status, "blocked", "case {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_assets_subdirectory_serving_only_public_files_deploys_past_the_guard() {
+        // The guard is lexical, not a ban on assets: a sibling `client/`
+        // dir leaves the config outside the served tree, so the pure guard
+        // says no. (The full deploy would need a cello binary past this.)
+        let root = PathBuf::from("/data/work/grocery");
+        let config = root.join("wrangler.json");
+        for ok in [
+            r#"{"name":"grocery","main":"index.js","assets":{"binding":"ASSETS","directory":"client"}}"#,
+            r#"{"name":"grocery","main":"index.js","assets":"./client"}"#,
+            r#"{"name":"grocery","main":"index.js"}"#,
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(ok).unwrap();
+            assert_eq!(
+                assets_directory_serves_config(&parsed, &root, &config),
+                None,
+                "sibling assets dir is fine: {ok}"
+            );
+        }
+        for (bad, dir) in [
+            (
+                r#"{"name":"g","main":"i.js","assets":{"directory":"."}}"#,
+                ".",
+            ),
+            (r#"{"name":"g","main":"i.js","assets":"./"}"#, "./"),
+            (
+                r#"{"name":"g","main":"i.js","assets":{"directory":".."}}"#,
+                "..",
+            ),
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(bad).unwrap();
+            assert_eq!(
+                assets_directory_serves_config(&parsed, &root, &config),
+                Some(dir.to_string()),
+                "served config is refused: {bad}"
+            );
+        }
+        // dist-rooted configs: the same rule, relative to dist/.
+        let dist_root = root.join("dist");
+        let dist_config = dist_root.join("wrangler.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(r#"{"name":"g","main":"i.js","assets":{"directory":"."}}"#)
+                .unwrap();
+        assert_eq!(
+            assets_directory_serves_config(&parsed, &dist_root, &dist_config),
+            Some(".".to_string())
+        );
     }
 
     #[tokio::test]

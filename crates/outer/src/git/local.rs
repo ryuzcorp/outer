@@ -271,10 +271,9 @@ pub async fn read_blob(
 async fn run_git_raw(args: &[&str], timeout: Duration) -> anyhow::Result<Vec<u8>> {
     use std::process::Stdio;
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
+    cmd.args(args);
+    super::manifest::lock_tokio_git_env(&mut cmd);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -645,10 +644,9 @@ async fn run_capped(args: &[&str], cap: usize) -> anyhow::Result<CappedOutput> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt as _;
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
+    cmd.args(args);
+    super::manifest::lock_tokio_git_env(&mut cmd);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
