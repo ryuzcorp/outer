@@ -78,6 +78,8 @@ export interface ConsoleApp {
   visibility: string;
   /** Visitor gate: open, pin or password. Never the hash. */
   access: string;
+  /** Adults-only flag (18+): confirmed visitors only. */
+  adults_only: boolean;
   /** Pro keep-warm flag; stored for every plan, ignored on Free. */
   always_on: boolean;
   status: string;

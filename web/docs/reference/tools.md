@@ -161,6 +161,18 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `mode` | string | yes | open (default, everyone walks in), pin (4-8 digits) or password (8-128 chars, no control characters). |
 | `secret` | string | no | Required for pin/password, refused for open. Never echoed back. |
 
+## `set_adults_only`
+
+- **Access:** signed in
+- **Description:** Mark an app adults-only (18+) {app, adults_only}: visitors confirm they are an adult before the app serves them, after the visitor gate when one is set. The confirmation cookie lasts 30 days per host. Owner only.
+
+**Input:**
+
+| Property | Type | Required | Description |
+| --- | --- | --- | --- |
+| `adults_only` | boolean | yes | true marks the app 18+: visitors confirm they are an adult before the app serves them. false removes the confirmation. |
+| `app` | string | yes | The app slug. |
+
 ## `share_app`
 
 - **Access:** signed in

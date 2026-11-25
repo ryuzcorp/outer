@@ -451,6 +451,8 @@ pub async fn app_summary(ctx: &Ctx<'_>, app: &App, role: Role) -> Result<Value, 
         // Pro keep-warm flag (feature #6); Free owners see it stored but
         // ignored until they upgrade.
         "always_on": app.always_on,
+        // Adults-only flag (18+): confirmed visitors only.
+        "adults_only": app.adults_only,
         "status": status,
     });
     // Inactivity deadline (spec §7.8) when it applies: Free owners see when
@@ -998,6 +1000,7 @@ mod tests {
             access_mode: crate::access::AccessMode::Open,
             access_hash: None,
             access_version: 0,
+            adults_only: false,
             preview_sha: None,
             preview_updated_at: None,
             preview_port: None,

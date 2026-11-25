@@ -138,6 +138,7 @@ mod tests {
             access_mode: crate::access::AccessMode::Open,
             access_hash: None,
             access_version: 0,
+            adults_only: false,
             preview_sha: None,
             preview_updated_at: None,
             preview_port: None,

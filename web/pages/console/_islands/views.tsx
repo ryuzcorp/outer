@@ -2250,6 +2250,7 @@ export function SettingsView({
       </section>
       {app.role === "owner" && <VisibilityCard app={app} plan={plan} onRefresh={onRefresh} />}
       {app.role === "owner" && <VisitorAccessCard app={app} plan={plan} onRefresh={onRefresh} />}
+      {app.role === "owner" && <AdultsOnlyCard app={app} onRefresh={onRefresh} />}
       {app.role === "owner" && <KeepWarmCard app={app} plan={plan} onRefresh={onRefresh} />}
       {app.role === "owner" && (
         <DomainsCard
@@ -2556,6 +2557,76 @@ function VisitorAccessCard({
             </button>
           </div>
         )}
+        {error() && (
+          <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
+            <span class="min-w-0 break-words">{error()}</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// Settings → Adults-only card: the app's 18+ flag (owner-only, every
+// plan). When on, visitors confirm they are an adult before the app serves
+// them — after the visitor gate, when one is set. The confirmation lasts
+// 30 days per host.
+function AdultsOnlyCard({
+  app,
+  onRefresh,
+}: {
+  app: AppDetail;
+  onRefresh: () => void;
+}) {
+  const pending = atom<boolean | null>(null);
+  const error = atom<string | null>(null);
+
+  async function change(adults_only: boolean): Promise<void> {
+    if (adults_only === app.adults_only || pending() !== null) {
+      return;
+    }
+    pending.set(true);
+    error.set(null);
+    try {
+      await settingsActions.setAdultsOnly.run({ slug: app.slug, adults_only });
+      onRefresh();
+    } catch (err: unknown) {
+      error.set(err instanceof Error ? err.message : String(err));
+    } finally {
+      pending.set(null);
+    }
+  }
+
+  return (
+    <section class="card card-border bg-base-100 min-w-0" aria-label="Adults only">
+      <div class="card-body min-w-0">
+        <h2 class="card-title min-w-0 truncate" title="Adults only">
+          Adults only
+          {app.adults_only && (
+            <span class="badge badge-soft badge-warning badge-sm shrink-0" title="Visitors confirm they are 18 or older">
+              18+
+            </span>
+          )}
+          {pending() && <span class="loading loading-spinner loading-xs shrink-0" aria-label="Saving" />}
+        </h2>
+        <p class="m-0 min-w-0 break-words text-[13px] opacity-60">
+          When on, visitors confirm they are 18 or older before the app serves them — after the visitor gate, when one is set. The confirmation lasts 30 days per address.
+        </p>
+        <div class="form-control min-w-0">
+          <label class="label min-w-0 cursor-pointer justify-start gap-3">
+            <input
+              type="checkbox"
+              class="toggle shrink-0"
+              checked={app.adults_only}
+              disabled={pending() !== null}
+              onchange={(e) => void change((e.target as HTMLInputElement).checked)}
+              aria-label="Mark this app adults-only (18+)"
+            />
+            <span class="label-text min-w-0 break-words">
+              {app.adults_only ? "18+ — visitors confirm their age" : "Everyone — no age check"}
+            </span>
+          </label>
+        </div>
         {error() && (
           <div class="alert alert-error alert-soft mt-2 min-w-0" role="alert">
             <span class="min-w-0 break-words">{error()}</span>

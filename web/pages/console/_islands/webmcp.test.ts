@@ -377,6 +377,7 @@ describe("console bridge", () => {
       visibility: "unlisted",
       access: "open",
       always_on: false,
+      adults_only: false,
       status: "running",
       last_request_at: null,
     },
