@@ -62,7 +62,7 @@ pub(crate) fn tool_status(code: &str) -> StatusCode {
         "forbidden" => StatusCode::FORBIDDEN,
         "payment_required" => StatusCode::PAYMENT_REQUIRED,
         "conflict" => StatusCode::CONFLICT,
-        "quota_exceeded" | "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+        "quota_exceeded" | "rate_limited" | "capacity" => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

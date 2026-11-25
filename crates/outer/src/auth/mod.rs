@@ -429,6 +429,19 @@ pub async fn send_code(
             user_message: Some("Outer couldn't send the code. Try again shortly.".to_string()),
             retry_after_s: Some(30),
         }),
+        Err(email::EmailError::BudgetExhausted { month, sent, cap }) => Err(AuthError {
+            // Sign-in codes flow until the hard cap; at the cap the caller
+            // retries next month, not in 30 s. Distinct code so the console
+            // (429 + budget text) and MCP (`rate_limited` + month-scale
+            // `retry_after_s`) answer accordingly.
+            code: "email_budget",
+            message: format!("email budget exhausted for {month} ({sent}/{cap} sent)"),
+            user_message: Some(
+                "Outer couldn't send the code: this month's email budget is spent. Try again next month."
+                    .to_string(),
+            ),
+            retry_after_s: Some(email::secs_until_next_month_utc()),
+        }),
         Err(email::EmailError::Permanent(detail)) => Err(AuthError {
             code: "email_failed",
             message: format!("email send failed: {detail}"),

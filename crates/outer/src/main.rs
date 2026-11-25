@@ -973,6 +973,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // (429 included). The sender is cloned everywhere from here, so one
     // hook covers every mail path.
     auth.config.email = auth.config.email.with_ops_hook(pool.clone());
+    // Monthly send budget (L-22): every Cloudflare send counts against this
+    // UTC month's 3,000 cap, and the sender refuses past it with a
+    // retry-next-month message (sign-in codes flow until the hard cap).
+    auth.config.email = auth.config.email.with_budget(pool.clone());
     // Console-capture tokens: `look_at_app` mints into this table, the app
     // proxy claims from it. One table shared by both states, never global.
     let look_tokens = outer::look_tokens::LookTokens::new();

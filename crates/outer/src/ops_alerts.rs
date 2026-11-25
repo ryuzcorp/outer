@@ -6,7 +6,7 @@
 //! carry secrets — counts, slugs and truncated error summaries only, never
 //! tokens, keys or recipient addresses.
 //!
-//! The six triggers:
+//! The eight triggers:
 //!
 //! | kind | source |
 //! | --- | --- |
@@ -16,6 +16,8 @@
 //! | `ops_jev` | the moderation classifier failing for over 15 minutes |
 //! | `ops_suspended` | an app in `suspended` moderation state |
 //! | `ops_queue` | non-terminal deploy rows over a depth threshold |
+//! | `ops_email_budget_warn` | this UTC month's sends at 80 % of the 3,000 cap |
+//! | `ops_email_budget_crit` | this UTC month's sends at 95 % of the 3,000 cap |
 //!
 //! Jev and email outages are tracked in the `ops_heartbeat` table: the
 //! classify call sites and the email sender record ok/err, and the sweep
@@ -39,6 +41,10 @@ pub const KIND_EMAIL: &str = "ops_email";
 pub const KIND_JEV: &str = "ops_jev";
 pub const KIND_SUSPENDED: &str = "ops_suspended";
 pub const KIND_QUEUE: &str = "ops_queue";
+/// The monthly email budget crossed 80 % (`ops:email-budget-80` subject).
+pub const KIND_EMAIL_BUDGET_WARN: &str = "ops_email_budget_warn";
+/// The monthly email budget crossed 95 % (`ops:email-budget-95` subject).
+pub const KIND_EMAIL_BUDGET_CRIT: &str = "ops_email_budget_crit";
 
 /// Thresholds for the operator sweep. Parsed once from the environment in
 /// [`crate::config`] (`OUTER_OPS_*`); tests build it literally.
@@ -208,6 +214,19 @@ pub fn email_outage(hb: &Heartbeat, now: i64, cfg: &OpsAlertConfig) -> bool {
         return false;
     };
     now.saturating_sub(last) <= cfg.cooldown.as_millis() as i64 * 2
+}
+
+/// Email budget decisions (L-22): pure in sent/cap, tested on literals.
+/// `warn` fires in [80 %, 95 %); `crit` fires at 95 % and above, including
+/// the hard cap itself. A zero cap never alerts (unconfigured, not empty).
+pub fn email_budget_warn(sent: u64, cap: u64) -> bool {
+    cap > 0 && sent * 100 >= cap * 80 && sent * 100 < cap * 95
+}
+
+/// Email budget decisions (L-22): pure in sent/cap, tested on literals. See
+/// [`email_budget_warn`]: the crit edge at 95 % supersedes the warn.
+pub fn email_budget_crit(sent: u64, cap: u64) -> bool {
+    cap > 0 && sent * 100 >= cap * 95
 }
 
 /// Snapshot failure decision: the sync tick's last error, if any.
@@ -452,12 +471,58 @@ async fn check_queue(ctx: &OpsCtx<'_>, now: i64) {
     .await;
 }
 
-/// One sweep tick: all six checks. Never raises; a dead mailer or a failed
+/// The monthly email budget check (L-22): warn at 80 %, crit at 95 %. Both
+/// read this UTC month's `email_month` count; neither blocks any send —
+/// sign-in codes flow until the [`crate::auth::email::EMAIL_MONTHLY_CAP`]
+/// hard cap, where the sender itself refuses with a retry-next-month
+/// message. `now` is injected (tests run it on a fake clock).
+async fn check_email_budget(ctx: &OpsCtx<'_>, now: i64) {
+    use crate::auth::email::{month_key, sent_in_month, EMAIL_MONTHLY_CAP};
+    let month = month_key(now);
+    let sent = sent_in_month(ctx.pool, &month).await;
+    let cap = EMAIL_MONTHLY_CAP;
+    if email_budget_crit(sent, cap) {
+        notify_ops(
+            ctx,
+            KIND_EMAIL_BUDGET_CRIT,
+            "ops:email-budget-95",
+            "Outer email budget critical (95 %)",
+            &format!(
+                "{sent}/{cap} emails sent in {month} (Cloudflare plan cap). \
+                 Sign-in codes keep flowing until the {cap} hard cap; at the cap every send \
+                 refuses with a retry-next-month message. Raise the Cloudflare plan or wait \
+                 for the month to turn; this repeats hourly while over 95 %."
+            ),
+            now,
+        )
+        .await;
+        return;
+    }
+    if email_budget_warn(sent, cap) {
+        notify_ops(
+            ctx,
+            KIND_EMAIL_BUDGET_WARN,
+            "ops:email-budget-80",
+            "Outer email budget at 80 %",
+            &format!(
+                "{sent}/{cap} emails sent in {month} (Cloudflare plan cap). \
+                 Sign-in codes keep flowing until the {cap} hard cap; at the cap every send \
+                 refuses with a retry-next-month message. Watch usage or raise the Cloudflare \
+                 plan; this repeats hourly while over 80 %."
+            ),
+            now,
+        )
+        .await;
+    }
+}
+
+/// One sweep tick: all seven checks. Never raises; a dead mailer or a failed
 /// lookup only logs.
 pub async fn check_all(ctx: &OpsCtx<'_>, now: i64) {
     check_snapshot(ctx, now).await;
     check_disk(ctx, now).await;
     check_email(ctx, now).await;
+    check_email_budget(ctx, now).await;
     check_jev(ctx, now).await;
     check_suspended(ctx, now).await;
     check_queue(ctx, now).await;
@@ -764,6 +829,69 @@ mod tests {
         record_heartbeat_ok(&pool, KIND_EMAIL, stale_at).await;
         let cleared = heartbeat(&pool, KIND_EMAIL).await.unwrap();
         assert!(!email_outage(&cleared, stale_at + 1_000, &cfg));
+    }
+
+    #[test]
+    fn email_budget_fires_at_80_and_95() {
+        // Edges: warn covers [80 %, 95 %), crit covers 95 % and up.
+        assert!(!email_budget_warn(2399, 3000));
+        assert!(email_budget_warn(2400, 3000));
+        assert!(email_budget_warn(2849, 3000));
+        assert!(!email_budget_warn(2850, 3000));
+        assert!(!email_budget_crit(2849, 3000));
+        assert!(email_budget_crit(2850, 3000));
+        assert!(email_budget_crit(3000, 3000));
+        assert!(
+            !email_budget_warn(3000, 3000),
+            "crit supersedes warn at the cap"
+        );
+        // A zero cap never alerts (unconfigured, not empty).
+        assert!(!email_budget_warn(0, 0));
+        assert!(!email_budget_crit(0, 0));
+        assert!(!email_budget_crit(1, 0));
+    }
+
+    #[tokio::test]
+    async fn email_budget_check_alerts_once_per_kind() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let pool = test_pool().await;
+        let cfg = cfg();
+        let sync = StateSync::new("test-budget");
+        let sender = EmailSender::Capture {
+            codes: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let admins = vec!["ops@example.com".to_string()];
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_path = data_dir.path().to_path_buf();
+        std::mem::forget(data_dir);
+        let month = crate::auth::email::month_key(NOW);
+        async fn seed(pool: &SqlitePool, month: &str, sent: i64) {
+            sqlx::query(
+                "INSERT INTO email_month (month, sent) VALUES (?1, ?2) \
+                 ON CONFLICT(month) DO UPDATE SET sent = ?2",
+            )
+            .bind(month)
+            .bind(sent)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        // Below 80 %: silent.
+        seed(&pool, &month, 2399).await;
+        check_all(&ctx(&pool, &sync, &sender, &admins, &cfg, &data_path), NOW).await;
+        assert_eq!(ledger_count(&pool, KIND_EMAIL_BUDGET_WARN).await, 0);
+        assert_eq!(ledger_count(&pool, KIND_EMAIL_BUDGET_CRIT).await, 0);
+        // At 80 %: one warn mail, no crit.
+        seed(&pool, &month, 2400).await;
+        check_all(&ctx(&pool, &sync, &sender, &admins, &cfg, &data_path), NOW).await;
+        assert_eq!(ledger_count(&pool, KIND_EMAIL_BUDGET_WARN).await, 1);
+        assert_eq!(ledger_count(&pool, KIND_EMAIL_BUDGET_CRIT).await, 0);
+        // At 95 %: one crit mail, and the warn does not refire on the same tick.
+        seed(&pool, &month, 2850).await;
+        check_all(&ctx(&pool, &sync, &sender, &admins, &cfg, &data_path), NOW).await;
+        assert_eq!(ledger_count(&pool, KIND_EMAIL_BUDGET_WARN).await, 1);
+        assert_eq!(ledger_count(&pool, KIND_EMAIL_BUDGET_CRIT).await, 1);
     }
 
     #[tokio::test]

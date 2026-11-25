@@ -1677,7 +1677,7 @@ async fn sign_in_post(
                     None,
                 ),
                 Err(err) => {
-                    let status = if err.code == "rate_limited" {
+                    let status = if err.code == "rate_limited" || err.code == "email_budget" {
                         StatusCode::TOO_MANY_REQUESTS
                     } else {
                         StatusCode::BAD_REQUEST
