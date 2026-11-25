@@ -53,11 +53,14 @@ fn hidden(request_id: &str, csrf: &str, step: &str) -> Markup {
     }
 }
 
-/// The email-first sign-in step. The invite field stays collapsed behind
-/// "Have an invite code?" (a no-JS `<details>`), opening automatically when
-/// the server refuses with the closed-beta message. `invite_value` preserves
-/// what the user typed across that refusal. Below the primary email form sits
-/// the review-account password form (operator-listed emails only).
+/// The email-first sign-in step. During the closed beta the invite field stays
+/// collapsed behind "Have an invite code?" (a no-JS `<details>`), opening
+/// automatically when the server refuses with the closed-beta message.
+/// `invite_value` preserves what the user typed across that refusal. With
+/// open signup the field renders nothing at all: no new email needs a code.
+/// Below the primary email form sits the review-account password form
+/// (operator-listed emails only).
+#[allow(clippy::too_many_arguments)]
 pub fn email_page(
     client: &ClientDoc,
     request_id: &str,
@@ -66,6 +69,7 @@ pub fn email_page(
     invite_open: bool,
     invite_value: &str,
     password_error: Option<&str>,
+    signup_open: bool,
 ) -> Markup {
     layout(
         "Sign in",
@@ -81,6 +85,7 @@ pub fn email_page(
                 input type="email" name="email" id="email" required autocomplete="email"
                     style="width:100%;font-size:1rem;padding:.5rem;" {}
                 br;
+                @if !signup_open {
                 details open[invite_open] {
                     summary { "Have an invite code?" }
                     p style="font-size:.9rem;" { "Outer is in closed beta. New here without an allowlisted email? Paste the code someone on Outer shared with you." }
@@ -92,6 +97,7 @@ pub fn email_page(
                         style="width:100%;font-size:1rem;padding:.5rem;" {}
                 }
                 br;
+                }
                 button type="submit" style="font-size:1rem;padding:.5rem 1rem;" { "Send code" }
             }
             hr style="margin:2rem 0 1.25rem;border:0;border-top:1px solid #ddd;";

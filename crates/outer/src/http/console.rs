@@ -70,7 +70,6 @@ pub fn router(state: super::AppState) -> Router<super::AppState> {
     Router::new()
         .route("/console/sign-in", get(sign_in_get).post(sign_in_post))
         .route("/api/console/me", get(api_me))
-        .route("/api/console/invites", get(api_invites))
         .route(
             "/api/console/admin/invites",
             get(api_admin_invites).post(api_admin_create_invites),
@@ -551,23 +550,6 @@ fn admin_invite_json(row: &crate::auth::invites::InviteRow) -> serde_json::Value
     let mut v = invite_json(row);
     v["createdByEmail"] = json!(row.created_by_email);
     v
-}
-
-/// `GET /api/console/invites`: the caller's own codes, newest first.
-async fn api_invites(State(state): State<super::AppState>, headers: HeaderMap) -> Response {
-    let mcp = &state.mcp;
-    let account = match guard(&mcp.auth, &headers).await {
-        Ok(account) => account,
-        Err(res) => return *res,
-    };
-    match crate::auth::invites::list_for_user(&mcp.pool, &account.id).await {
-        Ok(rows) => ok_json(json!({"codes": rows.iter().map(invite_json).collect::<Vec<_>>()})),
-        Err(_) => nostore_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unavailable",
-            "invites are unavailable right now",
-        ),
-    }
 }
 
 /// `GET /api/console/admin/invites?limit=&before=`: every code, newest
@@ -1461,6 +1443,7 @@ fn email_form(
     invite_open: bool,
     invite_value: &str,
     next: &str,
+    signup_open: bool,
 ) -> Markup {
     layout(
         "Sign in",
@@ -1478,6 +1461,7 @@ fn email_form(
                         style="width:100%;padding:.5rem;margin:.25rem 0";
                 }
                 br;
+                @if !signup_open {
                 details open[invite_open] {
                     summary { "Have an invite code?" }
                     p { "Outer is in closed beta. New here without an allowlisted email? Paste the code someone on Outer shared with you." }
@@ -1489,6 +1473,7 @@ fn email_form(
                     }
                 }
                 br;
+                }
                 button type="submit" style="padding:.5rem 1rem" { "Send code" }
             }
             hr style="margin:2rem 0 1.25rem;border:0;border-top:1px solid #ddd";
@@ -1625,7 +1610,14 @@ async fn sign_in_get(
     }
     page(
         StatusCode::OK,
-        email_form(None, None, false, "", &target),
+        email_form(
+            None,
+            None,
+            false,
+            "",
+            &target,
+            state.mcp.auth.config.signup_open,
+        ),
         None,
     )
 }
@@ -1653,6 +1645,7 @@ async fn sign_in_post(
                 false,
                 "",
                 "/console",
+                state.mcp.auth.config.signup_open,
             ),
             None,
         );
@@ -1695,6 +1688,7 @@ async fn sign_in_post(
                             err.code == "closed_beta",
                             &invite_value,
                             &target,
+                            mcp.auth.config.signup_open,
                         ),
                         None,
                     )
@@ -1782,6 +1776,7 @@ async fn sign_in_post(
                             false,
                             "",
                             &target,
+                            mcp.auth.config.signup_open,
                         ),
                         None,
                     )
@@ -1798,6 +1793,7 @@ async fn sign_in_post(
                         false,
                         "",
                         "/console",
+                        mcp.auth.config.signup_open,
                     ),
                     None,
                 );
@@ -1812,6 +1808,7 @@ async fn sign_in_post(
                         false,
                         "",
                         "/console",
+                        mcp.auth.config.signup_open,
                     ),
                     None,
                 );
@@ -1845,7 +1842,14 @@ async fn sign_in_post(
         }
         _ => page(
             StatusCode::BAD_REQUEST,
-            email_form(Some("Unknown sign-in step."), None, false, "", "/console"),
+            email_form(
+                Some("Unknown sign-in step."),
+                None,
+                false,
+                "",
+                "/console",
+                mcp.auth.config.signup_open,
+            ),
             None,
         ),
     }
@@ -2351,6 +2355,45 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn open_signup_hides_the_invite_field() {
+        let (app, _, config, _) = test_app().await;
+        assert!(config.signup_open, "the default test app runs open");
+        let (status, _, body) = send(
+            &app,
+            Request::get("/console/sign-in")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.to_lowercase().contains("invite"),
+            "open signup shows no invite copy, got: {body}"
+        );
+        assert!(
+            !body.contains("waitlist") && !body.contains("closed beta"),
+            "open signup shows no gate copy, got: {body}"
+        );
+
+        // The brake still works: closed signup renders the invite field.
+        let mut closed = config.clone();
+        closed.signup_open = false;
+        let (closed_app, _) = app_with_config(closed).await;
+        let (status, _, body) = send(
+            &closed_app,
+            Request::get("/console/sign-in")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("Have an invite code?"),
+            "closed signup keeps the invite field, got: {body}"
+        );
     }
 
     #[tokio::test]
@@ -3331,48 +3374,6 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(&app, authed("/api/console/admin/waitlist", &ana)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn console_invites_list_own_codes_with_status() {
-        let (app, pool, _, _) = test_app().await;
-        seed_account(&pool, "ana@example.com").await;
-        seed_account(&pool, "owner@example.com").await;
-        let first =
-            crate::auth::invites::mint_admin(&pool, "acct-ana@example.com", 1, Some("beta"), 7)
-                .await
-                .unwrap();
-        let second =
-            crate::auth::invites::mint_admin(&pool, "acct-ana@example.com", 1, Some("beta"), 8)
-                .await
-                .unwrap();
-        let made = [first[0].clone(), second[0].clone()];
-        // One code joined by the owner, one revoked.
-        sqlx::query("UPDATE invite_code SET redeemedBy = 'acct-owner@example.com', redeemedAt = 9 WHERE code = ?")
-            .bind(&made[0])
-            .execute(&pool)
-            .await
-            .unwrap();
-        crate::auth::invites::revoke(&pool, &made[1], 10)
-            .await
-            .unwrap();
-        let ana = login(&pool, "ana@example.com").await;
-
-        let (status, headers, body) = send(&app, authed("/api/console/invites", &ana)).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(headers["cache-control"], "no-store");
-        let list: serde_json::Value = body.parse().unwrap();
-        let codes = list["codes"].as_array().unwrap();
-        assert_eq!(codes.len(), 2);
-        assert_eq!(codes[0]["code"], made[1].as_str(), "newest first");
-        assert_eq!(codes[0]["kind"], "admin");
-        assert_eq!(codes[0]["note"], "beta");
-        assert_eq!(codes[0]["revokedAt"], 10);
-        assert_eq!(codes[0]["redeemedByEmail"], serde_json::Value::Null);
-        assert_eq!(codes[1]["code"], made[0].as_str());
-        assert_eq!(codes[1]["redeemedAt"], 9);
-        assert_eq!(codes[1]["redeemedByEmail"], "owner@example.com");
-        assert_eq!(codes[1]["revokedAt"], serde_json::Value::Null);
     }
 
     #[tokio::test]

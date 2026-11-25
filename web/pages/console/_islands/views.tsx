@@ -24,7 +24,6 @@ import {
   type DomainsSummary,
   type ErrorsSummary,
   type InviteEntry,
-  type InvitesSummary,
   type MetricsBucket,
   type MetricsSummary,
   type SecretsSummary,
@@ -2043,7 +2042,7 @@ export function CollaboratorsCard({
           <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end">
             <label class="form-control min-w-0 flex-1" for="collab-email">
               <span class="label min-w-0">
-                <span class="label-text truncate" title="The collaborator's email: allowlisted for the closed beta and emailed an invite">
+                <span class="label-text truncate" title="The collaborator's email: they get an invite email and the app shows in their list once they sign in">
                   Email to invite
                 </span>
               </span>
@@ -2141,8 +2140,8 @@ export function CollaboratorsCard({
                 Remove {confirming()}?
               </h3>
               <p class="min-w-0 break-words py-3 text-sm opacity-70">
-                They lose access to {app.slug} immediately. They stay on the
-                closed-beta list and can be re-invited later.
+                They lose access to {app.slug} immediately. They keep their
+                Outer account and can be re-invited later.
               </p>
               <div class="modal-action">
                 <button
@@ -2948,8 +2947,6 @@ function DangerZone({
   );
 }
 
-// --- Invites (account) ---------------------------------------------------------
-
 function inviteStatus(entry: InviteEntry): { label: string; badge: string } {
   if (entry.revokedAt != null) {
     return { label: "Revoked", badge: "badge-ghost" };
@@ -2958,115 +2955,6 @@ function inviteStatus(entry: InviteEntry): { label: string; badge: string } {
     return { label: "Joined", badge: "badge-success" };
   }
   return { label: "Available", badge: "badge-info" };
-}
-
-export function InvitesView({
-  panel,
-  isAdmin,
-  onRetry,
-}: {
-  panel: Panel<InvitesSummary>;
-  isAdmin: boolean;
-  onRetry: () => void;
-}) {
-  if (panel.kind === "loading") {
-    return <Loading label="Loading invite codes" />;
-  }
-  if (panel.kind === "error") {
-    return (
-      <div class="flex min-w-0 flex-col gap-3">
-        <Err message={panel.message} />
-        <div class="min-w-0">
-          <button type="button" class="btn btn-sm" onclick={onRetry}>
-            Retry
-          </button>
-        </div>
-      </div>
-    );
-  }
-  const codes = panel.value.codes;
-  const available = codes.filter(
-    (c) => c.revokedAt == null && c.redeemedAt == null,
-  ).length;
-  return (
-    <div class="flex min-w-0 flex-col gap-3">
-      <section class="card card-border bg-base-100 min-w-0" aria-label="About invite codes">
-        <div class="card-body min-w-0">
-          <p class="m-0 min-w-0 break-words opacity-60">
-            Outer is in closed beta: one code admits one new account. Share a
-            code with a friend and it is spent when they sign in
-            {available === 1 ? " — you have 1 unused code left." : ` — you have ${available} unused codes left.`}
-          </p>
-        </div>
-      </section>
-      {codes.length === 0 ? (
-        <EmptyState icon={<TicketIcon />} title="No invite codes">
-          {isAdmin
-            ? "Admins get no automatic codes — generate some on the Admin page."
-            : "Codes appear here when you earn or receive them."}
-        </EmptyState>
-      ) : (
-        <section class="card card-border bg-base-100 min-w-0" aria-label="Your invite codes">
-          <div class="card-body min-w-0">
-            <div class="min-w-0 overflow-x-auto">
-              <table class="table table-fixed w-full max-sm:[&_td]:px-2 max-sm:[&_th]:px-2">
-                <colgroup>
-                  <col class="sm:w-48" />
-                  <col class="w-20 max-sm:hidden" />
-                  <col class="w-28" />
-                  <col class="max-sm:hidden" />
-                  <col class="w-28 max-sm:hidden" />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th scope="col">Code</th>
-                    <th scope="col" class="max-sm:hidden">Kind</th>
-                    <th scope="col">Status</th>
-                    <th scope="col" class="max-sm:hidden">Joined by</th>
-                    <th scope="col" class="max-sm:hidden">Created</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {codes.map((entry) => {
-                    const status = inviteStatus(entry);
-                    return (
-                      <tr key={entry.code}>
-                        <td class="min-w-0">
-                          <span class="flex min-w-0 items-center gap-2">
-                            <span class="min-w-0 flex-1 truncate font-mono max-sm:text-xs" title={entry.code}>
-                              {entry.code}
-                            </span>
-                            <CopyButton value={entry.code} label={`Copy ${entry.code}`} />
-                          </span>
-                        </td>
-                        <td class="truncate max-sm:hidden" title={entry.kind}>
-                          {entry.kind}
-                        </td>
-                        <td class="min-w-0">
-                          <span class={`badge badge-soft ${status.badge}`} title={status.label}>
-                            {status.label}
-                          </span>
-                        </td>
-                        <td
-                          class="min-w-0 truncate max-sm:hidden"
-                          title={entry.redeemedByEmail ?? entry.note ?? ""}
-                        >
-                          {entry.redeemedByEmail ?? entry.note ?? "—"}
-                        </td>
-                        <td class="whitespace-nowrap max-sm:hidden" title={when(entry.createdAt)}>
-                          {timeAgo(entry.createdAt)}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </section>
-      )}
-    </div>
-  );
 }
 
 // --- Admin (account) -----------------------------------------------------------
@@ -3383,7 +3271,7 @@ function WaitlistCard({
         <h2 class="card-title m-0 min-w-0 text-base">Waitlist</h2>
         {entries.length === 0 ? (
           <EmptyState plain title="Nobody waiting">
-            Signups that hit the closed beta land here.
+            Signups refused while sign-up is closed land here.
           </EmptyState>
         ) : (
           <div class="min-w-0 overflow-x-auto">

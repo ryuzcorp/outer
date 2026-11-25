@@ -276,9 +276,6 @@ export interface InviteEntry {
   createdByEmail?: string | null;
 }
 
-export interface InvitesSummary {
-  codes: InviteEntry[];
-}
 
 export interface AdminInvitesPage {
   codes: InviteEntry[];

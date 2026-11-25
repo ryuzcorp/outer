@@ -56,9 +56,8 @@ copy-paste prompts:
 
 ## Status
 
-Outer is in closed beta. New accounts need an invite code
-(`OUTER-XXXX-XXXX`) — without one, sign-in puts you on the waitlist.
-Details: [Sign in](https://outer.now/get-started/sign-in).
+Outer is in open beta. Anyone can sign up with an email address — no
+invite code, no waitlist. Details: [Sign in](https://outer.now/get-started/sign-in).
 
 Scripts and clients without OAuth mint an API key at
 [outer.now/keys](https://outer.now/keys).
