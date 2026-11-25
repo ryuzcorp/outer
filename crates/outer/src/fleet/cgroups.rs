@@ -503,16 +503,20 @@ pub fn ensure_build_parent(
 pub const BUILD_PIDS_MAX: u64 = 512;
 
 /// One build's own leaf under the build parent, carrying its own
-/// `memory.max` and `pids.max`.
+/// `memory.max`, `pids.max` and `cpu.max` (`"MAX PERIOD"`): a hostile build
+/// busy-loops under the same quota as a fleet (spec §12.7 gate), so the
+/// spin cannot starve neighbouring fleets.
 pub fn ensure_build_leaf(
     parent: &Path,
     build_id: &str,
     memory_max_bytes: u64,
+    cpu_max: &str,
 ) -> anyhow::Result<PathBuf> {
     let dir = parent.join(fleet_dir_name(build_id));
     std::fs::create_dir_all(&dir)?;
     write_limit(&dir, "memory.max", &memory_max_bytes.to_string())?;
     write_limit(&dir, "pids.max", &BUILD_PIDS_MAX.to_string())?;
+    write_limit(&dir, "cpu.max", cpu_max)?;
     Ok(dir)
 }
 
@@ -781,7 +785,8 @@ mod tests {
                 .trim(),
             "10"
         );
-        let leaf = ensure_build_leaf(&parent, "build-1", 1024 * 1024 * 1024).unwrap();
+        let leaf =
+            ensure_build_leaf(&parent, "build-1", 1024 * 1024 * 1024, FLEET_CPU_MAX_FREE).unwrap();
         assert_eq!(
             std::fs::read_to_string(leaf.join("memory.max"))
                 .unwrap()
@@ -795,6 +800,13 @@ mod tests {
                 .unwrap()
                 .trim(),
             BUILD_PIDS_MAX.to_string()
+        );
+        // A hostile build busy-loops under the same quota as a fleet.
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("cpu.max"))
+                .unwrap()
+                .trim(),
+            FLEET_CPU_MAX_FREE
         );
     }
 

@@ -3,12 +3,13 @@
 # WITHOUT cargo (neither the `outer-outer-1` container nor the host has a
 # toolchain; the container does have bun/node, nft and setpriv).
 #
-# It mirrors `hostile_build_probes_are_contained` in
+# It mirrors `hostile_build_probes_are_contained` plus
+# `hostile_cpu_spin_is_capped_and_neighbour_keeps_p95` in
 # `crates/outer/tests/hostile.rs`, which cannot run here: same fixture
 # layout (sibling 0700 dirs owned by a sibling uid, a root-only canary, a
-# data dir, a cgroup leaf with memory.max/pids.max under the Outer anchor
-# `/sys/fs/cgroup/outer`), same `HOSTILE_*` env names, same verdict rule
-# (every must-fail build probe in `e2e/hostile/manifest.json` contained,
+# data dir, cgroup leaves with memory.max/pids.max/cpu.max under the Outer
+# anchor `/sys/fs/cgroup/outer`), same `HOSTILE_*` env names, same verdict
+# rule (every must-fail probe in `e2e/hostile/manifest.json` contained,
 # every must-succeed control green).
 #
 # Run as root INSIDE the container (host networking lets the nft output
@@ -32,11 +33,12 @@
 # must-fail probe leaked. Missing prerequisites print SKIP and exit 0 —
 # a skip is a gap, not a pass.
 #
-# Safe on a live host: bounded (`timeout 300`, a 512 MiB / 512-pid leaf the
-# probe's fork burst and memory hog die inside), read-only toward prod (the
-# nft table is only listed, the database only selected from), the canary is
-# a fresh temp file (not the real outer.sqlite), and a trap removes the
-# leaf, the dirs and the listener. The uids need no cleanup: they are bare
+# Safe on a live host: bounded (the build layer under `timeout 300` in a
+# 512 MiB / 512-pid leaf; the cpu layer under `timeout 90` per probe,
+# settling in ~25 s), read-only toward prod (the nft table is only listed,
+# the database only selected from), the canary is a fresh temp file (not
+# the real outer.sqlite), and a trap removes the leaves, the dirs, the
+# listener and both cpu runners. The uids need no cleanup: they are bare
 # numbers (the image pre-creates the whole range in /etc/passwd), no users
 # are created.
 set -eu
@@ -118,12 +120,20 @@ log "nft table inet outer covers uid $PROBE_UID via skuid $COVERED"
 BASE="$(mktemp -d /tmp/hostile-XXXXXX)"
 LEAF=""
 LISTENER_PID=""
+SPIN_PID=""
+NEIGH_PID=""
+SPIN_LEAF=""
+NEIGH_LEAF=""
 cleanup() {
     if [ -n "$LISTENER_PID" ]; then kill "$LISTENER_PID" 2>/dev/null || true; fi
-    if [ -n "$LEAF" ]; then
-        echo 1 > "$LEAF/cgroup.kill" 2>/dev/null || true
-        rmdir "$LEAF" 2>/dev/null || true
-    fi
+    if [ -n "$SPIN_PID" ]; then kill "$SPIN_PID" 2>/dev/null || true; fi
+    if [ -n "$NEIGH_PID" ]; then kill "$NEIGH_PID" 2>/dev/null || true; fi
+    for dead in "$LEAF" "$SPIN_LEAF" "$NEIGH_LEAF"; do
+        if [ -n "$dead" ]; then
+            echo 1 > "$dead/cgroup.kill" 2>/dev/null || true
+            rmdir "$dead" 2>/dev/null || true
+        fi
+    done
     rm -rf "$BASE"
 }
 trap cleanup EXIT INT TERM
@@ -198,13 +208,13 @@ log "loopback target serves at $TARGET"
 # delegation) skips instead of running uncapped.
 LEAF="$ANCHOR/hostile-$(date +%s)-$$"
 mkdir "$LEAF" || skip "cannot create cgroup leaf under $ANCHOR"
-for spec in "memory.max 536870912" "pids.max 512"; do
+for spec in "memory.max 536870912" "pids.max 512" "cpu.max ${OUTER_FLEET_CPU_MAX:-50000 100000}"; do
     # shellcheck disable=SC2086
     set -- $spec
     echo "$2" > "$LEAF/$1" 2>/dev/null || skip "cannot write $LEAF/$1 (no delegation?)"
     [ "$(cat "$LEAF/$1")" = "$2" ] || skip "$1 did not apply (wrote $2, have $(cat "$LEAF/$1"))"
 done
-log "leaf $LEAF carries memory.max=536870912 pids.max=512"
+log "leaf $LEAF carries memory.max=536870912 pids.max=512 cpu.max=${OUTER_FLEET_CPU_MAX:-50000 100000}"
 
 # The child's explicit env, mirroring sandbox.rs: base vars plus the HOSTILE_*
 # fixture pointers. Reserved platform names an app must never set are
@@ -314,3 +324,152 @@ log "probe report:"
 cat "$REPORT"
 "$RUNTIME" "$BASE/eval.mjs" "$FIXTURES/manifest.json" "$REPORT" || die "a must-fail probe leaked (see LEAK lines above)"
 log "done: every must-fail build probe stayed contained"
+
+# --- CPU-spin and neighbour-p95 layer (spec §12.7 M3 gate) ---
+#
+# A hostile busy-loop in a leaf capped at the fleet cpu.max quota must burn
+# no more than the quota allows (the fixture measures its own cpu.stat),
+# while a well-behaved neighbour serving /health in its own capped leaf
+# keeps its loopback p95 within the probe's bound (at most twice the idle
+# baseline, or the baseline plus 50 ms of shared-vCore scheduling slack).
+# Bounded: each probe runs under `timeout 90` but the layer settles in
+# ~25 s; the EXIT trap above kills both runners and removes both leaves.
+# Read-only toward prod data: only the nft table is listed (above), the
+# fixture dirs below are fresh temp dirs, and the uids need no cleanup.
+CPU_QUOTA="${OUTER_FLEET_CPU_MAX:-50000 100000}"
+SPIN_LEAF="$ANCHOR/hostile-spin-$(date +%s)-$$"
+NEIGH_LEAF="$ANCHOR/hostile-neigh-$(date +%s)-$$"
+mkleaf() {
+    _leaf="$1"; _mem="$2"
+    for spec in "memory.max $_mem" "pids.max 512" "cpu.max $CPU_QUOTA"; do
+        # shellcheck disable=SC2086
+        set -- $spec
+        echo "$2" > "$_leaf/$1" 2>/dev/null || skip "cannot write $_leaf/$1 (no delegation?)"
+        [ "$(cat "$_leaf/$1")" = "$2" ] || skip "$1 did not apply (wrote $2, have $(cat "$_leaf/$1"))"
+    done
+}
+mkdir "$SPIN_LEAF" || skip "cannot create cgroup leaf under $ANCHOR"
+mkdir "$NEIGH_LEAF" || skip "cannot create cgroup leaf under $ANCHOR"
+mkleaf "$SPIN_LEAF" 2147483648
+mkleaf "$NEIGH_LEAF" 536870912
+log "cpu leaves carry cpu.max=$CPU_QUOTA"
+SPIN_WORK="$BASE/work/spin"
+NEIGH_WORK="$BASE/work/neigh"
+mkdir -p "$SPIN_WORK" "$NEIGH_WORK" "$BASE/home-spin" "$BASE/tmp-spin" "$BASE/home-neigh" "$BASE/tmp-neigh"
+cp "$FIXTURES/cpu-spin.mjs" "$SPIN_WORK/cpu-spin.mjs"
+cp "$FIXTURES/neighbour-probe.mjs" "$NEIGH_WORK/neighbour-probe.mjs"
+chown "$PROBE_UID:$PROBE_UID" "$SPIN_WORK" "$SPIN_WORK/cpu-spin.mjs" "$BASE/home-spin" "$BASE/tmp-spin"
+chown "$SIBLING_UID:$SIBLING_UID" "$NEIGH_WORK" "$NEIGH_WORK/neighbour-probe.mjs" "$BASE/home-neigh" "$BASE/tmp-neigh"
+chmod 0700 "$SPIN_WORK" "$NEIGH_WORK"
+GO="$BASE/spin.go"
+READY="$BASE/spin.ready"
+DONE="$BASE/baseline.done"
+rm -f "$GO" "$READY" "$DONE"
+# One runner per tenant, same shape as the build runner above: move into
+# the leaf while still root, then drop to the tenant uid with an explicit
+# env. The CPU probes need no egress, so the env stays small.
+ASSIGN=""
+putenv PATH "/usr/local/bin:/usr/bin:/bin"
+putenv HOME "$BASE/home-spin"
+putenv TMPDIR "$BASE/tmp-spin"
+putenv HOSTILE_CGROUP_LEAF "$SPIN_LEAF"
+putenv HOSTILE_SPIN_MS "15000"
+putenv HOSTILE_SPIN_GO "$GO"
+SPIN_ASSIGN="$ASSIGN"
+{
+    printf '#!/bin/sh\nset -eu\n'
+    printf 'echo $$ > %s\n' "$(sq "$SPIN_LEAF/cgroup.procs")"
+    printf 'cd %s\n' "$(sq "$SPIN_WORK")"
+    # shellcheck disable=SC2086
+    printf 'exec setpriv --reuid %s --regid %s --clear-groups env -i %s %s %s\n' \
+        "$PROBE_UID" "$PROBE_UID" "$SPIN_ASSIGN" "$(sq "$RUNTIME")" "$(sq "$SPIN_WORK/cpu-spin.mjs")"
+} > "$BASE/spin-runner.sh"
+ASSIGN=""
+putenv PATH "/usr/local/bin:/usr/bin:/bin"
+putenv HOME "$BASE/home-neigh"
+putenv TMPDIR "$BASE/tmp-neigh"
+putenv HOSTILE_SPIN_READY "$READY"
+putenv HOSTILE_BASELINE_DONE "$DONE"
+putenv HOSTILE_NEIGHBOUR_COUNT "200"
+NEIGH_ASSIGN="$ASSIGN"
+{
+    printf '#!/bin/sh\nset -eu\n'
+    printf 'echo $$ > %s\n' "$(sq "$NEIGH_LEAF/cgroup.procs")"
+    printf 'cd %s\n' "$(sq "$NEIGH_WORK")"
+    # shellcheck disable=SC2086
+    printf 'exec setpriv --reuid %s --regid %s --clear-groups env -i %s %s %s\n' \
+        "$SIBLING_UID" "$SIBLING_UID" "$NEIGH_ASSIGN" "$(sq "$RUNTIME")" "$(sq "$NEIGH_WORK/neighbour-probe.mjs")"
+} > "$BASE/neigh-runner.sh"
+chmod 0755 "$BASE/spin-runner.sh" "$BASE/neigh-runner.sh"
+log "running cpu-spin.mjs as uid $PROBE_UID in $SPIN_LEAF and neighbour-probe.mjs as uid $SIBLING_UID in $NEIGH_LEAF"
+timeout 90 sh "$BASE/neigh-runner.sh" > "$BASE/neigh-stdout.log" 2> "$BASE/neigh-stderr.log" &
+NEIGH_PID="$!"
+timeout 90 sh "$BASE/spin-runner.sh" > "$BASE/spin-stdout.log" 2> "$BASE/spin-stderr.log" &
+SPIN_PID="$!"
+# Driver: the neighbour takes its unloaded baseline first, then the spin
+# starts; release the loaded loop once the workers ramped up.
+deadline=$(( $(date +%s) + 60 ))
+while [ ! -f "$DONE" ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || die "neighbour probe never finished its baseline"
+    sleep 0.2
+done
+: > "$GO"
+sleep 2
+: > "$READY"
+status=0; wait "$SPIN_PID" || status="$?"
+[ "$status" = 0 ] || { tail -30 "$BASE/spin-stderr.log" >&2; die "spinner run failed (exit $status)"; }
+status=0; wait "$NEIGH_PID" || status="$?"
+[ "$status" = 0 ] || { tail -30 "$BASE/neigh-stderr.log" >&2; die "neighbour run failed (exit $status)"; }
+SPIN_PID=""
+NEIGH_PID=""
+# Fail closed on the cpu fixture contract, like assert_contained: the
+# must-fail spin probe contained (ok:false), the must-succeed neighbour
+# control green. Two reports merge into one verdict.
+cat > "$BASE/eval-cpu.mjs" <<'EOF'
+import { readFileSync } from "node:fs";
+const manifest = JSON.parse(readFileSync(process.argv[2], "utf-8"));
+const reports = process.argv.slice(3).map((f) => JSON.parse(readFileSync(f, "utf-8")));
+for (const r of reports) {
+  if (r.phase !== "cpu") {
+    console.error(`report phase is ${r.phase}, want cpu`);
+    process.exit(1);
+  }
+}
+const merged = Object.assign({}, ...reports.map((r) => r.probes));
+const wanted = manifest.probes.filter((p) => p.phase === "cpu");
+const missing = wanted.filter((p) => !(p.id in merged)).map((p) => p.id);
+let leaked = [];
+for (const probe of wanted) {
+  const result = merged[probe.id];
+  if (!result) continue;
+  const bad = probe.must === "fail" ? result.ok : !result.ok;
+  console.log(`${bad ? "LEAK" : "held"} ${probe.id} ok=${result.ok} ${result.detail ?? ""}`);
+  if (bad) leaked.push(probe.id);
+}
+for (const [id, result] of Object.entries(merged)) {
+  const known = wanted.find((p) => p.id === id);
+  if (!known && result.ok) {
+    console.log(`LEAK ${id} (unknown probe) ${result.detail ?? ""}`);
+    leaked.push(id);
+  }
+}
+if (missing.length > 0) {
+  console.error(`probes went missing: ${missing.join(", ")}`);
+  process.exit(1);
+}
+if (leaked.length > 0) {
+  console.error(`LEAKED: ${leaked.join(", ")}`);
+  process.exit(1);
+}
+console.log(`all ${wanted.length} cpu probes held`);
+EOF
+SPIN_REPORT="$SPIN_WORK/dist/cpu-spin.json"
+NEIGH_REPORT="$NEIGH_WORK/dist/neighbour.json"
+[ -f "$SPIN_REPORT" ] || { LINE="$(grep '"phase"' "$BASE/spin-stdout.log" | tail -1)"; [ -n "$LINE" ] && { printf '%s\n' "$LINE" > "$BASE/cpu-spin.json"; SPIN_REPORT="$BASE/cpu-spin.json"; }; }
+[ -f "$NEIGH_REPORT" ] || { LINE="$(grep '"phase"' "$BASE/neigh-stdout.log" | tail -1)"; [ -n "$LINE" ] && { printf '%s\n' "$LINE" > "$BASE/neighbour.json"; NEIGH_REPORT="$BASE/neighbour.json"; }; }
+[ -f "$SPIN_REPORT" ] || { cat "$BASE/spin-stdout.log" >&2; die "the spinner printed no JSON report"; }
+[ -f "$NEIGH_REPORT" ] || { cat "$BASE/neigh-stdout.log" >&2; die "the neighbour printed no JSON report"; }
+log "cpu probe reports:"
+cat "$SPIN_REPORT" "$NEIGH_REPORT"
+"$RUNTIME" "$BASE/eval-cpu.mjs" "$FIXTURES/manifest.json" "$SPIN_REPORT" "$NEIGH_REPORT" || die "a cpu probe leaked (see LEAK lines above)"
+log "done: the spin stayed within quota and the neighbour kept its p95"

@@ -64,7 +64,7 @@ fn hostile_manifest_covers_every_required_category() {
     for probe in &manifest.probes {
         assert!(!probe.id.is_empty(), "probe ids are non-empty");
         assert!(
-            ["build", "worker", "r2", "deploy", "export", "platform"]
+            ["build", "worker", "r2", "deploy", "export", "platform", "cpu"]
                 .contains(&probe.phase.as_str()),
             "probe {} has a known phase",
             probe.id
@@ -176,6 +176,57 @@ fn hostile_fleet_limits_bound_memory_cpu_and_pids() {
         let quota: u64 = cpu.split_whitespace().next().unwrap().parse().unwrap();
         assert!(quota > 0, "cpu quota bounds spin loops");
     }
+}
+
+/// Fleet AND build leaves carry cpu.max (spec §12.7 gate): both quotas
+/// parse as cgroup v2 `"quota period"`, and the leaves the constructors
+/// write carry the configured value — so the spinner fixture runs under a
+/// real quota whichever phase (fleet or build) it escapes into.
+#[test]
+fn hostile_cgroup_config_sets_cpu_max_for_fleets_and_builds() {
+    for cpu in [
+        outer::fleet::cgroups::FLEET_CPU_MAX_FREE,
+        outer::fleet::cgroups::FLEET_CPU_MAX_PRO,
+    ] {
+        let (quota, period) = cpu.split_once(' ').expect("cpu.max is quota and period");
+        assert!(
+            quota.parse::<u64>().is_ok_and(|q| q > 0),
+            "cpu quota bounds spin loops: {cpu:?}"
+        );
+        assert!(
+            period.parse::<u64>().is_ok_and(|p| p > 0),
+            "cpu period is positive: {cpu:?}"
+        );
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fleet = outer::fleet::cgroups::ensure_fleet_leaf(
+        dir.path(),
+        "grocery",
+        &outer::fleet::cgroups::FleetLimits::new(
+            512 * 1024 * 1024,
+            outer::fleet::cgroups::FLEET_CPU_MAX_FREE,
+        ),
+    )
+    .expect("fleet leaf");
+    assert_eq!(
+        std::fs::read_to_string(fleet.join("cpu.max"))
+            .expect("fleet cpu.max")
+            .trim(),
+        outer::fleet::cgroups::FLEET_CPU_MAX_FREE
+    );
+    let build = outer::fleet::cgroups::ensure_build_leaf(
+        dir.path(),
+        "build-1",
+        2 * 1024 * 1024 * 1024,
+        outer::fleet::cgroups::FLEET_CPU_MAX_FREE,
+    )
+    .expect("build leaf");
+    assert_eq!(
+        std::fs::read_to_string(build.join("cpu.max"))
+            .expect("build cpu.max")
+            .trim(),
+        outer::fleet::cgroups::FLEET_CPU_MAX_FREE
+    );
 }
 
 /// Scoped credentials never leave `fleets/{slug}/`: the only prefix shape
@@ -506,6 +557,7 @@ async fn hostile_export_carries_no_secret_values() {
             },
             step_timeout: std::time::Duration::from_secs(120),
             cgroups: None,
+            cpu_max: "50000 100000".to_string(),
             apps_domain: "example.com".to_string(),
             cache_purge: None,
             jev: None,
@@ -861,13 +913,23 @@ fn nft_covers_uid(rules: &str, uid: u32) -> bool {
 /// A real cgroup leaf with kernel-enforced limits: the harness writes the
 /// limits and reads them back, like `cgroups::write_limit` — a silent no-op
 /// (read-only mount, no delegation) skips instead of running uncapped.
-fn make_leaf(anchor: &Path, name: &str, memory_max: &str, pids_max: &str) -> Option<PathBuf> {
+fn make_leaf(
+    anchor: &Path,
+    name: &str,
+    memory_max: &str,
+    pids_max: &str,
+    cpu_max: &str,
+) -> Option<PathBuf> {
     let leaf = anchor.join(name);
     if std::fs::create_dir_all(&leaf).is_err() {
         eprintln!("SKIP: cannot create cgroup leaf under {}", anchor.display());
         return None;
     }
-    for (file, value) in [("memory.max", memory_max), ("pids.max", pids_max)] {
+    for (file, value) in [
+        ("memory.max", memory_max),
+        ("pids.max", pids_max),
+        ("cpu.max", cpu_max),
+    ] {
         if std::fs::write(leaf.join(file), value).is_err() {
             eprintln!(
                 "SKIP: cannot write {} (no delegation?)",
@@ -900,6 +962,13 @@ fn chown(path: &Path, uid: u32, gid: u32) {
         .arg(path)
         .status();
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+/// The fleet/build cpu.max quota under test (`OUTER_FLEET_CPU_MAX`, default
+/// the `serve` default): the privileged leaves mirror what production
+/// writes, so the spinner probes the real quota.
+fn fleet_cpu_max() -> String {
+    std::env::var("OUTER_FLEET_CPU_MAX").unwrap_or_else(|_| "50000 100000".to_string())
 }
 
 /// The real build path: `build-probe.mjs` through `run_sandboxed` as an app
@@ -1004,7 +1073,7 @@ async fn hostile_build_probes_are_contained() {
 
     let anchor = PathBuf::from("/sys/fs/cgroup");
     let leaf_name = format!("hostile-{}", std::process::id());
-    let Some(leaf) = make_leaf(&anchor, &leaf_name, "536870912", "512") else {
+    let Some(leaf) = make_leaf(&anchor, &leaf_name, "536870912", "512", &fleet_cpu_max()) else {
         return;
     };
     let own = format!("0::/{}", leaf_name);
@@ -1097,6 +1166,193 @@ async fn hostile_build_probes_are_contained() {
         });
     let report: ProbeReport = serde_json::from_str(line).expect("report parses");
     assert_contained(&report, "build", &manifest());
+}
+
+/// CPU quota and neighbour latency (spec §12.7 M3 gate): a spinner
+/// busy-looping on up to 8 cores in a leaf capped at the fleet cpu.max quota
+/// must burn no more than the quota allows (measured from the leaf's
+/// cpu.stat), while a well-behaved neighbour serving /health in its own
+/// capped leaf keeps its loopback p95 within the probe's bound. Needs root,
+/// a writable cgroupfs with delegation and a JS runtime. Run with
+/// `cargo test --locked -- --ignored hostile`.
+#[tokio::test]
+#[ignore = "needs root, a writable cgroupfs with delegation and bun/node"]
+async fn hostile_cpu_spin_is_capped_and_neighbour_keeps_p95() {
+    if !require_root() {
+        return;
+    }
+    let Some(runtime) = js_runtime() else {
+        return;
+    };
+    let Some(range) = app_uid_range() else {
+        return;
+    };
+    let Some((probe_uid, sibling_uid)) = hostile_uids(range) else {
+        return;
+    };
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        eprintln!("SKIP: no cgroup v2 mount at /sys/fs/cgroup");
+        return;
+    }
+    // 2 GiB spinner leaf (the build-leaf size): the per-CPU runtimes are
+    // small but 8 of them must never OOM, or a memory kill pollutes a CPU
+    // experiment. Memory size is irrelevant to the assertions; the quota
+    // under test is cpu.max. The neighbour leaf is the fleet size.
+    let anchor = PathBuf::from("/sys/fs/cgroup");
+    let tag = std::process::id();
+    let quota = fleet_cpu_max();
+    let Some(spin_leaf) = make_leaf(
+        &anchor,
+        &format!("hostile-spin-{tag}"),
+        "2147483648",
+        "512",
+        &quota,
+    ) else {
+        return;
+    };
+    let Some(neigh_leaf) = make_leaf(
+        &anchor,
+        &format!("hostile-neigh-{tag}"),
+        "536870912",
+        "512",
+        &quota,
+    ) else {
+        kill_leaf(&spin_leaf);
+        return;
+    };
+    // One work/cache pair per tenant, staged with its fixture and owned by
+    // its uid — the same layout `run_sandboxed` expects from the pipeline.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let spin_work = dir.path().join("spin");
+    let neigh_work = dir.path().join("neigh");
+    let spin_cache = dir.path().join("cache-spin");
+    let neigh_cache = dir.path().join("cache-neigh");
+    for work in [&spin_work, &neigh_work, &spin_cache, &neigh_cache] {
+        std::fs::create_dir_all(work).expect("tenant dir");
+    }
+    std::fs::copy(
+        fixture_dir().join("cpu-spin.mjs"),
+        spin_work.join("cpu-spin.mjs"),
+    )
+    .expect("stage spinner");
+    std::fs::copy(
+        fixture_dir().join("neighbour-probe.mjs"),
+        neigh_work.join("neighbour-probe.mjs"),
+    )
+    .expect("stage neighbour");
+    chown(&spin_work, probe_uid, probe_uid);
+    chown(&spin_cache, probe_uid, probe_uid);
+    chown(&neigh_work, sibling_uid, sibling_uid);
+    chown(&neigh_cache, sibling_uid, sibling_uid);
+    // Handoff files: the neighbour takes its unloaded baseline first, then
+    // the harness starts the spin (GO), waits for the workers to ramp, and
+    // releases the loaded loop (READY).
+    let go = dir.path().join("spin.go");
+    let ready = dir.path().join("spin.ready");
+    let baseline_done = dir.path().join("baseline.done");
+    let empty: Vec<(String, String)> = Vec::new();
+    let spin_env = vec![
+        (
+            "HOSTILE_CGROUP_LEAF".to_string(),
+            spin_leaf.to_string_lossy().into_owned(),
+        ),
+        ("HOSTILE_SPIN_MS".to_string(), "15000".to_string()),
+        (
+            "HOSTILE_SPIN_GO".to_string(),
+            go.to_string_lossy().into_owned(),
+        ),
+    ];
+    let neigh_env = vec![
+        (
+            "HOSTILE_SPIN_READY".to_string(),
+            ready.to_string_lossy().into_owned(),
+        ),
+        (
+            "HOSTILE_BASELINE_DONE".to_string(),
+            baseline_done.to_string_lossy().into_owned(),
+        ),
+        ("HOSTILE_NEIGHBOUR_COUNT".to_string(), "200".to_string()),
+    ];
+    let spin_sb = outer::fleet::sandbox::Sandbox {
+        uid: Some(probe_uid),
+        gid: Some(probe_uid),
+        platform_env: &empty,
+        env: spin_env.as_slice(),
+        cache_root: &spin_cache,
+        cgroup_leaf: Some(&spin_leaf),
+    };
+    let neigh_sb = outer::fleet::sandbox::Sandbox {
+        uid: Some(sibling_uid),
+        gid: Some(sibling_uid),
+        platform_env: &empty,
+        env: neigh_env.as_slice(),
+        cache_root: &neigh_cache,
+        cgroup_leaf: Some(&neigh_leaf),
+    };
+    // Both fixtures start at once; the driver sequences them through the
+    // handoff files. `join!` (not spawned tasks) keeps the borrows local.
+    let spinner = outer::fleet::sandbox::run_sandboxed(
+        &runtime,
+        &["cpu-spin.mjs"],
+        &spin_work,
+        &spin_sb,
+        std::time::Duration::from_secs(90),
+    );
+    let neighbour = outer::fleet::sandbox::run_sandboxed(
+        &runtime,
+        &["neighbour-probe.mjs"],
+        &neigh_work,
+        &neigh_sb,
+        std::time::Duration::from_secs(90),
+    );
+    let driver = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if baseline_done.exists() {
+                std::fs::write(&go, "go\n").expect("go file");
+                // Let the workers ramp up before the loaded loop starts.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                std::fs::write(&ready, "ready\n").expect("ready file");
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("neighbour probe never finished its baseline; cannot start the spinner");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    let (spin_out, neigh_out, ()) = tokio::join!(spinner, neighbour, driver);
+    let spin_out = spin_out.expect("the spinner runs");
+    let neigh_out = neigh_out.expect("the neighbour runs");
+    kill_leaf(&spin_leaf);
+    kill_leaf(&neigh_leaf);
+    let spin_line = spin_out
+        .lines()
+        .rfind(|line| line.contains("\"phase\""))
+        .unwrap_or_else(|| {
+            panic!(
+                "the spinner prints a JSON report, got: {}",
+                spin_out.chars().take(500).collect::<String>()
+            )
+        });
+    let neigh_line = neigh_out
+        .lines()
+        .rfind(|line| line.contains("\"phase\""))
+        .unwrap_or_else(|| {
+            panic!(
+                "the neighbour prints a JSON report, got: {}",
+                neigh_out.chars().take(500).collect::<String>()
+            )
+        });
+    let mut report: ProbeReport = serde_json::from_str(spin_line).expect("spinner report parses");
+    let neigh_report: ProbeReport =
+        serde_json::from_str(neigh_line).expect("neighbour report parses");
+    for (id, probe) in neigh_report.probes {
+        if report.probes.insert(id.clone(), probe).is_some() {
+            panic!("duplicate probe id {id}");
+        }
+    }
+    assert_contained(&report, "cpu", &manifest());
 }
 
 /// A fleet's state credential stays in its state prefixes: `r2-probe.mjs`
