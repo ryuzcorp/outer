@@ -973,6 +973,22 @@ impl Config {
                     .to_string(),
             );
         }
+        // L-26: open signup must never run on sandbox keys — anyone with a
+        // test card would get free Pro. Closed signup keeps test keys for
+        // staging; localhost dev never reaches this branch.
+        if self.signup_open
+            && !self.is_local()
+            && self
+                .stripe
+                .secret_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("sk_test_") || key.starts_with("rk_test_"))
+        {
+            problems.push(
+                "open signup needs live Stripe keys: STRIPE_SECRET_KEY starts with a test prefix (sk_test_ or rk_test_), so OUTER_SIGNUP=open would hand Pro to anyone with a test card; switch to a live key or keep OUTER_SIGNUP=closed"
+                    .to_string(),
+            );
+        }
 
         if self.oauth_access_ttl.is_zero() {
             problems.push("OUTER_OAUTH_ACCESS_TTL_S must be at least 1".to_string());
@@ -2145,5 +2161,55 @@ mod tests {
             "{err:?}"
         );
         assert_no_secrets(&err);
+    }
+
+    /// L-26: open signup on a non-localhost domain refuses test Stripe
+    /// keys, with a message saying open signup needs live keys. Closed
+    /// signup keeps test keys for staging.
+    #[test]
+    fn open_signup_refuses_test_stripe_keys_off_localhost() {
+        let legal = tempfile::tempdir().unwrap();
+        for name in [
+            "terms.html",
+            "privacy.html",
+            "terms.pl.html",
+            "privacy.pl.html",
+            "checkout-notice.txt",
+        ] {
+            std::fs::write(legal.path().join(name), "Seller: Example Sp. z o.o.").unwrap();
+        }
+        let legal = legal.path().to_string_lossy().to_string();
+        let case = |signup: &str, key: &str| {
+            prod_vars(&[
+                ("OUTER_LEGAL_DIR", legal.as_str()),
+                ("OUTER_SIGNUP", signup),
+                ("STRIPE_SECRET_KEY", key),
+            ])
+        };
+        for key in ["sk_test_NEVER-LEAK-a", "rk_test_NEVER-LEAK-b"] {
+            let err = Config::from_vars(&case("open", key)).unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains("open signup needs live Stripe keys")),
+                "{key} with open signup must be refused: {err:?}"
+            );
+            assert_no_secrets(&err);
+        }
+        // Closed signup keeps test keys for staging.
+        let cfg = Config::from_vars(&case("closed", "sk_test_staging")).unwrap();
+        assert!(!cfg.signup_open);
+        // Open signup passes on a live key.
+        let cfg = Config::from_vars(&case("open", "sk_live_prod")).unwrap();
+        assert!(cfg.signup_open);
+        // Localhost dev never hits the rule, even open with test keys.
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_SIGNUP", "open"),
+            ("STRIPE_SECRET_KEY", "sk_test_1"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_test"),
+            ("STRIPE_PRICE_PRO", "price_pro"),
+        ]))
+        .unwrap();
+        assert!(cfg.signup_open);
     }
 }
