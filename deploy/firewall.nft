@@ -34,5 +34,9 @@ table inet outer_fw {
 		type filter hook output priority 0; policy accept;
 		tcp dport 8443 ip daddr 127.0.0.1 meta skuid != { 0, "cloudflared" } reject
 		tcp dport 8443 ip6 daddr ::1 meta skuid != { 0, "cloudflared" } reject
+		# sshd on loopback is tunnel-only as well: app uids have no reason
+		# to reach it.
+		tcp dport 22 ip daddr 127.0.0.1 meta skuid != { 0, "cloudflared" } reject
+		tcp dport 22 ip6 daddr ::1 meta skuid != { 0, "cloudflared" } reject
 	}
 }

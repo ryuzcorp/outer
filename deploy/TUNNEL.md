@@ -8,11 +8,13 @@ loopback only (`OUTER_LISTEN=127.0.0.1:8443`, plain HTTP).
 
 ## (a) One-time cutover order
 
-Each step stays reversible until it is verified: direct SSH and direct 443
-keep working through step 6, and nothing closes them until the tunnel path,
-the release and DNS are all proven. Keep a direct-SSH session open
-throughout; only step 7 changes what the network admits, and established
-connections survive even that.
+The cutover is one-way from step 4: `deploy/release.sh` installs and
+applies the closed firewall on every run, so new direct-SSH connections
+and direct 443 both go dark at the step-4 release — before the DNS flip.
+Recovery from step 4 on is fix-forward over tunnel SSH, which is why step
+2 verifies it first. Keep a direct-SSH session open throughout anyway:
+established connections survive the firewall, and until step 4 new direct
+connections still work for recovery.
 
 1. **Tunnel + cloudflared only.** Create the tunnel via the API
    (`POST /accounts/{id}/cfd_tunnel`, locally-managed, name e.g.
@@ -39,26 +41,31 @@ connections survive even that.
    still works — fix the tunnel/Access before continuing.
 3. **Switch the workstation ssh config.** Make (c) permanent. From here on,
    `<ssh-target>` in every deploy script means `outer-vps`.
-4. **Release the tunnel image.** Set `OUTER_LISTEN=127.0.0.1:8443` and
-   delete the TLS vars in `/srv/outer/outer.env`, then
-   `deploy/release.sh outer-vps` from a clean tree. Cloudflare →
-   origin:443 starts failing HERE — the blip begins. Reversible until the
-   DNS flip: `deploy/rollback.sh outer-vps` restores the 443 listener.
+4. **Point of no return: release the tunnel image.** First back up the
+   working direct-ingress env and confirm the TLS files are still in place
+   (they stay until (d)):
+   ```
+   ssh outer-vps 'cp -p /srv/outer/outer.env /srv/outer/outer.env.bak-pre-tunnel'
+   ```
+   Then set `OUTER_LISTEN=127.0.0.1:8443` and delete the TLS vars in
+   `/srv/outer/outer.env`, and run `deploy/release.sh outer-vps` from a
+   clean tree. The release re-applies the closed firewall: from here direct
+   443 is closed and new direct-SSH connections fail. `rollback.sh` does
+   NOT restore 443 — the old image cannot boot with the new env — so a bad
+   release is recovered fix-forward (fix env/image, re-release), always
+   over tunnel SSH.
 5. **Flip the app DNS records immediately** (keeps the blip to minutes):
    repoint `outer.now`, `*.outer.now` and `customers.outer.now` to
    proxied CNAMEs `<tunnel-id>.cfargotunnel.com`.
 6. **Verify https://outer.now** (health/ready, one app page) from anywhere.
-7. **ONLY THEN lock down**, over tunnel SSH:
+7. **Move sshd to loopback.** Over tunnel SSH:
    ```
    ssh outer-vps 'bash -s -- lockdown' < deploy/provision.sh
    ```
-   This applies the closed firewall (INPUT drop: lo/established/ICMP/DHCP
-   only; OUTPUT rejects everyone but uid 0 and `cloudflared` on
-   127.0.0.1:8443) and moves sshd to `ListenAddress 127.0.0.1` via
+   The closed firewall has been active since step 4, so this only
+   re-applies it (no-op) and flips sshd to `ListenAddress 127.0.0.1` via
    `daemon-reload + restart ssh.socket` (see the sshd note in
-   deploy/provision.sh). The pre-cutover direct session survives
-   (established connections), but no NEW direct connection is possible
-   after this — that is the point.
+   deploy/provision.sh).
 8. **Final verification** (over `outer-vps`):
    ```
    nft list table inet outer_fw        # == deploy/firewall.nft
@@ -86,6 +93,10 @@ that the ProxyCommand itself sources on every connection.
 export TUNNEL_SERVICE_TOKEN_ID=…
 export TUNNEL_SERVICE_TOKEN_SECRET=…
 ```
+The workstation needs `cloudflared` too (the ProxyCommand runs it
+locally): Arch/CachyOS `pacman -S cloudflared`; Debian via the same
+pkg.cloudflare.com repo that provision.sh adds on the host.
+
 `~/.ssh/config`:
 ```
 Host outer-vps

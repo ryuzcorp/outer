@@ -770,9 +770,9 @@ impl Config {
         if !is_hostname(&self.domain) {
             problems.push(format!("OUTER_DOMAIN={:?} is not a hostname", self.domain));
         }
-        if !self.is_local() && !self.listen.ip().is_loopback() {
+        if !self.is_local() && self.listen != SocketAddr::from(([127, 0, 0, 1], 8443)) {
             problems.push(format!(
-                "OUTER_LISTEN={} must be a loopback address (127.0.0.0/8 or ::1) when OUTER_DOMAIN={} is not a localhost dev domain: production ingress is the cloudflared tunnel on the host, which forwards to 127.0.0.1:8443",
+                "OUTER_LISTEN={} must be exactly 127.0.0.1:8443 when OUTER_DOMAIN={} is not a localhost dev domain: the host nft output rule and the cloudflared ingress pin exactly that address, so any other listener (even loopback) bypasses the uid filter",
                 self.listen, self.domain
             ));
         }
@@ -1196,6 +1196,7 @@ mod tests {
     fn r2_config_parses_and_never_prints_the_secret() {
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_LISTEN", "127.0.0.1:8443"),
             (
                 "OUTER_R2_ENDPOINT",
                 "https://acct.eu.r2.cloudflarestorage.com",
@@ -1584,8 +1585,15 @@ mod tests {
     }
 
     #[test]
-    fn non_localhost_domain_requires_a_loopback_listen() {
-        for listen in ["[::]:443", "0.0.0.0:8443", "203.0.113.7:8443"] {
+    fn non_localhost_domain_requires_exactly_the_tunnel_listen() {
+        for listen in [
+            "[::]:443",
+            "0.0.0.0:8443",
+            "203.0.113.7:8443",
+            "127.0.0.2:8443",
+            "[::1]:8443",
+            "127.0.0.1:8080",
+        ] {
             let err = Config::from_vars(&vars(&[
                 ("OUTER_DOMAIN", "outer.now"),
                 ("OUTER_STORE", "memory"),
@@ -1594,11 +1602,11 @@ mod tests {
             .unwrap_err();
             assert!(
                 err.iter()
-                    .any(|p| p.contains("OUTER_LISTEN") && p.contains("loopback")),
-                "public listener {listen} must be refused: {err:?}"
+                    .any(|p| p.contains("OUTER_LISTEN") && p.contains("127.0.0.1:8443")),
+                "non-tunnel listener {listen} must be refused: {err:?}"
             );
         }
-        // A loopback listener adds no problem of its own (the memory store
+        // The pinned listener adds no problem of its own (the memory store
         // still refuses off localhost for its own reason).
         let err = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),
@@ -1608,7 +1616,7 @@ mod tests {
         .unwrap_err();
         assert!(
             !err.iter().any(|p| p.contains("OUTER_LISTEN")),
-            "loopback listener must not raise listen problems: {err:?}"
+            "pinned listener must not raise listen problems: {err:?}"
         );
     }
 
