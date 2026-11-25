@@ -3591,3 +3591,70 @@ fn dummy_review_hash_is_a_valid_argon2id_phc() {
         "the dummy hash keeps the cost `outer hash-password` produces"
     );
 }
+
+/// A blocklisted domain is refused at sign-up, including subdomains of a
+/// listed domain — but an account that already exists on one still signs in
+/// (the list never locks anyone out).
+#[tokio::test]
+async fn disposable_blocklist_refuses_new_signups_but_not_existing() {
+    let pool = test_pool().await;
+    let (config, _codes) = test_config();
+
+    let err = auth::send_code(&pool, &config, "new@0-mail.com", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "disposable_email");
+    assert!(
+        err.user_message.is_some_and(|message| !message.is_empty()),
+        "refusal carries a user-facing message"
+    );
+
+    let err = auth::send_code(&pool, &config, "new@sub.0-mail.com", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "disposable_email", "subdomains are refused too");
+
+    // A lookalike that merely ends in the domain is a different domain.
+    auth::send_code(&pool, &config, "new@not-0-mail.com", None, None)
+        .await
+        .unwrap();
+
+    // An existing account on a blocklisted domain signs in untouched.
+    crate::apps::ensure_account(&pool, "old@0-mail.com")
+        .await
+        .unwrap();
+    auth::send_code(&pool, &config, "old@0-mail.com", None, None)
+        .await
+        .unwrap();
+}
+
+/// Plus-address variants share one OTP bucket: five sends across `u+1`…
+/// `u+5` admit the sixth send nowhere, while distinct base addresses keep
+/// their own buckets.
+#[tokio::test]
+async fn plus_variants_share_the_otp_limit() {
+    let pool = test_pool().await;
+    let (config, _codes) = test_config();
+
+    for index in 1..=5 {
+        auth::send_code(
+            &pool,
+            &config,
+            &format!("u+{index}@example.com"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let err = auth::send_code(&pool, &config, "u+6@example.com", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "rate_limited");
+    assert!(err.retry_after_s.is_some_and(|retry| retry > 0));
+
+    // A different base address is unaffected by `u`'s bucket.
+    auth::send_code(&pool, &config, "v+1@example.com", None, None)
+        .await
+        .unwrap();
+}
