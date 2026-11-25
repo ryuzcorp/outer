@@ -1,0 +1,23 @@
+---
+title: Cookie isolation
+description: How Outer keeps one app's cookies from reaching another app on outer.now.
+---
+
+Every app serves under `<your-app>.outer.now` — one registrable domain for all apps. Browsers therefore treat all apps as same-site: without platform help, one app could set a `Domain=outer.now` cookie that every other app receives. The Outer proxy stops that on shared-domain hosts (your app host and its preview hosts), in both directions.
+
+## What Outer guarantees
+
+- **Responses are host-locked.** The proxy rewrites every `Set-Cookie` your app sends: `sid` becomes `__Host-o.sid`, any `Domain` attribute is dropped, and `Path=/` plus `Secure` are forced. `Max-Age`, `Expires`, `HttpOnly`, `SameSite` and `Partitioned` survive; anything else is dropped. Cookies your app already marks `__Host-` pass through unchanged — browsers already scope those to the setting host.
+- **Requests carry only host cookies.** The proxy forwards only `__Host-` cookies to your app: `__Host-o.sid` maps back to `sid`, your own `__Host-` names pass as-is, platform cookies (`__Host-outer_sid`, the visitor and age gate cookies) stay stripped, and everything else — including any `Domain` cookie another app tossed, which can never carry a `__Host-` name — is dropped before your app sees it.
+- **Your JavaScript sees the same view.** The proxy injects a tiny shim into every HTML page that wraps `document.cookie` and `window.cookieStore` with the same mapping: reads skip foreign cookies, writes land host-locked. If your response carries a `Content-Security-Policy` with `script-src` or `default-src`, the proxy allowlists exactly the shim's hash and weakens nothing else.
+
+Names starting with `__Host-` (any casing of the three platform cookies included) are reserved: your app cannot set them, and they never reach your app.
+
+## Residual limits
+
+- **Cookie flooding is still possible.** Isolation is about *which* cookies arrive, not *how many*: a hostile app can still set large volumes of host-locked cookies in a victim's browser (browser jar limits apply per host, and eviction can drop the victim's own cookies). Rate-limit what you store client-side for anything valuable.
+- **A strict page CSP only loses the JS shim.** If your page carries a `<meta http-equiv="Content-Security-Policy">` that blocks inline scripts, or a response CSP the proxy cannot hash into, the client shim cannot run there. Server-side isolation still holds — the app's server never sees foreign cookies — but the page's own JavaScript reads raw `document.cookie`. Prefer the response header over the meta tag: the proxy allowlists the shim in response headers automatically.
+- **`Path` scoping becomes `/`.** Any `Path` your app sets is forced to `/`: cookies are per-app (per host), not per path, on shared domains.
+- **Custom domains are unaffected.** Isolation applies only under `outer.now`. Your [custom domain](/deploy/custom-domains) is its own site: cookies pass through exactly as your app sets them, and no shim is injected.
+
+Related reading: [Who can see your app](/security/who-can-see).

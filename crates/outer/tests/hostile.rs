@@ -387,6 +387,59 @@ fn hostile_platform_env_never_reaches_apps() {
     }
 }
 
+/// The `cookie:toss` probe (safe layer): a `Domain=outer.now` cookie tossed
+/// by app A never reaches app B's server. The proxy host-locks everything A
+/// sets on the way out, and drops everything without a `__Host-` name on the
+/// way in — so a tossed cookie, which can never carry a `__Host-` name
+/// (browsers refuse it), dies at the filter while B's own cookie maps back.
+#[test]
+fn hostile_cookie_toss_never_reaches_the_sibling_app() {
+    let probe = manifest()
+        .probes
+        .into_iter()
+        .find(|probe| probe.id == "cookie:toss")
+        .expect("manifest.json carries the cookie:toss probe");
+    assert_eq!(probe.must, "fail", "the toss must not reach the sibling");
+
+    // What hostile app A sets: a cross-host cookie the old way.
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "set-cookie",
+        "sid=victim; Domain=outer.now; Path=/"
+            .parse()
+            .expect("fixture header parses"),
+    );
+    outer::cookies::rewrite_set_cookie_headers(&mut headers);
+    let stored = headers
+        .get("set-cookie")
+        .expect("A's cookie still sets")
+        .to_str()
+        .expect("ASCII")
+        .to_string();
+    assert!(
+        stored.starts_with("__Host-o.sid=victim"),
+        "host-locked to A's host: {stored}"
+    );
+    assert!(
+        !stored.to_ascii_lowercase().contains("domain"),
+        "no Domain survives: {stored}"
+    );
+
+    // What the browser would send to B if the toss worked anyway: the bare
+    // name, which carries no `__Host-` prefix and dies at the filter.
+    assert_eq!(outer::cookies::isolate_request_cookies("sid=victim"), None);
+    // While B's own host-locked cookie maps back under the name it set.
+    assert_eq!(
+        outer::cookies::isolate_request_cookies("__Host-o.sid=abc"),
+        Some("sid=abc".to_string())
+    );
+    // And a platform name smuggled in the same header stays stripped.
+    assert_eq!(
+        outer::cookies::isolate_request_cookies("__Host-o.sid=abc; __Host-outer_sid=s"),
+        Some("sid=abc".to_string())
+    );
+}
+
 /// The fleet command binds loopback only and drops reserved names from app
 /// env: a worker that fetches the cello internal listener or another fleet's
 /// port from its own environment finds nothing to aim at, and the platform

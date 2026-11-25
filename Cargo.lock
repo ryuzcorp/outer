@@ -1726,6 +1726,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

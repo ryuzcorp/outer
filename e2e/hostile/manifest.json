@@ -35,6 +35,7 @@
     { "id": "deploy:pointer-rewrite", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "The fleet's credentials cannot PUT fleets/<slug>/deploy/current.json" },
     { "id": "r2:cross-prefix", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot read a sibling app's prefix" },
     { "id": "r2:cross-prefix-put", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot write into a sibling app's prefix" },
-    { "id": "r2:bucket-root", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot list the bucket root" }
+    { "id": "r2:bucket-root", "phase": "r2", "category": "credential-scope", "must": "fail", "desc": "Scoped creds cannot list the bucket root" },
+    { "id": "cookie:toss", "phase": "platform", "category": "cookie-isolation", "must": "fail", "desc": "A Domain cookie tossed by app A never reaches app B's server: the proxy host-locks what A sets and drops anything without a __Host- name" }
   ]
 }
