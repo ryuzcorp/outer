@@ -3070,6 +3070,7 @@ async fn cloudflare_sender_shape_bounce_and_retry() {
         api_token: "cf-secret-token".to_string(),
         from: EmailFrom::parse("Outer <hello@outer.now>"),
         ops_hook: None,
+        budget: None,
     };
 
     sender.send_code("ana@example.com", "123456").await.unwrap();
@@ -3111,6 +3112,49 @@ async fn cloudflare_sender_shape_bounce_and_retry() {
         .unwrap_err();
     assert!(matches!(err, EmailError::Permanent(_)), "{err}");
     assert!(err.to_string().contains("10001"));
+}
+
+#[tokio::test]
+async fn send_code_at_the_email_cap_tells_the_human_next_month() {
+    use crate::auth::email::{month_key, EmailFrom, EmailSender, EMAIL_MONTHLY_CAP};
+    let pool = test_pool().await;
+    let (mut cfg, _) = test_config();
+    cfg.email = EmailSender::cloudflare(
+        "acct-1".to_string(),
+        "tok".to_string(),
+        EmailFrom::parse("Outer <hello@outer.now>"),
+    )
+    .with_api_base("http://127.0.0.1:1".to_string())
+    .with_budget(pool.clone());
+    let month = month_key(crate::auth::now_ms());
+    sqlx::query("INSERT INTO email_month (month, sent) VALUES (?1, ?2)")
+        .bind(&month)
+        .bind(EMAIL_MONTHLY_CAP as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // At the cap the code refuses before any HTTP, naming next month.
+    let err = auth::send_code(&pool, &cfg, "ana@example.com", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "email_budget");
+    assert!(
+        err.user_message.as_deref().unwrap().contains("next month"),
+        "{err:?}"
+    );
+    assert!(err.retry_after_s.unwrap_or(0) > 0, "{err:?}");
+    // One send under the cap flows past the budget gate (and fails on the
+    // dead fake base instead, proving the refusal above is the budget).
+    sqlx::query("UPDATE email_month SET sent = ?1 WHERE month = ?2")
+        .bind(EMAIL_MONTHLY_CAP as i64 - 1)
+        .bind(&month)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = auth::send_code(&pool, &cfg, "bob@example.com", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "email_retry", "{err:?}");
 }
 
 /// Every app that identifies itself by an https document (Claude, ChatGPT,

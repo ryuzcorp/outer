@@ -1108,6 +1108,28 @@ async fn commit_to_preview(input: CommitInput, ctx: &Ctx<'_>) -> Result<Value, T
                         .unwrap_or(60);
                     return Err(ToolError::rate_limited(e.to_string(), retry_after_s));
                 }
+                Err(e) if e.is::<crate::apps::CreateError>() => {
+                    // The fleet-port range filled between the commit and the
+                    // reservation: same rollback as a filled preview cap, but
+                    // the platform is out of ports, so this refuses with the
+                    // retryable `capacity` error instead of `rate_limited`.
+                    let _ = crate::git::manifest::clear_preview(
+                        &ctx.state.store,
+                        &ctx.state.git,
+                        &ctx.state.sync,
+                        &app.slug,
+                    )
+                    .await;
+                    if let Err(refund) = refund_change(&ctx.state.pool, &app.owner_id).await {
+                        tracing::warn!("commit refund failed: {refund:#}");
+                    }
+                    let capacity = e.downcast::<crate::apps::CreateError>().map_err(internal)?;
+                    return Err(ToolError::from_create(
+                        capacity,
+                        "pro",
+                        &ctx.state.plans_url(),
+                    ));
+                }
                 Err(e) => return Err(internal(e)),
             }
         }

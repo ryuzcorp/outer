@@ -489,7 +489,7 @@ pub async fn rename_app_with_hooks(
             CreateError::InvalidSlug(e) => RenameError::InvalidSlug(e),
             CreateError::Profanity(e) => RenameError::Profanity(e),
             CreateError::Taken => RenameError::Taken,
-            CreateError::Exhausted(_) | CreateError::Quota { .. } => {
+            CreateError::Capacity { .. } | CreateError::Quota { .. } => {
                 RenameError::Internal(anyhow::anyhow!("claimable check refused: {err}"))
             }
             CreateError::Internal(e) => RenameError::Internal(e),
@@ -682,7 +682,7 @@ pub async fn rename_app_with_hooks(
             CreateError::InvalidSlug(e) => RenameError::InvalidSlug(e),
             CreateError::Profanity(e) => RenameError::Profanity(e),
             CreateError::Taken => RenameError::Taken,
-            CreateError::Exhausted(_) | CreateError::Quota { .. } => {
+            CreateError::Capacity { .. } | CreateError::Quota { .. } => {
                 RenameError::Internal(anyhow::anyhow!("claimable check refused: {err}"))
             }
             CreateError::Internal(e) => RenameError::Internal(e),

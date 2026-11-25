@@ -280,9 +280,13 @@ pub enum CreateError {
     /// leftover local state (a crashed or in-flight delete or rename).
     #[error("slug is taken; choose another slug")]
     Taken,
-    /// The range has no room left: `"uids"` or `"ports"`.
-    #[error("no free {0} left in the configured range; ask the operator to widen it")]
-    Exhausted(&'static str),
+    /// The platform itself is full: the uid range or the fleet-port range
+    /// has no room left. Unlike [`CreateError::Quota`] (the owner's plan),
+    /// this is the operator's quota, so it refuses retryably: capacity only
+    /// frees when other apps are deleted. Carries `resource` (`"uids"` or
+    /// `"ports"`) for the MCP `capacity` error.
+    #[error("platform capacity is full: no free {resource} left; try again in a minute")]
+    Capacity { resource: &'static str },
     /// The owner's plan allows no more apps (`limit` slots, `used` taken).
     #[error("plan allows {limit} app(s), {used} owned")]
     Quota { limit: u64, used: u64 },
@@ -531,7 +535,7 @@ async fn create_inner(
         .map_err(internal)?;
     uids.sort_unstable();
     let uid = lowest_free(&uids, alloc.uid_range.0 as i64, alloc.uid_range.1 as i64, 1)
-        .ok_or(CreateError::Exhausted("uids"))?[0];
+        .ok_or(CreateError::Capacity { resource: "uids" })?[0];
     // Preview fleets take their ports from the same ranges, so their ports
     // count here too: a create must never hand a live app a port a preview
     // fleet is serving on (and vice versa in `claim_preview_ports`).
@@ -551,7 +555,7 @@ async fn create_inner(
         alloc.port_range.1 as i64,
         2,
     )
-    .ok_or(CreateError::Exhausted("ports"))?;
+    .ok_or(CreateError::Capacity { resource: "ports" })?;
     let (port, internal_port) = (free[0], free[1]);
     let id = uuid::Uuid::new_v4().to_string();
     let insert = sqlx::query(
@@ -628,7 +632,7 @@ pub struct PreviewCapFull {
 /// (the second claim already sees the first's row write) nor overshoot the
 /// host cap past its pre-check. The caller writes the sha alongside these
 /// same ports when it records the preview state. Errors when the cap is
-/// full ([`PreviewCapFull`]) or the ranges are exhausted.
+/// full ([`PreviewCapFull`]) or the ranges are exhausted ([`CreateError::Capacity`]).
 pub async fn claim_preview_ports(
     pool: &SqlitePool,
     alloc: &Allocation,
@@ -655,7 +659,7 @@ pub async fn claim_preview_ports(
         alloc.port_range.1 as i64,
         2,
     )
-    .ok_or_else(|| anyhow::anyhow!("no free ports left for a preview fleet"))?;
+    .ok_or(CreateError::Capacity { resource: "ports" })?;
     sqlx::query("UPDATE app SET preview_port = ?1, preview_internal_port = ?2 WHERE id = ?3")
         .bind(free[0] as i64)
         .bind(free[1] as i64)
@@ -945,7 +949,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             create(&pool, &owner, "second", None, &tiny_uid, 10).await,
-            Err(CreateError::Exhausted("uids"))
+            Err(CreateError::Capacity { resource: "uids" })
         ));
         let tiny_ports = Allocation {
             uid_range: (500000, 500100),
@@ -957,7 +961,7 @@ mod tests {
         assert!(
             matches!(
                 create(&pool, &owner, "fourth", None, &tiny_ports, 10).await,
-                Err(CreateError::Exhausted("ports"))
+                Err(CreateError::Capacity { resource: "ports" })
             ),
             "one app takes both ports, so a two-port range fits exactly one"
         );

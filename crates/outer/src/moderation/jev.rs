@@ -24,7 +24,15 @@ const MAX_STATE_TOKENS_PER_CALL: usize = 2000;
 /// 2026-10-26, 256 short chunks pass and 320 fail whatever the text size.
 /// Half the passing count leaves room for longer answers.
 const MAX_CHUNKS_PER_CALL: usize = 128;
-/// Classify calls in flight at once.
+/// Classify calls in flight at once on one client. The semaphore is shared
+/// by every clone, so the whole process classifies at most this often: the
+/// pre-live gate ([`JevClient::classify`]) waits for a slot while the
+/// after-live crawl ([`JevClient::classify_crawl`]) defers when none is free,
+/// so crawls never starve a deploy-gate classification. Two slots let one
+/// gate and one crawl (or two gates) overlap; the gate path is short (3 s
+/// timeout plus one retry), so waiting is bounded.
+pub const JEV_MAX_INFLIGHT: usize = 2;
+/// Classify calls within one [`JevClient::classify`] in flight at once.
 const MAX_PARALLEL_CALLS: usize = 4;
 
 /// What the gate needs to reach Jev. Built once at boot from the config's
@@ -73,13 +81,23 @@ pub enum JevError {
     #[error("jev unavailable: {0}")]
     Unavailable(String),
 }
+/// What the crawl path got: either Jev's scores or a deferral. `Deferred`
+/// means every classifier slot is held by a pre-live gate — the crawl skips
+/// Jev this tick (heuristics still apply) and the next sweep retries.
+#[derive(Debug)]
+pub enum CrawlClassify {
+    Done(Result<Vec<ChunkScores>, JevError>),
+    Deferred,
+}
 
 /// Classifies chunk texts through AI Gateway. `Clone` shares the underlying
-/// connection pool.
+/// connection pool and the classifier slots: every clone contends on the
+/// same gate-first semaphore.
 #[derive(Clone)]
 pub struct JevClient {
     config: JevConfig,
     client: reqwest::Client,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for JevClient {
@@ -96,16 +114,67 @@ impl std::fmt::Debug for JevClient {
 
 impl JevClient {
     pub fn new(config: JevConfig) -> anyhow::Result<Self> {
+        Self::new_with_slots(config, JEV_MAX_INFLIGHT)
+    }
+
+    /// One client with a custom slot count (tests: `0` defers every crawl,
+    /// `1` with a held permit simulates a busy gate deterministically).
+    pub fn new_with_slots(config: JevConfig, slots: usize) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
             .map_err(|e| anyhow::anyhow!("building the Jev client: {e:#}"))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(slots)),
+        })
+    }
+
+    /// Hold one classifier slot (tests only): while the permit lives, a
+    /// same-client [`JevClient::classify_crawl`] defers.
+    #[cfg(test)]
+    pub fn hold_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.slots
+            .clone()
+            .try_acquire_owned()
+            .expect("test holds a free classifier slot")
     }
 
     /// Classify every text, preserving order. Empty input makes no calls.
     /// Batches hold ~2k tokens of state; up to four batches run at once.
+    /// The pre-live path: waits for a classifier slot, so a busy crawl
+    /// delays the gate instead of failing it.
     pub async fn classify(&self, texts: &[String]) -> Result<Vec<ChunkScores>, JevError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _slot = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| JevError::Unavailable("jev classifier shut down".to_string()))?;
+        self.classify_inner(texts).await
+    }
+
+    /// The crawl path: one classify attempt that defers instead of waiting.
+    /// [`CrawlClassify::Deferred`] means a pre-live gate holds every slot;
+    /// the caller skips Jev (fail open, heuristics still apply) and retries
+    /// on the next sweep — it must not write a crawl row or touch the crawl
+    /// watermark, or the deferral would read as a completed crawl.
+    pub async fn classify_crawl(&self, texts: &[String]) -> CrawlClassify {
+        if texts.is_empty() {
+            return CrawlClassify::Done(Ok(Vec::new()));
+        }
+        let Ok(_slot) = self.slots.try_acquire() else {
+            return CrawlClassify::Deferred;
+        };
+        CrawlClassify::Done(self.classify_inner(texts).await)
+    }
+
+    /// Classify every text, preserving order. Empty input makes no calls.
+    /// Batches hold ~2k tokens of state; up to four batches run at once.
+    async fn classify_inner(&self, texts: &[String]) -> Result<Vec<ChunkScores>, JevError> {
         let batches = pack_batches(texts);
         let out = stream::iter(batches)
             .map(|batch| self.classify_batch(texts, batch))
@@ -891,6 +960,57 @@ mod tests {
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("super-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// A client that never dials: the deferred paths short-circuit before
+    /// any HTTP, and the released path proves it proceeds by failing closed
+    /// against the dead base.
+    fn dead_client(slots: usize) -> JevClient {
+        let mut config = JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = "http://127.0.0.1:1".to_string();
+        config.timeout = Duration::from_millis(50);
+        JevClient::new_with_slots(config, slots).unwrap()
+    }
+
+    #[tokio::test]
+    async fn crawl_defers_while_the_gate_holds_every_slot() {
+        let client = dead_client(1);
+        let texts = vec!["hello".to_string()];
+        // A held slot reads as a gate in flight: the crawl defers without
+        // touching the network.
+        let _held = client.hold_slot();
+        assert!(
+            matches!(client.classify_crawl(&texts).await, CrawlClassify::Deferred),
+            "a busy gate defers the crawl"
+        );
+        drop(_held);
+        // Released, the same call proceeds (and fails closed against the
+        // dead base, which proves it did not defer).
+        assert!(
+            matches!(
+                client.classify_crawl(&texts).await,
+                CrawlClassify::Done(Err(_))
+            ),
+            "a free gate classifies the crawl"
+        );
+        // Empty input classifies trivially without taking a slot.
+        assert!(matches!(
+            client.classify_crawl(&[]).await,
+            CrawlClassify::Done(Ok(scores)) if scores.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn zero_slots_defers_every_crawl() {
+        let client = dead_client(0);
+        assert!(matches!(
+            client.classify_crawl(&["hello".to_string()]).await,
+            CrawlClassify::Deferred
+        ));
     }
 
     /// Live check against the real Jev API through AI Gateway. Needs

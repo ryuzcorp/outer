@@ -19,7 +19,7 @@ pub use gate::{
     cache_key, judge, run_gate, run_skipped, run_too_large, BlockReason, ChunkVerdict, Decision,
     Finding, GateError, GateOutcome, GateStats,
 };
-pub use jev::{ChunkScores, JevClient, JevConfig, JevError, JEV_MODEL};
+pub use jev::{ChunkScores, CrawlClassify, JevClient, JevConfig, JevError, JEV_MODEL};
 
 /// The agent-facing line for a blocked deploy, per spec §15.1 for profanity
 /// and analogous for the other block categories.
