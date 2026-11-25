@@ -90,6 +90,32 @@ impl ToolError {
         Self::new("rate_limited", message).with_extra("retry_after_s", json!(retry_after_s))
     }
 
+    /// How long a `capacity` refusal asks the caller to wait before retrying.
+    /// Platform capacity only frees when other apps are deleted, so this is a
+    /// polite backoff, not a promise: the retry may still refuse.
+    pub const CAPACITY_RETRY_AFTER_S: u64 = 60;
+
+    /// The platform itself is out of room (app uids, fleet ports): the
+    /// caller's input is fine, so this is retryable, unlike `quota_exceeded`
+    /// (the owner's plan) or `internal` (our bug). New code in the §8.3 set
+    /// (L-22 departure: §8.3 lists `rate_limited` for caller quotas; platform
+    /// exhaustion is the operator's quota, so it gets its own code with the
+    /// same retry shape). The console answers 429 for it, like `rate_limited`.
+    pub fn capacity(resource: &str) -> Self {
+        Self::new(
+            "capacity",
+            format!(
+                "platform capacity is full (no free {resource}); try again in {}s",
+                Self::CAPACITY_RETRY_AFTER_S
+            ),
+        )
+        .with_user(format!(
+            "Outer is at capacity right now (no free {resource}). Try again in a minute; if it keeps happening, the platform is full."
+        ))
+        .with_extra("capacity", json!(resource))
+        .with_extra("retry_after_s", json!(Self::CAPACITY_RETRY_AFTER_S))
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new("internal", message)
     }
@@ -103,6 +129,9 @@ impl ToolError {
         let user_message = err.user_message.clone();
         let mut out = match err.code {
             "rate_limited" => Self::rate_limited(message, err.retry_after_s.unwrap_or(60)),
+            // Month-scale backoff for the spent email budget: the retry starts
+            // next month, not in a minute. The `user_message` still names it.
+            "email_budget" => Self::rate_limited(message, err.retry_after_s.unwrap_or(3600)),
             "forbidden" | "closed_beta" => Self::forbidden(message),
             "invalid_email" | "invalid_code" | "too_many_attempts" | "code_expired"
             | "invalid_token" | "terms_required" | "invite_used" => Self::invalid_argument(message),
@@ -197,9 +226,7 @@ impl ToolError {
             E::InvalidSlug(e) => Self::invalid_argument(e.to_string()),
             E::Profanity(err) => Self::from_profanity(err),
             E::Taken => Self::invalid_argument("slug is taken; choose another slug"),
-            E::Exhausted(what) => {
-                Self::internal(format!("no free {what} left; ask the operator to widen it"))
-            }
+            E::Capacity { resource } => Self::capacity(resource),
             E::Quota { limit, used } => Self::quota_exceeded(
                 format!("app quota: {limit} allowed, {used} owned"),
                 crate::mcp::tools::app_slots_message(plan, limit, plans_url),
@@ -280,3 +307,33 @@ impl std::fmt::Display for ToolError {
 }
 
 impl std::error::Error for ToolError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_carries_retry_guidance() {
+        let err = ToolError::capacity("ports");
+        assert_eq!(err.code, "capacity");
+        assert_eq!(err.extra["capacity"], json!("ports"));
+        assert_eq!(
+            err.extra["retry_after_s"],
+            json!(ToolError::CAPACITY_RETRY_AFTER_S)
+        );
+        assert!(err.user_message.as_deref().unwrap().contains("at capacity"));
+    }
+
+    #[test]
+    fn email_budget_maps_to_month_scale_rate_limit() {
+        let tool = ToolError::from_auth(crate::auth::AuthError {
+            code: "email_budget",
+            message: "email budget exhausted for 2026-11 (3000/3000 sent)".to_string(),
+            user_message: Some("Try again next month.".to_string()),
+            retry_after_s: Some(2_000_000),
+        });
+        assert_eq!(tool.code, "rate_limited");
+        assert_eq!(tool.extra["retry_after_s"], json!(2_000_000));
+        assert_eq!(tool.user_message.as_deref(), Some("Try again next month."));
+    }
+}

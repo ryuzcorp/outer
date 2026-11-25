@@ -251,7 +251,7 @@ pub fn friendly_error(code: &str) -> &str {
         "rate_limited" => "Too many attempts. Try again shortly.",
         "invalid_email" => "That doesn't look like an email address.",
         "email_retry" => "Outer couldn't send the code. Try again shortly.",
-        "email_failed" => "Outer couldn't send the code to that address.",
+        "email_budget" => "Outer couldn't send the code: this month's email budget is spent. Try again next month.",
         "invite_used" => "That invite code was just used.",
         "password_required" => "This account signs in with a password.",
         "invalid_credentials" => "Wrong email or password.",

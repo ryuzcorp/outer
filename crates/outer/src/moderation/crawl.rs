@@ -18,6 +18,7 @@
 //! | Jev `profanity >= 0.5` on a rendered page | **hold** (503, email, queue) |
 //! | Jev `round(severity) == 2`, or `hate >= 0.5` | queue only |
 //! | Jev unavailable | **fail open**: no state change, logged and retried |
+//! | Gate holds every classifier slot | **defer**: no row, no watermark; the next sweep retries |
 //!
 //! Fail-open is the deliberate difference from the pre-live gate (which fails
 //! closed): a live app keeps serving through a Jev outage, and the next sweep
@@ -36,7 +37,7 @@ use sqlx::SqlitePool;
 
 use crate::apps::{brand_in_text, App, ModerationState};
 use crate::config::CrawlConfig;
-use crate::moderation::jev::{ChunkScores, JevClient};
+use crate::moderation::jev::{ChunkScores, CrawlClassify, JevClient};
 
 /// How often the periodic sweep looks for due apps.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
@@ -733,8 +734,8 @@ pub async fn crawl_app<F: PageFetch>(
                 indexed.push((i, text));
             }
             let texts: Vec<String> = indexed.iter().map(|(_, t)| t.clone()).collect();
-            match client.classify(&texts).await {
-                Ok(chunk_scores) => {
+            match client.classify_crawl(&texts).await {
+                CrawlClassify::Done(Ok(chunk_scores)) => {
                     crate::ops_alerts::record_heartbeat_ok(pool, crate::ops_alerts::KIND_JEV, now)
                         .await;
                     let mut full = vec![ChunkScores::default(); reports.len()];
@@ -743,7 +744,7 @@ pub async fn crawl_app<F: PageFetch>(
                     }
                     Some(full)
                 }
-                Err(err) => {
+                CrawlClassify::Done(Err(err)) => {
                     crate::ops_alerts::record_heartbeat_err(
                         pool,
                         crate::ops_alerts::KIND_JEV,
@@ -753,6 +754,24 @@ pub async fn crawl_app<F: PageFetch>(
                     .await;
                     tracing::warn!(slug = %app.slug, error = %err, "after-live crawl: Jev unavailable, failing open");
                     None
+                }
+                CrawlClassify::Deferred => {
+                    // Gate-first: a pre-live gate holds every classifier slot.
+                    // Defer, don't degrade: no verdict, no check row and no
+                    // watermark touch, so the app stays due and the next sweep
+                    // retries with Jev. A minute-scale delay: the sweep runs
+                    // every five minutes and the post-deploy hook's app is due
+                    // until its first crawl lands.
+                    tracing::info!(slug = %app.slug, "after-live crawl: gate holds the classifier, deferring to the next sweep");
+                    return Ok((
+                        CrawlResult {
+                            verdict: CrawlVerdict::Error,
+                            findings: Vec::new(),
+                            pages_crawled,
+                            skipped_unchanged: false,
+                        },
+                        CrawlEffects::default(),
+                    ));
                 }
             }
         }
@@ -1979,6 +1998,56 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.verdict, CrawlVerdict::Suspend);
+    }
+
+    #[tokio::test]
+    async fn busy_gate_defers_the_crawl_without_a_row_or_watermark() {
+        let (_dir, pool) = test_pool().await;
+        insert_app(&pool, "a", "shop").await;
+        let mut pages = HashMap::new();
+        pages.insert("/".to_string(), MapFetch::page("/", "<h1>Still here</h1>"));
+        let app = load_app(&pool, "a").await;
+        // Zero classifier slots: every Jev attempt defers without touching
+        // the network, as if a pre-live gate held them all.
+        let mut config = crate::moderation::jev::JevConfig::new(
+            "test-account".to_string(),
+            "test-token".to_string(),
+            "outer".to_string(),
+        );
+        config.api_base = "http://127.0.0.1:1".to_string();
+        let jev = JevClient::new_with_slots(config, 0).unwrap();
+        let (result, effects) = crawl_app(
+            &pool,
+            &app,
+            &MapFetch { pages },
+            Some(&jev),
+            &test_cfg(),
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        // Error-shaped, but nothing lands: no check row (the admin queue
+        // never sees a deferral), no watermark touch, no side effects — the
+        // app stays due, so the next sweep retries with Jev.
+        assert_eq!(result.verdict, CrawlVerdict::Error);
+        assert!(result.findings.is_empty());
+        assert!(effects.email_to.is_none());
+        assert!(!effects.stop_fleet && !effects.purge_host);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM moderation_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a deferral writes no check row");
+        let (watermark,): (Option<i64>,) =
+            sqlx::query_as("SELECT last_crawl_at FROM app WHERE id = 'a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(watermark, None, "a deferral never advances the watermark");
+        assert_eq!(
+            load_app(&pool, "a").await.moderation_state,
+            ModerationState::Ok
+        );
     }
 
     #[tokio::test]
