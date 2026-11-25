@@ -1,7 +1,7 @@
 //! Zero-downtime release handoff (loopback flag file + deploy drain).
 //!
-//! Releases hand a live `outer` to a newcomer with no 443 blackout and no
-//! killed in-flight deploys: the newcomer binds the same port with
+//! Releases hand a live `outer` to a newcomer with no listener blackout and
+//! no killed in-flight deploys: the newcomer binds the same port with
 //! `SO_REUSEPORT` while the old container is still serving, then the old
 //! container drains and exits. The two processes share one SQLite file and
 //! one bucket claim, so the handoff needs exactly-one-writer discipline:
@@ -33,8 +33,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::SqlitePool;
 
 /// Bind `listen` with `SO_REUSEPORT` (and `SO_REUSEADDR`): during a release
-/// handoff the newcomer binds 443 while the old container is still serving,
-/// and the kernel splits new connections between them. Either process
+/// handoff the newcomer binds the same loopback port while the old container
+/// is still serving, and the kernel splits new connections between them.
 /// exiting never drops a SYN — at least one socket stays bound throughout
 /// the swap — and the overlap needs no proxy component or fd passing.
 pub fn bind_reuseport(listen: std::net::SocketAddr) -> anyhow::Result<std::net::TcpListener> {
@@ -53,9 +53,8 @@ pub fn bind_reuseport(listen: std::net::SocketAddr) -> anyhow::Result<std::net::
     socket
         .bind(&listen.into())
         .with_context(|| format!("bind {listen}"))?;
-    // Tokio (both `axum::serve` and axum-server's `from_tcp`) takes this
-    // socket over and requires non-blocking mode; a blocking listener is a
-    // boot error there, not a slowdown.
+    // Tokio's `axum::serve` takes this socket over and requires non-blocking
+    // mode; a blocking listener is a boot error there, not a slowdown.
     socket.set_nonblocking(true)?;
     socket.listen(1024)?;
     Ok(socket.into())

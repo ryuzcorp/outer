@@ -201,10 +201,10 @@ fn html_with_csp(
 
 fn request_ip(
     headers: &HeaderMap,
-    origin_locked: bool,
+    behind_tunnel: bool,
     peer: Option<SocketAddr>,
 ) -> Option<String> {
-    client_ip(headers, origin_locked, peer)
+    client_ip(headers, behind_tunnel, peer)
 }
 
 /// `GET /.well-known/oauth-protected-resource[/mcp]` (spec §6.1).
@@ -347,7 +347,7 @@ async fn authorize_get(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let ip = request_ip(&headers, state.config.origin_locked, Some(peer))
+    let ip = request_ip(&headers, state.config.behind_tunnel, Some(peer))
         .unwrap_or_else(|| "unknown".to_string());
     let now = now_ms();
     // Limited first: an over-limit request must not insert an
@@ -494,7 +494,7 @@ async fn authorize_post(
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let now = now_ms();
-    let ip = request_ip(&headers, state.config.origin_locked, Some(peer));
+    let ip = request_ip(&headers, state.config.behind_tunnel, Some(peer));
     let error = |message: &str| {
         html(
             StatusCode::BAD_REQUEST,
@@ -805,7 +805,7 @@ async fn register(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let now = now_ms();
-    let ip = request_ip(&headers, state.config.origin_locked, Some(peer))
+    let ip = request_ip(&headers, state.config.behind_tunnel, Some(peer))
         .unwrap_or_else(|| "unknown".to_string());
     // Two buckets before the body is even parsed: the global one is a
     // row-growth guard for the 30-day-retained client rows, the per-IP one
@@ -967,7 +967,7 @@ async fn token(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let _ = request_ip(&headers, state.config.origin_locked, Some(peer));
+    let _ = request_ip(&headers, state.config.behind_tunnel, Some(peer));
     let now = now_ms();
     sqlx::query("DELETE FROM oauthAccessToken WHERE expiresAt < ?")
         .bind(now)

@@ -35,10 +35,10 @@ pub struct ProxyState {
     pub pool: sqlx::SqlitePool,
     pub fleets: FleetManager,
     pub apps_domain: String,
-    /// Behind Cloudflare origin pull (TLS + required client cert): trust the
-    /// `CF-Connecting-IP` header Cloudflare attests and report `https`.
-    /// Otherwise the header is spoofable and the peer address is used.
-    pub origin_locked: bool,
+    /// Behind the Cloudflare Tunnel: trust the `CF-Connecting-IP` header
+    /// Cloudflare attests and report `https`. Otherwise the header is
+    /// spoofable and the peer address is used.
+    pub behind_tunnel: bool,
     /// Upstream HTTP/1 client: idle pool entries recycled. Per state, never
     /// global, so tests cannot share connections or throttle entries.
     pub client: UpstreamClient,
@@ -75,7 +75,7 @@ impl ProxyState {
         pool: sqlx::SqlitePool,
         fleets: FleetManager,
         apps_domain: String,
-        origin_locked: bool,
+        behind_tunnel: bool,
         metrics: MetricsAgg,
     ) -> Self {
         let connector = hyper_util::client::legacy::connect::HttpConnector::new();
@@ -87,7 +87,7 @@ impl ProxyState {
             pool,
             fleets,
             apps_domain,
-            origin_locked,
+            behind_tunnel,
             client,
             last_touch_ms: Arc::new(Mutex::new(HashMap::new())),
             metrics,
@@ -179,7 +179,7 @@ fn redirect_to_slug(state: &ProxyState, raw_host: &str, target: &str, req: &Requ
         .split_once('.')
         .map(|(_, rest)| rest)
         .unwrap_or(&state.apps_domain);
-    let scheme = if state.origin_locked { "https" } else { "http" };
+    let scheme = if state.behind_tunnel { "https" } else { "http" };
     let path = req
         .uri()
         .path_and_query()
@@ -905,7 +905,7 @@ async fn report_submit(state: &ProxyState, app: &apps::App, req: Request) -> Res
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
-    let client = client_ip(req.headers(), state.origin_locked, peer);
+    let client = client_ip(req.headers(), state.behind_tunnel, peer);
     let (_parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
         Ok(bytes) => bytes,
@@ -1083,7 +1083,7 @@ async fn unlock_submit(state: &ProxyState, app: &apps::App, req: Request) -> Res
         .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok());
     let raw_host = request_host(&req).unwrap_or_default();
-    let scheme = if state.origin_locked { "https" } else { "http" };
+    let scheme = if state.behind_tunnel { "https" } else { "http" };
     let origin_ok = req
         .headers()
         .get("origin")
@@ -1108,7 +1108,7 @@ async fn unlock_submit(state: &ProxyState, app: &apps::App, req: Request) -> Res
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
-    let client = client_ip(req.headers(), state.origin_locked, peer);
+    let client = client_ip(req.headers(), state.behind_tunnel, peer);
     let (_parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
         Ok(bytes) => bytes,
@@ -1526,7 +1526,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
     let upgrade = wants_upgrade(req.headers());
     let is_head = req.method() == axum::http::Method::HEAD;
     let cf_ip = cf_connecting_ip(req.headers());
-    let client_ip = client_ip(req.headers(), state.origin_locked, peer);
+    let client_ip = client_ip(req.headers(), state.behind_tunnel, peer);
     // Grabbed before the request is split: the future resolves once the
     // handshake completes, after the 101 goes back downstream.
     let server_upgrade = if upgrade {
@@ -1585,7 +1585,7 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         if is_forwarded_spoof(name) {
             continue;
         }
-        // Spoofable off origin pull, attested on it (re-added below only
+        // Spoofable off the tunnel, attested on it (re-added below only
         // when valid): never forward what the client sent.
         if name.as_str() == "cf-connecting-ip" {
             continue;
@@ -1624,19 +1624,19 @@ pub async fn handle(state: ProxyState, mut req: Request) -> Response {
         outbound = outbound.header(name, value);
     }
     // Fresh chain: client-supplied `x-forwarded-for` was dropped above, so
-    // upstream sees exactly one value: the attested client IP when
-    // origin-locked, else the real peer IP.
+    // upstream sees exactly one value: the attested client IP behind the
+    // tunnel, else the real peer IP.
     if let Some(ip) = client_ip.as_deref() {
         outbound = outbound.header("x-forwarded-for", ip);
     }
-    if state.origin_locked {
+    if state.behind_tunnel {
         if let Some(cf) = cf_ip {
             outbound = outbound.header("cf-connecting-ip", cf);
         }
     }
     outbound = outbound.header("x-forwarded-host", raw_host).header(
         "x-forwarded-proto",
-        if state.origin_locked { "https" } else { "http" },
+        if state.behind_tunnel { "https" } else { "http" },
     );
     if look_armed || badge_identity {
         outbound = outbound.header(axum::http::header::ACCEPT_ENCODING, "identity");
@@ -3484,7 +3484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn origin_locked_uses_cf_connecting_ip() {
+    async fn behind_tunnel_uses_cf_connecting_ip() {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-cf", "cf", fleet.addr.port(), "public").await;
@@ -3512,7 +3512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlocked_strips_spoofable_cf_connecting_ip() {
+    async fn local_dev_strips_spoofable_cf_connecting_ip() {
         let fix = fixture().await;
         let fleet = start_fake_fleet().await;
         insert_app(&fix.pool, "app-plain", "plain", fleet.addr.port(), "public").await;
@@ -3536,11 +3536,11 @@ mod tests {
         let got = echo(&body);
         assert_eq!(
             got["headers"]["x-forwarded-for"], "9.9.9.9",
-            "off origin pull the peer IP wins, never the spoofable header"
+            "off the tunnel the peer IP wins, never the spoofable header"
         );
         assert!(
             got["headers"].get("cf-connecting-ip").is_none(),
-            "a client-sent cf-connecting-ip must not reach upstream when unlocked"
+            "a client-sent cf-connecting-ip must not reach upstream when local"
         );
         assert_eq!(got["headers"]["x-forwarded-proto"], "http");
     }

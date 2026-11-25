@@ -40,9 +40,9 @@ Kept untouched:
   `deploy/outer.env.example` (fill blanks, `chmod 600`). Outer no longer
   reads any `CELLD_*` or `OUTER_CELLD_BIN` key; a fresh copy keeps the
   file free of dead config.
-- `/srv/outer/release.env`, `/srv/outer/tls/` (`origin.pem`,
-  `origin.key`, `origin-pull-ca.pem`), the firewall units/table
-  (`inet outer_fw`).
+- `/srv/outer/release.env`, `/srv/outer/tls/` (review-logins), the firewall
+  units/table (`inet outer_fw`), and the tunnel (`/etc/cloudflared/`,
+  cloudflared.service).
 
 ## Steps
 
@@ -74,7 +74,8 @@ Kept untouched:
    from it: the DB, the handoff flag, `fleets/`, `work/`, `cache/`, `git/`
    (repo mirrors), `maps/` (tenant sourcemaps), `checks/` (build scratch),
    `examples/`, and `secret-sidecars/` (transient plaintext secret files).
-   Empty the directory itself; TLS and env live outside it:
+   Empty the directory itself; secrets (`/srv/outer/tls`, review-logins) and
+   env live outside it:
    ```
    find /srv/outer/data -mindepth 1 -delete
    ls -A /srv/outer/data   # must print nothing

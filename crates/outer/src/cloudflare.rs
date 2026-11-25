@@ -99,8 +99,8 @@ pub async fn purge_host_cache(purge: Option<&CachePurge>, host: &str) {
 
 /// Cloudflare for SaaS custom-hostname credentials (spec §7.7): the same
 /// zone and API token the purge uses. The zone must have SaaS enabled with
-/// an active fallback origin plus a CNAME target (e.g.
-/// `customers.outer.now` → the fallback); the token needs
+/// an active fallback origin whose record CNAMEs to the tunnel (e.g. the
+/// fallback origin → `customers.outer.now`); the token needs
 /// `SSL and Certificates: Write` (and `Zone: Read` for status polling).
 #[derive(Clone)]
 pub struct CustomHostnames {

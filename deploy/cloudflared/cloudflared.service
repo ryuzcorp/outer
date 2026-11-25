@@ -1,0 +1,33 @@
+# cloudflared tunnel client: the VPS's only ingress (open beta).
+#
+# Installed at /etc/systemd/system/cloudflared.service by
+# deploy/provision.sh. Runs as the unprivileged `cloudflared` system user
+# (created by provision.sh); root is never needed — the origin and sshd are
+# both on loopback. Updates come through unattended-upgrades (the
+# Cloudflare origin is allowlisted there), never from cloudflared itself:
+# --no-autoupdate here and `no-autoupdate: true` in config.yml agree.
+[Unit]
+Description=Cloudflare Tunnel (outer ingress)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudflared
+Group=cloudflared
+StateDirectory=cloudflared
+Environment=HOME=/var/lib/cloudflared
+ExecStart=/usr/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run --no-autoupdate
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

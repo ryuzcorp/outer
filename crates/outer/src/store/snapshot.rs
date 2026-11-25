@@ -89,7 +89,7 @@ enum BucketSnapshot {
 }
 
 /// After this many consecutive lineage refusals `/ready` fails: nothing
-/// routes traffic by it today (no healthcheck by design, mTLS), so this is
+/// routes traffic by it today (no healthcheck by design), so this is
 /// the monitoring tripwire that says backups stopped — with the refusal
 /// reason attached, not just a stale age.
 pub const READY_LINEAGE_REFUSAL_LIMIT: u64 = 30;

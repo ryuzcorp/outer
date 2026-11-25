@@ -34,7 +34,7 @@ static BRANDS: std::sync::LazyLock<Vec<(&'static str, bool)>> = std::sync::LazyL
 /// Checked before the shape rule so the error names the real problem.
 const RESERVED_SLUGS: &[&str] = &[
     "www", "mcp", "api", "app", "git", "admin", "auth", "oauth", "login", "billing", "docs",
-    "help", "status", "mail", "static", "cdn", "outer", "abuse", "ilha",
+    "help", "status", "mail", "static", "cdn", "outer", "abuse", "ilha", "ssh",
 ];
 
 /// Why a slug was refused. Every message tells the calling agent what to change.
@@ -271,7 +271,7 @@ mod tests {
     fn every_reserved_slug_is_refused() {
         for slug in [
             "www", "mcp", "api", "app", "git", "admin", "auth", "oauth", "login", "billing",
-            "docs", "help", "status", "mail", "static", "cdn", "outer", "abuse", "ilha",
+            "docs", "help", "status", "mail", "static", "cdn", "outer", "abuse", "ilha", "ssh",
         ] {
             assert_eq!(
                 validate_slug(slug),
