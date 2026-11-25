@@ -1,10 +1,18 @@
-// Neighbour-p95 probe: a well-behaved tenant serving /health on loopback
-// while the cpu-spin probe burns its own quota in another leaf. The harness
+// Neighbour-p95 probe: the measuring client. The harness
 // (`hostile_cpu_spin_is_capped_and_neighbour_keeps_p95`) or
-// `scripts/hostile-probe-vps.sh` runs this in a neighbour leaf with the
-// standard fleet limits, then drops the READY file once the spinner is up.
-// The probe measures its own loopback p95 idle (baseline) and loaded, and
+// `scripts/hostile-probe-vps.sh` runs this UNCONFINED (harness uid / root),
+// like real external traffic hitting a fleet — never as an app uid and never
+// in a leaf. The server (`neighbour-server.mjs`) holds the capped neighbour
+// leaf; this client reads its port from `HOSTILE_PORT_FILE`, takes an idle
+// baseline loop, signals `HOSTILE_BASELINE_DONE` so the harness starts the
+// spinner, waits for `HOSTILE_SPIN_READY`, and takes the loaded loop. It
 // passes (`ok: true`) when the loaded p95 stays within the bound below.
+//
+// Why unconfined: the nft `inet outer` table lets an app uid reach loopback
+// only on its own registered fleet ports and rejects everything else on
+// 127.0.0.0/8, so a client running as an app uid could not fetch even its
+// own listener. Measuring from outside the sandbox is also the faithful
+// shape: real neighbours are hit by external clients, not by other tenants.
 //
 // Thresholds: loaded p95 at most max(2x baseline, baseline + 50 ms). The
 // loopback baseline is sub-millisecond, so spec §12.7's ±10% aspiration is
@@ -14,8 +22,7 @@
 // contending neighbour several-fold) while tolerating normal contention.
 // The primary containment proof is exec:cpu-spin's cpu.stat assertion; this
 // probe guards the neighbour experience.
-import { createServer } from "node:http";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
 const out = {};
@@ -29,6 +36,7 @@ const need = (name) => {
 };
 
 const count = Number(process.env.HOSTILE_NEIGHBOUR_COUNT || "200");
+const portFile = need("HOSTILE_PORT_FILE");
 const readyFile = process.env.HOSTILE_SPIN_READY || "";
 const baselineDoneFile = process.env.HOSTILE_BASELINE_DONE || "";
 
@@ -37,18 +45,20 @@ const p95 = (samples) => {
   return sorted[Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1)];
 };
 
+const waitFor = async (file, what, ms) => {
+  const deadline = Date.now() + ms;
+  while (!existsSync(file)) {
+    if (Date.now() > deadline) throw new Error(what);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+};
+
 try {
-  const server = createServer((req, res) => {
-    if (req.url === "/health") {
-      res.writeHead(200, { "content-length": "2", connection: "close" });
-      res.end("ok");
-    } else {
-      res.writeHead(404, { connection: "close" });
-      res.end();
-    }
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const port = server.address().port;
+  // The server binds an ephemeral port and publishes it here; waiting
+  // fails closed (ok:false on a must-succeed probe fails the suite).
+  await waitFor(portFile, "neighbour server never published its port", 30000);
+  const port = Number(readFileSync(portFile, "utf-8").trim());
+  if (!(port > 0)) throw new Error(`neighbour server published a bad port`);
   const target = `http://127.0.0.1:${port}/health`;
 
   const loop = async () => {
@@ -66,17 +76,11 @@ try {
   const base = await loop();
   if (baselineDoneFile) writeFileSync(baselineDoneFile, "baseline\n");
   // The harness starts the spinner once the baseline is clean, then drops
-  // READY after the workers ramp up. Timing out fails closed (ok:false on a
-  // must-succeed probe fails the suite).
+  // READY after the workers ramp up. Timing out fails closed.
   if (readyFile) {
-    const deadline = Date.now() + 60000;
-    while (!existsSync(readyFile)) {
-      if (Date.now() > deadline) throw new Error("spinner never signalled READY");
-      await new Promise((r) => setTimeout(r, 100));
-    }
+    await waitFor(readyFile, "spinner never signalled READY", 60000);
   }
   const loaded = await loop();
-  server.close();
   const bound = Math.max(2 * base, base + 50);
   const detail =
     `p95 loaded ${loaded.toFixed(1)}ms vs baseline ${base.toFixed(1)}ms (bound ${bound.toFixed(1)}ms, n=${count})`;
