@@ -3454,6 +3454,41 @@ async fn collaborator_access_follows_the_owner_plan() {
     let (_, back) = call(&state, Some(&cara), "get_app", json!({"app": "groceries"})).await;
     assert!(result(&back).get("isError").is_none());
 }
+
+/// L-42: a banned owner's collaborators lose tool access — every app of
+/// that owner reads as missing (the same `not_found` a stranger gets),
+/// so no tool downstream can wake the fleet for them either.
+#[tokio::test]
+async fn banned_owner_cuts_off_collaborators_over_mcp() {
+    let (state, _) = setup().await;
+    let owner = pro_app(&state, "ana@example.com", "groceries").await;
+    invite(&state, &owner, "groceries", "bruno@example.com").await;
+    let bruno = api_key_for(&state, "bruno@example.com").await;
+    let (_, seen) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert!(result(&seen).get("isError").is_none(), "{seen}");
+    // The operator bans the owner and the app parks as stopped (what
+    // `ban_account` writes): the collaborator reads the slug as missing
+    // from here on.
+    sqlx::query("UPDATE user SET banned = 1 WHERE email = 'ana@example.com'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app SET desired_state = 'stopped' WHERE slug = 'groceries'")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (_, hidden) = call(&state, Some(&bruno), "get_app", json!({"app": "groceries"})).await;
+    assert_eq!(is_error(&hidden)["error"], "not_found");
+    let (_, apps) = call(&state, Some(&bruno), "list_apps", json!({})).await;
+    assert_eq!(
+        result(&apps)["structuredContent"]["apps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
 /// `public` is a Pro feature, gated in the shared domain function: a Free
 /// owner is refused with `payment_required` (and a user message pointing to
 /// Pro), `unlisted` is always allowed, and Pro flips the row.
