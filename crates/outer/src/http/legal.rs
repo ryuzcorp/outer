@@ -1,19 +1,31 @@
 //! Host-served legal pages: `GET` (and `HEAD`) `/terms`, `/privacy`,
-//! `/pl/terms` and `/pl/privacy`.
+//! `/pl/terms` and `/pl/privacy`, plus the seller-identity notice shown on
+//! the Stripe Checkout page.
 //!
 //! The documents live only on the host (`OUTER_LEGAL_DIR`, mounted
 //! read-only at `/legal` in production), never in the repo, so the operator
 //! stays unnamed in public. Each request reads its file fresh: host edits
-//! go live without a rollout. A file that disappears at runtime answers 500
-//! (logged) instead of falling through to the static site, so a half-written
-//! legal dir can never serve the wrong page. Without the dir (localhost dev
-//! without `OUTER_LEGAL_DIR`) the routes answer a short plain placeholder
-//! with 200, so dev keeps working.
+//! go live without a rollout. A page file that disappears at runtime answers
+//! 500 (logged) instead of falling through to the static site, so a
+//! half-written legal dir can never serve the wrong page. Without the dir
+//! (localhost dev without `OUTER_LEGAL_DIR`) the routes answer a short
+//! plain placeholder with 200, and checkouts send no custom text, so dev
+//! keeps working.
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use std::path::{Path, PathBuf};
+
+/// The host file holding the seller identity shown on the Stripe Checkout
+/// page (`custom_text[submit][message]`, max 1200 chars): plain text, kept
+/// next to the four legal pages so it never lands in the repo.
+pub const CHECKOUT_NOTICE_FILE: &str = "checkout-notice.txt";
+
+/// What Stripe accepts for `custom_text[submit][message]`
+/// (docs: <https://docs.stripe.com/api/checkout/sessions/create>): 1..=1200
+/// chars. `validate` in `config.rs` refuses anything longer off localhost.
+pub const MAX_CHECKOUT_NOTICE_CHARS: usize = 1200;
 
 /// The host legal dir, or `None` when `OUTER_LEGAL_DIR` is unset.
 #[derive(Clone, Debug)]
@@ -34,6 +46,20 @@ impl LegalDir {
     /// No legal dir configured: every path answers the placeholder.
     pub fn missing() -> Self {
         Self { root: None }
+    }
+
+    /// The seller identity for the Stripe Checkout page: `checkout-notice.txt`
+    /// trimmed, or `None` when there is no legal dir, the file is missing or
+    /// unreadable, or it trims to nothing (localhost dev without the file
+    /// then sends no `custom_text`). Like the pages, this reads the host
+    /// file on every call, so edits go live without a rollout. Callers pass
+    /// it as `custom_text[submit][message]`; length is enforced at boot by
+    /// `validate` in `config.rs`.
+    pub fn checkout_notice(&self) -> Option<String> {
+        let root = self.root.as_deref()?;
+        let raw = std::fs::read_to_string(root.join(CHECKOUT_NOTICE_FILE)).ok()?;
+        let notice = raw.trim().to_string();
+        (!notice.is_empty()).then_some(notice)
     }
 }
 
@@ -258,5 +284,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], b"legal pages not configured (OUTER_LEGAL_DIR)");
+    }
+    #[test]
+    fn checkout_notice_reads_trimmed_or_nothing() {
+        // No legal dir (localhost dev without OUTER_LEGAL_DIR): no notice,
+        // so checkouts send no custom_text.
+        assert_eq!(LegalDir::missing().checkout_notice(), None);
+        let dir = tempfile::tempdir().unwrap();
+        let legal = LegalDir::new(Some(dir.path()));
+        // Missing file: no notice either.
+        assert_eq!(legal.checkout_notice(), None);
+        // Present: trimmed verbatim, reread on every call.
+        std::fs::write(
+            dir.path().join(CHECKOUT_NOTICE_FILE),
+            "  Seller: Example Sp. z o.o.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legal.checkout_notice().as_deref(),
+            Some("Seller: Example Sp. z o.o.")
+        );
+        // Blank after trimming: no notice.
+        std::fs::write(dir.path().join(CHECKOUT_NOTICE_FILE), "  \n").unwrap();
+        assert_eq!(legal.checkout_notice(), None);
     }
 }

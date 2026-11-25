@@ -294,10 +294,11 @@ pub struct Config {
     pub site_dir: PathBuf,
     /// Host-served legal pages (`OUTER_LEGAL_DIR`, `None` on localhost dev):
     /// off localhost the dir must exist and hold `terms.html`,
-    /// `privacy.html`, `terms.pl.html` and `privacy.pl.html`, served at
-    /// `/terms`, `/privacy`, `/pl/terms` and `/pl/privacy`. The files live
-    /// only on the host, never in the repo, and are read per request so
-    /// edits go live without a rollout.
+    /// `privacy.html`, `terms.pl.html`, `privacy.pl.html` and
+    /// `checkout-notice.txt`, served at `/terms`, `/privacy`, `/pl/terms`,
+    /// `/pl/privacy` and (as `custom_text[submit][message]`) on every Stripe
+    /// Checkout page. The files live only on the host, never in the repo,
+    /// and are read per request so edits go live without a rollout.
     pub legal_dir: Option<PathBuf>,
     /// SQLite, git mirrors, worktrees and caches (`OUTER_DATA`).
     pub data_dir: PathBuf,
@@ -862,10 +863,12 @@ impl Config {
                     .to_string(),
             );
         }
-        // Legal pages (spec: terms + privacy, EN + PL): off localhost the
-        // dir is required and must hold all four files; the routes read
-        // them per request, so host edits go live without a rollout.
-        // Localhost dev without the dir serves a placeholder instead.
+        // Legal pages (spec: terms + privacy, EN + PL) and the checkout
+        // seller notice: off localhost the dir is required and must hold all
+        // four pages plus `checkout-notice.txt`; the routes and every Stripe
+        // Checkout Session read them per request, so host edits go live
+        // without a rollout. Localhost dev without the dir serves a
+        // placeholder instead and sends no `custom_text`.
         if !self.is_local() && self.legal_dir.is_none() {
             problems.push(
                 "OUTER_LEGAL_DIR is required when OUTER_DOMAIN is not a localhost dev domain (the Terms and Privacy pages are served from host files, never committed to the repo)"
@@ -875,7 +878,7 @@ impl Config {
         if let Some(dir) = &self.legal_dir {
             if !dir.is_dir() {
                 problems.push(format!(
-                    "OUTER_LEGAL_DIR={} is not a directory (it must hold terms.html, privacy.html, terms.pl.html and privacy.pl.html, served at /terms, /privacy, /pl/terms and /pl/privacy)",
+                    "OUTER_LEGAL_DIR={} is not a directory (it must hold terms.html, privacy.html, terms.pl.html, privacy.pl.html and checkout-notice.txt, served at /terms, /privacy, /pl/terms, /pl/privacy and on the Stripe Checkout page)",
                     dir.display()
                 ));
             } else {
@@ -890,6 +893,47 @@ impl Config {
                             "OUTER_LEGAL_DIR={} is missing {file} (served at {route})",
                             dir.display()
                         ));
+                    }
+                }
+                // The seller identity the law requires before a paid contract:
+                // trimmed plain text, 1..=1200 chars (Stripe's
+                // `custom_text[submit][message]` limit). Required off
+                // localhost; over-length is refused anywhere the dir is set,
+                // so a bad host edit fails at boot instead of at Stripe.
+                let notice_path = dir.join(crate::http::legal::CHECKOUT_NOTICE_FILE);
+                if !notice_path.is_file() {
+                    if !self.is_local() {
+                        problems.push(format!(
+                            "OUTER_LEGAL_DIR={} is missing {} (the seller identity shown on the Stripe Checkout page as custom_text[submit][message])",
+                            dir.display(),
+                            crate::http::legal::CHECKOUT_NOTICE_FILE,
+                        ));
+                    }
+                } else {
+                    match std::fs::read_to_string(&notice_path) {
+                        Ok(raw) => {
+                            let len = raw.trim().chars().count();
+                            if len == 0 && !self.is_local() {
+                                problems.push(format!(
+                                    "OUTER_LEGAL_DIR={} {} is empty (it must hold 1..=1200 chars shown on the Stripe Checkout page as custom_text[submit][message])",
+                                    dir.display(),
+                                    crate::http::legal::CHECKOUT_NOTICE_FILE,
+                                ));
+                            } else if len > crate::http::legal::MAX_CHECKOUT_NOTICE_CHARS {
+                                problems.push(format!(
+                                    "OUTER_LEGAL_DIR={} {} is {len} chars (shown on the Stripe Checkout page as custom_text[submit][message], max {})",
+                                    dir.display(),
+                                    crate::http::legal::CHECKOUT_NOTICE_FILE,
+                                    crate::http::legal::MAX_CHECKOUT_NOTICE_CHARS,
+                                ));
+                            }
+                        }
+                        Err(err) => problems.push(format!(
+                            "OUTER_LEGAL_DIR={} {} cannot be read: {}",
+                            dir.display(),
+                            crate::http::legal::CHECKOUT_NOTICE_FILE,
+                            err.kind(),
+                        )),
                     }
                 }
             }
@@ -1179,7 +1223,8 @@ mod tests {
                 .any(|p| p.contains("privacy.pl.html") && p.contains("/pl/privacy")),
             "{err:?}"
         );
-        // All four files present: no legal problems.
+        // All four files present and no notice: localhost dev still passes
+        // (checkouts send no custom_text without the file).
         std::fs::write(dir.path().join("privacy.pl.html"), "<html></html>").unwrap();
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_STORE", "memory"),
@@ -1187,6 +1232,92 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.legal_dir, Some(dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn checkout_notice_required_off_localhost_and_capped() {
+        let pages = [
+            "terms.html",
+            "privacy.html",
+            "terms.pl.html",
+            "privacy.pl.html",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for name in pages {
+            std::fs::write(dir.path().join(name), "<html></html>").unwrap();
+        }
+        let legal = dir.path().to_str().unwrap();
+        // Off localhost the four pages alone are not enough: the missing
+        // seller notice is reported in the same problem-list style.
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_STORE", "memory"),
+            ("OUTER_LEGAL_DIR", legal),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.contains("checkout-notice.txt")
+                    && p.contains("custom_text[submit][message]")),
+            "{err:?}"
+        );
+        // An empty notice is as useless as a missing one off localhost.
+        std::fs::write(dir.path().join("checkout-notice.txt"), "  \n").unwrap();
+        let err = Config::from_vars(&vars(&[
+            ("OUTER_DOMAIN", "outer.now"),
+            ("OUTER_STORE", "memory"),
+            ("OUTER_LEGAL_DIR", legal),
+        ]))
+        .unwrap_err();
+        assert!(
+            err.iter()
+                .any(|p| p.contains("checkout-notice.txt") && p.contains("empty")),
+            "{err:?}"
+        );
+        // Over Stripe's 1200-char custom_text limit: refused off localhost
+        // and on localhost alike, so a bad host edit fails at boot.
+        std::fs::write(
+            dir.path().join("checkout-notice.txt"),
+            "x".repeat(crate::http::legal::MAX_CHECKOUT_NOTICE_CHARS + 1),
+        )
+        .unwrap();
+        for case in [
+            vec![
+                ("OUTER_DOMAIN", "outer.now"),
+                ("OUTER_STORE", "memory"),
+                ("OUTER_LEGAL_DIR", legal),
+            ],
+            vec![("OUTER_STORE", "memory"), ("OUTER_LEGAL_DIR", legal)],
+        ] {
+            let err = Config::from_vars(&vars(&case)).unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains("checkout-notice.txt") && p.contains("1200")),
+                "{err:?}"
+            );
+        }
+        // A trimmed notice within the limit: no legal problems either way.
+        std::fs::write(
+            dir.path().join("checkout-notice.txt"),
+            "  Seller: Example Sp. z o.o.\n",
+        )
+        .unwrap();
+        for domain in ["outer.now", "outer.localhost"] {
+            match Config::from_vars(&vars(&[
+                ("OUTER_DOMAIN", domain),
+                ("OUTER_STORE", "memory"),
+                ("OUTER_LEGAL_DIR", legal),
+            ])) {
+                Ok(cfg) => assert_eq!(cfg.legal_dir, Some(dir.path().to_path_buf())),
+                // Off localhost other (non-legal) vars still refuse; what
+                // matters is the notice adds no problem of its own.
+                Err(problems) => assert!(
+                    !problems.iter().any(|p| p.contains("checkout-notice.txt")
+                        || p.contains("OUTER_LEGAL_DIR")),
+                    "{domain}: {problems:?}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -1297,6 +1428,11 @@ mod tests {
         ] {
             std::fs::write(legal.path().join(name), "<html></html>").unwrap();
         }
+        std::fs::write(
+            legal.path().join("checkout-notice.txt"),
+            "Seller: Example Sp. z o.o.",
+        )
+        .unwrap();
         let legal = legal.path().to_str().unwrap().to_string();
         let cfg = Config::from_vars(&vars(&[
             ("OUTER_DOMAIN", "outer.now"),

@@ -259,10 +259,16 @@ async fn billing_checkout(
             ),
         };
     }
+    let notice = state.legal.checkout_notice();
     match state
         .mcp
         .billing
-        .checkout_url(&account_id, &account.email, account.customer.as_deref())
+        .checkout_url(
+            &account_id,
+            &account.email,
+            account.customer.as_deref(),
+            notice.as_deref(),
+        )
         .await
     {
         None => text(
@@ -380,9 +386,15 @@ async fn api_console_checkout(
         ));
     }
     let customer = stored.and_then(|row| row.customer);
+    let notice = state.legal.checkout_notice();
     match mcp
         .billing
-        .checkout_url(&account.id, &account.email, customer.as_deref())
+        .checkout_url(
+            &account.id,
+            &account.email,
+            customer.as_deref(),
+            notice.as_deref(),
+        )
         .await
     {
         None => {
@@ -1017,6 +1029,8 @@ mod tests {
         // `customer_email` alongside it (Stripe rejects both together).
         assert!(body.contains("customer=cus_1"), "{body}");
         assert!(!body.contains("customer_email"), "{body}");
+        // No legal dir in tests: localhost behavior, no custom_text.
+        assert!(!body.contains("custom_text"), "{body}");
     }
 
     #[tokio::test]
@@ -1170,6 +1184,40 @@ mod tests {
         assert!(
             fake.posts.lock().unwrap().is_empty(),
             "no Checkout Session minted"
+        );
+    }
+
+    /// The host's `checkout-notice.txt` rides the starter checkout as
+    /// `custom_text[submit][message]`, read per request like the legal pages.
+    #[tokio::test]
+    async fn checkout_starter_sends_the_host_notice_as_custom_text() {
+        let fake = FakeStripe::start().await;
+        let (mut state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        let legal = tempfile::tempdir().unwrap();
+        std::fs::write(
+            legal.path().join("checkout-notice.txt"),
+            "Seller: Example Sp. z o.o., ul. Przykladowa 1, 00-001 Warszawa\n",
+        )
+        .unwrap();
+        state.legal = crate::http::legal::LegalDir::new(Some(legal.path()));
+        let token = crate::billing::sign_checkout_token(
+            b"test-sign-key",
+            "a1",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        let req = Request::get(format!("/billing/checkout?t={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let body = fake.body.lock().unwrap().clone().unwrap();
+        assert!(
+            body.contains(
+                "custom_text%5Bsubmit%5D%5Bmessage%5D=Seller%3A+Example+Sp.+z+o.o.%2C+\
+                 ul.+Przykladowa+1%2C+00-001+Warszawa"
+            ),
+            "{body}"
         );
     }
 }
