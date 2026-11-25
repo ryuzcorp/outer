@@ -327,7 +327,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<collab_inputs::AddCollaboratorInput>(
             "add_collaborator",
-            "Invite a collaborator to your app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; Free 1 collaborator per app, Pro 10.",
+            "Invite a collaborator to your app by email: {app, email}. The address gets an invite email and the app shows in their list_apps once they sign in. Owner only; Free 1 collaborator per app, Pro 10.",
             Account, false,
         ),
         tool::<collab_inputs::RemoveCollaboratorInput>(

@@ -199,14 +199,14 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `add_collaborator`
 
 - **Access:** signed in
-- **Description:** Invite a collaborator to your app by email: {app, email}. The address joins the closed beta and gets an invite email; the app shows in their list_apps once they sign in. Owner only; Free 1 collaborator per app, Pro 10.
+- **Description:** Invite a collaborator to your app by email: {app, email}. The address gets an invite email and the app shows in their list_apps once they sign in. Owner only; Free 1 collaborator per app, Pro 10.
 
 **Input:**
 
 | Property | Type | Required | Description |
 | --- | --- | --- | --- |
 | `app` | string | yes | The app slug. |
-| `email` | string | yes | The collaborator's email: allowlisted for the closed beta and emailed the invite. |
+| `email` | string | yes | The collaborator's email: they get an invite email and sign straight in; the app shows in their list_apps right after. |
 
 ## `remove_collaborator`
 

@@ -21,7 +21,6 @@ import {
   type ConsoleApp,
   type DomainsSummary,
   type ErrorsSummary,
-  type InvitesSummary,
   type LogLine,
   type MetricsSummary,
   type SecretsSummary,
@@ -51,14 +50,12 @@ import {
   SettingsIcon,
   ShieldIcon,
   SignOutIcon,
-  TicketIcon,
 } from "./icons.tsx";
 import {
   ActionsView,
   AdminView,
   DeploysView,
   EmptyState,
-  InvitesView,
   MetricsView,
   OverviewView,
   SecretsView,
@@ -208,7 +205,6 @@ const VIEW_TITLES: Record<ViewId, string> = {
   secrets: "Secrets",
   settings: "Settings",
   d1: "D1",
-  invites: "Invite codes",
   admin: "Admin",
   connections: "Connections & keys",
   usage: "Usage & plan",
@@ -245,7 +241,6 @@ export function Console() {
   const email = atom("");
   const plan = atom("free");
   const isAdmin = atom(false);
-  const invites = atom<Panel<InvitesSummary>>({ kind: "loading" });
   const adminInvites = atom<Panel<AdminInvitesPage>>({ kind: "loading" });
   const waitlist = atom<Panel<WaitlistSummary>>({ kind: "loading" });
   const moderationQueue = atom<Panel<ModerationQueue>>({ kind: "loading" });
@@ -346,10 +341,10 @@ export function Console() {
       case "do":
         return [];
       default: {
-        // Legacy `?t=usage|connections|invites` routes never reach the
+        // Legacy `?t=usage|connections` routes never reach the
         // loaders (readRoute maps them onto the hub), but exhaustiveness
         // here keeps the next added view honest.
-        const _exhaustive: "connections" | "usage" | "invites" = view;
+        const _exhaustive: "connections" | "usage" = view;
         return [];
       }
     }
@@ -603,21 +598,6 @@ export function Console() {
         adminStats.set(settle(stats));
         telemetry.set(settle(calls));
         setTitle(route(), null);
-      }
-      return;
-    }
-    if (r.acctab === "invites") {
-      invites.set({ kind: "loading" });
-      try {
-        const summary = await api<InvitesSummary>("/api/console/invites");
-        if (fresh()) {
-          invites.set({ kind: "ready", value: summary });
-          setTitle(route(), null);
-        }
-      } catch (err: unknown) {
-        if (fresh()) {
-          invites.set({ kind: "error", message: String(err) });
-        }
       }
       return;
     }
@@ -974,7 +954,7 @@ export function Console() {
       void enter(r, epoch);
     });
     // Noite's live feed, polling edition: refresh the visible view only.
-    // Account views never poll: invites change through this shell alone.
+    // Account views never poll.
     window.setInterval(() => {
       const r = route();
       if (!r.app || isAccountView(r.view) || document.hidden) {
@@ -1041,12 +1021,6 @@ export function Console() {
       />
     ) : r.acctab === "usage" ? (
       <UsageView panel={accountSummary()} onRetry={reloadAccount} />
-    ) : r.acctab === "invites" ? (
-      <InvitesView
-        panel={invites()}
-        isAdmin={isAdmin()}
-        onRetry={reloadAccount}
-      />
     ) : (
       <AccountView panel={accountSummary()} onRetry={reloadAccount} />
     )
@@ -1882,8 +1856,6 @@ function ViewIcon({ id }: { id: ViewId }) {
       return <SettingsIcon />;
     case "d1":
       return <DatabaseIcon />;
-    case "invites":
-      return <TicketIcon />;
     case "admin":
       return <ShieldIcon />;
     case "connections":

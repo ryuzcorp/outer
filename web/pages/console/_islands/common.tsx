@@ -20,7 +20,6 @@ export const ACCOUNT_TABS = [
   { id: "account", label: "Account" },
   { id: "usage", label: "Usage & plan" },
   { id: "connections", label: "Connections & keys" },
-  { id: "invites", label: "Invite codes" },
 ] as const;
 
 export type AccountTabId = (typeof ACCOUNT_TABS)[number]["id"];
@@ -29,7 +28,6 @@ export const ACCOUNT_VIEWS = [
   { id: "connections", label: "Connections & keys" },
   { id: "usage", label: "Usage & plan" },
   { id: "account", label: "Account" },
-  { id: "invites", label: "Invite codes" },
   { id: "admin", label: "Admin" },
 ] as const;
 
@@ -108,7 +106,6 @@ export function toAcctab(raw: string | null): AccountTabId {
 const LEGACY_ACCOUNT_TABS: Record<string, AccountTabId> = {
   usage: "usage",
   connections: "connections",
-  invites: "invites",
 };
 
 /**

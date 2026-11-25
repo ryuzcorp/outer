@@ -1,6 +1,6 @@
 ---
 title: Sign in
-description: OAuth for Claude, Codex, ChatGPT, Gemini and Perplexity; the /keys page for scripts, review-account passwords, invite codes, and API keys.
+description: OAuth for Claude, Codex, ChatGPT, Gemini and Perplexity; the /keys page for scripts, review-account passwords, and API keys.
 ---
 
 One Outer account is one email address. There are two ways in, both ending
@@ -13,7 +13,7 @@ Your agent does the technical steps. The agent version lives at Agents → [Quic
 These clients sign you in with OAuth: Claude, Codex, ChatGPT, Gemini,
 and Perplexity. Your client opens Outer's sign-in page:
 
-1. Enter your email. During the closed beta, an email that is not allowed in gets "Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist." Paste an invite code (`OUTER-XXXX-XXXX`) into the "Have an invite code?" field instead.
+1. Enter your email. Anyone can join: sign-up is open, no invite code needed.
 2. Enter the 6-digit code from your inbox.
 3. On first sign-in only, accept the Terms and Privacy Policy.
 4. Approve the client: "Allow Claude (claude.ai) to act as you on Outer?" — read your apps' code, database rows, logs and live pages; create, change, deploy and delete apps, or delete your whole account; set app secrets, API keys, sharing, visitor access and custom domains; see and revoke your other connections to Outer; and email people you name, such as collaborator invites. It cannot change your plan or pay for anything; billing stays in the console.
@@ -26,7 +26,7 @@ time on the Console's Connections and keys page, or by asking your agent.
 For scripts, older clients, and agent harnesses without OAuth, sign in on the
 web and copy an API key from [Keys](https://outer.now/keys):
 
-1. Open [Keys](https://outer.now/keys). It sends you to the sign-in page first: enter your email. Outer emails a 6-digit code (10-minute expiry, 5 attempts). During the closed beta, a new email that is not allowlisted also needs an invite code.
+1. Open [Keys](https://outer.now/keys). It sends you to the sign-in page first: enter your email. Outer emails a 6-digit code (10-minute expiry, 5 attempts).
 2. Enter the code from your inbox. On first sign-in, accept the Terms.
 3. Optionally name the key, then select "Create API key". It is shown once.
 4. Add it to your MCP config or script as the `Authorization: Bearer` header.
@@ -34,15 +34,11 @@ web and copy an API key from [Keys](https://outer.now/keys):
 The key is only a credential. Your agent cannot sign you in or mint keys over
 MCP: there are no sign-in or key tools on the endpoint.
 
-## Invite codes
+## Open beta
 
-Outer is in closed beta. New emails need an invite code (`OUTER-XXXX-XXXX`)
-to join. Joiners get 3 codes of their own to share, shown on the Console's
-Invites page. Collaborators and allowlisted emails get in without a code
-and get none. A code admits one new account and is spent when
-that account signs in. Allowlisted and existing emails never burn one. Admins
-generate codes in bulk from the Console's Admin page instead of getting
-automatic ones.
+Sign-up is open: anyone with an email address can join, no invite code and
+no waitlist. Collaborators join the same way — the app shows in their
+`list_apps` once they sign in with the invited address.
 
 ## API keys
 
