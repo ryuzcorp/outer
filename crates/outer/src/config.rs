@@ -283,6 +283,8 @@ impl std::fmt::Debug for Config {
             .field("oxfmt_bin", &self.oxfmt_bin)
             .field("log_filter", &self.log_filter)
             .field("runtime", &self.runtime)
+            .field("crawl", &self.crawl)
+            .field("ops", &self.ops)
             .finish()
     }
 }
@@ -366,6 +368,9 @@ pub struct Config {
     /// After-live moderation crawl (spec §15.2): page budget, timeouts,
     /// re-crawl cadences, the bad-host list and the report rate limit.
     pub crawl: CrawlConfig,
+    /// Operator alerting (L-24): disk/queue/Jev thresholds and the
+    /// per-kind mail cooldown (`OUTER_OPS_*`).
+    pub ops: crate::ops_alerts::OpsAlertConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -735,6 +740,38 @@ impl Config {
                 &mut problems,
             ),
         };
+        let ops = crate::ops_alerts::OpsAlertConfig {
+            disk_free_pct: parse_num(
+                get("OUTER_OPS_DISK_FREE_PCT"),
+                "OUTER_OPS_DISK_FREE_PCT",
+                10,
+                &mut problems,
+            ),
+            disk_free_min_bytes: parse_num(
+                get("OUTER_OPS_DISK_FREE_BYTES"),
+                "OUTER_OPS_DISK_FREE_BYTES",
+                5 * 1024 * 1024 * 1024,
+                &mut problems,
+            ),
+            deploy_queue_depth: parse_num(
+                get("OUTER_OPS_QUEUE_DEPTH"),
+                "OUTER_OPS_QUEUE_DEPTH",
+                50,
+                &mut problems,
+            ),
+            jev_outage: Duration::from_secs(parse_num(
+                get("OUTER_OPS_JEV_OUTAGE_S"),
+                "OUTER_OPS_JEV_OUTAGE_S",
+                900,
+                &mut problems,
+            )),
+            cooldown: Duration::from_secs(parse_num(
+                get("OUTER_OPS_COOLDOWN_S"),
+                "OUTER_OPS_COOLDOWN_S",
+                3600,
+                &mut problems,
+            )),
+        };
 
         let config = Config {
             domain,
@@ -766,6 +803,7 @@ impl Config {
             stripe,
             runtime,
             crawl,
+            ops,
         };
         problems.extend(config.validate());
         if problems.is_empty() {
@@ -815,6 +853,30 @@ impl Config {
         if self.crawl.reports_per_hour == 0 {
             problems.push(
                 "OUTER_REPORTS_PER_HOUR=0 would refuse every abuse report; it must be at least 1"
+                    .to_string(),
+            );
+        }
+        if !(1..=100).contains(&self.ops.disk_free_pct) {
+            problems.push(format!(
+                "OUTER_OPS_DISK_FREE_PCT={} is not a percent; it must be 1-100",
+                self.ops.disk_free_pct
+            ));
+        }
+        if self.ops.deploy_queue_depth < 1 {
+            problems.push(format!(
+                "OUTER_OPS_QUEUE_DEPTH={} would page on an empty queue; it must be at least 1",
+                self.ops.deploy_queue_depth
+            ));
+        }
+        if self.ops.jev_outage < Duration::from_secs(60) {
+            problems.push(
+                "OUTER_OPS_JEV_OUTAGE_S must be at least 60: a shorter window pages on one slow classify"
+                    .to_string(),
+            );
+        }
+        if self.ops.cooldown < Duration::from_secs(60) {
+            problems.push(
+                "OUTER_OPS_COOLDOWN_S must be at least 60: a shorter cooldown spams the admins"
                     .to_string(),
             );
         }
@@ -970,6 +1032,22 @@ impl Config {
         } else if !self.stripe.empty() && !self.stripe.enabled() {
             problems.push(
                 "partial Stripe config: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET and STRIPE_PRICE_PRO must all be set or all be empty (STRIPE_LAUNCH_COUPON is optional)"
+                    .to_string(),
+            );
+        }
+        // L-26: open signup must never run on sandbox keys — anyone with a
+        // test card would get free Pro. Closed signup keeps test keys for
+        // staging; localhost dev never reaches this branch.
+        if self.signup_open
+            && !self.is_local()
+            && self
+                .stripe
+                .secret_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("sk_test_") || key.starts_with("rk_test_"))
+        {
+            problems.push(
+                "open signup needs live Stripe keys: STRIPE_SECRET_KEY starts with a test prefix (sk_test_ or rk_test_), so OUTER_SIGNUP=open would hand Pro to anyone with a test card; switch to a live key or keep OUTER_SIGNUP=closed"
                     .to_string(),
             );
         }
@@ -2145,5 +2223,55 @@ mod tests {
             "{err:?}"
         );
         assert_no_secrets(&err);
+    }
+
+    /// L-26: open signup on a non-localhost domain refuses test Stripe
+    /// keys, with a message saying open signup needs live keys. Closed
+    /// signup keeps test keys for staging.
+    #[test]
+    fn open_signup_refuses_test_stripe_keys_off_localhost() {
+        let legal = tempfile::tempdir().unwrap();
+        for name in [
+            "terms.html",
+            "privacy.html",
+            "terms.pl.html",
+            "privacy.pl.html",
+            "checkout-notice.txt",
+        ] {
+            std::fs::write(legal.path().join(name), "Seller: Example Sp. z o.o.").unwrap();
+        }
+        let legal = legal.path().to_string_lossy().to_string();
+        let case = |signup: &str, key: &str| {
+            prod_vars(&[
+                ("OUTER_LEGAL_DIR", legal.as_str()),
+                ("OUTER_SIGNUP", signup),
+                ("STRIPE_SECRET_KEY", key),
+            ])
+        };
+        for key in ["sk_test_NEVER-LEAK-a", "rk_test_NEVER-LEAK-b"] {
+            let err = Config::from_vars(&case("open", key)).unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains("open signup needs live Stripe keys")),
+                "{key} with open signup must be refused: {err:?}"
+            );
+            assert_no_secrets(&err);
+        }
+        // Closed signup keeps test keys for staging.
+        let cfg = Config::from_vars(&case("closed", "sk_test_staging")).unwrap();
+        assert!(!cfg.signup_open);
+        // Open signup passes on a live key.
+        let cfg = Config::from_vars(&case("open", "sk_live_prod")).unwrap();
+        assert!(cfg.signup_open);
+        // Localhost dev never hits the rule, even open with test keys.
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_SIGNUP", "open"),
+            ("STRIPE_SECRET_KEY", "sk_test_1"),
+            ("STRIPE_WEBHOOK_SECRET", "whsec_test"),
+            ("STRIPE_PRICE_PRO", "price_pro"),
+        ]))
+        .unwrap();
+        assert!(cfg.signup_open);
     }
 }

@@ -290,7 +290,8 @@ struct ImageBlock {
 
 /// The MCP result: one text block (summary + the §8.4 notice) plus the
 /// screenshot as an image block, with the full JSON mirror as
-/// `structuredContent`.
+/// `structuredContent`. The mirror carries the §8.4 notice too, like every
+/// other untrusted result.
 fn look_result(summary: &str, note: &str, image: &[u8], structured: Value) -> Value {
     use base64::Engine as _;
     let text = image_notice(&format!("{summary}\n{note}"));
@@ -303,6 +304,6 @@ fn look_result(summary: &str, note: &str, image: &[u8], structured: Value) -> Va
                 mime_type: "image/jpeg",
             }).unwrap_or(Value::Null),
         ],
-        "structuredContent": structured,
+        "structuredContent": super::frame_untrusted(structured),
     })
 }

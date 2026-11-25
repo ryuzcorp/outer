@@ -12,3 +12,14 @@ Copyright 2026 the Noite authors
 Parts of Outer's source are derived from Noite's runner
 (apps/runner/src/host/). Each derived file names its Noite source and commit
 in its first line. Noite is licensed under the Apache License, Version 2.0.
+
+================================================================================
+
+disposable-email-domains blocklist
+https://github.com/disposable-email-domains/disposable-email-domains
+
+`crates/outer/wordlists/disposable_email_blocklist.conf` is a copy of that
+project's `disposable_email_blocklist.conf`, dedicated to the public domain
+under CC0 1.0 (https://creativecommons.org/publicdomain/zero/1.0/). No
+attribution is required; this notice records provenance. See
+`crates/outer/src/auth/disposable.rs` for the vendored commit and date.

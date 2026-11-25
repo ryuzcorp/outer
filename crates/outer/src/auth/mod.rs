@@ -7,6 +7,7 @@
 //! The MCP handler only calls the functions below; names and shapes are binding.
 
 pub mod cimd;
+pub mod disposable;
 pub mod email;
 pub mod invites;
 pub mod limits;
@@ -349,14 +350,24 @@ pub async fn send_code(
         }
     }
     // Returning users sign straight back in: the beta gate only admits new
-    // emails (invite joiners are never allowlisted, §6.5.1).
+    // emails (invite joiners are never allowlisted, §6.5.1). Disposable
+    // domains are refused for new emails only (spec §14.3): existing
+    // accounts keep signing in, and reviewer password logins never reach
+    // here.
     let carried = match &existing {
         Some(_) => None,
-        None => check_beta(pool, cfg, &email, invite_code, now).await?,
+        None => {
+            disposable::check_new_email(&email)?;
+            check_beta(pool, cfg, &email, invite_code, now).await?
+        }
     };
+    // The per-email OTP bucket keys on the canonical form (`a+1@x` and
+    // `a+2@x` share one limit): the code row itself stays per exact
+    // address, and account identity is untouched.
+    let limit_email = disposable::canonical_email_for_limits(&email);
     match limits::check_and_record(
         pool,
-        &format!("email:{email}"),
+        &format!("email:{limit_email}"),
         "otp_send",
         5,
         3_600_000,
@@ -549,6 +560,10 @@ pub async fn verify_code_core(
         // burns nothing (§6.5.1).
         Some(account) => account,
         None => {
+            // Defense in depth: `send_code` refuses these before minting a
+            // code, but a code minted before the domain was listed must not
+            // create an account either.
+            disposable::check_new_email(&email)?;
             if let Some(ip) = client_ip {
                 if let Some(retry_after_s) = limits::check_and_record(
                     pool,

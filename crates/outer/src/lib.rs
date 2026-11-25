@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod moderation;
 pub mod observe;
 pub mod ops;
+pub mod ops_alerts;
 pub mod preview;
 pub mod secrets;
 pub mod seed;

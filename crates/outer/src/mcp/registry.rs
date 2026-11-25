@@ -34,6 +34,9 @@ pub struct ToolDef {
     /// own text block.
     pub untrusted: bool,
     pub input_schema: Value,
+    /// The `structuredContent` shape, served as `outputSchema` in
+    /// `tools/list`. Set for every read-only tool; write tools omit it.
+    pub output_schema: Option<Value>,
     /// MCP tool annotations: clients decide from these whether a call needs
     /// the human's confirmation (read-only tools run without asking).
     pub hints: Hints,
@@ -225,45 +228,124 @@ fn tool<T: schemars::JsonSchema>(
         access,
         untrusted,
         input_schema,
+        output_schema: None,
         // Unclassified names fall back to the cautious default; the
         // registry test refuses them, so this never ships.
         hints: hints_for(name).unwrap_or(Hints::CAUTIOUS),
     }
 }
 
+/// Like [`tool`], but the result's `structuredContent` shape is advertised
+/// as `outputSchema`. Every read-only tool uses this: the schema names the
+/// top-level keys the handler returns (unframed mirrors stay accurate
+/// because `ok_untrusted` only *adds* the notice key).
+fn tool_out<T: schemars::JsonSchema>(
+    name: &'static str,
+    description: &'static str,
+    access: Access,
+    untrusted: bool,
+    output_schema: Value,
+) -> ToolDef {
+    let mut def = tool::<T>(name, description, access, untrusted);
+    def.output_schema = Some(output_schema);
+    def
+}
+
+/// One `{"type": ...}` property schema.
+fn prop(typ: &str) -> Value {
+    serde_json::json!({"type": typ})
+}
+
+/// An array-of-`items` property schema.
+fn arr(items: Value) -> Value {
+    serde_json::json!({"type": "array", "items": items})
+}
+
+/// An object schema over top-level `(name, schema)` properties, with the
+/// always-present keys listed as required. Nested values stay shallow
+/// (`object` / `array`): the schema pins the keys callers can rely on,
+/// not the whole tree.
+fn output_schema(props: &[(&str, Value)], required: &[&str]) -> Value {
+    let mut map = serde_json::Map::with_capacity(props.len());
+    for (name, schema) in props {
+        map.insert((*name).to_string(), schema.clone());
+    }
+    serde_json::json!({"type": "object", "properties": Value::Object(map), "required": required})
+}
+
+/// The `untrusted_notice` key [`crate::mcp::tools::ok_untrusted`] adds to
+/// every untrusted `structuredContent`: the same §8.4 notice as the text
+/// block, so framed data stays framed for clients that read past `content`.
+fn untrusted_prop() -> (&'static str, Value) {
+    ("untrusted_notice", prop("string"))
+}
+
 /// Every M1 tool, in `tools/list` order.
 pub fn registry() -> Vec<ToolDef> {
     use Access::{Account, Public};
     vec![
-        tool::<NoArgs>(
+        tool_out::<NoArgs>(
             "about",
-            "What Outer is, how to connect, and the ground rules. Call it when you have no token.",
+            "What Outer is, how clients connect, and the account ground rules.",
             Public, false,
+            output_schema(
+                &[
+                    ("what", prop("string")),
+                    ("connect", prop("string")),
+                    ("rules", arr(prop("string"))),
+                    ("plans", prop("string")),
+                ],
+                &["what", "connect", "rules", "plans"],
+            ),
         ),
-        tool::<account::DocsInput>(
+        tool_out::<account::DocsInput>(
             "docs",
-"Read an Outer agent guide: quickstart, templates, ilha, void, website, cello, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look. Read the ilha guide before writing any code.",
+"An Outer agent guide: quickstart, templates, ilha, void, website, cello, d1, storage, backups, kv, auth, cron, queues, websockets, sse, email, sandboxes, limits, moderation, custom-domains, export, previews or look. The ilha guide covers writing code.",
             Public, false,
+            output_schema(
+                &[("topic", prop("string")), ("markdown", prop("string"))],
+                &["topic", "markdown"],
+            ),
         ),
-        tool::<NoArgs>(
+        tool_out::<NoArgs>(
             "whoami",
             "Your account: email, plan, usage, limits and when they reset. deletes_at is your soonest Free-app deletion date for inactivity (null on Pro or with no apps).",
             Account, false,
+            output_schema(
+                &[
+                    ("email", prop("string")),
+                    ("plan", prop("string")),
+                    ("usage", prop("object")),
+                    ("limits", prop("object")),
+                    ("resets_at", prop("string")),
+                    ("stopped_apps", arr(prop("string"))),
+                    ("deletes_at", prop("string")),
+                ],
+                &["email", "plan", "usage", "limits", "resets_at", "stopped_apps"],
+            ),
         ),
-        tool::<NoArgs>(
+        tool_out::<NoArgs>(
             "list_api_keys",
             "List your API keys: id, name, prefix, use. Secrets are never shown again.",
             Account, false,
+            output_schema(
+                &[("keys", arr(prop("object")))],
+                &["keys"],
+            ),
         ),
         tool::<account::RevokeApiKeyInput>(
             "revoke_api_key",
             "Revoke an API key by its prefix.",
             Account, false,
         ),
-        tool::<NoArgs>(
+        tool_out::<NoArgs>(
             "list_connections",
             "List your OAuth grants: which clients (Claude, Codex, ChatGPT) may act as you.",
             Account, false,
+            output_schema(
+                &[("connections", arr(prop("object")))],
+                &["connections"],
+            ),
         ),
         tool::<account::RevokeConnectionInput>(
             "revoke_connection",
@@ -280,15 +362,35 @@ pub fn registry() -> Vec<ToolDef> {
             "Create an app and deploy it: {slug, name?, description?, template?, examples?, wait?}. Examples like [\"passkeys\"] seed working features in the first commit. Name (1-60 chars) and description (1-160 chars) brand the app; both default from the slug. Template \"app\" is an interactive Ilha + Void app, \"website\" an Astro content site (default \"app\"). Waits for the first deploy by default.",
             Account, false,
         ),
-        tool::<NoArgs>(
+        tool_out::<NoArgs>(
             "list_apps",
             "Your apps: slug, url, role, visibility, status, and deletes_at when a Free app faces deletion for inactivity (absent on Pro).",
             Account, false,
+            output_schema(
+                &[("apps", arr(prop("object")))],
+                &["apps"],
+            ),
         ),
-        tool::<app_inputs::GetAppInput>(
+        tool_out::<app_inputs::GetAppInput>(
             "get_app",
             "One app: url, role, visibility, status, its last deploy, and deletes_at when a Free app faces deletion for inactivity (absent on Pro).",
             Account, false,
+            output_schema(
+                &[
+                    ("slug", prop("string")),
+                    ("url", prop("string")),
+                    ("role", prop("string")),
+                    ("visibility", prop("string")),
+                    ("access", prop("string")),
+                    ("always_on", prop("boolean")),
+                    ("adults_only", prop("boolean")),
+                    ("status", prop("string")),
+                    ("deletes_at", prop("string")),
+                    ("last_deploy", prop("object")),
+                    ("preview", prop("object")),
+                ],
+                &["slug", "url", "role", "visibility", "access", "always_on", "adults_only", "status"],
+            ),
         ),
         tool::<app_inputs::RequestReviewInput>(
             "request_review",
@@ -315,10 +417,18 @@ pub fn registry() -> Vec<ToolDef> {
             "Mark an app adults-only (18+) {app, adults_only}: visitors confirm they are an adult before the app serves them, after the visitor gate when one is set. The confirmation cookie lasts 30 days per host. Owner only.",
             Account, false,
         ),
-        tool::<app_inputs::ShareAppInput>(
+        tool_out::<app_inputs::ShareAppInput>(
             "share_app",
             "Share an app: its url, a one-line share text and a QR code.",
             Account, false,
+            output_schema(
+                &[
+                    ("url", prop("string")),
+                    ("text", prop("string")),
+                    ("qr", prop("string")),
+                ],
+                &["url", "text", "qr"],
+            ),
         ),
         tool::<app_inputs::DeleteAppInput>(
             "delete_app",
@@ -332,7 +442,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<collab_inputs::AddCollaboratorInput>(
             "add_collaborator",
-            "Invite a collaborator to your app by email: {app, email}. The address gets an invite email and the app shows in their list_apps once they sign in. Owner only; Free 1 collaborator per app, Pro 10.",
+            "Invite a collaborator to your app by email: {app, email}. The address gets an invite email and sees the app once they sign in. Owner only; Free 1 collaborator per app, Pro 10.",
             Account, false,
         ),
         tool::<collab_inputs::RemoveCollaboratorInput>(
@@ -340,14 +450,21 @@ pub fn registry() -> Vec<ToolDef> {
             "Remove a collaborator from your app by email: {app, email}. Their access ends immediately. Owner only.",
             Account, false,
         ),
-        tool::<collab_inputs::ListCollaboratorsInput>(
+        tool_out::<collab_inputs::ListCollaboratorsInput>(
             "list_collaborators",
             "List your app's collaborators: email, joined or pending status, and when each was added. Owner only.",
             Account, false,
+            output_schema(
+                &[
+                    ("app", prop("string")),
+                    ("collaborators", arr(prop("object"))),
+                ],
+                &["app", "collaborators"],
+            ),
         ),
         tool::<domain_inputs::AddDomainInput>(
             "add_domain",
-            "Give an app a custom domain (Pro, one per app): registers it as a Cloudflare custom hostname and returns the CNAME/TXT records to create at your DNS. The domain serves the app once its status turns active; poll list_domains.",
+            "Give an app a custom domain (Pro, one per app): registers it as a Cloudflare custom hostname and returns the CNAME/TXT records to create at your DNS. The domain serves the app once its status turns active.",
             Account, false,
         ),
         tool::<domain_inputs::RemoveDomainInput>(
@@ -355,50 +472,106 @@ pub fn registry() -> Vec<ToolDef> {
             "Remove an app's custom domain: deletes the Cloudflare custom hostname and the local row, and purges its cached pages.",
             Account, false,
         ),
-        tool::<domain_inputs::ListDomainsInput>(
+        tool_out::<domain_inputs::ListDomainsInput>(
             "list_domains",
             "An app's custom domain: hostname, live status (pending, active or failed with a reason), and the DNS records to create.",
             Account, false,
+            output_schema(
+                &[("domains", arr(prop("object")))],
+                &["domains"],
+            ),
         ),
         tool::<export_inputs::ExportCodeInput>(
             "export_code",
             "Download your app's whole code as a zip (every plan, owner only): {app, sha?} defaults to main and returns a one-hour download url with its sha and size.",
             Account, false,
         ),
-        tool::<open_app_inputs::OpenAppInput>(
+        tool_out::<open_app_inputs::OpenAppInput>(
             "open_app",
-            "Orient on an app in one call: head sha, role-tagged tree, routes, D1 tables, bindings, brand, AGENTS.md digest, last deploy, open errors and quota. Start here, then read_files (batched ranges), search_code, stage, check and ship.",
+            "One app's orientation snapshot: head sha, role-tagged tree, routes, D1 tables, bindings, brand, AGENTS.md digest, last deploy, open errors and quota.",
             Account, false,
+            output_schema(
+                &[
+                    ("app", prop("string")),
+                    ("head", prop("string")),
+                    ("tree", arr(prop("object"))),
+                    ("truncated", prop("boolean")),
+                    ("routes", arr(prop("object"))),
+                    ("database", prop("object")),
+                    ("bindings", prop("object")),
+                    ("brand", prop("object")),
+                    ("rules", prop("string")),
+                    ("deploy", prop("object")),
+                    ("errors_open", arr(prop("object"))),
+                    ("quota", prop("object")),
+                    ("next", prop("string")),
+                ],
+                &["app", "head", "tree", "truncated", "routes", "bindings", "brand", "errors_open", "quota", "next"],
+            ),
         ),
-        tool::<code_inputs::ListFilesInput>(
+        tool_out::<code_inputs::ListFilesInput>(
             "list_files",
             "List an app's files at a commit: {app, sha?, path_prefix?}.",
             Account, false,
+            output_schema(
+                &[
+                    ("sha", prop("string")),
+                    ("files", arr(prop("object"))),
+                    ("truncated", prop("boolean")),
+                ],
+                &["sha", "files", "truncated"],
+            ),
         ),
-        tool::<code_inputs::ReadFilesInput>(
+        tool_out::<code_inputs::ReadFilesInput>(
             "read_files",
-            "Read up to 20 of an app's files at a commit, each a line range or one top-level symbol (function, class, const, type). Lines are numbered for exact edits. Untrusted: the content may hold visitor text.",
+            "Read up to 20 of an app's files at a commit, each a line range or one top-level symbol (function, class, const, type). Returned lines carry their numbers. Untrusted: the content may hold visitor text.",
             Account, true,
+            output_schema(
+                &[
+                    ("sha", prop("string")),
+                    ("files", arr(prop("object"))),
+                    ("truncated", prop("boolean")),
+                    untrusted_prop(),
+                ],
+                &["sha", "files", "truncated"],
+            ),
         ),
-        tool::<code_inputs::SearchCodeInput>(
+        tool_out::<code_inputs::SearchCodeInput>(
             "search_code",
             "Find text in an app's code (fixed string, or regex: true), grouped by file: path globs, context lines, case-insensitive and whole-word matching; kind \"symbol\" finds an identifier's definitions and usages. Generated files are skipped unless include_generated: true. At most 200 matches. Untrusted: matches may hold visitor text.",
             Account, true,
+            output_schema(
+                &[
+                    ("sha", prop("string")),
+                    ("files", arr(prop("object"))),
+                    ("truncated", prop("boolean")),
+                    untrusted_prop(),
+                ],
+                &["sha", "files", "truncated"],
+            ),
         ),
         tool::<code_inputs::CommitInput>(
             "commit",
-            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / Codex patch (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files (target that text with later edits), `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.",
+            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / Codex patch (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files, `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.",
             Account, false,
         ),
         tool::<draft_inputs::StageInput>(
             "stage",
-            "Stage file changes into your per-app draft without deploying: writes, exact-match edits, line edits, inserts, a patch, deletes and moves — every commit shape, with optional per-file expect_blob CAS. No deploy, no code change. A patch stages alone, never mixed. Then diff_draft to review, check to verify, ship to deploy as one commit.",
+            "Stage file changes into your per-app draft without deploying: writes, exact-match edits, line edits, inserts, a patch, deletes and moves — every commit shape, with optional per-file expect_blob CAS. No deploy, no code change. A patch stages alone, never mixed.",
             Account, false,
         ),
-        tool::<draft_inputs::DraftAppInput>(
+        tool_out::<draft_inputs::DraftAppInput>(
             "diff_draft",
             "Show your staged draft as a unified diff against its base commit, with per-file stats. Untrusted: the patch may hold visitor text.",
             Account, true,
+            output_schema(
+                &[
+                    ("draft", prop("object")),
+                    ("next", prop("string")),
+                    untrusted_prop(),
+                ],
+                &["draft", "next"],
+            ),
         ),
         tool::<draft_inputs::CheckInput>(
             "check",
@@ -415,15 +588,33 @@ pub fn registry() -> Vec<ToolDef> {
             "Drop your staged draft. The deployed app is untouched.",
             Account, false,
         ),
-        tool::<code_inputs::HistoryInput>(
+        tool_out::<code_inputs::HistoryInput>(
             "history",
             "An app's commits, newest first, with the next_skip cursor.",
             Account, false,
+            output_schema(
+                &[
+                    ("head", prop("string")),
+                    ("commits", arr(prop("object"))),
+                    ("next_skip", prop("integer")),
+                ],
+                &["head", "commits"],
+            ),
         ),
-        tool::<code_inputs::ShowCommitInput>(
+        tool_out::<code_inputs::ShowCommitInput>(
             "show_commit",
             "One commit: metadata, changed files and the unified patch. Untrusted: the patch may hold visitor text.",
             Account, true,
+            output_schema(
+                &[
+                    ("commit", prop("object")),
+                    ("files", arr(prop("object"))),
+                    ("truncated", prop("boolean")),
+                    ("root", prop("boolean")),
+                    untrusted_prop(),
+                ],
+                &["commit", "files", "truncated", "root"],
+            ),
         ),
         tool::<code_inputs::RollbackInput>(
             "rollback",
@@ -440,25 +631,69 @@ pub fn registry() -> Vec<ToolDef> {
             "Discard your app's preview: stops the preview fleet and removes its trial state. Live is untouched, and cleanup is always allowed, even off Pro.",
             Account, false,
         ),
-        tool::<runtime_inputs::DeployStatusInput>(
+        tool_out::<runtime_inputs::DeployStatusInput>(
             "deploy_status",
             "A deploy's status: success + url, failed + step and error, blocked + findings, or building + next. wait: true blocks until it finishes. Pass preview: true for preview runs.",
             Account, false,
+            output_schema(
+                &[
+                    ("status", prop("string")),
+                    ("deploy_id", prop("string")),
+                    ("sha", prop("string")),
+                    ("url", prop("string")),
+                    ("duration_ms", prop("integer")),
+                    ("steps", arr(prop("object"))),
+                    ("error", prop("string")),
+                    ("findings", prop("object")),
+                    ("user_message", prop("string")),
+                    ("diagnostics", arr(prop("object"))),
+                    ("log_tail", prop("string")),
+                    ("next", prop("string")),
+                    untrusted_prop(),
+                ],
+                &["status", "deploy_id", "sha"],
+            ),
         ),
-        tool::<runtime_inputs::DeployLogInput>(
+        tool_out::<runtime_inputs::DeployLogInput>(
             "deploy_log",
             "A deploy's build log. Untrusted: the log may hold visitor text. Pass preview: true for preview runs.",
             Account, true,
+            output_schema(
+                &[
+                    ("deploy_id", prop("string")),
+                    ("sha", prop("string")),
+                    ("status", prop("string")),
+                    ("log", prop("string")),
+                    untrusted_prop(),
+                ],
+                &["deploy_id", "sha", "status", "log"],
+            ),
         ),
-        tool::<runtime_inputs::AppLogsInput>(
+        tool_out::<runtime_inputs::AppLogsInput>(
             "app_logs",
             "An app's recent log lines from the fleet ring, oldest first; pass back next_since to poll. Untrusted: lines may hold visitor text.",
             Account, true,
+            output_schema(
+                &[
+                    ("lines", arr(prop("object"))),
+                    ("next_since", prop("string")),
+                    untrusted_prop(),
+                ],
+                &["lines"],
+            ),
         ),
-        tool::<runtime_inputs::AppErrorsInput>(
+        tool_out::<runtime_inputs::AppErrorsInput>(
             "app_errors",
             "An app's grouped runtime errors, newest first: ERROR lines and uncaught-exception stacks from the log stream, grouped by fingerprint, plus proxy 5xx over the last hour. Pass status to filter open, resolved or ignored issues. Untrusted: messages and frames may hold visitor text.",
             Account, true,
+            output_schema(
+                &[
+                    ("issues", arr(prop("object"))),
+                    ("s5xx_last_hour", prop("integer")),
+                    untrusted_prop(),
+                ],
+                &["issues", "s5xx_last_hour"],
+            ),
         ),
         tool::<runtime_inputs::ResolveErrorInput>(
             "resolve_error",
@@ -475,26 +710,74 @@ pub fn registry() -> Vec<ToolDef> {
             "Reopen one resolved or ignored error issue {app, fingerprint}: it returns to the open list as a fresh triage.",
             Account, false,
         ),
-        tool::<data_inputs::AppMetricsInput>(
+        tool_out::<data_inputs::AppMetricsInput>(
             "app_metrics",
             "An app's traffic over 24, 168 or 720 hours (default 24): requests, unique visitors, errors, p50/p95 latency, top paths and the 4xx/5xx split. Same source as the Console metrics tab. Untrusted: paths may hold visitor text.",
             Account, true,
+            output_schema(
+                &[
+                    ("app", prop("string")),
+                    ("hours", prop("integer")),
+                    ("requests", prop("integer")),
+                    ("visitors", prop("integer")),
+                    ("errors", prop("integer")),
+                    ("error_rate", prop("number")),
+                    ("s4xx", prop("integer")),
+                    ("s5xx", prop("integer")),
+                    ("p50_ms", prop("integer")),
+                    ("p95_ms", prop("integer")),
+                    ("top_paths", arr(prop("object"))),
+                    untrusted_prop(),
+                ],
+                &["app", "hours", "requests", "visitors", "errors", "error_rate", "s4xx", "s5xx", "p50_ms", "p95_ms", "top_paths"],
+            ),
         ),
-        tool::<data_inputs::DbQueryInput>(
+        tool_out::<data_inputs::DbQueryInput>(
             "db_query",
-            "Read an app's live D1 with one SELECT, WITH … SELECT or PRAGMA table_info (? placeholders come from params); at most 200 rows. Read-only: writes ship as migrations in your next commit. Untrusted: rows may hold visitor data.",
+            "Read an app's live D1 with one SELECT, WITH … SELECT or PRAGMA table_info (? placeholders come from params); at most 200 rows. Read-only: it refuses writes. Untrusted: rows may hold visitor data.",
             Account, true,
+            output_schema(
+                &[
+                    ("app", prop("string")),
+                    ("binding", prop("string")),
+                    ("columns", arr(prop("string"))),
+                    ("rows", arr(prop("object"))),
+                    ("row_count", prop("integer")),
+                    ("truncated", prop("boolean")),
+                    untrusted_prop(),
+                ],
+                &["app", "binding", "columns", "rows", "row_count", "truncated"],
+            ),
         ),
-        tool::<look_inputs::LookAtAppInput>(
+        tool_out::<look_inputs::LookAtAppInput>(
             "look_at_app",
-            "Look at your app's live page: renders it in a real browser and returns a screenshot plus its HTTP status and title, console errors and failed requests. Call after each change to verify your work. Untrusted: the screenshot and console entries render app content. When the console recorder cannot run (blocking CSP, oversize page), the note says why: use app_logs and app_errors for those cases.",
+            "Renders an app's live page in a real browser and returns a screenshot plus its HTTP status and title, console errors and failed requests. Untrusted: the screenshot and console entries render app content. When the console recorder cannot run, the note says why.",
             Account, true,
+            output_schema(
+                &[
+                    ("url", prop("string")),
+                    ("http_status", prop("integer")),
+                    ("title", prop("string")),
+                    ("width", prop("integer")),
+                    ("full_page", prop("boolean")),
+                    ("capture", prop("string")),
+                    ("console", arr(prop("object"))),
+                    ("failed_requests", arr(prop("object"))),
+                    ("note", prop("string")),
+                    untrusted_prop(),
+                ],
+                &["url", "http_status", "title", "width", "full_page", "capture", "console", "failed_requests", "note"],
+            ),
         ),
- tool::<secrets_inputs::ListSecretsInput>(
- "list_secrets",
- "An app's secret names and when each was set. Values are never shown: they reach the app as Worker env vars on the next deploy.",
- Account, false,
- ),
+        tool_out::<secrets_inputs::ListSecretsInput>(
+            "list_secrets",
+            "An app's secret names and when each was set. Values are never shown: they reach the app as Worker env vars on the next deploy.",
+            Account, false,
+            output_schema(
+                &[("secrets", arr(prop("object")))],
+                &["secrets"],
+            ),
+        ),
  tool::<secrets_inputs::SetSecretInput>(
  "set_secret",
  "Set an app secret {app, key, value}: encrypted at rest, injected as a Worker env var on the next deploy. Names use uppercase letters, digits and _, at most 64 characters, and at most 50 secrets fit per app.",
@@ -505,10 +788,14 @@ pub fn registry() -> Vec<ToolDef> {
             "Remove an app secret {app, key}. Applies on the next deploy.",
             Account, false,
         ),
-        tool::<backup_inputs::ListBackupsInput>(
+        tool_out::<backup_inputs::ListBackupsInput>(
             "list_backups",
             "An app's D1 backups: id, binding, when each dump was taken and its size. Daily dumps are automatic for active apps (a request or successful deploy in the prior 24 h; newest 3 kept, Pro 30); restore one with restore_backup, download one from Console → D1 → Backups. Owner only.",
             Account, false,
+            output_schema(
+                &[("backups", arr(prop("object")))],
+                &["backups"],
+            ),
         ),
         tool::<backup_inputs::BackupDatabaseInput>(
             "backup_database",
@@ -520,14 +807,34 @@ pub fn registry() -> Vec<ToolDef> {
             "Restore an app's D1 database from a backup: {app, binding?, backup_id, confirm} with confirm equal to backup_id. Takes a fresh backup first, then replaces the live tables with the dump. Owner only.",
             Account, false,
         ),
-        tool::<examples_inputs::ExamplesInput>(
+        tool_out::<examples_inputs::ExamplesInput>(
             "examples",
-            "Ready features for apps and sites: `examples` lists them, `examples {name}` shows the README and file list (contents with `files: true`). Apply one with `add_example`.",
+            "Ready features for apps and sites: with no name it lists them; with a name it shows the README and file list (contents with files: true).",
             Public, false,
+            // Union of both result shapes: listing names `examples`, one
+            // example names its metadata keys. Nothing is required, since
+            // the two shapes share no key.
+            output_schema(
+                &[
+                    ("examples", arr(prop("object"))),
+                    ("next", prop("string")),
+                    ("name", prop("string")),
+                    ("title", prop("string")),
+                    ("summary", prop("string")),
+                    ("template", prop("string")),
+                    ("requires", arr(prop("string"))),
+                    ("nav", arr(prop("object"))),
+                    ("bindings", prop("object")),
+                    ("readme", prop("string")),
+                    ("files", arr(prop("object"))),
+                    ("truncated", prop("boolean")),
+                ],
+                &[],
+            ),
         ),
         tool::<add_example_inputs::AddExampleInput>(
             "add_example",
-            "Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and migrations in one change and deploys. Customise with commit after.",
+            "Add a ready feature to your app: {app, name} (+ optional wait). Commits the example's pages, nav, bindings and migrations in one change and deploys.",
             Account, false,
         ),
     ]
@@ -541,6 +848,60 @@ mod tests {
     fn registry_shapes() {
         let tools = registry();
         assert_eq!(tools.len(), 59);
+    }
+
+    /// Claude Connectors review criteria (tool design): every tool name is
+    /// at most 64 chars and matches `^[a-zA-Z0-9_-]+$`.
+    #[test]
+    fn tool_names_are_directory_safe() {
+        for tool in registry() {
+            assert!(
+                tool.name.len() <= 64,
+                "{} is {} chars, over the 64-char limit",
+                tool.name,
+                tool.name.len()
+            );
+            assert!(
+                !tool.name.is_empty()
+                    && tool
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{} is not ^[a-zA-Z0-9_-]+$",
+                tool.name
+            );
+        }
+    }
+
+    /// Every read-only tool advertises its `structuredContent` shape as
+    /// `outputSchema`; write tools omit it.
+    #[test]
+    fn read_only_tools_advertise_output_schema() {
+        for tool in registry() {
+            let hints = hints_for(tool.name)
+                .unwrap_or_else(|| panic!("{} has no annotation hints", tool.name));
+            if hints.read_only {
+                let schema = tool
+                    .output_schema
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{} is read-only without outputSchema", tool.name));
+                assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+                assert!(
+                    schema
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|p| !p.is_empty()),
+                    "{} outputSchema has no properties",
+                    tool.name
+                );
+            } else {
+                assert!(
+                    tool.output_schema.is_none(),
+                    "{} is a write tool but carries outputSchema",
+                    tool.name
+                );
+            }
+        }
     }
 
     /// Commerce guidelines (owner decision D2): no tool description

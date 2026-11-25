@@ -420,7 +420,8 @@ pub async fn apply_event(
     let pro_price = ctx.billing.pro_price();
     let transition = match event_type {
         "checkout.session.completed" => {
-            apply_checkout_completed(&mut tx, object, checkout_subscription, pro_price).await?
+            apply_checkout_completed(&mut tx, object, checkout_subscription, pro_price, now_secs)
+                .await?
         }
         "customer.subscription.created" | "customer.subscription.updated" => {
             apply_subscription(
@@ -437,7 +438,7 @@ pub async fn apply_event(
             apply_subscription_deleted(&mut tx, &mut pending, &ctx.apps_domain, object, now_secs)
                 .await?
         }
-        "invoice.paid" => apply_invoice_paid(&mut tx, object).await?,
+        "invoice.paid" => apply_invoice_paid(&mut tx, object, now_secs).await?,
         "invoice.payment_failed" => {
             apply_payment_failed(&mut tx, &mut pending, object, now_secs).await?
         }
@@ -533,6 +534,17 @@ struct UserBilling {
     /// Downgraded after its subscription ended: `subscription` then names
     /// that ended subscription, kept so its late events can be recognized.
     ended: bool,
+    banned: i64,
+    ban_expires: Option<i64>,
+}
+
+impl UserBilling {
+    /// Whether the account is currently banned (L-42): `banned` set and the
+    /// ban not yet expired. A NULL `banExpires` never expires (the operator
+    /// ban writes NULL), mirroring the OAuth session check.
+    fn banned_now(&self, now_secs: i64) -> bool {
+        self.banned != 0 && self.ban_expires.is_none_or(|until| now_secs < until)
+    }
 }
 
 /// The subscription an invoice belongs to. From API version `2025-03-31`
@@ -566,6 +578,9 @@ struct UserRow {
     #[sqlx(rename = "stripeSubscriptionId")]
     subscription: Option<String>,
     ended: bool,
+    banned: i64,
+    #[sqlx(rename = "banExpires")]
+    ban_expires: Option<i64>,
 }
 
 fn to_billing(row: UserRow) -> UserBilling {
@@ -575,6 +590,8 @@ fn to_billing(row: UserRow) -> UserBilling {
         grace_until: row.grace_until,
         subscription: row.subscription,
         ended: row.ended,
+        banned: row.banned,
+        ban_expires: row.ban_expires,
     }
 }
 
@@ -583,7 +600,7 @@ async fn user_by_id(
     id: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId, \
+        "SELECT id, email, graceUntil, stripeSubscriptionId, banned, banExpires, \
          (plan = 'free' AND planStatus = 'canceled') AS ended FROM user WHERE id = ?1",
     )
     .bind(id)
@@ -597,7 +614,7 @@ async fn user_by_customer(
     customer: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId, \
+        "SELECT id, email, graceUntil, stripeSubscriptionId, banned, banExpires, \
          (plan = 'free' AND planStatus = 'canceled') AS ended FROM user \
          WHERE stripeCustomerId = ?1",
     )
@@ -616,7 +633,7 @@ async fn user_by_subscription(
     subscription: &str,
 ) -> anyhow::Result<Option<UserBilling>> {
     let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, graceUntil, stripeSubscriptionId, \
+        "SELECT id, email, graceUntil, stripeSubscriptionId, banned, banExpires, \
          (plan = 'free' AND planStatus = 'canceled') AS ended FROM user \
          WHERE stripeSubscriptionId = ?1",
     )
@@ -663,6 +680,26 @@ async fn set_pro(
          downgraded_stopped_at = NULL, \
          downgrade_purge_warned_at = NULL, expired_at = NULL, \
          inactivity_notices = 0 WHERE owner_id = ?1",
+    )
+    .bind(account_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// L-42: clear a banned account's downgrade stamps. The operator ban parks
+/// every owned app as an operator stop with no stamp (`ban_account`); a
+/// stamp that survives the ban (a raced write) would otherwise flip the
+/// stopped page to the plan text ("upgrade to reactivate") the next time an
+/// upgrade-shaped event lands and finds the account banned. The plan row
+/// itself is untouched — this only keeps the operator stop text.
+async fn clear_downgrade_stamps(
+    conn: &mut sqlx::SqliteConnection,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE app SET downgraded_stopped_at = NULL, downgrade_purge_warned_at = NULL \
+         WHERE owner_id = ?1",
     )
     .bind(account_id)
     .execute(&mut *conn)
@@ -727,6 +764,7 @@ async fn apply_checkout_completed(
     object: &serde_json::Value,
     checkout_subscription: Option<&serde_json::Value>,
     pro_price: Option<&str>,
+    now_secs: i64,
 ) -> anyhow::Result<Transition> {
     if object_str(object, "mode") != Some("subscription") {
         return Ok(Transition::kept(None));
@@ -768,6 +806,14 @@ async fn apply_checkout_completed(
     let Some(user) = user_by_id(&mut *conn, account).await? else {
         return Ok(Transition::kept(None));
     };
+    // L-42: a banned payer stays Free — the event above is still recorded,
+    // so Stripe stops retrying, but no upgrade (and no fleet restart via
+    // `set_pro`) ever follows. A stale downgrade stamp is cleared so the
+    // parked apps keep the operator stop text.
+    if user.banned_now(now_secs) {
+        clear_downgrade_stamps(&mut *conn, &user.id).await?;
+        return Ok(Transition::kept(Some(user.id)));
+    }
     let customer = object.get("customer").and_then(str_or_id);
     set_pro(&mut *conn, &user.id, customer, subscription_id).await?;
     Ok(Transition::kept(Some(user.id)))
@@ -805,6 +851,16 @@ async fn apply_subscription(
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
+    // L-42: a banned account is never promoted or graced — the event stays
+    // recorded, but the plan row is untouched. Downgrades (`canceled`,
+    // `unpaid`, `deleted`) still run: they only ever remove Pro extras.
+    // A stale downgrade stamp is cleared so the parked apps keep the
+    // operator stop text whatever order events land in (see
+    // `clear_downgrade_stamps`).
+    if matches!(status, "active" | "trialing" | "past_due") && user.banned_now(now_secs) {
+        clear_downgrade_stamps(&mut *conn, &user.id).await?;
+        return Ok(Transition::kept(Some(user.id)));
+    }
     let event_sub = if id.is_empty() { None } else { Some(id) };
     // A downgrade stops every app but the two oldest; the route stops their
     // fleets from the returned slugs.
@@ -947,6 +1003,7 @@ async fn apply_subscription_deleted(
 async fn apply_invoice_paid(
     conn: &mut sqlx::SqliteConnection,
     object: &serde_json::Value,
+    now_secs: i64,
 ) -> anyhow::Result<Transition> {
     let customer = object.get("customer").and_then(str_or_id);
     let subscription = invoice_subscription(object);
@@ -973,6 +1030,13 @@ async fn apply_invoice_paid(
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
+    // L-42: a banned account is never promoted — the event stays recorded,
+    // but the plan row is untouched. A stale downgrade stamp is cleared so
+    // the parked apps keep the operator stop text.
+    if user.banned_now(now_secs) {
+        clear_downgrade_stamps(&mut *conn, &user.id).await?;
+        return Ok(Transition::kept(Some(user.id)));
+    }
     if upgrade_is_stale(&user, subscription) {
         return Ok(Transition::kept(Some(user.id)));
     }
@@ -1010,6 +1074,14 @@ async fn apply_payment_failed(
     let Some(user) = user else {
         return Ok(Transition::kept(None));
     };
+    // L-42: a banned account never enters grace (and gets no dunning mail)
+    // — the event stays recorded, but the plan row is untouched. A stale
+    // downgrade stamp is cleared so the parked apps keep the operator stop
+    // text.
+    if user.banned_now(now_secs) {
+        clear_downgrade_stamps(&mut *conn, &user.id).await?;
+        return Ok(Transition::kept(Some(user.id)));
+    }
     if upgrade_is_stale(&user, subscription) {
         return Ok(Transition::kept(Some(user.id)));
     }
@@ -3477,5 +3549,139 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row, (None, 0));
+    }
+
+    /// L-42: a banned account is never promoted — every upgrade-shaped
+    /// event records its row (so Stripe stops retrying) but leaves the
+    /// plan on Free.
+    async fn seed_banned(pool: &SqlitePool) {
+        seed_user(pool, "a1", "a@example.com").await;
+        sqlx::query(
+            "UPDATE user SET banned = 1, stripeCustomerId = 'cus_1', \
+             stripeSubscriptionId = 'sub_1' WHERE id = 'a1'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn event_count(pool: &SqlitePool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM stripe_event WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn banned_account_ignores_checkout_completed() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_banned(&pool).await;
+        let outcome = apply_checkout(
+            &pool,
+            &sender,
+            &billing,
+            "evt_ban_checkout",
+            checkout_session(Some("a1"), "subscription", "paid", Some("sub_1")),
+            pro_subscription("sub_1", "price_pro"),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Applied {
+                    account_id: Some(_),
+                    ..
+                }
+            ),
+            "the event still applies as recorded"
+        );
+        assert_eq!(
+            plan_of(&pool, "a1").await,
+            ("free".to_string(), None, None),
+            "a banned account never upgrades"
+        );
+        assert_eq!(event_count(&pool, "evt_ban_checkout").await, 1);
+    }
+
+    #[tokio::test]
+    async fn banned_account_ignores_subscription_upgrades() {
+        let pool = pool().await;
+        let (sender, _) = capture();
+        let billing = enabled_billing();
+        seed_banned(&pool).await;
+        for (id, kind, object) in [
+            (
+                "evt_ban_active",
+                "customer.subscription.updated",
+                serde_json::json!({
+                    "id": "sub_1", "customer": "cus_1", "status": "active",
+                    "items": {"data": [{"price": {"id": "price_pro"}}]},
+                }),
+            ),
+            (
+                "evt_ban_paid",
+                "invoice.paid",
+                serde_json::json!({"id": "in_1", "customer": "cus_1", "subscription": "sub_1"}),
+            ),
+        ] {
+            let outcome = apply(&pool, &sender, &billing, id, kind, object).await;
+            assert!(
+                matches!(
+                    outcome,
+                    ApplyOutcome::Applied {
+                        account_id: Some(_),
+                        ..
+                    }
+                ),
+                "{kind} still records its row"
+            );
+        }
+        assert_eq!(
+            plan_of(&pool, "a1").await,
+            ("free".to_string(), None, None),
+            "a banned account never upgrades"
+        );
+        assert_eq!(event_count(&pool, "evt_ban_active").await, 1);
+        assert_eq!(event_count(&pool, "evt_ban_paid").await, 1);
+    }
+
+    #[tokio::test]
+    async fn banned_account_ignores_payment_failed() {
+        let pool = pool().await;
+        let (sender, codes) = capture();
+        let billing = enabled_billing();
+        seed_banned(&pool).await;
+        let outcome = apply(
+            &pool,
+            &sender,
+            &billing,
+            "evt_ban_failed",
+            "invoice.payment_failed",
+            serde_json::json!({"id": "in_1", "customer": "cus_1", "subscription": "sub_1"}),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Applied {
+                    account_id: Some(_),
+                    ..
+                }
+            ),
+            "the event still records its row"
+        );
+        assert_eq!(
+            plan_of(&pool, "a1").await,
+            ("free".to_string(), None, None),
+            "a banned account never enters grace"
+        );
+        assert!(
+            codes.lock().unwrap().get("a@example.com").is_none(),
+            "a banned account gets no dunning mail"
+        );
+        assert_eq!(event_count(&pool, "evt_ban_failed").await, 1);
     }
 }

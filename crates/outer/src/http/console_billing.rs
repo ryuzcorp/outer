@@ -43,21 +43,34 @@ struct BillingAccount {
     plan: String,
     customer: Option<String>,
     subscription: Option<String>,
+    banned: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct BillingAccountRow {
+    email: String,
+    plan: String,
+    #[sqlx(rename = "stripeCustomerId")]
+    customer: Option<String>,
+    #[sqlx(rename = "stripeSubscriptionId")]
+    subscription: Option<String>,
+    banned: i64,
 }
 
 async fn billing_account(pool: &sqlx::SqlitePool, account_id: &str) -> Option<BillingAccount> {
-    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT email, plan, stripeCustomerId, stripeSubscriptionId FROM user WHERE id = ?1",
+    let row: Option<BillingAccountRow> = sqlx::query_as(
+        "SELECT email, plan, stripeCustomerId, stripeSubscriptionId, banned FROM user WHERE id = ?1",
     )
     .bind(account_id)
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
-    row.map(|(email, plan, customer, subscription)| BillingAccount {
-        email,
-        plan,
-        customer,
-        subscription,
+    row.map(|row| BillingAccount {
+        email: row.email,
+        plan: row.plan,
+        customer: row.customer,
+        subscription: row.subscription,
+        banned: row.banned != 0,
     })
 }
 
@@ -242,6 +255,14 @@ async fn billing_checkout(
             "This account is gone. Ask your agent to sign you in again.",
         );
     };
+    // L-42: a banned account can never pay its way back — the link refuses
+    // before Stripe is involved, so no Checkout Session is ever minted.
+    if account.banned {
+        return text(
+            StatusCode::FORBIDDEN,
+            "This account is banned and cannot upgrade. Contact support if this is a mistake.",
+        );
+    }
     if state.mcp.billing.enabled()
         && crate::billing::has_live_subscription(&account.plan, account.subscription.as_deref())
     {
@@ -309,14 +330,27 @@ async fn billing_portal(
     };
     // Decode the nullable column as `Option`: sqlx reads a NULL into a bare
     // `String` as "", which would mint a portal session for no customer.
-    let customer: Option<String> =
-        sqlx::query_scalar::<_, Option<String>>("SELECT stripeCustomerId FROM user WHERE id = ?1")
+    let row: Option<(Option<String>, i64)> =
+        sqlx::query_as("SELECT stripeCustomerId, banned FROM user WHERE id = ?1")
             .bind(&account_id)
             .fetch_optional(&state.mcp.pool)
             .await
             .ok()
-            .flatten()
             .flatten();
+    let Some((customer, banned)) = row else {
+        return text(
+            StatusCode::NOT_FOUND,
+            "This account has no billing history yet. Ask your agent for a fresh upgrade link.",
+        );
+    };
+    // L-42: a banned account gets no portal session either — same as the
+    // checkout starter, the link refuses before Stripe is involved.
+    if banned != 0 {
+        return text(
+            StatusCode::FORBIDDEN,
+            "This account is banned and cannot manage billing. Contact support if this is a mistake.",
+        );
+    }
     let Some(customer) = customer else {
         return text(
             StatusCode::NOT_FOUND,
@@ -370,6 +404,23 @@ async fn api_console_checkout(
     let live = stored.as_ref().is_some_and(|row| {
         crate::billing::has_live_subscription(&row.plan, row.subscription.as_deref())
     });
+    // L-42: a banned account can never pay its way back — refused and
+    // audited before the live-subscription check or any Stripe call.
+    if stored.as_ref().is_some_and(|row| row.banned) {
+        record_account_action(
+            &mcp.pool,
+            &account.id,
+            "upgrade",
+            "upgrade",
+            "error",
+            Some("forbidden"),
+            started,
+        )
+        .await;
+        return tool_response(&ToolError::forbidden(
+            "this account is banned and cannot upgrade; contact support if this is a mistake",
+        ));
+    }
     if live && mcp.billing.enabled() {
         record_account_action(
             &mcp.pool,
@@ -454,15 +505,33 @@ async fn api_console_portal(State(state): State<super::AppState>, headers: Heade
         Err(res) => return *res,
     };
     let started = now_ms();
-    let customer: Option<String> =
-        sqlx::query_scalar::<_, Option<String>>("SELECT stripeCustomerId FROM user WHERE id = ?1")
+    // Decode the nullable column as `Option`: sqlx reads a NULL into a bare
+    // `String` as "", which would mint a portal session for no customer.
+    let row: Option<(Option<String>, i64)> =
+        sqlx::query_as("SELECT stripeCustomerId, banned FROM user WHERE id = ?1")
             .bind(&account.id)
             .fetch_optional(&mcp.pool)
             .await
             .ok()
-            .flatten()
             .flatten();
-    let Some(customer) = customer else {
+    // L-42: a banned account gets no portal session — refused and audited
+    // before any Stripe call.
+    if row.as_ref().is_some_and(|(_, banned)| *banned != 0) {
+        record_account_action(
+            &mcp.pool,
+            &account.id,
+            "manage_billing",
+            "manage_billing",
+            "error",
+            Some("forbidden"),
+            started,
+        )
+        .await;
+        return tool_response(&ToolError::forbidden(
+            "this account is banned and cannot manage billing; contact support if this is a mistake",
+        ));
+    }
+    let Some(customer) = row.and_then(|(customer, _)| customer) else {
         record_account_action(
             &mcp.pool,
             &account.id,
@@ -1218,6 +1287,123 @@ mod tests {
                  ul.+Przykladowa+1%2C+00-001+Warszawa"
             ),
             "{body}"
+        );
+    }
+
+    async fn seed_banned(pool: &SqlitePool) {
+        sqlx::query("UPDATE user SET banned = 1 WHERE id = 'a1'")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn text_body(res: axum::response::Response) -> (StatusCode, String) {
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// L-42: the checkout starter refuses a banned account before Stripe
+    /// is involved — no Checkout Session is ever minted.
+    #[tokio::test]
+    async fn checkout_starter_refuses_a_banned_user() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        seed_banned(&pool).await;
+        let token = crate::billing::sign_checkout_token(
+            b"test-sign-key",
+            "a1",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        let req = Request::get(format!("/billing/checkout?t={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        let (status, body) = text_body(res).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("banned"), "{body}");
+        assert!(
+            fake.posts.lock().unwrap().is_empty(),
+            "no Checkout Session minted"
+        );
+    }
+
+    /// L-42: the console Upgrade button refuses a banned account. The ban
+    /// kills the session first (`account_from_session` only resolves
+    /// unbanned rows), so the endpoint 401s before the handler's own
+    /// banned check — which stays as cover for a ban racing the guard —
+    /// and no Checkout Session is ever minted.
+    #[tokio::test]
+    async fn console_checkout_refuses_a_banned_user() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        let id = crate::auth::create_session(&pool, "a1").await.unwrap();
+        seed_banned(&pool).await;
+        let req = Request::post("/api/console/billing/checkout")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", format!("{}={id}", crate::auth::SESSION_COOKIE))
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            fake.posts.lock().unwrap().is_empty(),
+            "no Checkout Session minted"
+        );
+    }
+
+    /// L-42: the portal starter refuses a banned account before Stripe is
+    /// involved — no portal session is ever minted.
+    #[tokio::test]
+    async fn portal_starter_refuses_a_banned_user() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        seed_banned(&pool).await;
+        let token = crate::billing::sign_portal_token(
+            b"test-sign-key",
+            "a1",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        let req = Request::get(format!("/billing/portal?t={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        let (status, body) = text_body(res).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("banned"), "{body}");
+        assert!(
+            fake.posts.lock().unwrap().is_empty(),
+            "no portal session minted"
+        );
+    }
+
+    /// L-42: the console Manage billing button refuses a banned account.
+    /// Same session-first refusal as the Upgrade button: the ban kills
+    /// the session, the endpoint 401s, and no portal session is minted.
+    #[tokio::test]
+    async fn console_portal_refuses_a_banned_user() {
+        let fake = FakeStripe::start().await;
+        let (state, pool, _) = app_state(enabled_billing(fake.base.clone())).await;
+        seed_user(&pool).await;
+        let id = crate::auth::create_session(&pool, "a1").await.unwrap();
+        seed_banned(&pool).await;
+        let req = Request::post("/api/console/billing/portal")
+            .header("content-type", "application/json")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", format!("{}={id}", crate::auth::SESSION_COOKIE))
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = super::super::router(state).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            fake.posts.lock().unwrap().is_empty(),
+            "no portal session minted"
         );
     }
 }
