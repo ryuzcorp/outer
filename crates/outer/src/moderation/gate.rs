@@ -177,7 +177,26 @@ pub async fn run_gate(
     let mut scores = vec![ChunkScores::default(); chunks.len()];
     if !fresh.is_empty() {
         let texts: Vec<String> = fresh.iter().map(|(_, t)| t.clone()).collect();
-        let fresh_scores = jev.classify(&texts).await.map_err(GateError::Unavailable)?;
+        // The operator outage streak (L-24): a classify attempt either
+        // clears it or extends it. Cached-only runs attempt nothing and
+        // leave the streak alone.
+        let fresh_scores = match jev.classify(&texts).await {
+            Ok(scores) => {
+                crate::ops_alerts::record_heartbeat_ok(pool, crate::ops_alerts::KIND_JEV, now)
+                    .await;
+                scores
+            }
+            Err(err) => {
+                crate::ops_alerts::record_heartbeat_err(
+                    pool,
+                    crate::ops_alerts::KIND_JEV,
+                    now,
+                    &err.to_string(),
+                )
+                .await;
+                return Err(GateError::Unavailable(err));
+            }
+        };
         for ((i, _), s) in fresh.iter().zip(fresh_scores) {
             scores[*i] = s;
         }

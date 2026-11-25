@@ -164,7 +164,7 @@ fi
 # untouched: past aborts this must catch are a malformed OUTER_REVIEW_LOGINS
 # PHC, a review-logins path missing its /tls mount, a legal dir missing its
 # /legal mount, and STRIPE_* missing off localhost.
-if ! ssh "$TARGET" docker run --rm --pull=never --env-file /srv/outer/outer.env \
+if ! ssh "$TARGET" docker run --rm --pull=never --log-opt max-size=50m --log-opt max-file=5 --env-file /srv/outer/outer.env \
     -v /srv/outer/tls:/tls:ro -v /srv/outer/legal:/legal:ro -v /srv/outer/data:/data:ro "$IMAGE" check-config; then
     echo "release.sh: preflight check-config on $IMAGE failed; release aborted, prod untouched (fix the config or the image, then release again)" >&2
     exit 1
@@ -214,7 +214,7 @@ source /srv/outer/handoff.sh
 # validation reads files under /tls (e.g. OUTER_REVIEW_LOGINS_FILE) and
 # /legal (the Terms and Privacy files).
 # --pull=never: the image is local-only (same as the preflight above).
-docker run --rm --pull=never --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
+docker run --rm --pull=never --log-opt max-size=50m --log-opt max-file=5 --env-file /srv/outer/outer.env -v /srv/outer/tls:/tls:ro \
     -v /srv/outer/legal:/legal:ro \
     "outer:$SHA" state release-backup --sha "$SHA"
 if [[ "$FRESH_INSTALL" == 1 ]]; then

@@ -81,6 +81,10 @@ pub enum EmailSender {
         account_id: String,
         api_token: String,
         from: EmailFrom,
+        /// Operator-alerting failure hook (L-24): `None` unless the boot
+        /// wired `with_ops_hook`. Only the Cloudflare transport reports;
+        /// the localhost log and test capture senders have no provider.
+        ops_hook: Option<crate::ops_alerts::OpsMailHook>,
     },
     Log,
     #[cfg(test)]
@@ -92,9 +96,11 @@ pub enum EmailSender {
 impl std::fmt::Debug for EmailSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cloudflare { from, .. } => {
-                f.debug_struct("Cloudflare").field("from", from).finish()
-            }
+            Self::Cloudflare { from, ops_hook, .. } => f
+                .debug_struct("Cloudflare")
+                .field("from", from)
+                .field("ops_hook", &ops_hook.is_some())
+                .finish(),
             Self::Log => write!(f, "Log"),
             #[cfg(test)]
             Self::Capture { .. } => write!(f, "Capture"),
@@ -112,6 +118,31 @@ impl EmailSender {
             account_id,
             api_token,
             from,
+            ops_hook: None,
+        }
+    }
+
+    /// Record every Cloudflare send in the operator heartbeat table
+    /// (L-24): successes clear the email streak, failures extend it. Wired
+    /// once at boot; every clone of the sender carries it.
+    pub fn with_ops_hook(self, pool: sqlx::SqlitePool) -> Self {
+        match self {
+            Self::Cloudflare {
+                client,
+                api_base,
+                account_id,
+                api_token,
+                from,
+                ..
+            } => Self::Cloudflare {
+                client,
+                api_base,
+                account_id,
+                api_token,
+                from,
+                ops_hook: Some(crate::ops_alerts::OpsMailHook { pool }),
+            },
+            other => other,
         }
     }
 
@@ -124,6 +155,7 @@ impl EmailSender {
                 account_id,
                 api_token,
                 from,
+                ops_hook,
                 ..
             } => Self::Cloudflare {
                 client,
@@ -131,6 +163,7 @@ impl EmailSender {
                 account_id,
                 api_token,
                 from,
+                ops_hook,
             },
             other => other,
         }
@@ -215,10 +248,17 @@ impl EmailSender {
             account_id,
             api_token,
             from,
+            ops_hook,
         } = self
         else {
             unreachable!("post is only called on the Cloudflare sender");
         };
+        // The operator heartbeat hook (L-24), if the boot wired one: every
+        // provider failure extends the `ops_email` streak, every success
+        // clears it. Per-recipient bounces stay out (not a provider
+        // outage), and recording never fails the send. Inline, not
+        // spawned: callers observe the row when the send returns.
+        let ops_pool = ops_hook.as_ref().map(|hook| hook.pool.clone());
         let url = format!("{api_base}/client/v4/accounts/{account_id}/email/sending/send");
         let mut payload = serde_json::json!({
             "to": to,
@@ -233,32 +273,88 @@ impl EmailSender {
                 .collect::<serde_json::Map<_, _>>()
                 .into();
         }
-        let response = client
+        let response = match client
             .post(&url)
             .bearer_auth(api_token)
             .json(&payload)
             .send()
             .await
-            .map_err(|err| EmailError::Retryable(scrubbed(&err.to_string())))?;
+        {
+            Ok(response) => response,
+            Err(err) => {
+                let err = EmailError::Retryable(scrubbed(&err.to_string()));
+                if let Some(pool) = &ops_pool {
+                    crate::ops_alerts::record_heartbeat_err(
+                        pool,
+                        crate::ops_alerts::KIND_EMAIL,
+                        crate::auth::now_ms(),
+                        &err.to_string(),
+                    )
+                    .await;
+                }
+                return Err(err);
+            }
+        };
         let status = response.status();
-        let body: serde_json::Value = response.json().await.map_err(|err| {
-            EmailError::Retryable(format!("email API returned an unreadable body: {err}"))
-        })?;
+        let body: serde_json::Value = match response.json().await {
+            Ok(body) => body,
+            Err(err) => {
+                let err =
+                    EmailError::Retryable(format!("email API returned an unreadable body: {err}"));
+                if let Some(pool) = &ops_pool {
+                    crate::ops_alerts::record_heartbeat_err(
+                        pool,
+                        crate::ops_alerts::KIND_EMAIL,
+                        crate::auth::now_ms(),
+                        &err.to_string(),
+                    )
+                    .await;
+                }
+                return Err(err);
+            }
+        };
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || error_code(&body) == Some(10004) {
-            return Err(EmailError::Retryable(
+            let err = EmailError::Retryable(
                 "email provider is rate limited, try again shortly".to_string(),
-            ));
+            );
+            if let Some(pool) = &ops_pool {
+                crate::ops_alerts::record_heartbeat_err(
+                    pool,
+                    crate::ops_alerts::KIND_EMAIL,
+                    crate::auth::now_ms(),
+                    &err.to_string(),
+                )
+                .await;
+            }
+            return Err(err);
         }
         if !status.is_success() || body.get("success").and_then(|v| v.as_bool()) != Some(true) {
             let detail = first_error(&body).unwrap_or_else(|| status.to_string());
-            return Err(EmailError::Permanent(format!(
-                "email provider refused the message ({detail})"
-            )));
+            let err =
+                EmailError::Permanent(format!("email provider refused the message ({detail})"));
+            if let Some(pool) = &ops_pool {
+                crate::ops_alerts::record_heartbeat_err(
+                    pool,
+                    crate::ops_alerts::KIND_EMAIL,
+                    crate::auth::now_ms(),
+                    &err.to_string(),
+                )
+                .await;
+            }
+            return Err(err);
         }
         if permanent_bounce(&body, to) {
             return Err(EmailError::Permanent(format!(
                 "email to {to} permanently bounced"
             )));
+        }
+        if let Some(pool) = ops_pool {
+            crate::ops_alerts::record_heartbeat_ok(
+                &pool,
+                crate::ops_alerts::KIND_EMAIL,
+                crate::auth::now_ms(),
+            )
+            .await;
         }
         Ok(())
     }
