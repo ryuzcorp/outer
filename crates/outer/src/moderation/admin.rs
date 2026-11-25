@@ -435,8 +435,9 @@ pub struct PlanCount {
 }
 
 /// The `admin_stats` overview (spec §13): accounts, waitlist, fleets,
-/// recent deploy health, the moderation queue depth and the spec §1.3
-/// beta validation signals in `beta`.
+/// recent deploy health, the moderation queue depth, this UTC month's email
+/// sends against the Cloudflare plan cap (L-22), and the spec §1.3 beta
+/// validation signals in `beta`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     pub accounts_total: i64,
@@ -454,8 +455,19 @@ pub struct Stats {
     pub deploy_p50_ms_7d: Option<i64>,
     pub deploy_p95_ms_7d: Option<i64>,
     pub beta: BetaSignals,
+    pub email: EmailBudget,
 }
 
+/// This UTC month's email sends against the Cloudflare plan cap (L-22): the
+/// same count the ops sweep alerts on at 80 % and 95 %. Admins watch it on
+/// the admin stats view; the sender refuses past `cap` with a
+/// retry-next-month message.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailBudget {
+    pub month: String,
+    pub sent: u64,
+    pub cap: u64,
+}
 /// numerator/denominator for one §1.3 signal. `pct` is 0.0 when `of == 0`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Rate {
@@ -673,6 +685,16 @@ pub async fn stats(pool: &SqlitePool, now: i64) -> anyhow::Result<Stats> {
         deploy_p50_ms_7d: percentile(0.5),
         deploy_p95_ms_7d: percentile(0.95),
         beta,
+        email: {
+            use crate::auth::email::{month_key, sent_in_month, EMAIL_MONTHLY_CAP};
+            let month = month_key(now);
+            let sent = sent_in_month(pool, &month).await;
+            EmailBudget {
+                month,
+                sent,
+                cap: EMAIL_MONTHLY_CAP,
+            }
+        },
     })
 }
 
@@ -1027,5 +1049,28 @@ mod tests {
         assert!(beta["build_failures_7d"].is_number());
         assert!(beta["build_failure_rate_7d"].is_number());
         assert!(beta.get("attempts_before_first_success").is_some());
+    }
+
+    #[tokio::test]
+    async fn stats_carries_this_months_email_count() {
+        let pool = test_pool().await;
+        let now = 1_750_000_000_000;
+        let month = crate::auth::email::month_key(now);
+        sqlx::query("INSERT INTO email_month (month, sent) VALUES (?1, 42)")
+            .bind(&month)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s = stats(&pool, now).await.unwrap();
+        assert_eq!(s.email.month, month);
+        assert_eq!(s.email.sent, 42);
+        assert_eq!(s.email.cap, crate::auth::email::EMAIL_MONTHLY_CAP);
+        // A month with no sends reads as zero, not missing.
+        let other = stats(&pool, now + 40 * DAY_MS).await.unwrap();
+        assert_eq!(other.email.sent, 0);
+        assert_eq!(
+            other.email.month,
+            crate::auth::email::month_key(now + 40 * DAY_MS)
+        );
     }
 }

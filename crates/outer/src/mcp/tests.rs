@@ -1015,6 +1015,33 @@ async fn free_plan_caps_apps_at_two() {
 }
 
 #[tokio::test]
+async fn platform_capacity_refuses_with_retry_guidance() {
+    let (state, _) = setup().await;
+    let token = api_key_for(&state, "ana@example.com").await;
+    // Pro lifts the plan quota (20 apps); the test range holds 4 ports, so
+    // two apps spend it and the third hits platform capacity, not quota.
+    set_plan(&state, "ana@example.com", "pro").await;
+    create_app(&state, &token, "one").await;
+    create_app(&state, &token, "two").await;
+    let (_, third) = call(&state, Some(&token), "create_app", json!({"slug": "three"})).await;
+    let err = is_error(&third);
+    assert_eq!(err["error"], "capacity");
+    assert_eq!(err["capacity"], "ports");
+    assert!(
+        err["message"].as_str().unwrap().contains("no free ports"),
+        "{err}"
+    );
+    assert_eq!(err["retry_after_s"], 60);
+    let user = err["user_message"].as_str().unwrap();
+    assert!(user.contains("at capacity"), "{user}");
+    // The console answers the same code as 429, like `rate_limited`.
+    assert_eq!(
+        crate::http::console_actions::tool_status("capacity"),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
 async fn create_app_template_selects_the_starter() {
     let (state, _) = setup().await;
     let token = api_key_for(&state, "ana@example.com").await;
