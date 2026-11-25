@@ -62,6 +62,11 @@ pub struct DeploySettings {
     pub step_timeout: Duration,
     /// Cgroup anchor when containment is active, else `None` (dev).
     pub cgroups: Option<PathBuf>,
+    /// Per-build-leaf `cpu.max` (`OUTER_BUILD_CPU_MAX`): builds run the
+    /// tenant's install/bundling under their own, looser quota — the fleet
+    /// quota would stall them — while a hostile build still busy-loops
+    /// under a cap instead of starving neighbours.
+    pub build_cpu_max: String,
     /// Apps live at `<slug>.<apps_domain>`; the purge targets that host.
     pub apps_domain: String,
     /// Edge cache purge after a successful deploy. `None` skips the purge
@@ -2318,6 +2323,7 @@ impl Deployer {
             &parent,
             &format!("{deploy_id}-{step}"),
             BUILD_LEAF_MEMORY_MAX,
+            &self.settings.build_cpu_max,
         )?))
     }
 
@@ -3932,6 +3938,7 @@ mod tests {
             },
             step_timeout: Duration::from_secs(120),
             cgroups: None,
+            build_cpu_max: "200000 100000".to_string(),
             apps_domain: "outer.localhost".to_string(),
             cache_purge: None,
             jev: None,
@@ -7428,6 +7435,7 @@ exit 0
             step_timeout: Duration::from_secs(120),
             cgroups: None,
             apps_domain: "outer.now".to_string(),
+            build_cpu_max: "200000 100000".to_string(),
             cache_purge: None,
             jev: None,
             wake: None,

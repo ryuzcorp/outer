@@ -10,6 +10,8 @@
     { "id": "write:outside-workdir", "phase": "build", "category": "build-write-escape", "must": "fail", "desc": "Build writes outside its work dir (parent, /tmp, sibling, data root)" },
     { "id": "exec:fork-bomb", "phase": "build", "category": "resource-exhaustion", "must": "fail", "desc": "Bounded fork burst is refused by pids.max / NPROC" },
     { "id": "exec:memory-exhaust", "phase": "build", "category": "resource-exhaustion", "must": "fail", "desc": "Child allocating past the leaf is OOM-killed" },
+    { "id": "exec:cpu-spin", "phase": "cpu", "category": "resource-exhaustion", "must": "fail", "desc": "Busy-loop on every core stays within the leaf's cpu.max quota" },
+    { "id": "neighbour:p95", "phase": "cpu", "category": "cgroup-bounds", "must": "succeed", "desc": "Positive control: neighbour p95 stays within bound while the spinner runs" },
     { "id": "cgroup:leaf-limited", "phase": "build", "category": "cgroup-bounds", "must": "succeed", "desc": "Positive control: the step really runs inside a limited leaf" },
     { "id": "fetch:smtp", "phase": "build", "category": "blocked-egress", "must": "fail", "desc": "Build cannot open SMTP ports 25/465/587" },
     { "id": "fetch:blocked-ranges", "phase": "build", "category": "blocked-egress", "must": "fail", "desc": "Build cannot reach metadata, RFC1918, CGNAT, ULA, loopback services" },

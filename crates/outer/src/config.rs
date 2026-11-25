@@ -399,6 +399,11 @@ pub struct RuntimeConfig {
     /// Per-fleet `memory.max` (`OUTER_FLEET_MEMORY_MB`) and `cpu.max` (`OUTER_FLEET_CPU_MAX`).
     pub fleet_memory_mb: u64,
     pub fleet_cpu_max: String,
+    /// Per-build-leaf `cpu.max` (`OUTER_BUILD_CPU_MAX`, default two CPUs):
+    /// builds run the tenant's install/bundling uncapped by the fleet quota
+    /// (half a core would stall them), but a hostile build still busy-loops
+    /// under this quota instead of starving neighbours.
+    pub build_cpu_max: String,
     /// At most this many always-on fleets stay awake at once
     /// (`OUTER_ALWAYS_ON_MAX`, default 10). Past the cap the oldest-idle
     /// flagged apps may still sleep, and the warm-up stops waking.
@@ -674,6 +679,9 @@ impl Config {
             ),
             fleet_cpu_max: get("OUTER_FLEET_CPU_MAX")
                 .unwrap_or("50000 100000")
+                .to_string(),
+            build_cpu_max: get("OUTER_BUILD_CPU_MAX")
+                .unwrap_or("200000 100000")
                 .to_string(),
             always_on_max: parse_num(
                 get("OUTER_ALWAYS_ON_MAX"),
@@ -1086,6 +1094,12 @@ impl Config {
             problems.push(format!(
                 "OUTER_FLEET_CPU_MAX={:?} must be cgroup v2 cpu.max syntax: \"<quota> <period>\" or \"max <period>\"",
                 rt.fleet_cpu_max
+            ));
+        }
+        if !is_cpu_max(&rt.build_cpu_max) {
+            problems.push(format!(
+                "OUTER_BUILD_CPU_MAX={:?} must be cgroup v2 cpu.max syntax: \"<quota> <period>\" or \"max <period>\"",
+                rt.build_cpu_max
             ));
         }
         problems
@@ -1774,6 +1788,7 @@ mod tests {
             ("OUTER_APP_UID_RANGE", "lots"),
             ("OUTER_SLEEP_AFTER_S", "-5"),
             ("OUTER_FLEET_CPU_MAX", "half"),
+            ("OUTER_BUILD_CPU_MAX", "twice"),
             ("OUTER_WAKE_CONCURRENCY", "0"),
         ]))
         .unwrap_err();
@@ -1782,6 +1797,7 @@ mod tests {
             "OUTER_APP_UID_RANGE",
             "OUTER_SLEEP_AFTER_S",
             "OUTER_FLEET_CPU_MAX",
+            "OUTER_BUILD_CPU_MAX",
             "OUTER_BUILD_CONCURRENCY and OUTER_WAKE_CONCURRENCY",
         ] {
             assert!(

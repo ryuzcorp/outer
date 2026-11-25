@@ -21,11 +21,13 @@
 #   `inet outer` nft table, bun or node): `build-probe.mjs` runs through
 #   `run_sandboxed` as a scratch app uid in a 512 MiB / 512-pid leaf —
 #   the same function `deploy::pipeline` runs install/build through — and
-#   the suite fails unless every must-fail probe stayed contained. Probes
+#   the suite fails unless every must-fail probe stayed contained. The cpu
+#   layer (`cpu-spin.mjs` + `neighbour-probe.mjs` in quota-capped leaves)
+#   proves the cpu.max quota holds and the neighbour keeps its p95. Probes
 #   that cannot prove containment skip loudly instead of passing.
 # - VPS container path (no cargo on the box): `scripts/hostile-probe-vps.sh`
-#   runs the same build-probe layer as root inside `outer-outer-1` with bun
-#   + setpriv, against the live `inet outer` table and the real
+#   runs the build-probe and cpu layers as root inside `outer-outer-1` with
+#   bun + setpriv, against the live `inet outer` table and the real
 #   `/sys/fs/cgroup/outer` anchor. Fixtures ride in via scp + `docker cp`,
 #   the two top-of-range uids travel as arguments (verified spare on the
 #   host first). See that script's header for the exact commands.

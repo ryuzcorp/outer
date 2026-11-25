@@ -432,6 +432,7 @@ mod tests {
                 },
                 step_timeout: Duration::from_secs(30),
                 cgroups: None,
+                build_cpu_max: "200000 100000".to_string(),
                 apps_domain: "example.com".to_string(),
                 cache_purge: None,
                 jev: None,
