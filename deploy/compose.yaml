@@ -52,6 +52,14 @@ services:
       # Legal pages (OUTER_LEGAL_DIR). Host-only files, never committed:
       # read per request, so host edits go live without a rollout.
       - /srv/outer/legal:/legal:ro
+    # L-24: bound the container log on disk. The json-file driver keeps at
+    # most 5 × 50 MiB; older segments rotate away instead of filling
+    # /var/lib/docker on the VPS.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     # No HTTP healthcheck on purpose: the rollout verifies instead (the
     # container running on the new image + outer's "listening on" log line,
     # see deploy/release.sh).

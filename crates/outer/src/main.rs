@@ -878,7 +878,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     );
     deployer.set_egress(egress.clone());
     let purges = deployer.purges();
-    let auth = auth_state(&config, &pool)?;
+    let mut auth = auth_state(&config, &pool)?;
+    // Operator alerting (L-24): every Cloudflare send records into the
+    // `ops_email` heartbeat, so the sweep below sees provider failures
+    // (429 included). The sender is cloned everywhere from here, so one
+    // hook covers every mail path.
+    auth.config.email = auth.config.email.with_ops_hook(pool.clone());
     // Console-capture tokens: `look_at_app` mints into this table, the app
     // proxy claims from it. One table shared by both states, never global.
     let look_tokens = outer::look_tokens::LookTokens::new();
@@ -963,6 +968,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         let sweep_jev = mcp.jev.clone();
         let sweep_crawl = config.crawl.clone();
         let sweep_effects = crawl_effects.clone();
+        // Operator alerting (L-24): the sweep mails OUTER_ADMIN_EMAILS when
+        // the platform itself needs attention. Inside the handoff-delayed
+        // writers block, so a release never double-pages.
+        let sweep_ops_sync = sync.clone();
+        let sweep_ops_admins = config.admin_emails.clone();
+        let sweep_ops_cfg = config.ops.clone();
         let sleep_every = Duration::from_secs(60.min(rt.sleep_after_secs.max(1)));
         let sweep_windows =
             outer::inactivity::Windows::new(rt.inactive_days, rt.inactive_grace_days);
@@ -1078,6 +1089,19 @@ async fn serve(config: Config) -> anyhow::Result<()> {
                 jev: sweep_jev.clone(),
                 effects: sweep_effects,
             });
+            // Operator alerts (L-24): snapshot failures, low disk, email
+            // outages (429 included), Jev outages, suspensions and deep
+            // deploy queues, mailed to OUTER_ADMIN_EMAILS at most once per
+            // kind per cooldown. Five minutes, like the owner alert sweep.
+            outer::ops_alerts::spawn_ops_sweep(
+                sweep_pool.clone(),
+                sweep_ops_sync,
+                sweep_email.clone(),
+                sweep_ops_admins,
+                sweep_ops_cfg,
+                sweep_data_dir.clone(),
+                std::time::Duration::from_secs(300),
+            );
         });
     }
     // Request metrics (spec §13): owned by the proxy state, flushed to

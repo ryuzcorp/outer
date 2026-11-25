@@ -3069,6 +3069,7 @@ async fn cloudflare_sender_shape_bounce_and_retry() {
         account_id: "acct-1".to_string(),
         api_token: "cf-secret-token".to_string(),
         from: EmailFrom::parse("Outer <hello@outer.now>"),
+        ops_hook: None,
     };
 
     sender.send_code("ana@example.com", "123456").await.unwrap();

@@ -142,7 +142,7 @@ pub async fn set_prefs(
 }
 
 /// True when no `kind` send to `subject` happened inside the window.
-async fn should_send(
+pub(crate) async fn should_send(
     pool: &SqlitePool,
     subject: &str,
     kind: &str,
@@ -161,7 +161,12 @@ async fn should_send(
     Ok(recent.is_none())
 }
 
-async fn record_send(pool: &SqlitePool, subject: &str, kind: &str, now: i64) -> anyhow::Result<()> {
+pub(crate) async fn record_send(
+    pool: &SqlitePool,
+    subject: &str,
+    kind: &str,
+    now: i64,
+) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO alert_send (subject, kind, sent_at) VALUES (?1, ?2, ?3)")
         .bind(subject)
         .bind(kind)

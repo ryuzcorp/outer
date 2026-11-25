@@ -283,6 +283,8 @@ impl std::fmt::Debug for Config {
             .field("oxfmt_bin", &self.oxfmt_bin)
             .field("log_filter", &self.log_filter)
             .field("runtime", &self.runtime)
+            .field("crawl", &self.crawl)
+            .field("ops", &self.ops)
             .finish()
     }
 }
@@ -366,6 +368,9 @@ pub struct Config {
     /// After-live moderation crawl (spec §15.2): page budget, timeouts,
     /// re-crawl cadences, the bad-host list and the report rate limit.
     pub crawl: CrawlConfig,
+    /// Operator alerting (L-24): disk/queue/Jev thresholds and the
+    /// per-kind mail cooldown (`OUTER_OPS_*`).
+    pub ops: crate::ops_alerts::OpsAlertConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -735,6 +740,38 @@ impl Config {
                 &mut problems,
             ),
         };
+        let ops = crate::ops_alerts::OpsAlertConfig {
+            disk_free_pct: parse_num(
+                get("OUTER_OPS_DISK_FREE_PCT"),
+                "OUTER_OPS_DISK_FREE_PCT",
+                10,
+                &mut problems,
+            ),
+            disk_free_min_bytes: parse_num(
+                get("OUTER_OPS_DISK_FREE_BYTES"),
+                "OUTER_OPS_DISK_FREE_BYTES",
+                5 * 1024 * 1024 * 1024,
+                &mut problems,
+            ),
+            deploy_queue_depth: parse_num(
+                get("OUTER_OPS_QUEUE_DEPTH"),
+                "OUTER_OPS_QUEUE_DEPTH",
+                50,
+                &mut problems,
+            ),
+            jev_outage: Duration::from_secs(parse_num(
+                get("OUTER_OPS_JEV_OUTAGE_S"),
+                "OUTER_OPS_JEV_OUTAGE_S",
+                900,
+                &mut problems,
+            )),
+            cooldown: Duration::from_secs(parse_num(
+                get("OUTER_OPS_COOLDOWN_S"),
+                "OUTER_OPS_COOLDOWN_S",
+                3600,
+                &mut problems,
+            )),
+        };
 
         let config = Config {
             domain,
@@ -766,6 +803,7 @@ impl Config {
             stripe,
             runtime,
             crawl,
+            ops,
         };
         problems.extend(config.validate());
         if problems.is_empty() {
@@ -815,6 +853,30 @@ impl Config {
         if self.crawl.reports_per_hour == 0 {
             problems.push(
                 "OUTER_REPORTS_PER_HOUR=0 would refuse every abuse report; it must be at least 1"
+                    .to_string(),
+            );
+        }
+        if !(1..=100).contains(&self.ops.disk_free_pct) {
+            problems.push(format!(
+                "OUTER_OPS_DISK_FREE_PCT={} is not a percent; it must be 1-100",
+                self.ops.disk_free_pct
+            ));
+        }
+        if self.ops.deploy_queue_depth < 1 {
+            problems.push(format!(
+                "OUTER_OPS_QUEUE_DEPTH={} would page on an empty queue; it must be at least 1",
+                self.ops.deploy_queue_depth
+            ));
+        }
+        if self.ops.jev_outage < Duration::from_secs(60) {
+            problems.push(
+                "OUTER_OPS_JEV_OUTAGE_S must be at least 60: a shorter window pages on one slow classify"
+                    .to_string(),
+            );
+        }
+        if self.ops.cooldown < Duration::from_secs(60) {
+            problems.push(
+                "OUTER_OPS_COOLDOWN_S must be at least 60: a shorter cooldown spams the admins"
                     .to_string(),
             );
         }
