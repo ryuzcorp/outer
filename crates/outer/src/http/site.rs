@@ -245,6 +245,7 @@ fn content_type(relative: &str) -> &'static str {
         "webp" => "image/webp",
         "avif" => "image/avif",
         "ico" => "image/x-icon",
+        "mp4" => "video/mp4",
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "webmanifest" => "application/manifest+json",
@@ -541,6 +542,7 @@ mod tests {
             hdrs[axum::http::header::CONTENT_TYPE],
             "text/javascript; charset=utf-8"
         );
+        assert_eq!(content_type("review/walkthrough.mp4"), "video/mp4");
     }
 
     #[tokio::test]
