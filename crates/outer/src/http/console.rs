@@ -2361,6 +2361,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disposable_email_gets_the_throwaway_message_not_a_generic_error() {
+        let (app, _, _, codes) = test_app().await;
+        let (status, _, body) = send(
+            &app,
+            post_form(
+                "/console/sign-in",
+                &form(&[("step", "email"), ("email", "someone@mailinator.com")]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("throwaway email address"),
+            "the refusal names the reason, got: {body}"
+        );
+        assert!(codes
+            .lock()
+            .unwrap()
+            .get("someone@mailinator.com")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn open_signup_hides_the_invite_field() {
         let (app, _, config, _) = test_app().await;
         assert!(config.signup_open, "the default test app runs open");

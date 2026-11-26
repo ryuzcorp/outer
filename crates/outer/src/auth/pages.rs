@@ -250,6 +250,7 @@ pub fn friendly_error(code: &str) -> &str {
         "closed_beta" => "Outer is in closed beta. Ask someone on Outer for an invite code, or you're on the waitlist.",
         "rate_limited" => "Too many attempts. Try again shortly.",
         "invalid_email" => "That doesn't look like an email address.",
+        "disposable_email" => "That looks like a throwaway email address. Sign up with a permanent address instead.",
         "email_retry" => "Outer couldn't send the code. Try again shortly.",
         "email_budget" => "Outer couldn't send the code: this month's email budget is spent. Try again next month.",
         "invite_used" => "That invite code was just used.",
