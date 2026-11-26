@@ -402,9 +402,14 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, "<h1>Missing</h1>");
 
-        // Unknown non-site paths still reach the auth router.
-        let (status, _, _) = get(&app, "/.well-known/oauth-authorization-server", None).await;
-        assert_eq!(status, StatusCode::OK);
+        // OAuth and OpenID discovery aliases both reach the auth router.
+        for path in [
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/openid-configuration",
+        ] {
+            let (status, _, _) = get(&app, path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
     }
 
     /// `/.well-known/*`: only the auth router's exact discovery paths are
@@ -432,6 +437,11 @@ mod tests {
             "from-site",
         )
         .unwrap();
+        std::fs::write(
+            site_root.path().join(".well-known/openid-configuration"),
+            "from-site",
+        )
+        .unwrap();
         std::fs::write(site_root.path().join("404.html"), "<h1>Missing</h1>").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let app = test_router(dir.path(), site_root.path(), None).await;
@@ -447,16 +457,20 @@ mod tests {
         let (status, _, body) = get(&app, "/.well-known/agent-skills/index.json", None).await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "[]"));
 
-        // The auth router wins for its exact discovery paths even when the
-        // site dir holds a file with the same name.
-        let (status, headers, body) =
-            get(&app, "/.well-known/oauth-authorization-server", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            headers[axum::http::header::CONTENT_TYPE],
-            "application/json"
-        );
-        assert!(body.contains("\"issuer\""), "{body}");
+        // The auth router wins for both discovery aliases even when the site
+        // directory holds files with the same names.
+        for path in [
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/openid-configuration",
+        ] {
+            let (status, headers, body) = get(&app, path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(
+                headers[axum::http::header::CONTENT_TYPE],
+                "application/json"
+            );
+            assert!(body.contains("\"issuer\""), "{body}");
+        }
         let (status, _, _) = get(&app, "/.well-known/oauth-protected-resource", None).await;
         assert_eq!(status, StatusCode::OK);
 

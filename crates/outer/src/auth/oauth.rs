@@ -51,8 +51,10 @@ pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource
 /// `/.well-known/oauth-protected-resource/mcp`: the protected-resource
 /// document at the path clients derive from the MCP resource URL.
 pub const PROTECTED_RESOURCE_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
-/// `/.well-known/oauth-authorization-server` (RFC 8414).
+/// RFC 8414 authorization-server metadata path.
 pub const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-server";
+/// OpenID Connect discovery alias used by Google Connected Apps.
+pub const OPENID_CONFIGURATION_PATH: &str = "/.well-known/openid-configuration";
 
 /// The exact `/.well-known/*` paths the auth router answers. The platform
 /// fallback uses the same list ([`super::owns_path`]): every other
@@ -61,6 +63,7 @@ pub const WELL_KNOWN_PATHS: &[&str] = &[
     PROTECTED_RESOURCE_PATH,
     PROTECTED_RESOURCE_MCP_PATH,
     AUTHORIZATION_SERVER_PATH,
+    OPENID_CONFIGURATION_PATH,
 ];
 
 pub fn router(state: AuthState) -> Router {
@@ -68,6 +71,7 @@ pub fn router(state: AuthState) -> Router {
         .route(PROTECTED_RESOURCE_PATH, get(protected_resource))
         .route(PROTECTED_RESOURCE_MCP_PATH, get(protected_resource))
         .route(AUTHORIZATION_SERVER_PATH, get(authorization_server))
+        .route(OPENID_CONFIGURATION_PATH, get(authorization_server))
         .route("/oauth/register", post(register))
         .route("/oauth/authorize", get(authorize_get).post(authorize_post))
         .route("/oauth/token", post(token))

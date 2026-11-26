@@ -186,27 +186,32 @@ async fn discovery_documents_match_the_spec() {
         );
     }
 
-    let (status, headers, body) = send(&app, get("/.well-known/oauth-authorization-server")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
-    let doc: serde_json::Value = body.parse().unwrap();
-    assert_eq!(
-        doc,
-        serde_json::json!({
-            "issuer": ISSUER,
-            "authorization_endpoint": format!("{ISSUER}/oauth/authorize"),
-            "token_endpoint": format!("{ISSUER}/oauth/token"),
-            "registration_endpoint": format!("{ISSUER}/oauth/register"),
-            "revocation_endpoint": format!("{ISSUER}/oauth/revoke"),
-            "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
-            "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
-            "client_id_metadata_document_supported": true,
-            "authorization_response_iss_parameter_supported": true,
-            "scopes_supported": ["apps", "offline_access"],
-        })
-    );
+    for path in [
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/openid-configuration",
+    ] {
+        let (status, headers, body) = send(&app, get(path)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        let doc: serde_json::Value = body.parse().unwrap();
+        assert_eq!(
+            doc,
+            serde_json::json!({
+                "issuer": ISSUER,
+                "authorization_endpoint": format!("{ISSUER}/oauth/authorize"),
+                "token_endpoint": format!("{ISSUER}/oauth/token"),
+                "registration_endpoint": format!("{ISSUER}/oauth/register"),
+                "revocation_endpoint": format!("{ISSUER}/oauth/revoke"),
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+                "client_id_metadata_document_supported": true,
+                "authorization_response_iss_parameter_supported": true,
+                "scopes_supported": ["apps", "offline_access"],
+            })
+        );
+    }
 }
 
 #[tokio::test]
