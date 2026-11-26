@@ -95,6 +95,15 @@ impl Hints {
         idempotent: false,
         open_world: false,
     };
+    /// Overwrites a value whose effect reaches live visitors. Reapplying a
+    /// PIN or password rehashes it and signs existing visitors out, so the
+    /// call is not idempotent.
+    const OVERWRITE_EXTERNAL: Self = Self {
+        read_only: false,
+        destructive: true,
+        idempotent: false,
+        open_world: true,
+    };
     /// Overwrites a setting whose effect is public: publishing an app can
     /// expose it to search engines and crawlers, and renaming it serves the
     /// same app at a new public hostname. The previous setting or URL is
@@ -173,11 +182,14 @@ pub fn hints_for(name: &str) -> Option<Hints> {
         | "resolve_error" | "ignore_error" | "reopen_error" => Hints::ADDITIVE,
         // One reversible flag; the same call leaves the same state.
         "set_always_on" | "set_adults_only" => Hints::SETTING,
-        // Overwrites a value or replaces who can reach the app (a
-        // secret, PIN or tables are gone, and a retry can't restore them.
-        // `set_secret` is the audit's example: non-destructive would let
-        // injected text swap a Stripe key without a confirmation.
-        "set_secret" | "set_access" | "restore_backup" => Hints::OVERWRITE,
+        // Overwrites an account-confined value; the old secret or tables
+        // are gone, and a retry can't restore them. `set_secret` is the
+        // audit's example: non-destructive would let injected text swap a
+        // Stripe key without a confirmation.
+        "set_secret" | "restore_backup" => Hints::OVERWRITE,
+        // Replaces the visitor gate on every live host and path. Reapplying
+        // a secret rehashes it and signs visitors out.
+        "set_access" => Hints::OVERWRITE_EXTERNAL,
         // Replaces the current visibility or name *and* publishes outside
         // the private account: `set_visibility` can expose the app to
         // search engines and `rename_app` serves it at a new public
@@ -1035,5 +1047,8 @@ mod hint_tests {
         // `rename_app` retires the old URL and serves the app at a new
         // public hostname, so it is open-world as well as destructive.
         assert!(hints_for("rename_app").is_some_and(|h| h.destructive && h.open_world));
+        // `set_access` changes what independently controlled visitors can
+        // reach on the live app.
+        assert!(hints_for("set_access").is_some_and(|h| h.destructive && h.open_world));
     }
 }
