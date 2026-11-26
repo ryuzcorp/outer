@@ -477,7 +477,7 @@ async fn initialize_advertises_server_metadata() {
     assert_eq!(info["websiteUrl"], "https://outer.now/");
     let icons = info["icons"].as_array().unwrap();
     assert_eq!(icons.len(), 1);
-    assert_eq!(icons[0]["src"], "https://outer.now/logo.svg");
+    assert_eq!(icons[0]["src"], "https://outer.now/brand/mark.svg");
 }
 
 #[tokio::test]

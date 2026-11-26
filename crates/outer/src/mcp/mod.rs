@@ -47,10 +47,9 @@ pub const LATEST_PROTOCOL: &str = "2025-11-25";
 /// never workflow orders, and never how the model should behave.
 pub const INSTRUCTIONS: &str = "Outer is an app cloud for AI agents: each app is an Ilha + Void site at https://<slug>.outer.now, with code, a D1 database, files, secrets and scheduled jobs. Drafts stage edits, deploys build and publish, previews trial changes before going live. The docs tool lists the agent guides; /llms.txt is the full reference.";
 
-/// The stable public asset the `initialize` icons point at (Blume inlines
-/// `web/public/logo.svg` and serves it at `/logo.svg`; the owner is making
-/// a square one later, so this stays one constant).
-pub const SERVER_ICON_SRC: &str = "https://outer.now/logo.svg";
+/// The stable public asset the `initialize` icons point at (the square
+/// transparent master in `web/public/brand/mark.svg`).
+pub const SERVER_ICON_SRC: &str = "https://outer.now/brand/mark.svg";
 /// The service homepage, served as `websiteUrl` in `initialize`.
 pub const SERVER_WEBSITE_URL: &str = "https://outer.now/";
 /// The annotation title for the server itself.
