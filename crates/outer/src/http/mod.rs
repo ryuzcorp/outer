@@ -78,6 +78,9 @@ pub fn router(state: AppState) -> Router {
 /// OpenAI's app-submission domain check path: the configured token serves
 /// here verbatim, as plain text.
 const OPENAI_APPS_CHALLENGE_PATH: &str = "/.well-known/openai-apps-challenge";
+/// Google Connected Apps domain verification path: the configured tokens
+/// serve here as `{"verification_tokens":[...]}` JSON.
+const GOOGLE_CONNECTED_APPS_PATH: &str = "/.well-known/google-connected-apps";
 
 /// Platform-host fallback, in order: the built web site (static files
 /// from `OUTER_SITE_DIR`), then the auth router (OAuth, well-known
@@ -109,6 +112,29 @@ async fn platform_fallback(State(state): State<AppState>, req: axum::extract::Re
                 )
                     .into_response();
             }
+        }
+        // Google Connected Apps domain verification: the configured
+        // tokens, served as JSON. Empty leaves the path to the site and
+        // its 404.
+        if path == GOOGLE_CONNECTED_APPS_PATH
+            && (method == "GET" || method == "HEAD")
+            && !state.auth.config.google_connected_apps_tokens.is_empty()
+        {
+            let body = json!({
+                "verification_tokens": state.auth.config.google_connected_apps_tokens,
+            })
+            .to_string();
+            // HEAD answers the same headers and body length; hyper sends
+            // no body for it.
+            return (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/json"),
+                    ("cache-control", "no-store"),
+                ],
+                body,
+            )
+                .into_response();
         }
         if let Some(res) = state
             .site
@@ -218,15 +244,19 @@ mod tests {
     }
 
     /// The platform router over a temp database and site dir, carrying an
-    /// optional OpenAI challenge token in the auth config.
+    /// optional OpenAI challenge token and Google Connected Apps
+    /// verification tokens in the auth config.
     async fn test_router(
         dir: &std::path::Path,
         site_root: &std::path::Path,
         challenge: Option<&str>,
+        google_tokens: &[&str],
     ) -> Router {
         let pool = crate::db::open(&dir.join("outer.sqlite")).await.unwrap();
         let mut auth = crate::auth::test_support::test_state(pool.clone());
         auth.config.openai_apps_challenge = challenge.map(str::to_string);
+        auth.config.google_connected_apps_tokens =
+            google_tokens.iter().map(|t| t.to_string()).collect();
         router(AppState {
             pool: pool.clone(),
             sync: StateSync::new("test"),
@@ -444,7 +474,7 @@ mod tests {
         .unwrap();
         std::fs::write(site_root.path().join("404.html"), "<h1>Missing</h1>").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let app = test_router(dir.path(), site_root.path(), None).await;
+        let app = test_router(dir.path(), site_root.path(), None, &[]).await;
 
         // Blume's own well-known files are served, nested paths included.
         let (status, headers, body) = get(&app, "/.well-known/ai-catalog.json", None).await;
@@ -490,6 +520,7 @@ mod tests {
             dir.path(),
             site_root.path(),
             Some("openai-apps-challenge-token-abc123"),
+            &[],
         )
         .await;
         let (status, headers, body) = get(&app, "/.well-known/openai-apps-challenge", None).await;
@@ -515,6 +546,50 @@ mod tests {
         assert_eq!(
             res.headers()[axum::http::header::CONTENT_TYPE],
             "text/plain; charset=utf-8"
+        );
+        assert_eq!(res.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+    }
+
+    /// `/.well-known/google-connected-apps`: unset falls through to the
+    /// site's 404; set serves the tokens as JSON in configured order.
+    #[tokio::test]
+    async fn google_connected_apps_serves_tokens_as_json() {
+        let site_root = tempfile::tempdir().unwrap();
+        std::fs::write(site_root.path().join("404.html"), "<h1>Missing</h1>").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_router(dir.path(), site_root.path(), None, &[]).await;
+
+        // Unset: no handler, so the path falls through to the site's 404.
+        let (status, _, body) = get(&app, "/.well-known/google-connected-apps", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "<h1>Missing</h1>");
+
+        // Set: exact JSON body, in order, never cached.
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_router(dir.path(), site_root.path(), None, &["a", "b"]).await;
+        let (status, headers, body) = get(&app, "/.well-known/google-connected-apps", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(headers[axum::http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(body, "{\"verification_tokens\":[\"a\",\"b\"]}");
+
+        // HEAD gets the same status and headers (hyper sends no body).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::head("/.well-known/google-connected-apps")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
         );
         assert_eq!(res.headers()[axum::http::header::CACHE_CONTROL], "no-store");
     }

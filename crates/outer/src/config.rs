@@ -343,6 +343,11 @@ pub struct Config {
     /// absent = none): when set, `GET /.well-known/openai-apps-challenge`
     /// on the platform host serves the exact token as `text/plain`.
     pub openai_apps_challenge: Option<String>,
+    /// Google Connected Apps domain verification
+    /// (`OUTER_GOOGLE_CONNECTED_APPS_TOKENS`, absent = none): when
+    /// non-empty, `GET /.well-known/google-connected-apps` on the platform
+    /// host serves the tokens as `{"verification_tokens":[...]}` JSON.
+    pub google_connected_apps_tokens: Vec<String>,
     /// `OUTER_OAUTH_ACCESS_TTL_S` (default 3600).
     pub oauth_access_ttl: Duration,
     /// `OUTER_OAUTH_REFRESH_TTL_D` (default 90).
@@ -584,6 +589,13 @@ impl Config {
             .to_string();
         let webmcp_origin_trial = get("OUTER_WEBMCP_ORIGIN_TRIAL").map(str::to_string);
         let openai_apps_challenge = get("OUTER_OPENAI_APPS_CHALLENGE").map(str::to_string);
+        let google_connected_apps_tokens = get("OUTER_GOOGLE_CONNECTED_APPS_TOKENS")
+            .map(|raw| {
+                raw.split(',')
+                    .map(|t| t.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let oauth_access_ttl = Duration::from_secs(parse_num(
             get("OUTER_OAUTH_ACCESS_TTL_S"),
             "OUTER_OAUTH_ACCESS_TTL_S",
@@ -799,6 +811,7 @@ impl Config {
             email_from,
             webmcp_origin_trial,
             openai_apps_challenge,
+            google_connected_apps_tokens,
             oauth_access_ttl,
             oauth_refresh_ttl,
             tool_wait,
@@ -925,6 +938,36 @@ impl Config {
                     "OUTER_OPENAI_APPS_CHALLENGE must not contain whitespace or control characters (it is served verbatim as the domain-check body)"
                         .to_string(),
                 );
+            }
+        }
+        // Google compares each verification token byte for byte:
+        // whitespace, control characters or an oversized value only ever
+        // fail the check.
+        if self.google_connected_apps_tokens.len() > 10 {
+            problems.push(format!(
+                "OUTER_GOOGLE_CONNECTED_APPS_TOKENS has {} tokens; it must hold at most 10",
+                self.google_connected_apps_tokens.len()
+            ));
+        }
+        for token in &self.google_connected_apps_tokens {
+            if token.is_empty() {
+                problems.push(
+                    "OUTER_GOOGLE_CONNECTED_APPS_TOKENS must not contain empty entries (split on ',', trimmed)"
+                        .to_string(),
+                );
+            } else {
+                if token.len() > 512 {
+                    problems.push(format!(
+                        "OUTER_GOOGLE_CONNECTED_APPS_TOKENS entry is {} bytes; each token must be at most 512",
+                        token.len()
+                    ));
+                }
+                if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    problems.push(
+                        "OUTER_GOOGLE_CONNECTED_APPS_TOKENS entry must not contain whitespace or control characters (each token is served verbatim in the verification JSON)"
+                            .to_string(),
+                    );
+                }
             }
         }
         if !self.is_local() && self.terms_version == "dev" {
@@ -1463,6 +1506,46 @@ mod tests {
                 err.iter()
                     .any(|p| p.contains("OUTER_OPENAI_APPS_CHALLENGE")),
                 "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn google_connected_apps_tokens_parse_in_order_with_trimming() {
+        let cfg = Config::from_vars(&vars(&[("OUTER_STORE", "memory")])).unwrap();
+        assert!(cfg.google_connected_apps_tokens.is_empty());
+        let cfg = Config::from_vars(&vars(&[
+            ("OUTER_STORE", "memory"),
+            ("OUTER_GOOGLE_CONNECTED_APPS_TOKENS", "b,a , c"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.google_connected_apps_tokens, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn google_connected_apps_tokens_reject_bad_entries() {
+        let long = "a".repeat(513);
+        let eleven = (0..11)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for bad in [
+            "a,,b",
+            "a, ,b",
+            "abc def",
+            "abc\ndef",
+            long.as_str(),
+            eleven.as_str(),
+        ] {
+            let err = Config::from_vars(&vars(&[
+                ("OUTER_STORE", "memory"),
+                ("OUTER_GOOGLE_CONNECTED_APPS_TOKENS", bad),
+            ]))
+            .unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|p| p.contains("OUTER_GOOGLE_CONNECTED_APPS_TOKENS")),
+                "{bad:?}: {err:?}"
             );
         }
     }
