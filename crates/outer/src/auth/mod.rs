@@ -66,6 +66,11 @@ pub struct AuthConfig {
     /// /.well-known/openai-apps-challenge` serves it verbatim (OpenAI app
     /// submission domain check). `None` leaves the path to the site/404.
     pub openai_apps_challenge: Option<String>,
+    /// `OUTER_GOOGLE_CONNECTED_APPS_TOKENS`: when non-empty, `GET
+    /// /.well-known/google-connected-apps` serves them as
+    /// `{"verification_tokens":[...]}` JSON (Google Connected Apps domain
+    /// verification). Empty leaves the path to the site/404.
+    pub google_connected_apps_tokens: Vec<String>,
     /// `OUTER_OAUTH_ACCESS_TTL_S` (3600).
     pub access_ttl: Duration,
     /// `OUTER_OAUTH_REFRESH_TTL_D` (90 d).
@@ -1273,6 +1278,7 @@ pub mod test_support {
             signup_open: true,
             terms_version: "2026-10-23".to_string(),
             openai_apps_challenge: None,
+            google_connected_apps_tokens: Vec::new(),
             access_ttl: Duration::from_secs(3600),
             refresh_ttl: Duration::from_secs(90 * 86400),
             email: EmailSender::Capture {

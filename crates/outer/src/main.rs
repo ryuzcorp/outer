@@ -727,6 +727,7 @@ fn auth_state(config: &Config, pool: &sqlx::SqlitePool) -> anyhow::Result<outer:
             signup_open: config.signup_open,
             terms_version: config.terms_version.clone(),
             openai_apps_challenge: config.openai_apps_challenge.clone(),
+            google_connected_apps_tokens: config.google_connected_apps_tokens.clone(),
             access_ttl: config.oauth_access_ttl,
             refresh_ttl: config.oauth_refresh_ttl,
             email,
