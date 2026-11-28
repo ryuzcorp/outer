@@ -83,7 +83,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `list_connections`
 
 - **Access:** signed in
-- **Description:** List your OAuth grants: which clients (Claude, Codex, ChatGPT) may act as you.
+- **Description:** List your OAuth grants: which connected clients may act as you.
 
 **Input:** none.
 **Output (`structuredContent`):**
@@ -466,7 +466,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 ## `commit`
 
 - **Access:** signed in
-- **Description:** Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / Codex patch (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files, `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.
+- **Description:** Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / `*** Begin Patch` block (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files, `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.
 
 **Input:**
 
@@ -480,7 +480,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `line_edits` | array of object | no | Line-range replacements (inclusive, 1-based read_files numbering). Ranges in one file must not overlap. Refused on a file that also carries exact edits. Copy the read_files blob into expect_blob: a shifted file then answers conflict instead of editing wrong lines. |
 | `message` | string | yes | Commit message, 1-500 chars. |
 | `moves` | array of object | no | File renames. |
-| `patch` | string | no | One unified diff, or a Codex `*** Begin Patch` block. A commit carrying patch carries no other change kind. Hunks apply with exact context; any reject fails the whole commit. |
+| `patch` | string | no | One unified diff, or a `*** Begin Patch` block. A commit carrying patch carries no other change kind. Hunks apply with exact context; any reject fails the whole commit. |
 | `preview` | boolean | no | Preview the change instead of shipping it (Pro): commits to the preview ref, deploys to the `<slug>--preview` URL with a fresh, empty data namespace, and leaves live untouched. Counts a code change like a live commit. |
 | `wait` | boolean | no | Wait for the deploy (default true). False returns immediately; poll deploy_status (with preview: true for a preview commit). |
 | `writes` | array of object | no | Full-file writes (new files or replacements). |
@@ -500,7 +500,7 @@ Every Outer tool in `tools/list` order, rendered from the registry. Generated â€
 | `inserts` | array of object | no | Insertions after a line (0 is the top). |
 | `line_edits` | array of object | no | Line-range replacements (inclusive, 1-based read_files numbering). |
 | `moves` | array of object | no | File renames. |
-| `patch` | string | no | One unified diff, or a Codex `*** Begin Patch` block. A draft carrying a patch carries nothing else: stage it alone, then ship. |
+| `patch` | string | no | One unified diff, or a `*** Begin Patch` block. A draft carrying a patch carries nothing else: stage it alone, then ship. |
 | `writes` | array of object | no | Full-file writes (new files or replacements). |
 
 ## `diff_draft`

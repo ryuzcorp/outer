@@ -41,7 +41,7 @@ pub async fn about(_input: NoArgs, ctx: &Ctx<'_>) -> Result<Value, ToolError> {
     let structured = json!({
         "what": "Outer is an agent's app cloud, built on Ilha. An agent talks to Outer, Outer builds the app and serves it at https://<slug>.outer.now.",
         "connect": format!(
-            "Claude, Codex and ChatGPT sign in through OAuth automatically. Clients without OAuth: sign in at {keys_url} and send `Authorization: Bearer <key>`."
+            "MCP clients that support OAuth sign in automatically. Clients without OAuth: sign in at {keys_url} and send `Authorization: Bearer <key>`."
         ),
         "rules": [
             "The ilha guide covers writing code for these apps.",

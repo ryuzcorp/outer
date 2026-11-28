@@ -378,7 +378,7 @@ pub struct CommitInput {
     /// line_edits range of the same file, nor on a file that also carries
     /// exact edits.
     pub inserts: Option<Vec<InsertInput>>,
-    /// One unified diff, or a Codex `*** Begin Patch` block. A commit
+    /// One unified diff, or a `*** Begin Patch` block. A commit
     /// carrying patch carries no other change kind. Hunks apply with exact
     /// context; any reject fails the whole commit.
     pub patch: Option<String>,
