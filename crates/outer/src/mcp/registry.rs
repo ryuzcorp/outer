@@ -352,7 +352,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool_out::<NoArgs>(
             "list_connections",
-            "List your OAuth grants: which clients (Claude, Codex, ChatGPT) may act as you.",
+            "List your OAuth grants: which connected clients may act as you.",
             Account, false,
             output_schema(
                 &[("connections", arr(prop("object")))],
@@ -564,7 +564,7 @@ pub fn registry() -> Vec<ToolDef> {
         ),
         tool::<code_inputs::CommitInput>(
             "commit",
-            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / Codex patch (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files, `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.",
+            "Change your Ilha app's files and deploy: full-file writes, exact-match edits (old must occur exactly once), line-anchored line_edits (inclusive 1-based ranges from read_files numbering) and after-line inserts, or one unified diff / `*** Begin Patch` block (stands alone; hunks apply with exact context and any reject fails the whole commit). Per-file expect_blob pins the blob you read: a stale blob answers conflict with the current blob, unrelated files never conflict; whole-head base still CASes the tip. Counts one code change; waits for the deploy and returns success + url, failed + log, or blocked + the lines to fix. Written/edited code is formatted with oxfmt before the commit: `commit.formatted` lists changed files, `commit.format_skipped` lists files committed unformatted with why. Pass preview: true to trial the change at a temporary preview URL instead (Pro): same gate, a fresh empty data namespace, live untouched.",
             Account, false,
         ),
         tool::<draft_inputs::StageInput>(
@@ -882,6 +882,48 @@ mod tests {
                 "{} is not ^[a-zA-Z0-9_-]+$",
                 tool.name
             );
+        }
+    }
+
+    /// Directory review rule (Anthropic, 2026-11-28): tool copy must not
+    /// name specific AI assistants, or the listing reads as aimed at
+    /// another client. Covers every description and schema (schemars
+    /// turns field doc comments into schema descriptions) plus the
+    /// server-level text sent in `initialize`.
+    #[test]
+    fn tool_copy_names_no_ai_assistant() {
+        const NAMES: &[&str] = &[
+            "claude",
+            "anthropic",
+            "chatgpt",
+            "openai",
+            "codex",
+            "gemini",
+            "copilot",
+            "perplexity",
+        ];
+        let mut texts = vec![
+            (
+                "server instructions".to_string(),
+                crate::mcp::INSTRUCTIONS.to_string(),
+            ),
+            (
+                "server description".to_string(),
+                crate::mcp::SERVER_DESCRIPTION.to_string(),
+            ),
+        ];
+        for tool in registry() {
+            texts.push((tool.name.to_string(), tool.description.to_string()));
+            texts.push((tool.name.to_string(), tool.input_schema.to_string()));
+            if let Some(schema) = &tool.output_schema {
+                texts.push((tool.name.to_string(), schema.to_string()));
+            }
+        }
+        for (owner, text) in texts {
+            let lower = text.to_lowercase();
+            for name in NAMES {
+                assert!(!lower.contains(name), "{owner} names {name}: {text}");
+            }
         }
     }
 

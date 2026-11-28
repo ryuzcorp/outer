@@ -41,7 +41,7 @@ pub struct StageInput {
     pub line_edits: Option<Vec<LineEditInput>>,
     /// Insertions after a line (0 is the top).
     pub inserts: Option<Vec<InsertInput>>,
-    /// One unified diff, or a Codex `*** Begin Patch` block. A draft
+    /// One unified diff, or a `*** Begin Patch` block. A draft
     /// carrying a patch carries nothing else: stage it alone, then ship.
     pub patch: Option<String>,
     /// Paths to delete.
